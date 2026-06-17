@@ -1,4 +1,5 @@
 import cv2
+import os
 import numpy as np
 import torch
 import torchvision.models as models
@@ -35,7 +36,12 @@ class FeatureExtractor:
     def __init__(self, device='cpu'):
         self.device = device
         # Use torchvision ResNet18 pre-trained on ImageNet
-        self.model = models.resnet18(pretrained=True)
+        self.model = models.resnet18(pretrained=False)
+        local_weights = os.path.expanduser("~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth")
+        if os.path.exists(local_weights):
+            self.model.load_state_dict(torch.load(local_weights, map_location='cpu'))
+        else:
+            self.model = models.resnet18(pretrained=True)
         # Remove the classification head (fc layer)
         self.model.fc = torch.nn.Identity()
         self.model.to(device)

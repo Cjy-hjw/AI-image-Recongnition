@@ -43,18 +43,22 @@ def main():
     is_phantom, auth_probs = auth_module.predict(img_np)
     
     deduplicator = Deduplicator(
+        device=device,
         phash_threshold=config["gatekeeper"]["phash_threshold"],
         cosine_threshold=config["gatekeeper"].get("cosine_threshold", 0.95)
     )
     # Seed deduplicator with train database if it exists
     if os.path.exists(config["data"]["train_path"]):
-        for sample_dir in os.listdir(config["data"]["train_path"]):
+        train_samples = os.listdir(config["data"]["train_path"])
+        print("Populating deduplicator database from disk (decoding images)...")
+        for i, sample_dir in enumerate(train_samples):
             p = os.path.join(config["data"]["train_path"], sample_dir, "image.png")
             if os.path.exists(p):
                 train_img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
                 if train_img is not None:
                     deduplicator.add_image(train_img)
-                    
+            if (i + 1) % 500 == 0 or (i + 1) == len(train_samples):
+                print(f"--> Loaded {i + 1}/{len(train_samples)} training samples into deduplicator database.")
     is_duplicate, dup_reason = deduplicator.is_duplicate(img_np)
     is_copy_move, cm_mask, cm_bbox = detect_copy_move(img_np)
     is_spliced, sp_mask, sp_bbox = detect_splicing(img_np)

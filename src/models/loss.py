@@ -28,7 +28,7 @@ class MultiTaskLoss(nn.Module):
     Balances segmentation BCE+Dice, TI-RADS concepts, and cost-sensitive malignancy classification
     using Homoscedastic Uncertainty Weighting and ACR TI-RADS prior regularization.
     """
-    def __init__(self, num_tasks=3, alpha_prior=0.1, fn_weight=2.5):
+    def __init__(self, num_tasks=3, alpha_prior=0.1, fn_weight=1.5):
         super().__init__()
         # 3 learnable task uncertainty weights: 0 -> seg, 1 -> concepts, 2 -> malignancy
         self.log_vars = nn.Parameter(torch.tensor([-0.5, 0.0, 0.0]))

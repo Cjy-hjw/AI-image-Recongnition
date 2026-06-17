@@ -137,41 +137,60 @@ def validate_epoch(model, loader, criterion, device):
     avg_acc = mal_correct / total_samples
     return avg_loss, avg_dice, avg_acc
 
+def extract_single_feat_and_label(sample_dir):
+    from src.gatekeeper.authenticity import extract_authenticity_features
+    import json
+    import cv2
+    import os
+    import numpy as np
+    
+    meta_path = os.path.join(sample_dir, "meta.json")
+    authenticity = 0
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        authenticity = meta.get("label_authenticity", 0)
+        
+    img_np = cv2.imread(os.path.join(sample_dir, "image.png"), cv2.IMREAD_GRAYSCALE)
+    if img_np is None:
+        return np.zeros(8, dtype=np.float32), int(authenticity)
+        
+    # Resize to 256x256 to speed up GLCM texture calculation significantly
+    img_np = cv2.resize(img_np, (256, 256))
+    feat = extract_authenticity_features(img_np)
+    return feat, int(authenticity)
+
 def train_authenticity_classifier(train_dataset, val_dataset, device, save_path):
-    from src.gatekeeper.authenticity import AuthenticityClassifier, extract_authenticity_features
+    from src.gatekeeper.authenticity import AuthenticityClassifier
     import torch.nn as nn
+    from multiprocessing import Pool
     
     print("Training Gatekeeper Authenticity Classifier MLP...")
     auth_model = AuthenticityClassifier().to(device)
     optimizer = optim.Adam(auth_model.parameters(), lr=0.01)
     criterion = nn.CrossEntropyLoss()
     
-    # Extract features for training
-    train_feats = []
-    train_labels = []
-    for idx in range(len(train_dataset)):
-        img_tensor, _, labels = train_dataset[idx]
-        img_np_255 = (img_tensor.squeeze(0).numpy() * 255.0).astype(np.uint8)
-        feat = extract_authenticity_features(img_np_255)
-        train_feats.append(feat)
-        train_labels.append(labels["authenticity"])
+    # Parallel feature extraction for training
+    train_dirs = [os.path.dirname(s["img_path"]) for s in train_dataset.samples]
+    print(f"Extracting features for {len(train_dirs)} training samples in parallel...")
+    with Pool() as pool:
+        results = pool.map(extract_single_feat_and_label, train_dirs)
         
+    train_feats = [r[0] for r in results]
+    train_labels = [r[1] for r in results]
     train_feats = torch.tensor(np.array(train_feats), dtype=torch.float32).to(device)
     train_labels = torch.tensor(train_labels, dtype=torch.long).to(device)
     
-    # Extract features for validation
-    val_feats = []
-    val_labels = []
-    for idx in range(len(val_dataset)):
-        img_tensor, _, labels = val_dataset[idx]
-        img_np_255 = (img_tensor.squeeze(0).numpy() * 255.0).astype(np.uint8)
-        feat = extract_authenticity_features(img_np_255)
-        val_feats.append(feat)
-        val_labels.append(labels["authenticity"])
+    # Parallel feature extraction for validation
+    val_dirs = [os.path.dirname(s["img_path"]) for s in val_dataset.samples]
+    print(f"Extracting features for {len(val_dirs)} validation samples in parallel...")
+    with Pool() as pool:
+        results_val = pool.map(extract_single_feat_and_label, val_dirs)
         
+    val_feats = [r[0] for r in results_val]
+    val_labels = [r[1] for r in results_val]
     val_feats = torch.tensor(np.array(val_feats), dtype=torch.float32).to(device)
     val_labels = torch.tensor(val_labels, dtype=torch.long).to(device)
-    
     # Train
     auth_model.train()
     for epoch in range(50):

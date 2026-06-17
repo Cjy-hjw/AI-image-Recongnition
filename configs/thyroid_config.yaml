@@ -4,14 +4,14 @@
 environment:
   device: "cuda"            # cuda or cpu
   seed: 42
-  num_workers: 4            # Enable multi-threaded data loading (recommended for speed)
+  num_workers: 8            # Enable multi-threaded data loading (recommended for speed)
 
 data:
   train_path: "data/train"
   val_path: "data/val"
   holdout_path: "data/holdout"
-  batch_size: 8             # Optimized for 8GB VRAM (set to 16/32 for A800 80GB)
-  img_size: 256             # Resized resolution (set to 512 or 1024 for A800 80GB)
+  batch_size: 32             # Optimized for 8GB VRAM (set to 16/32 for A800 80GB)
+  img_size: 512             # Resized resolution (set to 512 or 1024 for A800 80GB)
   num_folds: 5
 
 gatekeeper:
@@ -33,7 +33,7 @@ model:
   num_classes_malignancy: 2   # benign, malignant
 
 train:
-  epochs: 20                # Keep low for quick laptop testing (set to 50+ on server)
+  epochs: 120                # Keep low for quick laptop testing (set to 50+ on server)
   lr: 0.00015
   weight_decay: 0.0005
   amp: true                 # Automatic Mixed Precision

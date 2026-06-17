@@ -133,6 +133,43 @@ python train.py --config configs/thyroid_config.yaml --device cuda:0
 python evaluate.py --model_path checkpoints/best_model.pth --data_path data/val
 ```
 
+### 6.4 远程服务器（A800）部署与背景运行
+由于服务器具备大算力，建议在服务器上直接通过国内镜像进行依赖补全和后台静默训练：
+
+1. **校园网登录认证（连通外网）**：
+   ```bash
+   curl -G "http://10.0.1.5/drcom/login" \
+     --data-urlencode "DDDDD=23032304023" \
+     --data-urlencode "upass=zd79718812@.." \
+     --data-urlencode "0MKKey=123456" \
+     --data-urlencode "R1=0" --data-urlencode "R2=" --data-urlencode "R3=0" --data-urlencode "R6=0" \
+     --data-urlencode "para=00" --data-urlencode "v4ip=10.12.0.4" --data-urlencode "terminal_type=1" \
+     --data-urlencode "lang=zh-cn" --data-urlencode "jsVersion=4.2" --data-urlencode "v=" \
+     -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)" \
+     -H "Referer: http://10.0.1.5/"
+   ```
+
+2. **创建独立 Python 虚拟环境**：
+   ```bash
+   # 克隆已有 CUDA 支持的 d2l_env 环境，避免重新下载 2.4 GB 框架包
+   /root/miniconda3/bin/conda create --name thyroid_env --clone d2l_env -y
+   ```
+
+3. **在线国内镜像安装其余库**：
+   ```bash
+   /root/miniconda3/envs/thyroid_env/bin/pip install opencv-python-headless monai \
+     albumentations scikit-image scikit-learn faiss-cpu pyyaml \
+     -i https://pypi.tuna.tsinghua.edu.cn/simple
+   ```
+
+4. **后台静默挂载多任务模型训练**：
+   ```bash
+   # 注入 Hugging Face 国内镜像站，利用 8 线程并行 dataloader 启动 120 轮高清训练
+   cd /root/AI_image_Recognition
+   export HF_ENDPOINT=https://hf-mirror.com
+   (nohup /root/miniconda3/envs/thyroid_env/bin/python -u train.py --config configs/thyroid_config.yaml > train.log 2>&1 < /dev/null &) &
+   ```
+
 ---
 
 ## 7. 代码规范与通用模式 (Code Conventions & Common Patterns)

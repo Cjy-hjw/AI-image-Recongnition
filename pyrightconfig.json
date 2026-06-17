@@ -1,0 +1,8 @@
+{
+  "venvPath": "D:\\program\\Python\\anaconda\\envs",
+  "venv": "Demo_D",
+  "pythonPath": "D:\\program\\Python\\anaconda\\envs\\Demo_D\\python.exe",
+  "include": [
+    "."
+  ]
+}

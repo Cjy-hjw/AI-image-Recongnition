@@ -1,0 +1,42 @@
+# Configuration for Thyroid AI Detection Pipeline
+# Optimized for 4060 Laptop (8GB VRAM)
+
+environment:
+  device: "cuda"            # cuda or cpu
+  seed: 42
+  num_workers: 4            # Enable multi-threaded data loading (recommended for speed)
+
+data:
+  train_path: "data/train"
+  val_path: "data/val"
+  holdout_path: "data/holdout"
+  batch_size: 8             # Optimized for 8GB VRAM (set to 16/32 for A800 80GB)
+  img_size: 256             # Resized resolution (set to 512 or 1024 for A800 80GB)
+  num_folds: 5
+
+gatekeeper:
+  fpr_threshold: 0.01
+  precision_threshold: 0.98
+  phash_threshold: 1        # Hamming distance limit
+  cosine_threshold: 0.995   # Cosine similarity limit for deep features
+  faiss_dim: 768            # DINOv2-base feature dimension
+  tamper_threshold: 0.5
+
+model:
+  backbone: "resnet18"      # Lightweight for 4060 (use swinv2_tiny or convnext_tiny on server)
+  pretrained: true
+  num_classes_composition: 4 # cystic, spongiform, mixed, solid
+  num_classes_echogenicity: 4 # anechoic, hyperechoic/isoechoic, hypoechoic, very hypoechoic
+  num_classes_shape: 2        # wider-than-tall, taller-than-wide
+  num_classes_margin: 4       # smooth, ill-defined, lobulated/irregular, extrathyroidal extension
+  num_classes_foci: 4         # none/comet-tail, large coarse, peripheral/rim, punctate echogenic
+  num_classes_malignancy: 2   # benign, malignant
+
+train:
+  epochs: 10                # Keep low for quick laptop testing (set to 50+ on server)
+  lr: 0.0003
+  weight_decay: 0.0001
+  amp: true                 # Automatic Mixed Precision
+  early_stopping_patience: 5
+  slr_beta: 0.99            # Supervised Label Rectification smoothing factor
+  slr_threshold: 2.0        # SLR gradient threshold

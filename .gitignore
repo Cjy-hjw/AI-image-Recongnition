@@ -1,0 +1,13 @@
+# Ignore dataset and weights
+data/
+checkpoints/
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+.cache/
+.ipynb_checkpoints/
+
+# System files
+desktop.ini
+.DS_Store

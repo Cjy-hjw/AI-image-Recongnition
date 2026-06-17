@@ -31,7 +31,7 @@ class MultiTaskLoss(nn.Module):
     def __init__(self, num_tasks=3, alpha_prior=0.1, fn_weight=2.5):
         super().__init__()
         # 3 learnable task uncertainty weights: 0 -> seg, 1 -> concepts, 2 -> malignancy
-        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+        self.log_vars = nn.Parameter(torch.tensor([-0.5, 0.0, 0.0]))
         self.alpha_prior = alpha_prior  # Clinical prior regularization factor
         self.fn_weight = fn_weight      # Penalty factor for False Negatives in malignancy
         

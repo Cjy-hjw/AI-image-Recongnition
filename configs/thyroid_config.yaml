@@ -34,7 +34,7 @@ model:
 
 train:
   epochs: 20                # Keep low for quick laptop testing (set to 50+ on server)
-  lr: 0.0001
+  lr: 0.00015
   weight_decay: 0.0005
   amp: true                 # Automatic Mixed Precision
   early_stopping_patience: 5

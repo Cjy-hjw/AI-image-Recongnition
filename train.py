@@ -242,11 +242,24 @@ def main():
     
     criterion = MultiTaskLoss().to(device)
     
-    optimizer = optim.AdamW(
-        list(model.parameters()) + list(criterion.parameters()),
-        lr=config["train"]["lr"],
-        weight_decay=config["train"]["weight_decay"]
-    )
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "bias" in name or "bn" in name or "norm" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+            
+    for name, param in criterion.named_parameters():
+        if param.requires_grad:
+            no_decay_params.append(param)
+            
+    optimizer = optim.AdamW([
+        {"params": decay_params, "weight_decay": config["train"]["weight_decay"]},
+        {"params": no_decay_params, "weight_decay": 0.0}
+    ], lr=config["train"]["lr"])
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["train"]["epochs"])

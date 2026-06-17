@@ -25,16 +25,17 @@ class GatedTaskAttention(nn.Module):
     """
     def __init__(self, in_channels):
         super().__init__()
-        self.conv_reduce = nn.Conv2d(in_channels, in_channels // 4, kernel_size=1)
+        mid_channels = max(1, in_channels // 4)
+        self.conv_reduce = nn.Conv2d(in_channels, mid_channels, kernel_size=1)
         self.channel_gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels // 4, in_channels // 4, kernel_size=1),
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels // 4, in_channels, kernel_size=1),
+            nn.Conv2d(mid_channels, in_channels, kernel_size=1),
             nn.Sigmoid()
         )
         self.spatial_gate = nn.Sequential(
-            nn.Conv2d(in_channels // 4, 1, kernel_size=7, padding=3),
+            nn.Conv2d(mid_channels, 1, kernel_size=7, padding=3),
             nn.Sigmoid()
         )
         self.conv_project = nn.Conv2d(in_channels, in_channels, kernel_size=1)

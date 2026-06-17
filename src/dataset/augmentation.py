@@ -214,18 +214,18 @@ def apply_mixup_or_cutmix(images, masks, labels, alpha=0.2, prob=0.5):
             
             if total_nodule > 0:
                 R = donor_nodule / (total_nodule + 1e-6)
+                if R >= 0.65:
+                    lams[i] = 0.0      # inherits 100% of donor labels
+                    mask_weight[i] = 1.0
+                elif R <= 0.35:
+                    lams[i] = 1.0      # inherits 100% of recipient labels
+                    mask_weight[i] = 1.0
+                else:
+                    lams[i] = 0.0      # masked out for classification losses
+                    mask_weight[i] = 0.0
             else:
-                R = 0.0
-                
-            if R >= 0.65:
-                lams[i] = 0.0      # inherits 100% of donor labels
-                mask_weight[i] = 1.0
-            elif R <= 0.35:
-                lams[i] = 1.0      # inherits 100% of recipient labels
-                mask_weight[i] = 1.0
-            else:
-                lams[i] = 0.0      # masked out for classification losses
-                mask_weight[i] = 0.0
+                lams[i] = 0.0      # no nodule present
+                mask_weight[i] = 0.0   # completely mask out classification losses
     else:
         # Standard MixUp logic
         mixed_images = lam * images + (1.0 - lam) * images[index]

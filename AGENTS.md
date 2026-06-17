@@ -20,15 +20,15 @@
 
 ### 2.2 多任务诊断阶段 (Multi-task Diagnosis MTL)
 通过统一的多任务学习（MTL）网络，共享 Encoder 并行处理多个下游任务：
-- **主干网络 (Backbone)**: 选用 2D `Swin-v2`、`ConvNeXt` 或 `MFS-Unet` (Vision Mamba)。**严禁使用任何 3D 网络**，超声是纯 2D 模态。
+- **主干网络 (Backbone)**: 选用 2D `EfficientNet-B2`（或 `ConvNeXt-Tiny`）作为 U-Net 编码器以适配 8GB 显存，引入门控任务注意力（Gated Task Attention, GTA）将局部空间边界特征与全局语义诊断特征进行通道和空间层面的解耦过滤。**严禁使用任何 3D 网络**，超声是纯 2D 模态。
 - **并行任务头**:
   1. **病灶检测与分割**: 预测结节的像素级掩码（Segment Mask）与 Bound Box。
   2. **ACR TI-RADS 评估头**:
      - *成分 (Composition)*、*回声 (Echogenicity)*、*形状 (Shape)*、*边缘 (Margin)*：形式化为多类别分类任务，使用 **Softmax 激活 + 分类交叉熵损失（Categorical Cross-Entropy）**。
      - *强回声灶 (Echogenic Foci)*：非互斥的多标签分类任务，使用 **Sigmoid 激活 + 二元交叉熵损失（Binary Cross-Entropy）**。
      - 对高危特征（如“长大于宽”、微钙化点）赋予更高的假阴性惩罚权重。
-  3. **概念瓶颈模型 (CBM)**: 强制网络先预测 5 个 TI-RADS 临床概念，再通过浅层决策树或线性层输出最终的良恶性分类及定级，使决策过程严格与临床指南绑定。
-  4. **可解释性输出 (XAI)**: 结合 Grad-CAM 与 Object Prompt，在图上自动标注病灶边缘及钙化关键点位，并可结合 VLM（如 LLaVA-Med）生成临床 Chain-of-Thought（思维链）文本推理报告。
+  3. **概念瓶颈模型 (CBM)**: 潜空间残差概念瓶颈模型（Latent-Residual CBM），融合直接可解释性的线性直连路径与捕捉复杂交互的潜特征非线性路径，并结合可微的 ACR TI-RADS 积分 MSE 正则化项，确保推理决策流严格符合临床医学共识。
+  4. **可解释性输出 (XAI)**: 结合 Grad-CAM 与特征图在图上自动标注病灶边缘及钙化关键点位，并可生成高度对齐的规范结构化文本临床报告。
 
 ```
 Raw Image -> [SRAD + ELA / GLCM + EfficientNet] -> 真实性校验
@@ -84,7 +84,7 @@ Raw Image -> [SRAD + ELA / GLCM + EfficientNet] -> 真实性校验
 - **指定 Anaconda 虚拟环境路径**: `D:\program\Python\anaconda\envs\Demo_D`（解释器指向 `D:\program\Python\anaconda\envs\Demo_D\python.exe`）。
 - **包管理工具**: `pip`（沙箱环境部署需支持基于离线依赖包目录的无网离线安装）。
 - **核心依赖库**:
-  - `torch`, `torchvision`, `torchaudio` (CUDA 11.8+ 兼容版本)
+  - `torch`, `torchvision`, `torchaudio` (CUDA 12.1+ 兼容版本)
   - `monai` (医疗影像变换与分割评估)
   - `timm` (2D 预训练模型加载)
   - `faiss-gpu` (去重嵌入检索)
@@ -103,8 +103,7 @@ Raw Image -> [SRAD + ELA / GLCM + EfficientNet] -> 真实性校验
 ```bash
 # 1. 激活指定环境并安装 CUDA 编译的 PyTorch 框架
 conda activate Demo_D
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 # 2. 安装项目依赖项
 pip install monai timm wandb faiss-gpu opencv-python scikit-image scikit-learn PyWavelets
 

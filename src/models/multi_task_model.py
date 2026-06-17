@@ -18,6 +18,105 @@ class ConvBlock(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+class GatedTaskAttention(nn.Module):
+    """
+    Gated Task Attention (GTA): Decouples spatial/channel details of features
+    before feeding into the classification CBM head.
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv_reduce = nn.Conv2d(in_channels, in_channels // 4, kernel_size=1)
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels // 4, in_channels // 4, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // 4, in_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(in_channels // 4, 1, kernel_size=7, padding=3),
+            nn.Sigmoid()
+        )
+        self.conv_project = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        feat_reduced = self.conv_reduce(x)
+        c_weight = self.channel_gate(feat_reduced)
+        s_weight = self.spatial_gate(feat_reduced)
+        
+        decoupled = x * c_weight * s_weight
+        return self.conv_project(decoupled)
+
+class LatentResidualCBMHead(nn.Module):
+    """
+    Latent-Residual Concept Bottleneck Model (CBM) Head.
+    Combines direct linear clinical pathways and latent non-linear MLP pathways.
+    """
+    def __init__(self, in_features, num_concepts=18):
+        super().__init__()
+        # 1. Concept prediction heads (logits)
+        self.head_composition = nn.Linear(in_features, 4)
+        self.head_echogenicity = nn.Linear(in_features, 4)
+        self.head_shape = nn.Linear(in_features, 2)
+        self.head_margin = nn.Linear(in_features, 4)
+        self.head_foci = nn.Linear(in_features, 4)
+        
+        # 2. Concept attention加权网络 (CoAt)
+        self.concept_attention = nn.Sequential(
+            nn.Linear(num_concepts, num_concepts),
+            nn.ReLU(),
+            nn.Linear(num_concepts, num_concepts),
+            nn.Sigmoid()
+        )
+        
+        # 3. 辅助非线性关系提取器 (Latent MLP)
+        self.latent_mlp = nn.Sequential(
+            nn.Linear(num_concepts, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+        
+        # 4. 混合分类器 (2 classes for compatibility with cross-entropy evaluation)
+        self.classifier_direct = nn.Linear(num_concepts, 2, bias=False)
+        self.classifier_latent = nn.Linear(16, 2)
+
+    def forward(self, x):
+        # Predict individual concept logits
+        logits_comp = self.head_composition(x)
+        logits_echo = self.head_echogenicity(x)
+        logits_shape = self.head_shape(x)
+        logits_margin = self.head_margin(x)
+        logits_foci = self.head_foci(x)
+        
+        # Compute probabilities for the bottleneck representation
+        prob_comp = F.softmax(logits_comp, dim=1)
+        prob_echo = F.softmax(logits_echo, dim=1)
+        prob_shape = F.softmax(logits_shape, dim=1)
+        prob_margin = F.softmax(logits_margin, dim=1)
+        prob_foci = torch.sigmoid(logits_foci)
+        
+        # Concat to get 18-dim concept probability vector
+        concept_vector = torch.cat([
+            prob_comp,
+            prob_echo,
+            prob_shape,
+            prob_margin,
+            prob_foci
+        ], dim=1)
+        
+        # Concept-wise Attention (CoAt)
+        attn_weights = self.concept_attention(concept_vector)
+        weighted_concepts = concept_vector * attn_weights
+        
+        # Extract latent complex interactions
+        latent_features = self.latent_mlp(weighted_concepts)
+        
+        # Residual fusion to predict malignancy logits (2 classes)
+        logits_malignancy = self.classifier_direct(weighted_concepts) + self.classifier_latent(latent_features)
+        
+        return logits_comp, logits_echo, logits_shape, logits_margin, logits_foci, concept_vector, logits_malignancy
+
 class MultiTaskThyroidModel(nn.Module):
     """
     Multi-task Thyroid AI Model.
@@ -28,8 +127,7 @@ class MultiTaskThyroidModel(nn.Module):
     def __init__(self, backbone_name="resnet18", pretrained=True, config=None):
         super().__init__()
         
-        # Load feature extraction backbone
-        # e.g., resnet18 has feature channels: [64, 64, 128, 256, 512] at reductions [2, 4, 8, 16, 32]
+        # Load feature extraction backbone (in_chans=1 for B-mode ultrasound)
         self.encoder = timm.create_model(
             backbone_name, 
             pretrained=pretrained, 
@@ -39,108 +137,56 @@ class MultiTaskThyroidModel(nn.Module):
         encoder_channels = self.encoder.feature_info.channels()
         
         # U-Net style decoder for segmentation
-        # Input resolutions: 1/32, 1/16, 1/8, 1/4, 1/2 of original size
-        self.up4 = nn.ConvTranspose2d(encoder_channels[4], encoder_channels[3], kernel_size=2, stride=2)
-        self.dec4 = ConvBlock(encoder_channels[3] * 2, encoder_channels[3])
+        self.up_blocks = nn.ModuleList()
+        in_ch = encoder_channels[-1]
         
-        self.up3 = nn.ConvTranspose2d(encoder_channels[3], encoder_channels[2], kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(encoder_channels[2] * 2, encoder_channels[2])
-        
-        self.up2 = nn.ConvTranspose2d(encoder_channels[2], encoder_channels[1], kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(encoder_channels[1] * 2, encoder_channels[1])
-        
-        self.up1 = nn.ConvTranspose2d(encoder_channels[1], encoder_channels[0], kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(encoder_channels[0] * 2, encoder_channels[0])
-        
+        for i in reversed(range(len(encoder_channels) - 1)):
+            skip_ch = encoder_channels[i]
+            self.up_blocks.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2),
+                    nn.Conv2d(in_ch // 2 + skip_ch, in_ch // 2, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(in_ch // 2),
+                    nn.ReLU(inplace=True)
+                )
+            )
+            in_ch = in_ch // 2
+            
         # Final segmentation output head (upsample from 1/2 back to full resolution)
-        self.final_up = nn.ConvTranspose2d(encoder_channels[0], 32, kernel_size=2, stride=2)
-        self.segmentation_head = nn.Conv2d(32, 1, kernel_size=1)
+        self.final_up = nn.ConvTranspose2d(in_ch, 32, kernel_size=2, stride=2)
+        self.seg_head = nn.Conv2d(32, 1, kernel_size=1)
         
-        # Classification Heads (TI-RADS Concepts)
-        latent_dim = encoder_channels[4]
-        
-        # 1. Composition head: 4 classes
-        self.head_composition = nn.Linear(latent_dim, 4)
-        # 2. Echogenicity head: 4 classes
-        self.head_echogenicity = nn.Linear(latent_dim, 4)
-        # 3. Shape head: 2 classes
-        self.head_shape = nn.Linear(latent_dim, 2)
-        # 4. Margin head: 4 classes
-        self.head_margin = nn.Linear(latent_dim, 4)
-        # 5. Foci head: 4 independent binary labels (multi-label)
-        self.head_foci = nn.Linear(latent_dim, 4)
-        
-        # 6. Concept Bottleneck layer -> Malignancy
-        # Total concept dimensions = 4 (comp) + 4 (echo) + 2 (shape) + 4 (margin) + 4 (foci) = 18
-        self.concept_dim = 18
-        self.head_malignancy = nn.Linear(self.concept_dim, 2)
+        # Classification & CBM decoupling gateway
+        self.decouple_gate = GatedTaskAttention(encoder_channels[-1])
+        self.cbm_head = LatentResidualCBMHead(in_features=encoder_channels[-1], num_concepts=18)
         
     def forward(self, x):
         # 1. Encoder (forward through backbone layers)
         features = self.encoder(x)
-        c1, c2, c3, c4, c5 = features # features at different scales
+        deepest_feat = features[-1]
         
         # 2. Decoder (segmentation mask)
-        d4 = self.up4(c5)
-        # Pad or crop if spatial dimensions differ slightly
-        if d4.shape[2:] != c4.shape[2:]:
-            d4 = F.interpolate(d4, size=c4.shape[2:], mode='bilinear', align_corners=False)
-        d4 = torch.cat([d4, c4], dim=1)
-        d4 = self.dec4(d4)
+        seg_feat = deepest_feat
+        idx = 0
+        for i in reversed(range(len(features) - 1)):
+            skip = features[i]
+            seg_feat = self.up_blocks[idx][0](seg_feat)
+            if seg_feat.shape[2:] != skip.shape[2:]:
+                seg_feat = F.interpolate(seg_feat, size=skip.shape[2:], mode='bilinear', align_corners=True)
+            seg_feat = torch.cat([seg_feat, skip], dim=1)
+            seg_feat = self.up_blocks[idx][1:](seg_feat)
+            idx += 1
+            
+        seg_feat = self.final_up(seg_feat)
+        if seg_feat.shape[2:] != x.shape[2:]:
+            seg_feat = F.interpolate(seg_feat, size=x.shape[2:], mode='bilinear', align_corners=True)
+        mask_out = self.seg_head(seg_feat) # Raw logits
         
-        d3 = self.up3(d4)
-        if d3.shape[2:] != c3.shape[2:]:
-            d3 = F.interpolate(d3, size=c3.shape[2:], mode='bilinear', align_corners=False)
-        d3 = torch.cat([d3, c3], dim=1)
-        d3 = self.dec3(d3)
+        # 3. Classification / CBM决策路径
+        decoupled_feat = self.decouple_gate(deepest_feat)
+        gap = F.adaptive_avg_pool2d(decoupled_feat, (1, 1)).view(decoupled_feat.size(0), -1)
         
-        d2 = self.up2(d3)
-        if d2.shape[2:] != c2.shape[2:]:
-            d2 = F.interpolate(d2, size=c2.shape[2:], mode='bilinear', align_corners=False)
-        d2 = torch.cat([d2, c2], dim=1)
-        d2 = self.dec2(d2)
-        
-        d1 = self.up1(d2)
-        if d1.shape[2:] != c1.shape[2:]:
-            d1 = F.interpolate(d1, size=c1.shape[2:], mode='bilinear', align_corners=False)
-        d1 = torch.cat([d1, c1], dim=1)
-        d1 = self.dec1(d1)
-        
-        # Upsample to input resolution
-        mask_out = self.final_up(d1)
-        if mask_out.shape[2:] != x.shape[2:]:
-            mask_out = F.interpolate(mask_out, size=x.shape[2:], mode='bilinear', align_corners=False)
-        mask_out = self.segmentation_head(mask_out)
-        
-        # 3. Classification (Concept Bottleneck Model)
-        # Global Average Pooling on the deepest feature map
-        gap = F.adaptive_avg_pool2d(c5, (1, 1)).view(c5.size(0), -1)
-        
-        # Predict concepts (logits)
-        logits_comp = self.head_composition(gap)
-        logits_echo = self.head_echogenicity(gap)
-        logits_shape = self.head_shape(gap)
-        logits_margin = self.head_margin(gap)
-        logits_foci = self.head_foci(gap)
-        
-        # Convert logits to probability distributions to pass through bottleneck
-        prob_comp = F.softmax(logits_comp, dim=1)
-        prob_echo = F.softmax(logits_echo, dim=1)
-        prob_shape = F.softmax(logits_shape, dim=1)
-        prob_margin = F.softmax(logits_margin, dim=1)
-        prob_foci = torch.sigmoid(logits_foci) # Foci is multi-label
-        
-        # Concatenate concepts
-        concept_vector = torch.cat([
-            prob_comp, 
-            prob_echo, 
-            prob_shape, 
-            prob_margin, 
-            prob_foci
-        ], dim=1)
-        
-        # Predict malignancy from concepts
-        logits_malignancy = self.head_malignancy(concept_vector)
+        logits_comp, logits_echo, logits_shape, logits_margin, logits_foci, concept_vector, logits_malignancy = self.cbm_head(gap)
         
         outputs = {
             "mask": mask_out,

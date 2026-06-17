@@ -1,5 +1,14 @@
 #!/bin/bash
 set -e
+export HTTP_PROXY=http://127.0.0.1:1203
+export HTTPS_PROXY=http://127.0.0.1:1203
+export http_proxy=http://127.0.0.1:1203
+export https_proxy=http://127.0.0.1:1203
+
+# Run training
+echo "Starting training..."
+D:/program/Python/anaconda/envs/Demo_D/python.exe train.py --config configs/thyroid_config.yaml
+echo "Training completed."
 
 # Run evaluation and capture output
 OUTPUT=$(D:/program/Python/anaconda/envs/Demo_D/python.exe evaluate.py --config configs/thyroid_config.yaml)

@@ -23,7 +23,7 @@ gatekeeper:
   tamper_threshold: 0.5
 
 model:
-  backbone: "resnet18"      # Lightweight for 4060 (use swinv2_tiny or convnext_tiny on server)
+  backbone: "efficientnet_b2"      # Lightweight for 4060 (use swinv2_tiny or convnext_tiny on server)
   pretrained: true
   num_classes_composition: 4 # cystic, spongiform, mixed, solid
   num_classes_echogenicity: 4 # anechoic, hyperechoic/isoechoic, hypoechoic, very hypoechoic
@@ -33,9 +33,9 @@ model:
   num_classes_malignancy: 2   # benign, malignant
 
 train:
-  epochs: 10                # Keep low for quick laptop testing (set to 50+ on server)
-  lr: 0.0003
-  weight_decay: 0.0001
+  epochs: 15                # Keep low for quick laptop testing (set to 50+ on server)
+  lr: 0.0001
+  weight_decay: 0.0005
   amp: true                 # Automatic Mixed Precision
   early_stopping_patience: 5
   slr_beta: 0.99            # Supervised Label Rectification smoothing factor

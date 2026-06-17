@@ -240,8 +240,10 @@ def main():
         pretrained=config["model"]["pretrained"]
     ).to(device)
     
+    criterion = MultiTaskLoss().to(device)
+    
     optimizer = optim.AdamW(
-        model.parameters(),
+        list(model.parameters()) + list(criterion.parameters()),
         lr=config["train"]["lr"],
         weight_decay=config["train"]["weight_decay"]
     )
@@ -249,7 +251,6 @@ def main():
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["train"]["epochs"])
     scaler = torch.cuda.amp.GradScaler(enabled=config["train"]["amp"])
-    criterion = MultiTaskLoss()
     
     best_val_loss = float("inf")
     os.makedirs("checkpoints", exist_ok=True)

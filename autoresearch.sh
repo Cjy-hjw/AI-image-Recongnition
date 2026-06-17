@@ -1,31 +1,37 @@
 #!/bin/bash
 set -e
-export HTTP_PROXY=http://127.0.0.1:1203
-export HTTPS_PROXY=http://127.0.0.1:1203
-export http_proxy=http://127.0.0.1:1203
-export https_proxy=http://127.0.0.1:1203
 
-# Run training
-echo "Starting training..."
-D:/program/Python/anaconda/envs/Demo_D/python.exe train.py --config configs/thyroid_config.yaml
+SERVER="root@182.91.14.5"
+PORT=22038
+SERVER_DIR="/root/AI_image_Recognition"
+SERVER_PY="/root/miniconda3/envs/thyroid_env/bin/python"
+SSH="ssh -p $PORT -o StrictHostKeyChecking=no"
+SCP="scp -P $PORT -o StrictHostKeyChecking=no"
+
+# 1. Deploy latest code to server
+echo "Deploying code to server..."
+D:/program/Python/anaconda/envs/Demo_D/python.exe deploy.py
+
+# 2. Train on server (A800 80GB)
+echo "Starting training on server (A800)..."
+$SSH $SERVER "cd $SERVER_DIR && $SERVER_PY -u train.py --config configs/thyroid_config.yaml"
 echo "Training completed."
 
-# Run evaluation and capture output
-OUTPUT=$(D:/program/Python/anaconda/envs/Demo_D/python.exe evaluate.py --config configs/thyroid_config.yaml)
+# 3. Run evaluation on server, capture output
+echo "Running evaluation on server..."
+OUTPUT=$($SSH $SERVER "cd $SERVER_DIR && $SERVER_PY -u evaluate.py --config configs/thyroid_config.yaml 2>&1")
 echo "$OUTPUT"
 
-# Extract metrics using grep and awk
+# 4. Extract metrics
 DICE=$(echo "$OUTPUT" | grep -i "Mean Nodule Segmentation Dice" | awk -F': ' '{print $2}' | awk -F'%' '{print $1}')
-AUC=$(echo "$OUTPUT" | grep -i "Malignancy Classification AUC" | awk -F': ' '{print $2}' | awk -F'%' '{print $1}')
-F1=$(echo "$OUTPUT" | grep -i "Average TI-RADS F1-Score" | awk -F': ' '{print $2}' | awk -F'%' '{print $1}')
+AUC=$(echo "$OUTPUT"  | grep -i "Malignancy Classification AUC"  | awk -F': ' '{print $2}' | awk -F'%' '{print $1}')
+F1=$(echo "$OUTPUT"   | grep -i "Average TI-RADS F1-Score"       | awk -F': ' '{print $2}' | awk -F'%' '{print $1}')
 
-# Check if any metric is empty
-if [ -z "$DICE" ] || [ -z "$AUC" ] || [ -z "$F1" ] || [ "$DICE" == "N/A" ] || [ "$AUC" == "N/A" ] || [ "$F1" == "N/A" ]; then
-    echo "Error: Failed to parse metrics from evaluation output."
+if [ -z "$DICE" ] || [ -z "$AUC" ] || [ -z "$F1" ] || [ "$DICE" = "N/A" ] || [ "$AUC" = "N/A" ] || [ "$F1" = "N/A" ]; then
+    echo "Error: Failed to parse metrics."
     exit 1
 fi
 
-# Calculate composite score using Python
 COMPOSITE=$(D:/program/Python/anaconda/envs/Demo_D/python.exe -c "print(round(0.4 * $DICE + 0.4 * $AUC + 0.2 * $F1, 2))")
 
 echo "METRIC composite_score=$COMPOSITE"

@@ -120,20 +120,24 @@ def validate_epoch(model, loader, criterion, device):
             loss, loss_dict = criterion(outputs, targets)
             val_loss += loss.item()
             
-            # Calculate Dice for validation
-            pred_mask = torch.sigmoid(outputs["mask"]) > 0.5
-            intersection = (pred_mask * masks).sum()
-            union = pred_mask.sum() + masks.sum()
-            dice = (2.0 * intersection + 1e-6) / (union + 1e-6)
-            seg_dice += dice.item()
+            # Calculate sample-level mDice (batch loop)
+            for b in range(images.size(0)):
+                pm = pred_mask[b]
+                gt = masks[b]
+                inter = (pm * gt).sum().item()
+                denom = pm.sum().item() + gt.sum().item()
+                if denom == 0:
+                    seg_dice += 1.0  # both empty → perfect
+                else:
+                    seg_dice += (2.0 * inter + 1e-6) / (denom + 1e-6)
+            total_samples += images.size(0)
             
             # Calculate malignancy accuracy
             pred_mal = torch.argmax(outputs["malignancy"], dim=1)
             mal_correct += (pred_mal == targets["malignancy"]).sum().item()
-            total_samples += images.size(0)
             
     avg_loss = val_loss / len(loader)
-    avg_dice = seg_dice / len(loader)
+    avg_dice = seg_dice / total_samples
     avg_acc = mal_correct / total_samples
     return avg_loss, avg_dice, avg_acc
 

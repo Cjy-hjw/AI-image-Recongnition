@@ -28,13 +28,12 @@ class MultiTaskLoss(nn.Module):
     Balances segmentation BCE+Dice, TI-RADS concepts, and cost-sensitive malignancy classification
     using Homoscedastic Uncertainty Weighting and ACR TI-RADS prior regularization.
     """
-    def __init__(self, num_tasks=3, alpha_prior=0.1, beta_fn=4.0, gamma_focal=2.0):
+    def __init__(self, num_tasks=3, alpha_prior=0.1, fn_weight=2.5):
         super().__init__()
         # 3 learnable task uncertainty weights: 0 -> seg, 1 -> concepts, 2 -> malignancy
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
         self.alpha_prior = alpha_prior  # Clinical prior regularization factor
-        self.beta_fn = beta_fn          # False Negative penalty for malignancy
-        self.gamma_focal = gamma_focal  # Focal loss gamma
+        self.fn_weight = fn_weight      # Penalty factor for False Negatives in malignancy
         
         self.bce_seg = nn.BCEWithLogitsLoss()
         self.dice_seg = DiceLoss()
@@ -119,20 +118,29 @@ class MultiTaskLoss(nn.Module):
         # Apply mask_weight
         loss_concepts = (loss_concepts * mask_weight)
         
-        # 3. Cost-Sensitive Non-symmetric Focal Loss for malignancy (computed sample-wise)
+        # 3. Cost-Sensitive NLL Loss for malignancy (computed sample-wise)
         mal_logits = outputs["malignancy"]
-        prob_mal = F.softmax(mal_logits, dim=1)[:, 1]
-        p = torch.clamp(prob_mal, 1e-7, 1.0 - 1e-7)
+        mal_targets = targets["malignancy"]
+        log_prob = F.log_softmax(mal_logits, dim=1)
         
-        y_orig = targets["malignancy"].float()
-        loss_mal_orig = - self.beta_fn * y_orig * ((1.0 - p) ** self.gamma_focal) * torch.log(p) - (1.0 - y_orig) * (p ** self.gamma_focal) * torch.log(1.0 - p)
+        # Original targets loss
+        loss_mal_raw_orig = F.nll_loss(log_prob, mal_targets, reduction='none')
+        preds_orig = torch.argmax(mal_logits, dim=1)
+        fn_mask_orig = (mal_targets == 1) & (preds_orig == 0)
+        penalty_weights_orig = torch.ones_like(loss_mal_raw_orig, dtype=torch.float32)
+        penalty_weights_orig[fn_mask_orig] = self.fn_weight
+        loss_mal_orig = loss_mal_raw_orig * penalty_weights_orig
         
-        y_perm = targets["malignancy"][index].float()
-        loss_mal_perm = - self.beta_fn * y_perm * ((1.0 - p) ** self.gamma_focal) * torch.log(p) - (1.0 - y_perm) * (p ** self.gamma_focal) * torch.log(1.0 - p)
+        # Permuted targets loss
+        mal_targets_perm = mal_targets[index]
+        loss_mal_raw_perm = F.nll_loss(log_prob, mal_targets_perm, reduction='none')
+        fn_mask_perm = (mal_targets_perm == 1) & (preds_orig == 0)
+        penalty_weights_perm = torch.ones_like(loss_mal_raw_perm, dtype=torch.float32)
+        penalty_weights_perm[fn_mask_perm] = self.fn_weight
+        loss_mal_perm = loss_mal_raw_perm * penalty_weights_perm
         
         loss_mal = lam * loss_mal_orig + (1.0 - lam) * loss_mal_perm
         loss_mal = (loss_mal * mask_weight)
-        
         # Apply Supervised Label Rectification weights if provided
         if slr_weights is not None:
             loss_concepts = loss_concepts * slr_weights

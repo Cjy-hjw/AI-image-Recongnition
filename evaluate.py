@@ -169,9 +169,17 @@ def main():
             # Generate Grad-CAM for verification
             gradcam = None
             try:
-                # Target the last layer of ResNet18 backbone
-                # In timm resnet18, features are from layers: self.encoder.layer4
-                target_layer = model.encoder.layer4[-1]
+                # Dynamically discover the last convolutional layer of the encoder
+                target_layer = None
+                if hasattr(model.encoder, "layer4"):
+                    target_layer = model.encoder.layer4[-1]
+                elif hasattr(model.encoder, "blocks"):
+                    target_layer = model.encoder.blocks[-1][-1]
+                else:
+                    for module in reversed(list(model.encoder.modules())):
+                        if isinstance(module, nn.Conv2d):
+                            target_layer = module
+                            break
                 gradcam = GradCAM(model, target_layer)
                 heatmap = gradcam.generate_heatmap(img_tensor, target_class=1)
                 overlay = overlay_heatmap(img_np, heatmap)

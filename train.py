@@ -265,7 +265,7 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["train"]["epochs"])
     scaler = torch.cuda.amp.GradScaler(enabled=config["train"]["amp"])
     
-    best_val_loss = float("inf")
+    best_val_score = -1.0
     os.makedirs("checkpoints", exist_ok=True)
     
     print("Starting training loop...")
@@ -279,11 +279,12 @@ def main():
               f"Train Loss: {train_loss:.4f} (Seg: {train_seg:.3f}, Mal: {train_mal:.3f}) | "
               f"Val Loss: {val_loss:.4f} | Val Dice: {val_dice:.3f} | Val Mal Acc: {val_acc:.3f}")
               
-        # Checkpoint saving
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Checkpoint saving based on validation score
+        val_score = val_dice + val_acc
+        if val_score > best_val_score:
+            best_val_score = val_score
             torch.save(model.state_dict(), "checkpoints/best_model.pth")
-            print("--> Saved new best checkpoint to checkpoints/best_model.pth")
+            print(f"--> Saved new best checkpoint (Score: {val_score:.4f}) to checkpoints/best_model.pth")
             
     print("Training finished successfully.")
 

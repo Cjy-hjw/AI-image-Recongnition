@@ -1,16 +1,16 @@
 # Configuration for Thyroid AI Detection Pipeline
-# Optimized for 4060 Laptop (8GB VRAM)
+# Optimized for NVIDIA A800 80GB GPU
 
 environment:
   device: "cuda"            # cuda or cpu
   seed: 42
-  num_workers: 8            # Enable multi-threaded data loading (recommended for speed)
+  num_workers: 12            # Enable multi-threaded data loading (recommended for speed)
 
 data:
   train_path: "data/train"
   val_path: "data/val"
   holdout_path: "data/holdout"
-  batch_size: 32             # Optimized for 8GB VRAM (set to 16/32 for A800 80GB)
+  batch_size: 128             # Balanced configuration to fit available GPU VRAM safely
   img_size: 512             # Resized resolution (set to 512 or 1024 for A800 80GB)
   num_folds: 5
 
@@ -19,11 +19,11 @@ gatekeeper:
   precision_threshold: 0.98
   phash_threshold: 1        # Hamming distance limit
   cosine_threshold: 0.995   # Cosine similarity limit for deep features
-  faiss_dim: 768            # DINOv2-base feature dimension
+  faiss_dim: 512            # ResNet18 feature dimension
   tamper_threshold: 0.5
 
 model:
-  backbone: "efficientnet_b2"      # Lightweight for 4060 (use swinv2_tiny or convnext_tiny on server)
+  backbone: "efficientnet_b2"      # Backbone optimized for multi-task thyroid diagnostic
   pretrained: true
   num_classes_composition: 4 # cystic, spongiform, mixed, solid
   num_classes_echogenicity: 4 # anechoic, hyperechoic/isoechoic, hypoechoic, very hypoechoic
@@ -33,10 +33,17 @@ model:
   num_classes_malignancy: 2   # benign, malignant
 
 train:
-  epochs: 120                # Keep low for quick laptop testing (set to 50+ on server)
-  lr: 0.00015
+  epochs: 120                # 120 Epochs for full convergence on server
+  lr: 0.0024                 # Tuned for batch size 128
   weight_decay: 0.0005
   amp: true                 # Automatic Mixed Precision
   early_stopping_patience: 5
+  label_smoothing: 0.1
+  cbm_dropout: 0.3
   slr_beta: 0.99            # Supervised Label Rectification smoothing factor
   slr_threshold: 2.0        # SLR gradient threshold
+  # Next-Gen Rebuilding Parameters
+  supcon_temperature: 0.07
+  slr_alpha: 0.1
+  prior_mlp_dim: 16
+  physical_kappa: 100.0

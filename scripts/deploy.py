@@ -3,9 +3,9 @@ import paramiko
 
 host = "182.91.14.5"
 port = 22038
-user = "root"
+user = "cjy"
 password = "LIUpeng!@2026"
-remote_base = "/root/AI_image_Recognition"
+remote_base = "/home/cjy/AI_image_Recognition"
 
 ignore_dirs = {".git", ".cache", "__pycache__", ".omp", ".ipynb_checkpoints", "runs", "data"}
 ignore_files = {"deploy.py", "bash.cmd", "deploy_bundle.tar", "upload.py"}
@@ -44,7 +44,7 @@ for root, dirs, files in os.walk(local_base):
     remote_mkdir_p(remote_dir)
     
     for f in files:
-        if f in ignore_files or f.endswith(".pyc") or f.endswith(".tmp"):
+        if f in ignore_files or f.endswith(".pyc") or f.endswith(".tmp") or f.endswith(".md"):
             continue
         local_file = os.path.join(root, f)
         remote_file = os.path.join(remote_dir, f).replace("\\", "/")

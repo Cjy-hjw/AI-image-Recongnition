@@ -1,203 +1,229 @@
+import os
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
+from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
+
 
 class ConvBlock(nn.Module):
     """Basic double convolution block for U-Net style decoder."""
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
+
     def forward(self, x):
         return self.conv(x)
 
-class GatedTaskAttention(nn.Module):
-    """
-    Gated Task Attention (GTA): Decouples spatial/channel details of features
-    before feeding into the classification CBM head.
-    """
-    def __init__(self, in_channels):
-        super().__init__()
-        mid_channels = max(1, in_channels // 4)
-        self.conv_reduce = nn.Conv2d(in_channels, mid_channels, kernel_size=1)
-        self.channel_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(mid_channels, mid_channels, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv2d(mid_channels, in_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(mid_channels, 1, kernel_size=7, padding=3),
-            nn.Sigmoid()
-        )
-        self.conv_project = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-
-    def forward(self, x):
-        feat_reduced = self.conv_reduce(x)
-        c_weight = self.channel_gate(feat_reduced)
-        s_weight = self.spatial_gate(feat_reduced)
-        
-        decoupled = x * c_weight * s_weight
-        return self.conv_project(decoupled)
-
-class LatentResidualCBMHead(nn.Module):
-    """
-    Latent-Residual Concept Bottleneck Model (CBM) Head.
-    Combines direct linear clinical pathways and latent non-linear MLP pathways.
-    """
-    def __init__(self, in_features, num_concepts=18):
-        super().__init__()
-        # 1. Concept prediction heads (logits)
-        self.head_composition = nn.Linear(in_features, 4)
-        self.head_echogenicity = nn.Linear(in_features, 4)
-        self.head_shape = nn.Linear(in_features, 2)
-        self.head_margin = nn.Linear(in_features, 4)
-        self.head_foci = nn.Linear(in_features, 4)
-        
-        # 2. Concept attention加权网络 (CoAt)
-        self.concept_attention = nn.Sequential(
-            nn.Linear(num_concepts, num_concepts),
-            nn.ReLU(),
-            nn.Linear(num_concepts, num_concepts),
-            nn.Sigmoid()
-        )
-        
-        # 3. 辅助非线性关系提取器 (Latent MLP)
-        self.latent_mlp = nn.Sequential(
-            nn.Linear(num_concepts, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU()
-        )
-        
-        # 4. 混合分类器 (2 classes for compatibility with cross-entropy evaluation)
-        self.classifier_direct = nn.Linear(num_concepts, 2, bias=False)
-        self.classifier_latent = nn.Linear(16, 2)
-
-    def forward(self, x):
-        # Predict individual concept logits
-        logits_comp = self.head_composition(x)
-        logits_echo = self.head_echogenicity(x)
-        logits_shape = self.head_shape(x)
-        logits_margin = self.head_margin(x)
-        logits_foci = self.head_foci(x)
-        
-        # Compute probabilities for the bottleneck representation
-        prob_comp = F.softmax(logits_comp, dim=1)
-        prob_echo = F.softmax(logits_echo, dim=1)
-        prob_shape = F.softmax(logits_shape, dim=1)
-        prob_margin = F.softmax(logits_margin, dim=1)
-        prob_foci = torch.sigmoid(logits_foci)
-        
-        # Concat to get 18-dim concept probability vector
-        concept_vector = torch.cat([
-            prob_comp,
-            prob_echo,
-            prob_shape,
-            prob_margin,
-            prob_foci
-        ], dim=1)
-        
-        # Concept-wise Attention (CoAt)
-        attn_weights = self.concept_attention(concept_vector)
-        weighted_concepts = concept_vector * attn_weights
-        
-        # Extract latent complex interactions
-        latent_features = self.latent_mlp(weighted_concepts)
-        
-        # Residual fusion to predict malignancy logits (2 classes)
-        logits_malignancy = self.classifier_direct(weighted_concepts) + self.classifier_latent(latent_features)
-        
-        return logits_comp, logits_echo, logits_shape, logits_margin, logits_foci, concept_vector, logits_malignancy
 
 class MultiTaskThyroidModel(nn.Module):
     """
-    Multi-task Thyroid AI Model.
-    - Backbone: 2D timm encoder.
-    - Decoder: U-Net style decoder for pixel-level segmentation.
-    - Classification: Concept Bottleneck Model (CBM) for TI-RADS and malignancy classification.
+    基于双分支特征解耦与可微物理先验注入的2D甲状腺超声多任务一体化诊断系统
     """
-    def __init__(self, backbone_name="resnet18", pretrained=True, config=None):
+
+    def __init__(self, backbone_name="efficientnet_b2", pretrained=True, config=None):
         super().__init__()
-        
-        # Load feature extraction backbone (in_chans=1 for B-mode ultrasound)
-        self.encoder = timm.create_model(
-            backbone_name, 
-            pretrained=pretrained, 
-            features_only=True, 
-            in_chans=1
-        )
-        encoder_channels = self.encoder.feature_info.channels()
-        
-        # U-Net style decoder for segmentation
-        self.up_blocks = nn.ModuleList()
-        in_ch = encoder_channels[-1]
-        
-        for i in reversed(range(len(encoder_channels) - 1)):
-            skip_ch = encoder_channels[i]
-            self.up_blocks.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2),
-                    nn.Conv2d(in_ch // 2 + skip_ch, in_ch // 2, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(in_ch // 2),
-                    nn.ReLU(inplace=True)
-                )
+
+        # 提取图像尺寸 (默认 512)
+        self.img_size = 512
+        if config is not None and "data" in config:
+            self.img_size = config["data"].get("img_size", 512)
+
+        self.current_epoch = 120  # 默认设置为较大值，使评估或默认前向时物理特征全激活
+
+        # 1. 创建单 full_backbone 并加载离线预训练权重 (避免 aliasing 破坏优化器/梯度)
+        local_pretrained_path = "checkpoints/efficientnet_b2_pretrained.safetensors"
+        full_backbone = None
+
+        if (
+            backbone_name == "efficientnet_b2"
+            and pretrained
+            and os.path.exists(local_pretrained_path)
+        ):
+            print(
+                f"--> Found offline local backbone checkpoint: {local_pretrained_path}. Loading weights locally."
             )
-            in_ch = in_ch // 2
-            
-        # Final segmentation output head (upsample from 1/2 back to full resolution)
-        self.final_up = nn.ConvTranspose2d(in_ch, 32, kernel_size=2, stride=2)
-        self.seg_head = nn.Conv2d(32, 1, kernel_size=1)
-        
-        # Classification & CBM decoupling gateway
-        self.decouple_gate = GatedTaskAttention(encoder_channels[-1])
-        self.cbm_head = LatentResidualCBMHead(in_features=encoder_channels[-1], num_concepts=18)
-        
+            full_backbone = timm.create_model(
+                backbone_name, pretrained=False, features_only=False, in_chans=1
+            )
+            try:
+                from safetensors.torch import load_file
+
+                state_dict = load_file(local_pretrained_path)
+                if "conv_stem.weight" in state_dict:
+                    stem_weight = state_dict["conv_stem.weight"]
+                    if stem_weight.shape[1] == 3:
+                        state_dict["conv_stem.weight"] = stem_weight.sum(
+                            dim=1, keepdim=True
+                        )
+                full_backbone.load_state_dict(state_dict, strict=False)
+                print(
+                    "--> Successfully loaded offline local backbone pretrained weights."
+                )
+            except Exception as e:
+                print(
+                    f"[WARNING] Failed to load offline backbone weights: {e}. Falling back to default timm initialization."
+                )
+                full_backbone = None
+
+        if full_backbone is None:
+            full_backbone = timm.create_model(
+                backbone_name, pretrained=pretrained, features_only=False, in_chans=1
+            )
+
+        # 2. 提取低级特征共享底座 (Stage 0 - Stage 3)
+        stem_modules = [full_backbone.conv_stem, full_backbone.bn1]
+        if hasattr(full_backbone, "act1"):
+            stem_modules.append(full_backbone.act1)
+        elif hasattr(full_backbone, "act"):
+            stem_modules.append(full_backbone.act)
+        self.shared_stem = nn.Sequential(*stem_modules)
+        self.shared_blocks = nn.Sequential(
+            *[full_backbone.blocks[i] for i in range(5)]
+        )  # Stage 0-4
+
+        # 3. 独立构建分割专属分支 (Stage 5)
+        self.seg_stage5 = nn.Sequential(
+            full_backbone.blocks[5], full_backbone.blocks[6]
+        )
+
+        # 4. 通过 copy.deepcopy 独立构建分类专属分支 (Stage 5)
+        self.cls_stage5 = nn.Sequential(
+            copy.deepcopy(full_backbone.blocks[5]),
+            copy.deepcopy(full_backbone.blocks[6]),
+        )
+
+        # 5. U-Net 堆叠上采样对齐解码器
+        self.up5 = nn.ConvTranspose2d(352, 120, kernel_size=2, stride=2)
+        self.dec5 = nn.Sequential(
+            nn.Conv2d(240, 120, 3, padding=1),
+            nn.BatchNorm2d(120),
+            nn.ReLU(inplace=True),
+        )
+
+        self.up4 = nn.ConvTranspose2d(120, 48, kernel_size=2, stride=2)
+        self.dec4 = nn.Sequential(
+            nn.Conv2d(96, 48, 3, padding=1), nn.BatchNorm2d(48), nn.ReLU(inplace=True)
+        )
+
+        self.up3 = nn.ConvTranspose2d(48, 24, kernel_size=2, stride=2)
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(48, 24, 3, padding=1), nn.BatchNorm2d(24), nn.ReLU(inplace=True)
+        )
+
+        self.up2 = nn.ConvTranspose2d(24, 16, kernel_size=2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(32, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(inplace=True)
+        )
+
+        self.up1 = nn.ConvTranspose2d(16, 16, kernel_size=2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(16, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(inplace=True)
+        )
+
+        self.seg_head = nn.Conv2d(16, 1, kernel_size=1)
+
+        # 6. 可微物理先验流注入模块
+        self.prior_extractor = DifferentiablePhysicalPriorExtractor(
+            img_size=self.img_size
+        )
+        self.prior_mlp = nn.Sequential(
+            nn.Linear(3, 16), nn.LayerNorm(16), nn.ReLU(inplace=True), nn.Linear(16, 16)
+        )
+
+        # 7. 概念瓶颈架构 (CBM) 分类头层设计与 vCLUB 估计器
+        self.cls_pool = nn.AdaptiveAvgPool2d(1)
+        self.cbm_head = ConceptEmbeddingCBMHead(in_features=352, num_concepts=18)
+        self.vclub = VariationalCLUBMean(x_dim=352, y_dim=18, hidden_size=64)
+
+        # 8. 有监督对比学习投影头 (SupCon Head) - 输入映射变更为 352 维全局平均池化特征
+        self.supcon_projector = nn.Sequential(
+            nn.Linear(352, 128), nn.ReLU(inplace=True), nn.Linear(128, 128)
+        )
+
+    def set_epoch(self, epoch):
+        self.current_epoch = epoch
+
     def forward(self, x):
-        # 1. Encoder (forward through backbone layers)
-        features = self.encoder(x)
-        deepest_feat = features[-1]
-        
-        # 2. Decoder (segmentation mask)
-        seg_feat = deepest_feat
-        idx = 0
-        for i in reversed(range(len(features) - 1)):
-            skip = features[i]
-            seg_feat = self.up_blocks[idx][0](seg_feat)
-            if seg_feat.shape[2:] != skip.shape[2:]:
-                seg_feat = F.interpolate(seg_feat, size=skip.shape[2:], mode='bilinear', align_corners=True)
-            seg_feat = torch.cat([seg_feat, skip], dim=1)
-            seg_feat = self.up_blocks[idx][1:](seg_feat)
-            idx += 1
-            
-        seg_feat = self.final_up(seg_feat)
-        if seg_feat.shape[2:] != x.shape[2:]:
-            seg_feat = F.interpolate(seg_feat, size=x.shape[2:], mode='bilinear', align_corners=True)
-        mask_out = self.seg_head(seg_feat) # Raw logits
-        
-        # 3. Classification / CBM决策路径
-        decoupled_feat = self.decouple_gate(deepest_feat)
-        gap = F.adaptive_avg_pool2d(decoupled_feat, (1, 1)).view(decoupled_feat.size(0), -1)
-        
-        logits_comp, logits_echo, logits_shape, logits_margin, logits_foci, concept_vector, logits_malignancy = self.cbm_head(gap)
-        
+        B, C, H, W = x.shape
+        assert (
+            H == self.img_size and W == self.img_size
+        ), f"Input shape mismatch: expected {self.img_size}x{self.img_size}, got {H}x{W}"
+
+        # 1. 共享基础编码特征提取 (Stage 0 - Stage 3)
+        # 1. 共享基础编码特征提取 (Stage 0 - Stage 4)
+        feat = self.shared_stem(x)
+        f_s0 = self.shared_blocks[0](feat)
+        f_s1 = self.shared_blocks[1](f_s0)
+        f_s2 = self.shared_blocks[2](f_s1)
+        f_temp3 = self.shared_blocks[3](f_s2)
+        f_s3 = self.shared_blocks[4](f_temp3)
+
+        # 2. 分割编码专用流演进 (Seg-Encoder Stage 5)
+        f_seg5 = self.seg_stage5(f_s3)
+
+        # 3. 分割解码重组 (U-Net Dense Reconstruction)
+        d5 = self.dec5(torch.cat([self.up5(f_seg5), f_s3], dim=1))
+        d4 = self.dec4(torch.cat([self.up4(d5), f_s2], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), f_s1], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), f_s0], dim=1))
+        d1 = self.dec1(self.up1(d2))
+        logits_mask = self.seg_head(d1)
+        soft_mask = torch.sigmoid(logits_mask)
+
+        # 4. 可微物理先验主动估计与提取
+        v_phys = self.prior_extractor(soft_mask, x)  # [B, 3]
+        e_prior_raw = self.prior_mlp(v_phys)  # [B, 16]
+
+        # 动态时间退火门控：前 20 轮全关闭，之后 20 轮渐进式解冻，Epoch 40 全激活以防噪声污染（训练与评估须保持一致以防分布偏移）
+        gamma = max(0.0, min(1.0, (self.current_epoch - 20) / 20.0))
+        e_prior = e_prior_raw * gamma
+
+        # 5. 分类编码专用流演进 (Cls-Encoder Stage 5)
+        f_cls5 = self.cls_stage5(f_s3)
+        f_cls_pooled = self.cls_pool(f_cls5).view(B, -1)  # [B, 352]
+
+        # 6. 计算双极 CBM 概率及其概念分布与先验特征拼接
+        (
+            logits_comp,
+            logits_echo,
+            logits_shape,
+            logits_margin,
+            logits_foci,
+            concept_vector,
+            logits_malignancy,
+            W_norm,
+            latent_res,
+        ) = self.cbm_head(f_cls_pooled, e_prior)
+
+        z_contrastive = self.supcon_projector(f_cls_pooled)  # [B, 128]
+
         outputs = {
-            "mask": mask_out,
+            "mask": logits_mask,  # 注意这里必须放 logits_mask，否则 criterion 内计算 BCE/Dice 会崩
+            "soft_mask": soft_mask,  # 同时也把 soft_mask 放进去，方便其他地方读取
             "composition": logits_comp,
             "echogenicity": logits_echo,
             "shape": logits_shape,
             "margin": logits_margin,
             "foci": logits_foci,
             "concept_vector": concept_vector,
-            "malignancy": logits_malignancy
+            "malignancy": logits_malignancy,
+            "W_norm": W_norm,
+            "latent_res": latent_res,
+            "z_latent": f_cls_pooled,
+            "z_contrastive": z_contrastive,
+            "physical_vector": v_phys,
+            "spin_l1": self.cbm_head.get_l1_penalty(),
         }
-        
+
         return outputs

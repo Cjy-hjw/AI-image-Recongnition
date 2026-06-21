@@ -5,6 +5,8 @@ checkpoints/
 # Python cache and temporary files
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
 .cache/
 .ipynb_checkpoints/
 

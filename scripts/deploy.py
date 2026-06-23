@@ -42,10 +42,12 @@ local_base = os.getcwd()
 print("Starting deployment to server...")
 
 for root, dirs, files in os.walk(local_base):
-    # Filter ignored directories in-place
-    dirs[:] = [d for d in dirs if d not in ignore_dirs]
-
     rel_path = os.path.relpath(root, local_base)
+    # Filter ignored directories, but keep scripts/data/ (Python modules, not image data)
+    dirs[:] = [
+        d for d in dirs
+        if d not in ignore_dirs or (d == "data" and rel_path == "scripts")
+    ]
     if rel_path == ".":
         remote_dir = remote_base
     else:

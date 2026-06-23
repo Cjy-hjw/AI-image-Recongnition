@@ -2,7 +2,6 @@ import os
 import csv
 import json
 import shutil
-import cv2
 import numpy as np
 
 from scripts.data.pseudo_labels import extract_features_from_mask_and_image
@@ -82,8 +81,10 @@ def format_split(csv_path, img_dir, mask_dir, dest_dir, split_ratio=0.8, is_trai
             shape, foci, foci_coords, echo, comp, margin = extract_features_from_mask_and_image(img_path, mask_path)
                 
             # 每张图像为独立身份(TN3K 无患者元数据)。
+            # 加来源前缀防 trainval/test 编号碰撞:tv=trainval, ho=holdout。
             image_id = img_name.split('.')[0]
-            patient_id = image_id
+            prefix = "tv" if is_trainval else "ho"
+            patient_id = f"{prefix}_{image_id}"
             
             # Construct standard metadata JSON
             meta = {

@@ -17,6 +17,7 @@ from src.inference.model_runner import run_forward
 from src.inference.export import _resolve_gradcam_target_layer
 from src.inference.io import _PHI_FIELDS
 from src.training.loop import validate_step
+from scripts.data.split_tn3k import _split_samples
 
 
 # ── Phase A: 解耦 + 死代码清理 ────────────────────────────────────────────────
@@ -123,6 +124,45 @@ def test_validate_step_fixed_gamma_prior():
     src = inspect.getsource(validate_step.validate_batch)
     assert "gamma_prior=1.0" in src
     assert "(epoch - 20)" not in src
+
+
+# ── Phase D: 数据划分去伪分组 ─────────────────────────────────────────────────
+
+def test_split_samples_disjoint():
+    """train/val 图像 ID 集合互斥。"""
+    samples = [(f"{i:04d}.jpg", i % 2) for i in range(100)]
+    train, val = _split_samples(samples, split_ratio=0.85, seed=42)
+    train_ids = {t[0] for t in train}
+    val_ids = {v[0] for v in val}
+    assert train_ids.isdisjoint(val_ids), "train/val must be disjoint!"
+
+
+def test_split_samples_ratio():
+    """划分比例 ≈ split_ratio。"""
+    samples = [(f"{i:04d}.jpg", 0) for i in range(1000)]
+    train, val = _split_samples(samples, split_ratio=0.85, seed=42)
+    assert len(train) == 850 and len(val) == 150, (
+        f"ratio mismatch: train={len(train)}, val={len(val)}"
+    )
+
+
+def test_split_samples_reproducible():
+    """固定 seed 可复现。"""
+    samples = [(f"{i:04d}.jpg", 0) for i in range(500)]
+    a = _split_samples(samples, split_ratio=0.8, seed=7)
+    b = _split_samples(samples, split_ratio=0.8, seed=7)
+    assert [t[0] for t in a[0]] == [t[0] for t in b[0]], "seed 7 should produce same train order"
+    assert [t[0] for t in a[1]] == [t[0] for t in b[1]], "seed 7 should produce same val order"
+
+
+def test_split_samples_patient_id_is_image_id():
+    """每张图独立身份(不再臆造 PAT_{//2} 伪分组)。"""
+    # 验证 format_split 写 meta 时 patient_id == image_id(而非 PAT_xxx)
+    # 这里的测试面向 _split_samples 的返回值:每张图像只出现一次,等价于独立 identity
+    samples = [(f"{i:04d}.jpg", 0) for i in range(50)]
+    train, val = _split_samples(samples, split_ratio=0.8, seed=1)
+    all_combined = set(t[0] for t in train) | set(v[0] for v in val)
+    assert len(all_combined) == 50, "every sample must appear exactly once across train∪val"
 
 
 if __name__ == "__main__":

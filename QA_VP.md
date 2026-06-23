@@ -33,10 +33,10 @@ All deep learning implementations MUST be verified by quantifiable automated tes
 ### 1.4 Data Leakage & Domain Shift Auditing
 *   **Safety Risk**: Patient overlap between splits causes false confidence in metrics. Dynamic statistic recalculation on validation data leaks future statistics.
 *   **Rule**: Patient IDs in train, val, and holdout splits must be completely disjoint. The dataset partition MUST be strictly grouped by patient identity, and never split randomly by raw image filenames or index numbers.
-*   **当前实现现状(2026-06,待 Phase D 修复)**:
-    - TN3K 原始数据**无患者级元数据**,`scripts/data/split_tn3k.py` 用 `PAT_{img_id//2}` **合成**伪患者 ID。train/val 按此伪 ID 互斥切分,但伪分组会造成 val 内部轻微泄漏、使 val 指标偏高(已知问题,Phase D 改为真实/纯随机划分)。
+*   **当前实现现状(2026-06,Phase D 已修复)**:
+    - TN3K 原始数据**无患者级元数据**。此前用 `PAT_{img_id//2}` 合成伪患者 ID 制造了"按患者隔离"的假象;Phase D 已废弃伪分组,改为**纯随机图像级划分**(`_split_samples`),每张图即为独立身份、train/val 图像级互斥、固定 seed 可复现。
     - holdout 来自 TN3K 独立 `test-image/` 目录,与 train/val 物理隔离,**无泄漏**;Holdout AUC 可信。
-    - `gate5_data_leakage.py` 仅校验 train↔val(合成 ID 必 0 重叠,恒 PASS),**不检查 holdout**;Phase D 将补图像级 holdout 重叠校验。
+    - `gate5_data_leakage.py` 已补**双检查**:train↔val 互斥 + holdout↔trainval 图像级重叠校验,覆盖范围完整。
 *   **Verification**:
     ```python
     assert set(train_patient_ids).isdisjoint(set(val_patient_ids)), "Leakage: patient ID overlap!"

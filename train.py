@@ -22,6 +22,11 @@ def main():
     parser.add_argument("--config", type=str, default="configs/thyroid_config.yaml")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--start_epoch", type=int, default=1)
+    parser.add_argument(
+        "--skip-auth",
+        action="store_true",
+        help="Skip authenticity classifier training when weights exist",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -67,9 +72,23 @@ def main():
     )
 
     auth_weights_path = "checkpoints/authenticity_model.pth"
-    train_authenticity_classifier(train_dataset, val_dataset, device, auth_weights_path)
+    if args.skip_auth and os.path.exists(auth_weights_path):
+        print(
+            f"--> Skipping authenticity training; found existing weights at {auth_weights_path}"
+        )
+    elif args.skip_auth:
+        print(
+            f"[WARNING] --skip-auth set but {auth_weights_path} not found; training authenticity classifier."
+        )
+        train_authenticity_classifier(
+            train_dataset, val_dataset, device, auth_weights_path
+        )
+    else:
+        train_authenticity_classifier(
+            train_dataset, val_dataset, device, auth_weights_path
+        )
 
-    # Initialize Multi-task model with LayerwiseGTA & DSCA & SphericalCBMHead
+    # Initialize dual-backbone model (ConvNeXt-Nano seg + EfficientNet-B2 cls + TaskAlignmentAdaptor + ConceptEmbeddingCBMHead)
     model = MultiTaskThyroidModel(
         backbone_name=config["model"]["backbone"],
         pretrained=config["model"]["pretrained"],
@@ -104,6 +123,9 @@ def main():
 
     # Early Stopping
     early_stopping_patience = config["train"].get("early_stopping_patience", 5)
+    w_dice = config["train"].get("checkpoint_w_dice", 0.30)
+    w_auc = config["train"].get("checkpoint_w_auc", 0.70)
+    stage3_es_patience = config["train"].get("stage3_early_stopping_patience", 0)
     patience_counter = 0
 
     for epoch in range(args.start_epoch, config["train"]["epochs"] + 1):
@@ -113,20 +135,15 @@ def main():
         )
 
         # 2. 创建或重建优化器：阶段边界时必须重建以反映冻结参数变化
-        if epoch == args.start_epoch:
-            prev_stage = None  # first epoch: always create
-        else:
-            from src.training.stages import get_stage_number
-
-            prev_stage = get_stage_number(epoch - 1)
-
+        # prev_stage 取上一 epoch 的真实阶段(对续训同样成立),不再用 None 特例,
+        # 使「optimizer 重建」与「Stage3 重置」都能在续训(start_epoch=101)时正确触发。
         from src.training.stages import get_stage_number
 
         current_stage = get_stage_number(epoch)
+        prev_stage = get_stage_number(epoch - 1)
+        stage_changed = prev_stage != current_stage
 
-        if optimizer is None or (
-            prev_stage is not None and prev_stage != current_stage
-        ):
+        if optimizer is None or stage_changed:
             optimizer = optim.AdamW(param_groups, lr=stage_lr)
             print(f"  [Optimizer rebuilt] Stage {current_stage}, lr={stage_lr:.6f}")
         else:
@@ -146,7 +163,7 @@ def main():
             running_losses_history,
             epoch,
         )
-        val_loss, val_dice, val_acc, val_loss_l2 = validate_epoch(
+        val_loss, val_dice, val_acc, val_loss_l2, val_auc = validate_epoch(
             model, val_loader, criterion, device, epoch
         )
 
@@ -157,33 +174,61 @@ def main():
             torch.tensor(lambda_latent, device=criterion.lambda_latent.device)
         )
 
+        # Stage 3 起点(由 get_stage_number 边界派生,避免硬编码 epoch==101):
+        # 进入 Stage 3 的首个 epoch 重置选模/早停跟踪器。
+        # 用 prev_stage(上一 epoch 真实阶段)判定,续训(start_epoch=101)也能正确触发。
+        if current_stage == 3 and prev_stage != 3:
+            best_val_score = -1.0
+            patience_counter = 0
+            print(
+                "--> Stage 3 started: reset checkpoint tracker and early-stopping counter"
+            )
+
+        if current_stage == 1:
+            val_score = val_dice
+        elif val_auc is not None:
+            val_score = w_dice * val_dice + w_auc * val_auc
+        else:
+            val_score = val_dice
+
+        if current_stage == 1:
+            val_auc_str = "N/A (Stage 1)"
+        elif val_auc is not None:
+            val_auc_str = f"{val_auc:.4f}"
+        else:
+            val_auc_str = "N/A"
+
         print(
             f"Epoch {epoch:02d}/{config['train']['epochs']:02d} | [{stage_name}] | "
             f"Train Loss: {train_loss:.4f} (Seg: {train_seg:.3f}, Mal: {train_mal:.3f}) | "
             f"Val Loss: {val_loss:.4f} | Val Dice: {val_dice:.3f} | Val Mal Acc: {val_acc:.3f} | "
+            f"Val AUC: {val_auc_str} | Val Score: {val_score:.4f} | "
             f"Latent L2: {val_loss_l2:.4f} | Lambda: {lambda_latent:.4f}"
         )
 
-        # 3.5 早期熔断安全锁 (Early Abort Check): 在第 5 轮若 Val Dice 仍然接近零（低于 0.05），说明模型不收敛发生崩塌，立刻停机排查
+        # 3.5 早期熔断安全锁 (Early Abort Check): 在第 10 轮若 Val Dice 仍然接近零（低于 0.05），说明模型不收敛发生崩塌，立刻停机排查
         if epoch == 10 and val_dice < 0.05:
             raise RuntimeError(
                 f"Early abort triggered at epoch 10 due to non-convergence (Val Dice: {val_dice:.3f} < 0.05). Check gradients or parameters."
             )
-        # 4. 基于 val_score 保存最优模型 + Early Stopping
-        val_score = val_dice + val_acc
+
+        val_auc_log = f"{val_auc:.4f}" if val_auc is not None else "N/A"
         if val_score > best_val_score:
             best_val_score = val_score
             patience_counter = 0
             torch.save(model.state_dict(), "checkpoints/best_model.pth")
             print(
-                f"--> Saved new best checkpoint (Score: {val_score:.4f}) to checkpoints/best_model.pth"
+                f"--> Saved new best checkpoint (Score: {val_score:.4f}, Dice: {val_dice:.4f}, AUC: {val_auc_log}) to checkpoints/best_model.pth"
             )
         else:
             patience_counter += 1
-            if patience_counter >= early_stopping_patience:
+            active_patience = (
+                stage3_es_patience if current_stage == 3 else early_stopping_patience
+            )
+            if active_patience > 0 and patience_counter >= active_patience:
                 print(
                     f"--> Early stopping triggered at epoch {epoch} "
-                    f"(patience={early_stopping_patience}, best={best_val_score:.4f})"
+                    f"(patience={active_patience}, best={best_val_score:.4f})"
                 )
                 break
 

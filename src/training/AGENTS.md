@@ -1,57 +1,66 @@
 # src/training/AGENTS.md - Training Pipeline Specifications
 
-This protocol defines the multi-stage training strategy, parameter freezing rules, and diagnostic logging contracts.
-
----
-
-## 1. THREE-STAGE PROGRESSIVE TRAINING (`stages.py`)
-
-The training follows a 3-stage curriculum to prevent gradient conflicts between segmentation and classification tasks:
+## 1. THREE-STAGE PROGRESSIVE TRAINING (`stages.py` + `MultiTaskThyroidModel`)
 
 | Stage | Epochs | Strategy | Learning Rate |
 |:---|:---|:---|:---|
-| **Stage 1** | 1–40 | Segmentation + Concepts training (classification head frozen, loss_mal/supcon masked to 0.0) | `lr_base` (0.0024) |
+| **Stage 1** | 1–40 | Segmentation + Concepts (classification frozen, loss_mal/supcon masked to 0.0) | `lr_base` (0.0024) |
 | **Stage 2** | 41–100 | Full model unfrozen, 5-task FAMO scheduling | `lr_base` (0.0024) |
-| **Stage 3** | 101–120 | Backbone + segmentation frozen, AUC-Margin fine-tuning only | 5e-6 |
+| **Stage 3** | 101–120 | Backbone + seg frozen, AUC-Margin fine-tuning only | 5e-6 |
+
+Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_stage(stage)` and `is_param_trainable(name, stage)`. `configure_stage_parameters()` delegates freezing to the model, then builds optimizer param groups and LR schedule.
 
 ### Critical Freezing Rules
 
-- **vCLUB isolation**: `model.vclub` parameters have `requires_grad=True` in ALL stages but are optimized by a **separate** `vclub_optimizer` (lr=1e-4), never by the main optimizer.
+- **vCLUB isolation**: `model.vclub` optimized by **separate** `vclub_optimizer` (lr=1e-4), never by main optimizer.
+- **Stage 1**: `loss_mal` and `loss_supcon` multiplied by 0.0 to prevent classification gradient leakage.
+- **Stage 3**: FAMO disabled (`update_famo_weights=False`).
+- **BatchNorm auto-eval**: After `model.train()`, modules with all-frozen params are set to `.eval()` (see `loop/bn_freeze.py`).
 
-- **Stage 1 (Epochs 1-40)**: 
-  - Frozen: `cbm_head.classifier_direct`, `cbm_head.latent_mlp`, `criterion.mal_loss_fn` (AUCM dual params)
-  - Active: backbone, segmentation decoder, concept prediction heads (`proj_plus`, `proj_minus`, `s_layer`)
-  - Gradient masking: `loss_mal` and `loss_supcon` are multiplied by 0.0 to prevent classification gradients from leaking into backbone
+### Checkpoint & Early Stopping
 
-- **Stage 2 (Epochs 41-100)**: 
-  - All model parameters unfrozen and active
-  - 5-task FAMO scheduling enabled (segmentation, concepts, prior, malignancy, supcon)
-  - AUCM dual params (`a`, `b`, `alpha`) added to `no_decay_params` group (weight_decay=0.0)
+- **Stage 1 best**: `val_dice` only.
+- **Stage 2–3 best**: `checkpoint_w_dice * val_dice + checkpoint_w_auc * val_auc` (defaults 0.30 / 0.70).
+- **Stage 3 ES**: `stage3_early_stopping_patience=0` disables early stopping; tracker resets at epoch 101.
+- **`validate_epoch` return**: 5-tuple `(avg_loss, avg_dice, avg_acc, avg_loss_l2, val_auc)`; `val_auc` is `None` in Stage 1 or single-class val sets.
 
-- **Stage 3 (Epochs 101-120)**: 
-  - Frozen: backbone (`shared_stem`, `shared_blocks`), segmentation decoder, physical prior extractor
-  - Active: `cbm_head.classifier_direct`, `cbm_head.latent_mlp`
-  - FAMO disabled (`update_famo_weights=False`), direct AUC-Margin optimization
-  - Learning rate fixed at 5e-6 for fine-tuning
-
-- **BatchNorm automatic eval mode**: After `model.train()`, any module with all parameters frozen (`requires_grad=False`) is automatically set to `.eval()` mode to prevent BatchNorm running statistics from updating.
 ---
 
-## 2. TRAINING & VALIDATION LOOPS (`trainer.py`)
+## 2. TRAINING & VALIDATION LOOPS
+
+### Package Structure (`training/loop/`)
+
+| File | Responsibility |
+|:---|:---|
+| `train_step.py` | `train_batch()` — single batch forward/backward with MixUp, vCLUB, SLR, AMP |
+| `validate_step.py` | `validate_batch()` — single batch validation with Val Diag print |
+| `slr.py` | `compute_slr_weights()` — Supervised Label Rectification (1000-sample history, mean+2σ anomaly) |
+| `vclub.py` | `vclub_learning_step()`, `compute_vclub_mi_bound()` — mutual information decoupling |
+| `bn_freeze.py` | `set_frozen_modules_eval()` — automatic BatchNorm eval for frozen modules |
+
+### `trainer.py` (Thin Orchestrator)
+
+`trainer.py` contains `train_epoch()` and `validate_epoch()` which delegate to `loop/train_step.py` and `loop/validate_step.py`.
 
 ### NaN Sentinel Diagnostics
-The `MultiTaskLoss.forward()` contains 4 NaN sentinel guards (see `src/models/AGENTS.md` §0). In `trainer.py`, the validation loop includes a **Val Diag** print that logs `pred_prob` statistics (mean/std/min/max) at `batch_idx == 0` for each epoch. This diagnostic MUST be preserved to detect degenerate all-zeros or all-ones mask predictions.
 
-### SLR Weight Computation
-Supervised Label Rectification weights are computed per-sample using a running history of 1000 losses. Anomalies (losses > mean + 2σ) are down-weighted by `1 - slr_beta`.
+The validation loop includes a **Val Diag** print at `batch_idx == 0`:
+```python
+print(f"  [Val Diag] pred_prob: mean={pred_mean:.4f}, std={pred_std:.4f}, min={...}, max={...}", flush=True)
+```
 
-### GradScaler Protocol
-- `scaler.unscale_(optimizer)` MUST be called before alpha gradient inversion.
-- `clip_grad_norm_(model.parameters(), max_norm=1.0)` applied after every backward pass.
-- **PCGrad Compatibility**: Never combine `PCGradWrapper` with a standard `GradScaler` unless unscaling is performed per-task or manual scaling math is verified. If using `PCGrad`, run backward passes in FP32 or use BF16 autocast (which does not require scaling on A800 GPUs).
+### GradScaler Protocol & Optimizer Encapsulation
+
+- `scaler.unscale_(optimizer)` before alpha gradient inversion
+- `clip_grad_norm_(model.parameters(), max_norm=1.0)` after every backward
+- Dual optimization is encapsulated: `criterion.mal_loss_fn.step_dual_variable("pre")` before `optimizer.step()`, and `"post"` afterwards.
 
 ---
 
-## 3. AUTHENTICITY CLASSIFIER (`authenticity.py`)
+## 3. AUTHENTICITY CLASSIFIER (`authenticity_trainer.py`)
 
-Lightweight MLP trained on GLCM+ELA features for image authenticity verification. This runs **before** main training starts and saves weights to `checkpoints/authenticity_model.pth`. The main model weights MUST NOT include these parameters.
+Lightweight MLP trained on GLCM+ELA features. Runs **before** main training by default. Saves to `checkpoints/authenticity_model.pth`. Main model weights MUST NOT include these parameters.
+
+Use `python train.py --skip-auth` to skip when `checkpoints/authenticity_model.pth` already exists. If the flag is set but weights are missing, training logs a warning and runs authenticity training anyway.
+
+Note: Renamed from `authenticity.py` to `authenticity_trainer.py` to avoid confusion with `src/gatekeeper/authenticity.py` (feature extraction + inference module).

@@ -74,47 +74,20 @@ class AUCMLossApprox(nn.Module):
 
         return loss_pos + loss_neg + term_dual + term_penalty
 
-
-class AdaptiveVSAndAsymmetricLoss(nn.Module):
-    """Vector Scaling + Asymmetric Loss for long-tail binary classification.
-
-    cls_num_list: [n_benign, n_malignant] = [1629, 818]
-    gamma_pos=0.0, gamma_neg=4.0: down-weight easy negatives aggressively
-    margin_shift=0.05: asymmetric probability margin
-    max_m=0.5, scale_s=30.0: VS margin and logit scaling
-    Returns per-sample loss [B]; caller is responsible for averaging.
-    """
-
-    def __init__(
-        self,
-        cls_num_list,
-        gamma_pos=0.0,
-        gamma_neg=4.0,
-        margin_shift=0.05,
-        max_m=0.5,
-        scale_s=1.0,
-    ):
-        super().__init__()
-        cls_num = torch.FloatTensor(cls_num_list)
-        m_list = 1.0 / torch.sqrt(torch.sqrt(cls_num))
-        self.m_list = m_list * (max_m / torch.max(m_list))
-        self.scale_s = scale_s
-        self.gamma_pos = gamma_pos
-        self.gamma_neg = gamma_neg
-        self.margin_shift = margin_shift
-
-    def forward(self, logits, targets):
-        index = torch.zeros_like(logits, dtype=torch.bool)
-        index.scatter_(1, targets.view(-1, 1), True)
-        m = self.m_list.to(logits.device)
-        batch_m = m[targets].view(-1, 1)
-        adjusted = logits - index.float() * batch_m
-        probs = torch.softmax(self.scale_s * adjusted, dim=1)
-        pt = probs.gather(1, targets.view(-1, 1)).view(-1)
-        loss_pos = -((1.0 - pt) ** self.gamma_pos) * torch.log(pt + 1e-8)
-        pn_m = (1.0 - pt - self.margin_shift).clamp(min=0.0)
-        loss_neg = -(pn_m**self.gamma_neg) * torch.log(pt + 1e-8)
-        return torch.where(targets == 1, loss_pos, loss_neg)
+    def step_dual_variable(self, phase="pre"):
+        """
+        Encapsulates the optimizer magic required for the Lagrangian multiplier.
+        - 'pre' (before optimizer.step): Flips the gradient sign so alpha is maximized.
+        - 'post' (after optimizer.step): Clamps alpha to [0, inf) non-negative constraint.
+        """
+        if phase == "pre":
+            if self.alpha.grad is not None:
+                self.alpha.grad.data.mul_(-1.0)
+        elif phase == "post":
+            with torch.no_grad():
+                self.alpha.clamp_(min=0.0)
+        else:
+            raise ValueError("phase must be 'pre' or 'post'")
 
 
 class SupervisedContrastiveLoss(nn.Module):

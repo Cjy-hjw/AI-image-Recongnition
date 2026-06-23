@@ -87,7 +87,3 @@ class ThyroidDataset(Dataset):
         mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
         
         return img_tensor, mask_tensor, labels
-
-def get_patient_groups(dataset):
-    """Utility to return patient IDs for patient-grouped split validation."""
-    return [s["meta_path"] for s in dataset.samples] # can read patient_id directly

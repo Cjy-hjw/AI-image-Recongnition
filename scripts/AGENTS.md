@@ -1,34 +1,44 @@
 # scripts/AGENTS.md - Verification & Partitioning Guidelines
 
-This protocol governs the automated testing suite and dataset splitting algorithms used in this folder.
-
----
-
 ## 1. DATA SPLITTING & GROUP LEAKAGE RED-LINE
-- **Rule**: Train and validation datasets must have absolutely ZERO patient overlap.
-- **Key Hashing Basis**: Split algorithms in `format_tn3k.py` must partition the dataset strictly by the DICOM-based `PatientID` metadata. Filename-based random split is strictly prohibited.
-- **Validation Assert**: Pre-flight checks must verify `assert len(overlap) == 0`.
+
+- **Rule**: Train and validation datasets must have ZERO patient overlap.
+- **Key Hashing Basis**: Split algorithms partition by DICOM `PatientID`. Filename-based random split is prohibited.
+- **Validation Assert**: `assert len(overlap) == 0`
+
+### Package Structure (`scripts/data/`)
+
+| File | Contents |
+|:---|:---|
+| `data/pseudo_labels.py` | `extract_features_from_mask_and_image()` — TI-RADS pseudo-label extraction from image+mask |
+| `data/split_tn3k.py` | `format_split()` — PatientID-grouped train/val/holdout partitioning |
+
+`format_tn3k.py` is a thin CLI that imports from `scripts/data/`.
 
 ---
 
 ## 2. verify_model.py SEVEN-GATE TEST SUITE
 
-### 1.5 BACKWARD COMPATIBILITY & IMPORTS
-The codebase has been decomposed into modular packages (see `rules.md` §6 and `AGENTS.md` §1.1), but all verification scripts maintain backward compatibility through `__init__.py` re-export shims:
-- `verify_model.py` imports `MultiTaskLoss` via `from src.models.loss import MultiTaskLoss` — this resolves through the shim in `src/models/loss.py` to the actual implementation in `src/models/losses/multitask.py`.
-- No changes to verification logic are required due to the decomposition.
+### Package Structure (`scripts/verify/`)
 
----
-All modifications must pass the 7-Gate pre-checks:
-- **Gate 1**: Shape correctness of predictions across classification and segmentation outputs.
-- **Gate 2**: vCLUB gradient isolation check (Encoder gradient sum $< 1 \times 10^{-7}$).
-- **Gate 3**: AUC-Margin `alpha` gradient existence, unscale alignment, non-negativity update, and automatic BatchNorm freeze state check (frozen modules set to eval mode).
-- **Gate 4**: FAMO 5-channel dynamic weights evolution and non-NaN check.
-- **Gate 5**: Hard assert on patient dataset isolation overlap.
-- **Gate 6**: Stage 1 gradient masking verification (loss_mal=0.0, loss_supcon=0.0, zero gradient leakage from classification/contrast losses).
-- **Gate 7**: Rebuilt optimizer LR alignment check across all 3 stages (epochs 1, 41, 101).
+| File | Contents |
+|:---|:---|
+| `verify/runner.py` | `verify()` — orchestrates gate1→gate7, returns True/False |
+| `verify/gates/gate1_shapes.py` | Output tensor shape assertions |
+| `verify/gates/gate2_vclub.py` | vCLUB gradient isolation (encoder grad sum < 1e-7) |
+| `verify/gates/gate3_auc_margin.py` | AUC-Margin dual params + BatchNorm freeze check |
+| `verify/gates/gate4_famo.py` | FAMO 5-channel weight dynamics |
+| `verify/gates/gate5_data_leakage.py` | Patient ID isolation (warn-skip if data missing) |
+| `verify/gates/gate6_stage1_masking.py` | Stage 1 gradient masking (loss_mal=0.0, zero leakage) |
+| `verify/gates/gate7_optimizer_lr.py` | Optimizer LR alignment across 3 stages |
+
+`verify_model.py` is a thin CLI (~11 lines) importing from `scripts/verify/runner.py`.
+
+### Backward Compatibility
+- `from src.models.loss import MultiTaskLoss` resolves through `loss.py` shim → `losses/multitask.py`.
+
 ---
 
 ## 3. ZERO-HALLUCINATION DIAGNOSTIC LOOP
-- If any gate in `verify_model.py` fails (Exit Code != 0), the AI agent must output a structured JSON diagnostic report mapping to the schema in `reference/2D甲状腺超声多任务一体化诊断模型工程升级与质量保障架构报告.md` (Section 4).
-- The report must state the failed gate, the line range, the observed vs expected metrics, and a minimal recovery guidance.
+
+If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: failed gate, line range, observed vs expected metrics, recovery guidance.

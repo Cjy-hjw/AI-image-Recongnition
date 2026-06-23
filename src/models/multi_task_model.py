@@ -1,11 +1,35 @@
-import os
-import copy
+from typing import TypedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
+from src.models.pretrained_loader import load_local_safetensors
+
+
+class ModelOutputs(TypedDict):
+    """Single source of truth for MultiTaskThyroidModel.forward() output keys.
+
+    Downstream consumers (train_step, validate_step, vclub, losses, evaluate,
+    predict, postprocess, export) all index these keys; renaming any key here
+    flags every consumer site.
+    """
+
+    mask: torch.Tensor
+    composition: torch.Tensor
+    echogenicity: torch.Tensor
+    shape: torch.Tensor
+    margin: torch.Tensor
+    foci: torch.Tensor
+    malignancy: torch.Tensor
+    concept_vector: torch.Tensor
+    latent_res: torch.Tensor
+    z_latent: torch.Tensor
+    z_contrastive: torch.Tensor
+    physical_vector: torch.Tensor
+    spin_l1: torch.Tensor
 
 
 class ConvBlock(nn.Module):
@@ -26,114 +50,144 @@ class ConvBlock(nn.Module):
         return self.conv(x)
 
 
+class TaskAlignmentAdaptor(nn.Module):
+    def __init__(self, seg_in_channels, cls_in_channels):
+        super().__init__()
+        self.channel_projector = nn.Sequential(
+            nn.Conv2d(seg_in_channels, cls_in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(cls_in_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.attention_generator = nn.Sequential(
+            nn.Conv2d(
+                cls_in_channels,
+                cls_in_channels,
+                kernel_size=3,
+                padding=1,
+                groups=cls_in_channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(cls_in_channels),
+            nn.Sigmoid(),
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, f_seg_detached, f_cls):
+        if f_seg_detached.shape[-2:] != f_cls.shape[-2:]:
+            f_seg_detached = F.interpolate(
+                f_seg_detached,
+                size=f_cls.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        f_seg_detached = f_seg_detached.float()
+        f_cls_float = f_cls.float()
+        projected = self.channel_projector(f_seg_detached)
+        attention_mask = self.attention_generator(projected)
+        out = f_cls_float + self.gamma * (f_cls_float * attention_mask)
+        return out.to(dtype=f_cls.dtype)
+
+
 class MultiTaskThyroidModel(nn.Module):
     """
     基于双分支特征解耦与可微物理先验注入的2D甲状腺超声多任务一体化诊断系统
     """
 
+    CLS_STAGE3_CHANNELS = 88
+    CLS_STAGE4_CHANNELS = 208
+
+    STAGE1_FROZEN_CBM_SUBMODULES = ("classifier_direct", "latent_mlp")
+    STAGE3_FROZEN_PREFIXES = (
+        "seg_backbone",
+        "cls_backbone",
+        "up_stages",
+        "dec_stages",
+        "seg_head",
+        "prior_extractor",
+        "prior_mlp",
+        "supcon_projector",
+        "adaptor_stage3",
+        "adaptor_stage4",
+    )
+
     def __init__(self, backbone_name="efficientnet_b2", pretrained=True, config=None):
         super().__init__()
 
-        # 提取图像尺寸 (默认 512)
         self.img_size = 512
         if config is not None and "data" in config:
             self.img_size = config["data"].get("img_size", 512)
 
-        self.current_epoch = 120  # 默认设置为较大值，使评估或默认前向时物理特征全激活
+        self.current_epoch = 120
 
-        # 1. 创建单 full_backbone 并加载离线预训练权重 (避免 aliasing 破坏优化器/梯度)
-        local_pretrained_path = "checkpoints/efficientnet_b2_pretrained.safetensors"
-        full_backbone = None
-
-        if (
-            backbone_name == "efficientnet_b2"
-            and pretrained
-            and os.path.exists(local_pretrained_path)
-        ):
-            print(
-                f"--> Found offline local backbone checkpoint: {local_pretrained_path}. Loading weights locally."
+        self.seg_backbone = timm.create_model(
+            "convnext_nano",
+            pretrained=False,
+            features_only=True,
+            out_indices=(0, 1, 2, 3),
+            in_chans=1,
+        )
+        if pretrained:
+            seg_pretrained_path = "checkpoints/convnext_nano_pretrained.safetensors"
+            loaded = load_local_safetensors(
+                self.seg_backbone,
+                seg_pretrained_path,
+                in_chans=1,
+                stem_key="stem.0.weight",
             )
-            full_backbone = timm.create_model(
-                backbone_name, pretrained=False, features_only=False, in_chans=1
-            )
-            try:
-                from safetensors.torch import load_file
-
-                state_dict = load_file(local_pretrained_path)
-                if "conv_stem.weight" in state_dict:
-                    stem_weight = state_dict["conv_stem.weight"]
-                    if stem_weight.shape[1] == 3:
-                        state_dict["conv_stem.weight"] = stem_weight.sum(
-                            dim=1, keepdim=True
-                        )
-                full_backbone.load_state_dict(state_dict, strict=False)
+            if not loaded:
                 print(
-                    "--> Successfully loaded offline local backbone pretrained weights."
+                    "--> Local ConvNeXt-Nano weights not found; falling back to timm online pretrained."
                 )
-            except Exception as e:
-                print(
-                    f"[WARNING] Failed to load offline backbone weights: {e}. Falling back to default timm initialization."
+                online_seg = timm.create_model(
+                    "convnext_nano",
+                    pretrained=True,
+                    features_only=True,
+                    out_indices=(0, 1, 2, 3),
+                    in_chans=1,
                 )
-                full_backbone = None
+                self.seg_backbone.load_state_dict(online_seg.state_dict(), strict=False)
 
-        if full_backbone is None:
-            full_backbone = timm.create_model(
-                backbone_name, pretrained=pretrained, features_only=False, in_chans=1
+        self.cls_backbone = timm.create_model(
+            backbone_name, pretrained=False, features_only=False, in_chans=1
+        )
+        if backbone_name == "efficientnet_b2" and pretrained:
+            load_local_safetensors(
+                self.cls_backbone,
+                "checkpoints/efficientnet_b2_pretrained.safetensors",
+                stem_key="conv_stem.weight",
             )
 
-        # 2. 提取低级特征共享底座 (Stage 0 - Stage 3)
-        stem_modules = [full_backbone.conv_stem, full_backbone.bn1]
-        if hasattr(full_backbone, "act1"):
-            stem_modules.append(full_backbone.act1)
-        elif hasattr(full_backbone, "act"):
-            stem_modules.append(full_backbone.act)
-        self.shared_stem = nn.Sequential(*stem_modules)
-        self.shared_blocks = nn.Sequential(
-            *[full_backbone.blocks[i] for i in range(5)]
-        )  # Stage 0-4
-
-        # 3. 独立构建分割专属分支 (Stage 5)
-        self.seg_stage5 = nn.Sequential(
-            full_backbone.blocks[5], full_backbone.blocks[6]
+        seg_channels = list(self.seg_backbone.feature_info.channels())
+        self.seg_stage_channels = seg_channels
+        self.cls_stage3_channels = self.CLS_STAGE3_CHANNELS
+        self.cls_stage4_channels = self.CLS_STAGE4_CHANNELS
+        self.adaptor_stage3 = TaskAlignmentAdaptor(
+            seg_channels[1], self.cls_stage3_channels
+        )
+        self.adaptor_stage4 = TaskAlignmentAdaptor(
+            seg_channels[2], self.cls_stage4_channels
         )
 
-        # 4. 通过 copy.deepcopy 独立构建分类专属分支 (Stage 5)
-        self.cls_stage5 = nn.Sequential(
-            copy.deepcopy(full_backbone.blocks[5]),
-            copy.deepcopy(full_backbone.blocks[6]),
+        self.up_stages = nn.ModuleList(
+            [
+                nn.ConvTranspose2d(seg_channels[3], 320, kernel_size=2, stride=2),
+                nn.ConvTranspose2d(320, 160, kernel_size=2, stride=2),
+                nn.ConvTranspose2d(160, 80, kernel_size=2, stride=2),
+                nn.ConvTranspose2d(80, 40, kernel_size=2, stride=2),
+                nn.ConvTranspose2d(40, 20, kernel_size=2, stride=2),
+            ]
         )
-
-        # 5. U-Net 堆叠上采样对齐解码器
-        self.up5 = nn.ConvTranspose2d(352, 120, kernel_size=2, stride=2)
-        self.dec5 = nn.Sequential(
-            nn.Conv2d(240, 120, 3, padding=1),
-            nn.BatchNorm2d(120),
-            nn.ReLU(inplace=True),
+        self.dec_stages = nn.ModuleList(
+            [
+                ConvBlock(320 + seg_channels[2], 320),
+                ConvBlock(160 + seg_channels[1], 160),
+                ConvBlock(80 + seg_channels[0], 80),
+                ConvBlock(40, 40),
+                ConvBlock(20, 20),
+            ]
         )
+        self.seg_head = nn.Conv2d(20, 1, kernel_size=1)
 
-        self.up4 = nn.ConvTranspose2d(120, 48, kernel_size=2, stride=2)
-        self.dec4 = nn.Sequential(
-            nn.Conv2d(96, 48, 3, padding=1), nn.BatchNorm2d(48), nn.ReLU(inplace=True)
-        )
-
-        self.up3 = nn.ConvTranspose2d(48, 24, kernel_size=2, stride=2)
-        self.dec3 = nn.Sequential(
-            nn.Conv2d(48, 24, 3, padding=1), nn.BatchNorm2d(24), nn.ReLU(inplace=True)
-        )
-
-        self.up2 = nn.ConvTranspose2d(24, 16, kernel_size=2, stride=2)
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(32, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(inplace=True)
-        )
-
-        self.up1 = nn.ConvTranspose2d(16, 16, kernel_size=2, stride=2)
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(16, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(inplace=True)
-        )
-
-        self.seg_head = nn.Conv2d(16, 1, kernel_size=1)
-
-        # 6. 可微物理先验流注入模块
         self.prior_extractor = DifferentiablePhysicalPriorExtractor(
             img_size=self.img_size
         )
@@ -141,86 +195,95 @@ class MultiTaskThyroidModel(nn.Module):
             nn.Linear(3, 16), nn.LayerNorm(16), nn.ReLU(inplace=True), nn.Linear(16, 16)
         )
 
-        # 7. 概念瓶颈架构 (CBM) 分类头层设计与 vCLUB 估计器
         self.cls_pool = nn.AdaptiveAvgPool2d(1)
-        self.cbm_head = ConceptEmbeddingCBMHead(in_features=352, num_concepts=18)
-        self.vclub = VariationalCLUBMean(x_dim=352, y_dim=18, hidden_size=64)
-
-        # 8. 有监督对比学习投影头 (SupCon Head) - 输入映射变更为 352 维全局平均池化特征
+        # 分类分支 pooled 特征维度(EfficientNet-B2 最后 block 输出通道)与概念总维,
+        # cbm_head / vclub / supcon_projector 三者必须共用同一 in_features,否则静默错配。
+        self.CLS_POOLED_DIM = 352
+        self.NUM_CONCEPTS = 18
+        self.cbm_head = ConceptEmbeddingCBMHead(
+            in_features=self.CLS_POOLED_DIM, num_concepts=self.NUM_CONCEPTS
+        )
+        self.vclub = VariationalCLUBMean(
+            x_dim=self.CLS_POOLED_DIM, y_dim=self.NUM_CONCEPTS, hidden_size=64
+        )
         self.supcon_projector = nn.Sequential(
-            nn.Linear(352, 128), nn.ReLU(inplace=True), nn.Linear(128, 128)
+            nn.Linear(self.CLS_POOLED_DIM, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 128),
         )
 
-    def set_epoch(self, epoch):
-        self.current_epoch = epoch
+    def is_param_trainable(self, name: str, stage: int) -> bool:
+        if "vclub" in name:
+            return True
+        if stage == 1:
+            return not any(sub in name for sub in self.STAGE1_FROZEN_CBM_SUBMODULES)
+        if stage == 2:
+            return True
+        return not any(name.startswith(pfx) for pfx in self.STAGE3_FROZEN_PREFIXES)
 
-    def forward(self, x):
+    def set_training_stage(self, stage: int) -> None:
+        for name, param in self.named_parameters():
+            param.requires_grad = self.is_param_trainable(name, stage)
+
+    def _forward_cls_backbone(self, x, seg_features):
+        """EfficientNet-B2 classification branch with task-alignment injection."""
+        B = x.shape[0]
+        x_cls = self.cls_backbone.conv_stem(x)
+        x_cls = self.cls_backbone.bn1(x_cls)
+        x_cls = self.cls_backbone.blocks[0](x_cls)
+        x_cls = self.cls_backbone.blocks[1](x_cls)
+        x_cls = self.cls_backbone.blocks[2](x_cls)
+        x_cls = self.cls_backbone.blocks[3](x_cls)
+        x_cls = self.adaptor_stage3(seg_features[1].detach(), x_cls)
+        x_cls = self.cls_backbone.blocks[4](x_cls)
+        x_cls = self.cls_backbone.blocks[5](x_cls)
+        x_cls = self.adaptor_stage4(seg_features[2].detach(), x_cls)
+        x_cls = self.cls_backbone.blocks[6](x_cls)
+        return self.cls_pool(x_cls).view(B, -1)
+
+    def forward(self, x, gamma_prior=1.0) -> ModelOutputs:
         B, C, H, W = x.shape
         assert (
             H == self.img_size and W == self.img_size
         ), f"Input shape mismatch: expected {self.img_size}x{self.img_size}, got {H}x{W}"
 
-        # 1. 共享基础编码特征提取 (Stage 0 - Stage 3)
-        # 1. 共享基础编码特征提取 (Stage 0 - Stage 4)
-        feat = self.shared_stem(x)
-        f_s0 = self.shared_blocks[0](feat)
-        f_s1 = self.shared_blocks[1](f_s0)
-        f_s2 = self.shared_blocks[2](f_s1)
-        f_temp3 = self.shared_blocks[3](f_s2)
-        f_s3 = self.shared_blocks[4](f_temp3)
-
-        # 2. 分割编码专用流演进 (Seg-Encoder Stage 5)
-        f_seg5 = self.seg_stage5(f_s3)
-
-        # 3. 分割解码重组 (U-Net Dense Reconstruction)
-        d5 = self.dec5(torch.cat([self.up5(f_seg5), f_s3], dim=1))
-        d4 = self.dec4(torch.cat([self.up4(d5), f_s2], dim=1))
-        d3 = self.dec3(torch.cat([self.up3(d4), f_s1], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), f_s0], dim=1))
-        d1 = self.dec1(self.up1(d2))
-        logits_mask = self.seg_head(d1)
+        seg_features = self.seg_backbone(x)
+        d = self.up_stages[0](seg_features[-1])
+        d = self.dec_stages[0](torch.cat([d, seg_features[2]], dim=1))
+        d = self.up_stages[1](d)
+        d = self.dec_stages[1](torch.cat([d, seg_features[1]], dim=1))
+        d = self.up_stages[2](d)
+        d = self.dec_stages[2](torch.cat([d, seg_features[0]], dim=1))
+        d = self.up_stages[3](d)
+        d = self.dec_stages[3](d)
+        d = self.up_stages[4](d)
+        d = self.dec_stages[4](d)
+        logits_mask = self.seg_head(d)
         soft_mask = torch.sigmoid(logits_mask)
 
-        # 4. 可微物理先验主动估计与提取
-        v_phys = self.prior_extractor(soft_mask, x)  # [B, 3]
-        e_prior_raw = self.prior_mlp(v_phys)  # [B, 16]
+        v_phys = self.prior_extractor(soft_mask, x)
+        e_prior = self.prior_mlp(v_phys) * gamma_prior
 
-        # 动态时间退火门控：前 20 轮全关闭，之后 20 轮渐进式解冻，Epoch 40 全激活以防噪声污染（训练与评估须保持一致以防分布偏移）
-        gamma = max(0.0, min(1.0, (self.current_epoch - 20) / 20.0))
-        e_prior = e_prior_raw * gamma
+        x_cls = self._forward_cls_backbone(x, seg_features)
+        assert x_cls.shape[1] == self.CLS_POOLED_DIM, (
+            f"cls pooled dim mismatch: expected {self.CLS_POOLED_DIM}, "
+            f"got {x_cls.shape[1]} — cbm_head/vclub/supcon in_features will misalign"
+        )
 
-        # 5. 分类编码专用流演进 (Cls-Encoder Stage 5)
-        f_cls5 = self.cls_stage5(f_s3)
-        f_cls_pooled = self.cls_pool(f_cls5).view(B, -1)  # [B, 352]
-
-        # 6. 计算双极 CBM 概率及其概念分布与先验特征拼接
-        (
-            logits_comp,
-            logits_echo,
-            logits_shape,
-            logits_margin,
-            logits_foci,
-            concept_vector,
-            logits_malignancy,
-            W_norm,
-            latent_res,
-        ) = self.cbm_head(f_cls_pooled, e_prior)
-
-        z_contrastive = self.supcon_projector(f_cls_pooled)  # [B, 128]
+        cbm = self.cbm_head(x_cls, e_prior)
+        z_contrastive = self.supcon_projector(x_cls)
 
         outputs = {
-            "mask": logits_mask,  # 注意这里必须放 logits_mask，否则 criterion 内计算 BCE/Dice 会崩
-            "soft_mask": soft_mask,  # 同时也把 soft_mask 放进去，方便其他地方读取
-            "composition": logits_comp,
-            "echogenicity": logits_echo,
-            "shape": logits_shape,
-            "margin": logits_margin,
-            "foci": logits_foci,
-            "concept_vector": concept_vector,
-            "malignancy": logits_malignancy,
-            "W_norm": W_norm,
-            "latent_res": latent_res,
-            "z_latent": f_cls_pooled,
+            "mask": logits_mask,
+            "composition": cbm.logits_comp,
+            "echogenicity": cbm.logits_echo,
+            "shape": cbm.logits_shape,
+            "margin": cbm.logits_margin,
+            "foci": cbm.logits_foci,
+            "malignancy": cbm.logits_malignancy,
+            "concept_vector": cbm.concept_vector,
+            "latent_res": cbm.latent_res,
+            "z_latent": x_cls,
             "z_contrastive": z_contrastive,
             "physical_vector": v_phys,
             "spin_l1": self.cbm_head.get_l1_penalty(),

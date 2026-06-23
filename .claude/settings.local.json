@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node *)",
+      "Bash(D:/program/Python/anaconda/envs/Demo_D/python.exe scripts/verify_model.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 D:/program/Python/anaconda/envs/Demo_D/python.exe scripts/verify_model.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 D:/program/Python/anaconda/envs/Demo_D/python.exe -m pytest tests/ -q)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 PYTHONWARNINGS=ignore D:/program/Python/anaconda/envs/Demo_D/python.exe -m pytest tests/ -q)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 PYTHONWARNINGS=ignore D:/program/Python/anaconda/envs/Demo_D/python.exe scripts/verify_model.py)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 PYTHONWARNINGS=ignore D:/program/Python/anaconda/envs/Demo_D/python.exe -m pytest tests/test_phase_refactor.py -q)",
+      "Bash(cat .claude/settings.local.json)",
+      "Bash(cat .claude/settings.json)",
+      "Skill(update-config)"
+    ]
+  }
+}

@@ -14,8 +14,10 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Data Loading & Augmentation** | `/src/dataset/AGENTS.md` | Static normalization, MixUp/CutMix, patient ID grouping. |
 | **Inference Pipeline** | `/src/AGENTS.md` §2 | Shared inference modules: io, model_runner, postprocess, export. |
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
+| **Tests** | `/tests/AGENTS.md` | 回归测试套件:43 tests(Phase A/B/D 重构守卫 + 模块稳定测试)。 |
+| **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
+| **Tests** | `/tests/AGENTS.md` | 43 tests: 18 physical_prior + 16 cbm_head + 14 phase_refactor(Phase A/B/D regression). |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
-| **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, JSON diagnostics. |
 
 ---
 
@@ -53,11 +55,12 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `verify/gates/` — 7 individual gate modules (gate1_shapes..gate7_optimizer_lr)
   - `verify/runner.py` — Gate orchestrator (`verify()`)
   - `data/pseudo_labels.py` — TI-RADS pseudo-label extraction
-  - `data/split_tn3k.py` — PatientID-grouped dataset partitioning
+  - `data/split_tn3k.py` — 纯随机图像级 train/val/holdout 划分(Phase D)
 
-### `tests/` — Module stability tests
+### `tests/` — 回归测试套件
   - `test_physical_prior.py` — DifferentiablePhysicalPriorExtractor (18 tests)
   - `test_cbm_head.py` — ConceptEmbeddingCBMHead (16 tests)
+  - `test_phase_refactor.py` — Phase A/B/D 重构回归守卫 (14 tests)
 
 **Backward Compatibility**: All decomposed modules maintain `__init__.py` re-export shims to preserve existing import paths.
 
@@ -70,7 +73,7 @@ The project follows strict functional decomposition (see `rules.md` §6):
 - **Adaptive Precision**: `--precision` choices `fp32`, `fp16`, `bf16`. Half-precisions apply `torch.clamp(..., min=-15.0, max=15.0)` on malignancy predictions.
 
 ### 2.2 PACS DICOM Metadata Anonymization
-- **Privacy Standard**: 5 PHI fields overwritten: `PatientName`, `PatientID`, `PatientBirthDate` (→ `"00000101"`), `ReferringPhysicianName`, `InstitutionName`.
+- **Privacy Standard**: 21 PHI fields overwritten (HIPAA Safe Harbor): PatientName, PatientID, PatientBirthDate (→ `"00000101"`), PatientSex, PatientAge, PatientAddress, PatientTelephoneNumbers, OtherPatientIDs, AccessionNumber, StudyID, StudyDate, SeriesDate, AcquisitionDate, ContentDate, InstitutionName, InstitutionAddress, StationName, DeviceSerialNumber, ReferringPhysicianName, PerformingPhysicianName, OperatorsName. 完整清单见 `src/inference/io.py` 的 `_PHI_FIELDS`。
 
 ### 2.3 Container Checksum Verification
 - `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth` and `predict.py`. `PRODUCTION=1` → hard exit on hash mismatch.

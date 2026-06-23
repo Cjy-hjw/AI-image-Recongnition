@@ -123,14 +123,18 @@ The Lagrangian multiplier `alpha` in `AUCMLossApprox` must be optimized in the m
 The model itself is stateless regarding time. The annealing factor `gamma_prior` is calculated by the training loop and injected during the forward pass:
 
 ```python
-# Computed in train_step.py / validate_step.py based on epoch
+# 训练时(train_step.py):epoch 1-20 gamma=0, 21-40 线性升到 1, 41+ gamma=1
 gamma_prior = max(0.0, min(1.0, (epoch - 20) / 20.0))
 outputs = model(images, gamma_prior=gamma_prior)
+
+# 验证时(validate_step.py, Phase B 固定):gamma_prior = 1.0(不再随 epoch 漂移)
+outputs = model(images, gamma_prior=1.0)
 ```
 
-- **Epoch 1-20**: `gamma_prior = 0.0` (physical prior disabled)
-- **Epoch 21-40**: `gamma_prior` linearly increases from 0 to 1
-- **Epoch 41+**: `gamma_prior = 1.0` (full physical prior active)
+- **训练 Epoch 1-20**: `gamma_prior = 0.0` (physical prior disabled)
+- **训练 Epoch 21-40**: `gamma_prior` linearly increases from 0 to 1
+- **训练 Epoch 41+**: `gamma_prior = 1.0` (full physical prior active)
+- **验证全阶段**: `gamma_prior = 1.0`(Phase B 固定,避免 val 指标随 epoch 漂移)
 
 ---
 

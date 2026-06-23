@@ -1,6 +1,22 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass
+class CBMHeadOutput:
+    """Keyed output of ConceptEmbeddingCBMHead (replaces fragile positional tuple)."""
+
+    logits_comp: torch.Tensor
+    logits_echo: torch.Tensor
+    logits_shape: torch.Tensor
+    logits_margin: torch.Tensor
+    logits_foci: torch.Tensor
+    concept_vector: torch.Tensor
+    logits_malignancy: torch.Tensor
+    latent_res: torch.Tensor
 
 
 class VariationalCLUBMean(nn.Module):
@@ -18,20 +34,35 @@ class VariationalCLUBMean(nn.Module):
         )
 
     def get_mu(self, x_samples):
-        return self.p_mu(x_samples.float())
+        with torch.cuda.amp.autocast(enabled=False):
+            # self.p_mu contains linear layers, need to cast weights
+            h = F.linear(
+                x_samples.float(),
+                self.p_mu[0].weight.float(),
+                self.p_mu[0].bias.float(),
+            )
+            h = F.relu(h)
+            return F.linear(h, self.p_mu[2].weight.float(), self.p_mu[2].bias.float())
 
     def forward(self, x_samples, y_samples):
         """
         计算变分互信息上界 I(z; C_pred)
         使用 detach 权重前向，将互信息极小化惩罚限制在主干输入特征层，防止估计器参数暗中作弊
         """
-        x_samples = x_samples.float()
-        y_samples = y_samples.float()
-        h = F.linear(
-            x_samples, self.p_mu[0].weight.detach(), self.p_mu[0].bias.detach()
-        )
-        h = F.relu(h)
-        mu = F.linear(h, self.p_mu[2].weight.detach(), self.p_mu[2].bias.detach())
+        with torch.cuda.amp.autocast(enabled=False):
+            x_samples = x_samples.float()
+            y_samples = y_samples.float()
+            h = F.linear(
+                x_samples,
+                self.p_mu[0].weight.detach().float(),
+                self.p_mu[0].bias.detach().float(),
+            )
+            h = F.relu(h)
+            mu = F.linear(
+                h,
+                self.p_mu[2].weight.detach().float(),
+                self.p_mu[2].bias.detach().float(),
+            )
 
         positive = -0.5 * torch.sum((mu - y_samples) ** 2, dim=-1)
         prediction_1 = mu.unsqueeze(1)  # [B, 1, y_dim]
@@ -161,19 +192,15 @@ class ConceptEmbeddingCBMHead(nn.Module):
         c_fused = self.dropout(c_fused)
         logits_malignancy = self.classifier_direct(c_fused) + latent_res
 
-        # W_norm dummy for compatibility, as loss_ortho will be set to 0 in loss.py
-        W_norm = torch.eye(18, device=x.device)
-
-        return (
-            logits_comp,
-            logits_echo,
-            logits_shape,
-            logits_margin,
-            logits_foci,
-            concept_vector,
-            logits_malignancy,
-            W_norm,
-            latent_res,
+        return CBMHeadOutput(
+            logits_comp=logits_comp,
+            logits_echo=logits_echo,
+            logits_shape=logits_shape,
+            logits_margin=logits_margin,
+            logits_foci=logits_foci,
+            concept_vector=concept_vector,
+            logits_malignancy=logits_malignancy,
+            latent_res=latent_res,
         )
 
     def get_l1_penalty(self):

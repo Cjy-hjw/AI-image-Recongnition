@@ -1,17 +1,17 @@
-import os
+"""Holdout evaluation — NO gatekeeper, metrics benchmarking only."""
 import argparse
-import json
+import os
 import yaml
-import cv2
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score, f1_score
 
 from src.dataset.loader import ThyroidDataset
-from src.models.multi_task_model import MultiTaskThyroidModel
-from src.utils.grad_cam import GradCAM, overlay_heatmap
-from src.utils.report_generator import calculate_tirads_points, generate_report
+from src.inference.model_runner import build_model, run_forward
+from src.inference.postprocess import decode_predictions, build_tirads_breakdown
+from src.inference.export import save_gradcam_overlay
+from src.utils.report_generator import generate_report
 
 
 def main():
@@ -19,97 +19,65 @@ def main():
     parser.add_argument("--config", type=str, default="configs/thyroid_config.yaml")
     parser.add_argument("--weights", type=str, default="checkpoints/best_model.pth")
     parser.add_argument("--data_dir", type=str, default="data/holdout")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Forward precision; must match production predict.py for comparable AUC.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
-
     device = torch.device(
         config["environment"]["device"] if torch.cuda.is_available() else "cpu"
     )
     print(f"Evaluating on device: {device}")
 
-    # Load dataset
     dataset = ThyroidDataset(
         data_dir=args.data_dir, img_size=config["data"]["img_size"]
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     print(f"Loaded {len(dataset)} evaluation samples from {args.data_dir}.")
 
-    # NOTE: Gatekeeper modules (auth, tampering) are NOT run during offline holdout evaluation.
-    # They are designed for production inference gates, not offline metric benchmarking.
-    # Running GLCM + FAST/RANSAC on 614 samples would take ~15 minutes with no diagnostic value.
-    # Gate pass rate is reported as 100% (all holdout samples are known-clean ground truth).
+    # NOTE: Gatekeeper modules NOT run during offline holdout evaluation.
+    # Gate pass rate reported as 100% (all holdout samples are known-clean ground truth).
 
-    # 2. Initialize Diagnosis model
-    model = MultiTaskThyroidModel(
-        backbone_name=config["model"]["backbone"],
-        pretrained=False,
-        config=config,
-    ).to(device)
-    if os.path.exists(args.weights):
-        model.load_state_dict(
-            torch.load(args.weights, map_location=device), strict=False
-        )
-        print(f"Loaded model weights from {args.weights}")
-    else:
-        print(
-            "[WARNING] Best model weights not found. Evaluating with random initialization."
-        )
+    model = build_model(config, args.weights, device)
 
-    model.eval()
-
-    # Metrics accumulator
-    gate_total = 0
-    gate_passed = 0
-
-    # Ground truth & predictions for diagnostic evaluation
-    all_mal_targets = []
-    all_mal_probs = []
-    all_comp_targets = []
-    all_comp_preds = []
-    all_echo_targets = []
-    all_echo_preds = []
-    all_shape_targets = []
-    all_shape_preds = []
-    all_margin_targets = []
-    all_margin_preds = []
-    all_foci_targets = []
-    all_foci_preds = []
-
+    gate_total, gate_passed = 0, 0
+    all_mal_targets, all_mal_probs = [], []
+    all_comp_targets, all_comp_preds = [], []
+    all_echo_targets, all_echo_preds = [], []
+    all_shape_targets, all_shape_preds = [], []
+    all_margin_targets, all_margin_preds = [], []
+    all_foci_targets, all_foci_preds = [], []
     dice_scores = []
 
-    # Loop over holdout set
     for idx, (img_tensor, mask_tensor, labels) in enumerate(loader):
         sample = dataset.samples[idx]
+        import cv2
         img_np = cv2.imread(sample["img_path"], cv2.IMREAD_GRAYSCALE)
 
         gate_total += 1
-        gate_passed += (
-            1  # All holdout samples are clean ground truth; no gate filtering
-        )
-        # --- B. Diagnostic Multi-task Inference ---
-        # Run forward pass for evaluation even if gatekeeper failed (to calculate metrics)
+        gate_passed += 1  # All holdout samples are clean ground truth
+
         img_tensor = img_tensor.to(device)
         mask_tensor = mask_tensor.to(device)
 
-        with torch.no_grad():
-            outputs = model(img_tensor)
+        # 走与生产 predict.py 一致的统一前向(precision + clamp),保证 AUC 基准可比
+        outputs = run_forward(model, img_tensor, args.precision, device)
 
-        # Nodule segmentation Dice
-        pred_mask = torch.sigmoid(outputs["mask"]) > 0.5
-        intersection = (pred_mask * mask_tensor).sum().item()
-        union = pred_mask.sum().item() + mask_tensor.sum().item()
-        dice = (2.0 * intersection + 1e-6) / (union + 1e-6)
-
-        # Don't evaluate dice if there is no nodule in ground truth and model correctly predicted no mask
-        if mask_tensor.sum().item() == 0 and pred_mask.sum().item() == 0:
-            dice = 1.0
+        # Segmentation Dice —— 口径对齐训练期 validate_step(逐样本 dim=(2,3),无双空特判)
+        pred_mask = (torch.sigmoid(outputs["mask"]) > 0.5).float()
+        intersection = (pred_mask * mask_tensor).sum(dim=(2, 3))
+        union = pred_mask.sum(dim=(2, 3)) + mask_tensor.sum(dim=(2, 3))
+        dice = ((2.0 * intersection + 1e-6) / (union + 1e-6)).mean().item()
         dice_scores.append(dice)
 
-        # Collect classification outputs
+        # Classification outputs
         mal_prob = torch.softmax(outputs["malignancy"], dim=1)[0, 1].item()
-
         all_mal_probs.append(mal_prob)
         all_mal_targets.append(labels["malignancy"][0].item())
 
@@ -125,72 +93,42 @@ def main():
         all_margin_targets.append(labels["margin"][0].item())
         all_margin_preds.append(torch.argmax(outputs["margin"], dim=1)[0].item())
 
-        # Foci (multi-label)
         foci_prob = torch.sigmoid(outputs["foci"])[0].cpu().numpy()
         all_foci_preds.append((foci_prob >= 0.5).astype(int))
         all_foci_targets.append(labels["foci"][0].cpu().numpy().astype(int))
 
-        # Generate diagnostic report for the first sample
+        # Sample report + Grad-CAM for first sample
         if idx == 0:
-            comp_pred_idx = torch.argmax(outputs["composition"], dim=1)[0].item()
-            echo_pred_idx = torch.argmax(outputs["echogenicity"], dim=1)[0].item()
-            shape_pred_idx = torch.argmax(outputs["shape"], dim=1)[0].item()
-            margin_pred_idx = torch.argmax(outputs["margin"], dim=1)[0].item()
-
-            breakdown = calculate_tirads_points(
-                comp_pred_idx, echo_pred_idx, shape_pred_idx, margin_pred_idx, foci_prob
+            preds = decode_predictions(outputs)
+            breakdown = build_tirads_breakdown(
+                preds["comp_idx"], preds["echo_idx"],
+                preds["shape_idx"], preds["margin_idx"], preds["foci_prob"],
             )
             report_txt = generate_report(
                 image_id=sample["meta_path"].split(os.sep)[-2],
                 patient_id=labels["patient_id"][0],
                 breakdown=breakdown,
-                malignancy_prob=mal_prob,
+                malignancy_prob=preds["mal_prob"],
             )
             print("\n=== SAMPLE CLINICAL REPORT (First Holdout Sample) ===")
             print(report_txt)
             print("====================================================\n")
 
-            # Generate Grad-CAM for verification
-            gradcam = None
-            try:
-                # Dynamically discover the last convolutional layer of the encoder
-                target_layer = None
-                if hasattr(model.encoder, "layer4"):
-                    target_layer = model.encoder.layer4[-1]
-                elif hasattr(model.encoder, "blocks"):
-                    target_layer = model.encoder.blocks[-1][-1]
-                else:
-                    for module in reversed(list(model.encoder.modules())):
-                        if isinstance(module, nn.Conv2d):
-                            target_layer = module
-                            break
-                gradcam = GradCAM(model, target_layer)
-                heatmap = gradcam.generate_heatmap(img_tensor, target_class=1)
-                overlay = overlay_heatmap(img_np, heatmap)
-                cv2.imwrite("data/holdout_sample_0_gradcam.png", overlay)
-                print(
-                    "--> Saved sample Grad-CAM heatmap to data/holdout_sample_0_gradcam.png"
-                )
-            except Exception as e:
-                print(f"[Grad-CAM Error] Could not generate heatmap: {e}")
-            finally:
-                if gradcam is not None:
-                    gradcam.remove_hooks()
+            save_gradcam_overlay(
+                model, img_tensor, img_np, "data/holdout_sample_0_gradcam.png"
+            )
 
-    # --- C. Metrics Summarization & SOTA Target Verification ---
+    # Metrics summary
     print("\n" + "=" * 50)
     print("             EVALUATION PERFORMANCE REPORT")
     print("=" * 50)
 
-    # 1. Gatekeeper Metrics
     gate_pass_rate = (gate_passed / gate_total) * 100
     print(f"Gatekeeper Passed Rate: {gate_passed}/{gate_total} ({gate_pass_rate:.2f}%)")
 
-    # 2. Segmentation Metrics
     mean_dice = np.mean(dice_scores) * 100
     print(f"Mean Nodule Segmentation Dice: {mean_dice:.2f}% (SOTA Target: > 82.00%)")
 
-    # 3. Malignancy AUC
     try:
         auc = roc_auc_score(all_mal_targets, all_mal_probs) * 100
         print(f"Malignancy Classification AUC: {auc:.2f}% (SOTA Target: > 90.00%)")
@@ -199,13 +137,11 @@ def main():
             "Malignancy Classification AUC: N/A (Holdout needs both positive & negative classes)"
         )
 
-    # 4. TI-RADS Concept Accuracies
     comp_f1 = f1_score(all_comp_targets, all_comp_preds, average="weighted") * 100
     echo_f1 = f1_score(all_echo_targets, all_echo_preds, average="weighted") * 100
     shape_f1 = f1_score(all_shape_targets, all_shape_preds, average="weighted") * 100
     margin_f1 = f1_score(all_margin_targets, all_margin_preds, average="weighted") * 100
 
-    # Foci multi-label F1
     all_foci_targets = np.array(all_foci_targets)
     all_foci_preds = np.array(all_foci_preds)
     foci_f1 = f1_score(all_foci_targets, all_foci_preds, average="weighted") * 100
@@ -213,7 +149,6 @@ def main():
     avg_tirads_f1 = np.mean([comp_f1, echo_f1, shape_f1, margin_f1, foci_f1])
     print(f"Average TI-RADS F1-Score: {avg_tirads_f1:.2f}% (SOTA Target: > 82.00%)")
 
-    # Print comparison table
     print("\n--- SOTA Target Benchmark Verification ---")
     print(f"| Metric | Local Baseline | SOTA Target | Status |")
     print(f"| :--- | :--- | :--- | :--- |")
@@ -233,4 +168,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  # force update
+    main()

@@ -2,7 +2,6 @@ import math
 from typing import Dict, List, Tuple
 
 import torch.nn as nn
-from torch.optim import Optimizer
 
 
 def get_stage_number(epoch: int) -> int:
@@ -61,67 +60,15 @@ def configure_stage_parameters(
         param.requires_grad = True
 
     stage = get_stage_number(epoch)
+    model.set_training_stage(stage)
 
     if stage == 1:
-        # ── Stage 1 (Epoch 1-40): 分割 + 概念联合训练 ──
-        # 冻结: classifier_direct, latent_mlp (CBM 分类子模块)
-        for name, param in model.cbm_head.classifier_direct.named_parameters():
-            param.requires_grad = False
-        for name, param in model.cbm_head.latent_mlp.named_parameters():
-            param.requires_grad = False
-        # 冻结: AUCM 对偶变量 (a, b, alpha)
         for param in criterion.mal_loss_fn.parameters():
             param.requires_grad = False
-        # 解冻所有其他参数（分割解码器、主干、概念投影层等）
-        for name, param in model.named_parameters():
-            if "vclub" in name:
-                continue
-            if "classifier_direct" in name or "latent_mlp" in name:
-                continue  # 已在上方冻结
-            param.requires_grad = True
-
     elif stage == 2:
-        # ── Stage 2 (Epoch 41-100): 全模型解冻 ──
-        for name, param in model.named_parameters():
-            if "vclub" not in name:
-                param.requires_grad = True
         for param in criterion.mal_loss_fn.parameters():
             param.requires_grad = True
-
-    else:  # stage == 3
-        # ── Stage 3 (Epoch 101-120): 分类器微调 ──
-        # 冻结: 主干 (shared_stem, shared_blocks, seg_stage5, cls_stage5)
-        # 冻结: 分割解码器 (up1-5, dec1-5, seg_head)
-        # 冻结: 物理先验网络 (prior_extractor, prior_mlp)
-        # 冻结: SupCon 投影头
-        freeze_prefixes = (
-            "shared_stem",
-            "shared_blocks",
-            "seg_stage5",
-            "cls_stage5",
-            "up5",
-            "up4",
-            "up3",
-            "up2",
-            "up1",
-            "dec5",
-            "dec4",
-            "dec3",
-            "dec2",
-            "dec1",
-            "seg_head",
-            "prior_extractor",
-            "prior_mlp",
-            "supcon_projector",
-        )
-        for name, param in model.named_parameters():
-            if "vclub" in name:
-                continue
-            if any(name.startswith(pfx) for pfx in freeze_prefixes):
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
-        # AUCM 对偶变量在 Stage 3 保持激活
+    else:
         for param in criterion.mal_loss_fn.parameters():
             param.requires_grad = True
 
@@ -164,37 +111,3 @@ def configure_stage_parameters(
     ]
 
     return param_groups, lr, stage_name
-
-
-def create_optimizer(
-    param_groups: List[Dict],
-    lr: float,
-) -> Optimizer:
-    """
-    创建 AdamW 优化器。
-
-    Args:
-        param_groups: 参数组列表
-        lr: 学习率
-
-    Returns:
-        AdamW 优化器实例
-    """
-    from torch.optim import AdamW
-
-    return AdamW(param_groups, lr=lr)
-
-
-def update_optimizer_lr(
-    optimizer: Optimizer,
-    new_lr: float,
-) -> None:
-    """
-    更新优化器的学习率（保留 Adam 矩状态）。
-
-    Args:
-        optimizer: 优化器实例
-        new_lr: 新的学习率
-    """
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = new_lr

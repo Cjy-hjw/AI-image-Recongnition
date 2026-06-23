@@ -4,8 +4,6 @@ import json
 import os
 
 import cv2
-import numpy as np
-import torch
 import torch.nn as nn
 
 from src.utils.grad_cam import GradCAM, overlay_heatmap

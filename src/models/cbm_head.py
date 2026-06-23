@@ -34,7 +34,7 @@ class VariationalCLUBMean(nn.Module):
         )
 
     def get_mu(self, x_samples):
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):  # type: ignore[attr-defined]
             # self.p_mu contains linear layers, need to cast weights
             h = F.linear(
                 x_samples.float(),
@@ -49,7 +49,7 @@ class VariationalCLUBMean(nn.Module):
         计算变分互信息上界 I(z; C_pred)
         使用 detach 权重前向，将互信息极小化惩罚限制在主干输入特征层，防止估计器参数暗中作弊
         """
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):  # type: ignore[attr-defined]
             x_samples = x_samples.float()
             y_samples = y_samples.float()
             h = F.linear(

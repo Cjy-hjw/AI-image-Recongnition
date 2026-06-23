@@ -37,5 +37,8 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
   - Group related classes/functions by domain (e.g., `losses/segmentation.py`, `losses/classification.py`)
   - Keep training logic separate from model definitions (e.g., `src/training/` vs `src/models/`)
 
+## 8. 子Agent模型选择策略
+* **Rule**: 不重要或低风险的子任务(如搜索文件、简单检查、格式化)创建子agent时使用便宜模型(`model="sonnet"`);重要任务(如代码审查、逻辑验证、复杂重构)使用主会话同型号(默认)。节省 token 预算。
+
 ## 7. Official Category Constraint (Project-Level Business Rule)
 * **Rule (Official Category Constraint)**: As per 2026 official regulations, Track 7 does NOT offer a "Self-built Model Group" (自建模型组). Our team is strictly registered under the **"Own Model Group" (自有模型组)**. The deployment must package our custom gatekeeper, TaskAlignmentAdaptor cross-task alignment, and ConceptEmbedding CBM report generator into a standard offline inference container via `predict.py`.

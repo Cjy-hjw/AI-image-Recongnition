@@ -24,6 +24,6 @@ def compute_malignancy_losses(
             flush=True,
         )
     if torch.isnan(loss_supcon):
-        print(f"  [NaN Guard] loss_supcon is NaN!", flush=True)
+        print("  [NaN Guard] loss_supcon is NaN!", flush=True)
 
     return loss_mal, loss_supcon

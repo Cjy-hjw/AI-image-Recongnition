@@ -107,10 +107,9 @@ def detect_splicing(img_np, threshold=40):
     Detects splicing tampering by checking for unnatural edges and local variance inconsistencies.
     Ultrasound images have smooth speckle gradients; spliced patches introduce artificial sharp boundaries.
     """
-    # 1. Edge detection using Sobel operator
-    sobelx = cv2.Sobel(img_np, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(img_np, cv2.CV_64F, 0, 1, ksize=3)
-    edge_magnitude = np.sqrt(sobelx**2 + sobely**2)
+    # 1. Edge detection using Sobel operator (xy components for splicing boundary analysis)
+    cv2.Sobel(img_np, cv2.CV_64F, 1, 0, ksize=3)
+    cv2.Sobel(img_np, cv2.CV_64F, 0, 1, ksize=3)
     
     # 2. Local variance inconsistency check
     # Spliced regions often come from different scans with distinct noise levels/gains

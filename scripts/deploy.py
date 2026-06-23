@@ -13,6 +13,8 @@ ignore_dirs = {
     "__pycache__",
     ".omp",
     ".ipynb_checkpoints",
+    ".pytest_cache",
+    ".ruff_cache",
     "runs",
     "data",
 }

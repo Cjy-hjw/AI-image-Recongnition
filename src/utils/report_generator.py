@@ -1,4 +1,3 @@
-import numpy as np
 
 # TI-RADS clinical attributes definitions & point configurations
 COMPOSITION_MAP = {

@@ -126,9 +126,9 @@ class Deduplicator:
         # 2. ResNet feature screening
         if self.use_faiss:
             # Query FAISS
-            D, I = self.index.search(np.expand_dims(query_feat, axis=0).astype(np.float32), 1)
-            best_sim = D[0][0]
-            best_idx = I[0][0]
+            distances, indices = self.index.search(np.expand_dims(query_feat, axis=0).astype(np.float32), 1)
+            best_sim = distances[0][0]
+            best_idx = indices[0][0]
             if best_sim >= self.cosine_threshold and best_idx != -1:
                 return True, f"Deep feature match (Cosine Similarity: {best_sim:.4f})"
         else:

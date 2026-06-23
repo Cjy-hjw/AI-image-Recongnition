@@ -1,7 +1,4 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from src.training.loop.bn_freeze import set_frozen_modules_eval

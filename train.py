@@ -235,7 +235,7 @@ def main():
         # 确保最后一轮训练结束时保存最终模型
         if epoch == config["train"]["epochs"]:
             torch.save(model.state_dict(), "checkpoints/final_model.pth")
-            print(f"--> Saved final epoch checkpoint to checkpoints/final_model.pth")
+            print("--> Saved final epoch checkpoint to checkpoints/final_model.pth")
     print("Training finished successfully.")
 
 

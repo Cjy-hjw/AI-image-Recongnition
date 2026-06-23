@@ -150,8 +150,8 @@ def main():
     print(f"Average TI-RADS F1-Score: {avg_tirads_f1:.2f}% (SOTA Target: > 82.00%)")
 
     print("\n--- SOTA Target Benchmark Verification ---")
-    print(f"| Metric | Local Baseline | SOTA Target | Status |")
-    print(f"| :--- | :--- | :--- | :--- |")
+    print("| Metric | Local Baseline | SOTA Target | Status |")
+    print("| :--- | :--- | :--- | :--- |")
     print(
         f"| Segmentation Dice | {mean_dice:.2f}% | > 82.00% | {'PASS' if mean_dice >= 82.00 else 'FAIL/SCALABLE'} |"
     )
@@ -160,7 +160,7 @@ def main():
             f"| Classification AUC | {auc:.2f}% | > 90.00% | {'PASS' if auc >= 90.00 else 'FAIL/SCALABLE'} |"
         )
     except NameError:
-        print(f"| Classification AUC | N/A | > 90.00% | N/A |")
+        print("| Classification AUC | N/A | > 90.00% | N/A |")
     print(
         f"| TI-RADS Concepts F1 | {avg_tirads_f1:.2f}% | > 82.00% | {'PASS' if avg_tirads_f1 >= 82.00 else 'FAIL/SCALABLE'} |"
     )

@@ -13,9 +13,9 @@ def apply_famo_weighting(
 ):
     """Apply FAMO 5-channel dynamic loss weighting."""
     if torch.isnan(loss_concepts_ce):
-        print(f"  [NaN Guard] loss_concepts_ce is NaN!", flush=True)
+        print("  [NaN Guard] loss_concepts_ce is NaN!", flush=True)
     if torch.isnan(loss_prior):
-        print(f"  [NaN Guard] loss_prior is NaN!", flush=True)
+        print("  [NaN Guard] loss_prior is NaN!", flush=True)
 
     losses_tensor = torch.stack(
         [loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon]

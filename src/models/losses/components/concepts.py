@@ -144,6 +144,51 @@ def compute_concept_losses(
     )
     loss_prior = F.huber_loss(score_pred, score_gt, delta=1.0)
 
+    # ── Masked Task-Specific Loss (label validity) ──────────────────────────
+    # When targets contains "label_validity", apply per-sample per-task masking
+    # and use sum / (valid_count + eps) to avoid diluting the denominator with
+    # masked-out (=0) samples. Falls back to original .mean() path if absent.
+    _eps = 1e-8
+    if "label_validity" in targets:
+        lv = targets["label_validity"]  # dict of [B] float tensors
+
+        def _masked_reduce(per_sample_loss, task):
+            """sum(loss * validity * mask_weight) / (sum(validity * mask_weight) + eps)"""
+            v = lv[task]
+            w = per_sample_loss * v * mask_weight
+            return w.sum() / ((v * mask_weight).sum() + _eps)
+
+        loss_comp_r = _masked_reduce(loss_comp, "composition")
+        loss_echo_r = _masked_reduce(loss_echo, "echogenicity")
+        loss_shape_r = _masked_reduce(loss_shape, "shape")
+        loss_margin_r = _masked_reduce(loss_margin, "margin")
+        loss_foci_r = _masked_reduce(loss_foci, "foci")
+
+        # concepts_ce: average of per-concept masked losses
+        loss_concepts_ce_r = (
+            loss_comp_r + loss_echo_r + loss_shape_r + loss_margin_r + loss_foci_r
+        )
+
+        # Prior: use composition validity as proxy (TI-RADS prior requires all
+        # five concept labels; composition is the anchor concept in ACR TI-RADS
+        # and also most commonly annotated). If composition is invalid the prior
+        # score is unreliable, so we gate by composition validity.
+        v_prior = lv["composition"]
+        loss_prior_r = (loss_prior * v_prior * mask_weight).sum() / (
+            (v_prior * mask_weight).sum() + _eps
+        )
+
+        return {
+            "comp": loss_comp_r,
+            "echo": loss_echo_r,
+            "shape": loss_shape_r,
+            "margin": loss_margin_r,
+            "foci": loss_foci_r,
+            "concepts_ce": loss_concepts_ce_r,
+            "prior": loss_prior_r,
+        }
+
+    # ── Legacy path (no label_validity) — behaviour unchanged ───────────────
     loss_concepts_ce = loss_concepts_ce * mask_weight
     loss_prior = loss_prior * mask_weight
 

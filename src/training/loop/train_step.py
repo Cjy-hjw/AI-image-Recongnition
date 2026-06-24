@@ -49,11 +49,36 @@ def train_batch(
         "malignancy": labels["malignancy"].to(device),
     }
 
+    # Label validity mask (per-sample per-task): 1=valid, 0=absent
+    # If labels contain valid_* keys (new datasets), build label_validity dict.
+    # If absent (old data / no valid_* keys), skip → loss components use legacy path.
+    _validity_tasks = ("composition", "echogenicity", "shape", "margin", "foci", "malignancy")
+    if f"valid_{_validity_tasks[0]}" in labels:
+        _B = masks.shape[0]
+
+        def _to_validity_tensor(key):
+            v = labels.get(key)
+            if v is None:
+                return torch.ones(_B, dtype=torch.float32, device=device)
+            if isinstance(v, torch.Tensor):
+                return v.float().to(device)
+            # scalar (int/float) shared across batch
+            return torch.full((_B,), float(v), dtype=torch.float32, device=device)
+
+        targets["label_validity"] = {
+            task: _to_validity_tensor(f"valid_{task}") for task in _validity_tasks
+        }
+        # Segmentation validity
+        targets["valid_mask"] = _to_validity_tensor("valid_mask")
+
     # Apply MixUp / CutMix
     images, masks, targets, mix_info = apply_mixup_or_cutmix(
         images, masks, targets, alpha=0.2, prob=0.3
     )
     targets["mask"] = masks
+    # label_validity is NOT mixed — validity flags are batch-level metadata,
+    # not feature-space signals. We keep the original batch's validity unchanged.
+    # (A mixed sample still has the same label availability as its primary sample.)
 
     # vCLUB 独立优化：使用前一批次的 detached 输出，在 autocast 外执行独立 backward
     vclub_learning_step(model, vclub_optimizer, prev_z_latent, prev_concept_vector)
@@ -67,7 +92,7 @@ def train_batch(
 
         # SLR 鲁棒标签校正
         if slr_beta < 1.0:
-            slr_weights, sample_losses = compute_slr_weights(
+            slr_weights, _sample_losses = compute_slr_weights(
                 outputs,
                 targets,
                 mix_info,

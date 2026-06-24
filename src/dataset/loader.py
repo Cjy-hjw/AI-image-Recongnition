@@ -77,6 +77,15 @@ class ThyroidDataset(Dataset):
             "is_tampered": int(meta.get("is_tampered", 0)),
             "patient_id": meta.get("patient_id", "UNKNOWN")
         }
+
+        # Label validity mask: 1 = label available, 0 = label absent (skip gradient)
+        # Read from meta.json "label_mask" dict; default all tasks valid (=1)
+        lm = meta.get("label_mask", {})
+        concept_tasks = ("composition", "echogenicity", "shape", "margin", "foci", "malignancy")
+        for task in concept_tasks:
+            labels[f"valid_{task}"] = int(lm.get(task, 1))
+        # Segmentation mask validity
+        labels["valid_mask"] = int(lm.get("mask", 1))
         
         # Apply data augmentations if specified
         if self.transform is not None:

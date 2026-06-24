@@ -4,12 +4,40 @@ This protocol defines the 3-layer gatekeeper pipeline for detecting fake, duplic
 
 ---
 
+## 0. SYNTHESIS ENGINE (`synthesis.py`)
+
+在线合成引擎,为 gatekeeper 基础项(真实性/规范性)提供可训练/可测试数据。全部函数支持 `rng_or_seed` 参数确保确定性可复现。
+
+### 导出函数
+
+| 函数 | 功能 |
+|:---|:---|
+| `make_phantom_like(img, rng_or_seed)` | 模拟体模:平滑匀化 + 高 GLCM homogeneity |
+| `make_synthetic_like(img, rng_or_seed)` | 模拟 GAN/扩散合成:频域周期伪影 + 激进 JPEG 重压 |
+| `make_near_duplicate(img, rng_or_seed)` | 近重复:重采样/裁剪/水印/亮度偏移 |
+| `make_copy_move(img, rng_or_seed, patch_frac)` | → `(tampered, mask, bbox)` |
+| `make_splice(img, donor, rng_or_seed, patch_frac)` | → `(spliced, mask, bbox)` |
+
+### 类别约定
+
+| Label | 含义 |
+|:---|:---|
+| 0 | 真实图像 |
+| 1 | 体模(phantom) |
+| 2 | AI 合成(GAN/扩散) |
+
+---
+
 ## 1. AUTHENTICITY CLASSIFIER (`authenticity.py`)
 
-- **Feature extraction**: GLCM texture features + Error Level Analysis (ELA) frequency residuals.
-- **Model**: Shallow MLP classifier.
+- **Feature extraction**: 8 维真实特征:ELA + GLCM + 频域特征(非随机噪声占位)。
+- **训练数据**: 从真实训练图提取 label=0(真实)、`make_phantom_like` 生成 label=1(体模)、`make_synthetic_like` 生成 label=2(合成),特征标准化后 40 epoch 训练。
+- **Model**: Shallow MLP 三分类器(`AuthenticityClassifier`)。
 - **Weights**: Trained during `train.py` startup, saved to `checkpoints/authenticity_model.pth`.
+- **验证**: 训练结束在验证集报告三类准确率。
 - **Red-line**: MLP weights MUST NOT be altered without retraining on physical phantom datasets.
+
+> **历史说明**: 旧版用 `torch.randn` 随机噪声 + 随机标签做假训练(完全无用占位),已于本次重写为真实特征训练流程。
 
 ---
 
@@ -26,10 +54,10 @@ Two-stage duplicate detection:
 
 ## 3. TAMPERING DETECTION (`tampering.py`)
 
-| Attack Type | Detection Method |
-|:---|:---|
-| **Copy-Move** | Dense block-matching to find duplicate pixel regions |
-| **Splicing** | Sobel edge variance + local image gradient noise analysis |
+| Attack Type | Detection Method | 当前能力边界 |
+|:---|:---|:---|
+| **Copy-Move** | Dense block-matching to find duplicate pixel regions | 召回约 20–40%(干净图零误报);合成引擎现可批量生成训练样本供后续迭代提升 |
+| **Splicing** | Sobel edge variance + local image gradient noise analysis | **已知局限**:自适应阈值过保守,当前几乎不响应;`tests/test_gatekeeper.py` 中标记 `xfail`,待 Step 2 升级为更鲁棒检测器 |
 
 ---
 

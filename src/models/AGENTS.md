@@ -118,6 +118,32 @@ The Lagrangian multiplier `alpha` in `AUCMLossApprox` must be optimized in the m
 
 ---
 
+## 7b. MASKED TASK-SPECIFIC LOSS(逐样本逐任务有效性掩码)
+
+为多数据集混训防梯度污染,各损失组件支持逐样本有效性掩码,无效样本的 loss 贡献被精确置零。
+
+### 数据流
+
+1. **`loader.py`**: 从 `meta.json` 读可选 `label_mask` dict → `labels["valid_{task}"]`(缺失默认 1)。
+2. **`train_step.py`**: 组装 `targets["label_validity"]`(概念任务掩码 dict)和 `targets["valid_mask"]`(分割有效性);mixup 不混合有效性掩码(元数据透传)。
+3. **`losses/components/`**: 各组件新增 masked 分支:
+
+| 组件文件 | 掩码行为 |
+|:---|:---|
+| `components/concepts.py` | 逐样本 loss × `label_validity[task]`,用 `sum/有效数` 归约(非 `.mean`,避免被屏蔽样本稀释) |
+| `components/malignancy.py` | AUCM 为批量级损失,改用布尔索引过滤有效样本后再计算;全无效返回 0 梯度 |
+| `components/segmentation.py` | BCE+Dice 逐样本 × `valid_mask`;全无效返回 0 梯度 |
+
+### 向后兼容
+
+**`targets` 中无 `label_validity` 键时完全走旧路径**,现有数据集(TN3K 单一数据集训练)零改动。
+
+### 触发条件
+
+仅当 `meta.json` 含 `label_mask` 字段时激活,缺失字段默认有效(`valid=1`)。
+
+---
+
 ## 8. PHYSICAL PRIOR TIME-DECAY GATING
 
 The model itself is stateless regarding time. The annealing factor `gamma_prior` is calculated by the training loop and injected during the forward pass:

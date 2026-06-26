@@ -112,6 +112,23 @@ def main():
             print(
                 f"--> [WARNING] Resume weights not found at {args.resume}. Starting from scratch."
             )
+        # 恢复续训态:FAMO 动态权重 + criterion(AUCM 对偶参数/lambda_latent) + best 分数。
+        # 不含 optimizer 动量——optimizer 按 stage 边界重建(见下方循环),续训通常落在
+        # stage 边界,故动量持久化非必需,此处为已知简化。
+        state_path = "checkpoints/training_state.pth"
+        if os.path.exists(state_path):
+            ts = torch.load(state_path, map_location=device)
+            criterion.load_state_dict(ts["criterion"])
+            criterion.famo.load_state_dict(ts["famo"])
+            best_val_score = ts.get("best_val_score", best_val_score)
+            print(
+                f"--> Restored training state from epoch {ts.get('epoch')} "
+                f"(best_val_score={best_val_score:.4f}; FAMO + AUCM dual params + lambda_latent)"
+            )
+        else:
+            print(
+                "--> [WARNING] training_state.pth not found; FAMO/criterion start fresh."
+            )
 
     print("Starting training loop with Stage-wise Progressive Training...")
     running_losses_history = []
@@ -217,6 +234,18 @@ def main():
             best_val_score = val_score
             patience_counter = 0
             torch.save(model.state_dict(), "checkpoints/best_model.pth")
+            # 续训态与 best_model 同步落盘,严格配对。best_model.pth 保持纯
+            # model.state_dict 以兼容 predict/evaluate/SHA256;FAMO 动态权重与
+            # criterion(AUCM 对偶参数 a/b/alpha + lambda_latent)单列于此。
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "best_val_score": best_val_score,
+                    "criterion": criterion.state_dict(),
+                    "famo": criterion.famo.state_dict(),
+                },
+                "checkpoints/training_state.pth",
+            )
             print(
                 f"--> Saved new best checkpoint (Score: {val_score:.4f}, Dice: {val_dice:.4f}, AUC: {val_auc_log}) to checkpoints/best_model.pth"
             )

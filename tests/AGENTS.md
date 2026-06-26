@@ -4,15 +4,15 @@
 
 | File | Scope | Tests | 对应 Phase |
 |:---|:---|:---|:---|
-| `test_physical_prior.py` | `DifferentiablePhysicalPriorExtractor` — 形态学腐蚀、软圆形度、EMA 熵门控 | 18 | — |
-| `test_cbm_head.py` | `ConceptEmbeddingCBMHead` — 输出 dataclass 字段、vCLUB forward、latent 维度 | 16 | — |
-| `test_phase_refactor.py` | 重构回归守卫 — 解耦/死代码/评估尺子/数据划分 | 14 | Phase A/B/D |
-| `test_gatekeeper.py` | 合成引擎确定性+输出契约、dedup 近重复检测、copy-move 检测(召回~20-40%、干净图零误报)、authenticity 特征三类可分;splicing 检测器标记 `xfail`(自适应阈值过保守,Step2 升级) | ~17 (+1 xfail) | — |
+| `test_physical_prior.py` | `DifferentiablePhysicalPriorExtractor` — 形态学腐蚀、软圆形度、EMA 熵门控 | 14 | — |
+| `test_cbm_head.py` | `ConceptEmbeddingCBMHead` — 输出 dataclass 字段、vCLUB forward、latent 维度 | 15 | — |
+| `test_phase_refactor.py` | 重构回归守卫 — 解耦/死代码/评估尺子/数据划分/续训态持久化 | 17 | Phase A/B/C/D |
+| `test_gatekeeper.py` | 合成引擎确定性+输出契约、dedup 近重复检测、copy-move 检测(召回~20-40%、干净图零误报)、authenticity 特征三类可分;splicing 检测器标记 `xfail`(自适应阈值过保守,Step2 升级) | 12 (+1 xfail) | — |
 | `test_masked_loss.py` | Masked Task-Specific Loss — 无效样本零梯度贡献、全有效与旧路径数值一致(向后兼容) | 10 | — |
 
 ---
 
-## `test_phase_refactor.py` — 重构不变式(65 passed + 1 xfailed total, 此文件 14)
+## `test_phase_refactor.py` — 重构不变式(全套 68 passed + 1 xfailed,此文件 17)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |
@@ -39,6 +39,13 @@
 | `test_split_samples_ratio` | 划分比例 ≈ split_ratio |
 | `test_split_samples_reproducible` | 固定 seed 可复现 |
 | `test_split_samples_patient_id_is_image_id` | 每张图独立身份,全集覆盖 |
+
+### Phase C: 损失正确性 + 续训态持久化
+| Test | 验证内容 |
+|:---|:---|
+| `test_famo_state_dict_round_trip` | FAMO w_logits/prev_loss 序列化往返精确恢复 |
+| `test_famo_load_rejects_task_count_mismatch` | 任务数不匹配的 checkpoint 显式报错,不静默广播 |
+| `test_criterion_persists_dual_params_and_lambda` | criterion.state_dict 覆盖 AUCM 对偶参数 + lambda_latent,往返恢复 |
 
 ---
 

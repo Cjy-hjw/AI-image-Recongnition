@@ -29,6 +29,8 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
 * **Rule (Deep Research Gate)**: Before any major architectural iteration or complex optimization strategy change, the agent **MUST** generate a `提示词.md` and instruct the user to run a Deep Research query (via o1/o3-mini or specialized agents) to fetch the latest medical imaging constraints.
 * **Rule (Deep Research Grounding)**: To prevent mathematical formulation flaws, grid/shape alignment mismatches, and numpy/pytorch type coercion bugs (e.g. bitwise ufunc errors), the agent **MUST** feed the exact relevant codebase implementation snippets (especially morphological renderers, data shapes, and tensor slicing indices) as grounding context into the Deep Research query prompt. Abstract theoretical queries are strictly discouraged.
 * **Rule (Dynamic Maintenance)**: Both `rules.md` and `AGENTS.md` must be dynamically updated as dependencies, paths, or constraints evolve.
+* **Rule (Phased Refactoring)**: 涉及多项复杂 ML 改动(CEM/KAN/损失重构/路径门控等)时**禁止单体重写**。必须拆成顺序、低风险、可独立验证的阶段(如 Phase 1 移除一致性损失 → Phase 2 门控优化 → Phase 3 CEM/MLP 瓶颈),每阶段跑 `verify_model.py` + Holdout 评估通过后方可进入下一阶段。
+* **Rule (Detail-Preserving Edits 细节优先)**: 精简或重构任何文档(`rules.md`/`AGENTS.md`/`QA_VP.md`/`docs/`)时,**最大限度保留技术细节**——命令、数值阈值(如 FP16 上限 65504、clamp ±15、泄漏阈值 1e-7)、assert 代码、字段清单、以及规则背后的「为什么」均不得为求简洁而删除。只允许删:① 确定的跨文件重复;② 已落地的过时叙述;③ 纯修辞性赘语。**有疑则保留**,宁可冗长不可丢失硬约束。
 
 ## 6. Code Modularity & Maintainability
 * **Rule (Functional Decomposition)**: Every Python module must maintain a clear single responsibility. When a file exceeds 300 lines or contains more than 3 distinct functional domains (e.g., model architecture + physical priors + classification heads), it **MUST** be decomposed into separate modules.

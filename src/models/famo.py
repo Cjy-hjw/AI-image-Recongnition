@@ -57,3 +57,29 @@ class FAMOScheduler:
         # Weighted loss summation
         weighted_loss = (losses_tensor * weights).sum()
         return weighted_loss, weights
+
+    def state_dict(self) -> dict:
+        """Serialize dynamic state for checkpoint resume.
+
+        Only the two dynamic tensors need persisting; hyperparameters
+        (num_tasks/beta/gamma) are restored from __init__. Stored on CPU so the
+        checkpoint is device-agnostic.
+        """
+        return {
+            "w_logits": self.w_logits.detach().cpu().clone(),
+            "prev_loss": self.prev_loss.detach().cpu().clone(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore dynamic state saved by ``state_dict``.
+
+        Asserts task-count consistency so a checkpoint trained with a different
+        number of FAMO channels fails loudly instead of broadcasting silently.
+        """
+        w = state["w_logits"]
+        assert w.numel() == self.num_tasks, (
+            f"FAMO state mismatch: checkpoint has {w.numel()} tasks, "
+            f"scheduler expects {self.num_tasks}"
+        )
+        self.w_logits = w.clone()
+        self.prev_loss = state["prev_loss"].clone()

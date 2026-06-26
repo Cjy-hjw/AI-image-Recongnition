@@ -165,6 +165,51 @@ def test_split_samples_patient_id_is_image_id():
     assert len(all_combined) == 50, "every sample must appear exactly once across train∪val"
 
 
+# ── Phase C: FAMO / criterion 续训态持久化 ────────────────────────────────────
+
+def test_famo_state_dict_round_trip():
+    """FAMO 动态权重(w_logits/prev_loss)可序列化并精确恢复。"""
+    from src.models.famo import FAMOScheduler
+    famo = FAMOScheduler(num_tasks=5)
+    losses = torch.tensor([1.0, 0.8, 0.5, 1.2, 0.3])
+    famo.get_weighted_loss(losses, update_weights=True)          # 改变内部状态
+    famo.get_weighted_loss(losses * 0.9, update_weights=True)
+    state = famo.state_dict()
+
+    restored = FAMOScheduler(num_tasks=5)
+    restored.load_state_dict(state)
+    assert torch.allclose(restored.w_logits, famo.w_logits)
+    assert torch.allclose(restored.prev_loss, famo.prev_loss)
+
+
+def test_famo_load_rejects_task_count_mismatch():
+    """任务数不一致的 checkpoint 必须显式报错,而非静默广播。"""
+    import pytest
+    from src.models.famo import FAMOScheduler
+    src_famo = FAMOScheduler(num_tasks=5)
+    dst_famo = FAMOScheduler(num_tasks=3)
+    with pytest.raises(AssertionError):
+        dst_famo.load_state_dict(src_famo.state_dict())
+
+
+def test_criterion_persists_dual_params_and_lambda():
+    """criterion.state_dict 覆盖 AUCM 对偶参数与 lambda_latent;往返后精确恢复。"""
+    crit = MultiTaskLoss()
+    with torch.no_grad():                                        # 模拟训练改写动态状态
+        crit.mal_loss_fn.a.fill_(0.37)
+        crit.mal_loss_fn.alpha.fill_(0.21)
+        crit.lambda_latent.fill_(0.055)
+    keys = crit.state_dict().keys()
+    assert "mal_loss_fn.a" in keys and "mal_loss_fn.alpha" in keys
+    assert "lambda_latent" in keys
+
+    restored = MultiTaskLoss()
+    restored.load_state_dict(crit.state_dict())
+    assert torch.allclose(restored.mal_loss_fn.a, crit.mal_loss_fn.a)
+    assert torch.allclose(restored.mal_loss_fn.alpha, crit.mal_loss_fn.alpha)
+    assert torch.allclose(restored.lambda_latent, crit.lambda_latent)
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))

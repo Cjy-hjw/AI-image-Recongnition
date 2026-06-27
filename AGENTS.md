@@ -15,7 +15,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Inference Pipeline** | `/src/AGENTS.md` §2 | Shared inference modules: io, model_runner, postprocess, export. |
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
-| **Tests** | `/tests/AGENTS.md` | 全套 68 passed + 1 xfailed:14 physical_prior + 15 cbm_head + 17 phase_refactor(Phase A/B/C/D regression) + 12 gatekeeper(+1 xfail) + 10 masked_loss. |
+| **Tests** | `/tests/AGENTS.md` | 全套 71 passed:14 physical_prior + 15 cbm_head + 17 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss. |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---

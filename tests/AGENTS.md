@@ -7,12 +7,12 @@
 | `test_physical_prior.py` | `DifferentiablePhysicalPriorExtractor` — 形态学腐蚀、软圆形度、EMA 熵门控 | 14 | — |
 | `test_cbm_head.py` | `ConceptEmbeddingCBMHead` — 输出 dataclass 字段、vCLUB forward、latent 维度 | 15 | — |
 | `test_phase_refactor.py` | 重构回归守卫 — 解耦/死代码/评估尺子/数据划分/续训态持久化 | 17 | Phase A/B/C/D |
-| `test_gatekeeper.py` | 合成引擎确定性+输出契约、dedup 近重复检测、copy-move 检测(召回~20-40%、干净图零误报)、authenticity 特征三类可分;splicing 检测器标记 `xfail`(自适应阈值过保守,Step2 升级) | 12 (+1 xfail) | — |
+| `test_gatekeeper.py` | 合成引擎确定性+输出契约、dedup 近重复检测、copy-move 检测(召回~20-40%、干净图零误报)、authenticity 特征三类可分;splicing 检测器「轴对齐长直缝+角点正交相交」几何判据(干净图 0/80 零误报、真实组织拼接召回~84%、返回契约) | 15 | — |
 | `test_masked_loss.py` | Masked Task-Specific Loss — 无效样本零梯度贡献、全有效与旧路径数值一致(向后兼容) | 10 | — |
 
 ---
 
-## `test_phase_refactor.py` — 重构不变式(全套 68 passed + 1 xfailed,此文件 17)
+## `test_phase_refactor.py` — 重构不变式(全套 71 passed,此文件 17)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

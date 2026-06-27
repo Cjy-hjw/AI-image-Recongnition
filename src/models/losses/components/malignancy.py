@@ -42,7 +42,12 @@ def compute_malignancy_losses(
             # AUCM returns scalar; mask_weight broadcast → [n_valid]; reduce
             loss_mal = loss_mal.mean()
 
-            loss_supcon = supcon_loss_fn(outputs["z_contrastive"], mal_targets)
+            # SupCon 同样仅用有效样本:无效样本的 malignancy 标签是占位值(默认 0),
+            # 喂入全 batch 会用垃圾标签构造对比正负对,污染对比学习的特征结构。
+            # 有效子集 < 2 时 SupervisedContrastiveLoss 内部返回 0,安全。
+            loss_supcon = supcon_loss_fn(
+                outputs["z_contrastive"][valid_idx], mal_targets[valid_idx]
+            )
             if loss_supcon.dim() > 0:
                 loss_supcon = loss_supcon.mean()
     else:

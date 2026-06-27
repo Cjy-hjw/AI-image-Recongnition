@@ -171,7 +171,15 @@ def train_authenticity_classifier(train_dataset, val_dataset, device, save_path)
 
     print(f"--> Val Accuracy: {correct}/{total} = {acc:.4f}")
 
-    # 保存权重
+    # 保存权重 + 特征标准化参数(推理端 predict 必须用同一组 mean/std,否则
+    # 训练/推理特征分布不一致导致分类失效)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(clf.state_dict(), save_path)
-    print(f"--> Saved Authenticity Classifier weights to {save_path}")
+    torch.save(
+        {
+            "state_dict": clf.state_dict(),
+            "feat_mean": feat_mean.astype(np.float32),
+            "feat_std": feat_std.astype(np.float32),
+        },
+        save_path,
+    )
+    print(f"--> Saved Authenticity Classifier weights (+norm stats) to {save_path}")

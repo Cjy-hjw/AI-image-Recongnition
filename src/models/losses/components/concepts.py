@@ -142,7 +142,10 @@ def compute_concept_losses(
     score_gt = lam * torch.mv(gt_concepts, tirads_matrix) + (1.0 - lam) * torch.mv(
         gt_concepts_perm, tirads_matrix
     )
-    loss_prior = F.huber_loss(score_pred, score_gt, delta=1.0)
+    # reduction="none" → 保留 [B] 逐样本误差,使下方 masked / legacy 两条路径都能
+    # 逐样本加权。此前默认 "mean" 会先把 prior 压成标量,导致 label_validity 屏蔽
+    # 与 mask_weight 对 prior 完全失效(无效样本的 prior 误差被混进标量 mean)。
+    loss_prior = F.huber_loss(score_pred, score_gt, delta=1.0, reduction="none")
 
     # ── Masked Task-Specific Loss (label validity) ──────────────────────────
     # When targets contains "label_validity", apply per-sample per-task masking

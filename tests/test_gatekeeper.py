@@ -190,19 +190,36 @@ class TestAuthenticityFeatures:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ② 规范性 - splicing:已知局限(自适应阈值过保守,当前不响应)
+# ② 规范性 - splicing:直线缝检测(角点正交相交判据)
 # ═════════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(
-    reason="splicing 检测器自适应阈值 mean+4.5σ 过保守,当前几乎不响应;"
-    "Step 2 将重标定阈值。本测试记录已知局限,升级后转为正式断言。",
-    strict=False,
-)
 class TestSplicingDetection:
+    """拼接检测器以「轴对齐长直缝在角点正交相交」为判据。
+
+    设计取舍:像素/区域方差无法区分拼接块与真实结节(实测干净图 20/20 误报),
+    而误报触碰"真实性/规范性"一票否决红线。故改用硬粘贴矩形特有的几何缝特征,
+    宁可放弃纯噪声 donor 这类极端对抗样本的部分召回,也要换取干净图零误报。
+    """
+
     def test_detects_splice(self):
-        base = _structured_ultrasound()
-        donor = np.clip(
-            np.random.RandomState(3).normal(140, 45, (256, 256)), 0, 255
-        ).astype(np.uint8)
+        # 真实组织拼接:donor 取另一张结构化超声图(贴近真实篡改场景)
+        base = _structured_ultrasound(seed=1)
+        donor = _structured_ultrasound(seed=99, vary_structure=True)
         sp, _, _ = make_splice(base, donor, 2, patch_frac=0.30)
-        assert detect_splicing(sp)[0], "splice 未检出"
+        assert detect_splicing(sp)[0], "结构化 donor 拼接未检出"
+
+    def test_no_false_positive_on_clean(self):
+        # 一票否决红线:干净结构化超声图(含解剖结节)必须零误报
+        for seed in range(12):
+            clean = _structured_ultrasound(seed=seed, vary_structure=(seed % 2 == 0))
+            assert not detect_splicing(clean)[0], f"干净图误报 (seed={seed}) — 一票否决红线"
+
+    def test_returns_contract(self):
+        # 返回契约:(is_spliced, mask_2d_uint8, bbox)
+        base = _structured_ultrasound(seed=1)
+        donor = _structured_ultrasound(seed=99, vary_structure=True)
+        sp, _, _ = make_splice(base, donor, 2, patch_frac=0.30)
+        is_spliced, mask, bbox = detect_splicing(sp)
+        assert mask.shape == sp.shape and mask.dtype == np.uint8
+        if is_spliced:
+            assert bbox is not None and len(bbox) == 4

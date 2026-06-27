@@ -31,7 +31,9 @@ def extract_glcm_features(img_np):
     
     # Extract properties
     contrast = graycoprops(glcm, 'contrast').mean()
-    correlation = graycoprops(glcm, 'correlation').mean()
+    # 零方差(如理想 phantom 平滑图)时 GLCM correlation 除零→NaN,会沿特征向量
+    # 传播污染标准化与 CrossEntropy,导致 authenticity 训练整批 NaN。此处守卫。
+    correlation = np.nan_to_num(graycoprops(glcm, 'correlation').mean())
     energy = graycoprops(glcm, 'energy').mean()
     homogeneity = graycoprops(glcm, 'homogeneity').mean()
     
@@ -81,14 +83,28 @@ class AuthenticityModule:
     def __init__(self):
         self.model = AuthenticityClassifier()
         self.model.eval()
-        
+        # 训练集特征标准化参数(随权重一起加载);None 时表示旧格式权重,跳过标准化
+        self.feat_mean = None
+        self.feat_std = None
+
     def load_weights(self, path):
         if os.path.exists(path):
-            self.model.load_state_dict(torch.load(path, map_location='cpu'))
-            
+            ckpt = torch.load(path, map_location='cpu')
+            if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                self.model.load_state_dict(ckpt["state_dict"])
+                fm, fs = ckpt.get("feat_mean"), ckpt.get("feat_std")
+                self.feat_mean = None if fm is None else np.asarray(fm, dtype=np.float32)
+                self.feat_std = None if fs is None else np.asarray(fs, dtype=np.float32)
+            else:
+                # 兼容旧的纯 state_dict 格式(无标准化参数)
+                self.model.load_state_dict(ckpt)
+
     def predict(self, img_np):
         features = extract_authenticity_features(img_np)
-        feat_tensor = torch.tensor(features).unsqueeze(0)
+        # 应用与训练一致的特征标准化(否则训练/推理分布不一致,分类失效)
+        if self.feat_mean is not None and self.feat_std is not None:
+            features = (features - self.feat_mean) / (self.feat_std + 1e-6)
+        feat_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             logits = self.model(feat_tensor)
             prob = torch.softmax(logits, dim=1).numpy()[0]

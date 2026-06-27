@@ -37,7 +37,7 @@ Pipeline:
 1. **Authenticity** — `AuthenticityModule` (GLCM + ELA MLP) → phantom/synthetic detection
 2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set
 3. **Copy-Move** — `detect_copy_move()` dense block-matching
-4. **Splicing** — `detect_splicing()` Sobel edge variance
+4. **Splicing** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)
 
 **Rejection JSON** (on failure):
 ```json

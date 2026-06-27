@@ -57,7 +57,7 @@ Two-stage duplicate detection:
 | Attack Type | Detection Method | 当前能力边界 |
 |:---|:---|:---|
 | **Copy-Move** | Dense block-matching to find duplicate pixel regions | 召回约 20–40%(干净图零误报);合成引擎现可批量生成训练样本供后续迭代提升 |
-| **Splicing** | Sobel edge variance + local image gradient noise analysis | **已知局限**:自适应阈值过保守,当前几乎不响应;`tests/test_gatekeeper.py` 中标记 `xfail`,待 Step 2 升级为更鲁棒检测器 |
+| **Splicing** | 轴对齐长直缝几何判据:Sobel 强阶跃边 → HoughLinesP 找长直线(≥0.14·min(H,W))→ 按 ±10° 分水平/垂直缝 → **要求一条水平缝与一条垂直缝端点在 14px 内角点正交相交**(硬粘贴矩形特征) | 经两轮失败定案:像素/区域方差方案在含结节的干净图 20/20 误报(结节本身即方差异常区),触碰一票否决红线故弃用。现方案干净图 **0/80 零误报**、真实组织拼接召回 **~84%**,放弃纯噪声 donor 等极端对抗样本部分召回以换零误报 |
 
 ---
 

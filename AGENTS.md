@@ -15,7 +15,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Inference Pipeline** | `/src/AGENTS.md` §2 | Shared inference modules: io, model_runner, postprocess, export. |
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
-| **Tests** | `/tests/AGENTS.md` | 全套 73 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss. |
+| **Tests** | `/tests/AGENTS.md` | 全套 90 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss + 17 video(动态图/cine 管线). |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---
@@ -44,10 +44,11 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `model_runner.py` — Model build + preprocess + forward (inference_mode + autocast)
   - `postprocess.py` — Prediction decoding + TI-RADS breakdown
   - `export.py` — Artifact saving + Grad-CAM overlay
+  - `video_io.py` — 动态图/cine 抽帧(MP4/AVI/MOV/MKV + 多帧 DICOM);`video_aggregate.py` — 抽样下标 + 帧级聚合(恶性取最大帧)。驱动:根目录 `video_predict.py`
 
 ### `src/dataset/` — Data pipeline
   - `loader.py` — ThyroidDataset with PatientID grouping
-  - `augmentation/transforms.py` — 8 ultrasound-specific transforms + `get_train_transforms()`
+  - `augmentation/transforms.py` — 7 ultrasound-specific transforms + `get_train_transforms()`
   - `augmentation/mixup.py` — Dominant-Region CutMix + standard MixUp
 
 ### `scripts/` — Verification & data formatting

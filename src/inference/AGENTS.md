@@ -13,6 +13,8 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `model_runner.py` | Model build, image preprocessing, forward pass |
 | `postprocess.py` | Prediction decoding and TI-RADS breakdown |
 | `export.py` | Artifact saving (mask, report, JSON, Grad-CAM overlay) |
+| `video_io.py` | 动态图/视频(cine)抽帧:MP4/AVI/MOV/MKV via OpenCV + 多帧 DICOM cine via pydicom;复用 `io._PHI_FIELDS` 脱敏,经 `_to_gray` 统一灰度兜底(含彩色/多普勒 cine)。供 `video_predict.py`(根目录) |
+| `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先) |
 
 ---
 
@@ -29,9 +31,12 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 ## 2. `gatekeeper_runner.py` — 4-Layer Audit
 
-### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir)` → `(passed, rejection_json)`
+### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None)` → `(passed, rejection_json)`
 
 **Scope**: Production inference only. `evaluate.py` MUST NOT import this module.
+
+- `deduplicator` 可选:传入预先用 `build_seeded_deduplicator(config, device)` 播种好的实例,供**视频逐帧复用**(否则每帧重复读取+ResNet 编码最多 200 张训练图,O(帧数×200) 拖慢延迟)。为 None 时即时构建,单图路径行为不变(向后兼容)。
+- **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
 
 Pipeline:
 1. **Authenticity** — `AuthenticityModule` (GLCM + ELA MLP) → phantom/synthetic detection

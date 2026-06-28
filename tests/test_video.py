@@ -112,6 +112,50 @@ class TestGrayUtils:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 单图 DICOM 彩色帧回归:彩色多普勒单帧 (H,W,3) 必须经 _to_gray 收敛为 2D,
+# 否则 preprocess_image 产出 5 维张量令模型前向 `too many values to unpack` 崩溃。
+# 守 io.py 单图路径与 video_io cine 路径的灰度口径对称性。
+#
+# 用 monkeypatch 伪造 pydicom 注入,只测「接线」(DICOM 分支是否经 _to_gray),
+# 不依赖真实 pydicom 安装(本地无 pydicom 时仍真跑,不 skip;容器内 pydicom
+# 在 requirements 中,行为一致)。
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestColorDicomSingleFrame:
+    def test_color_single_frame_dicom_collapses_to_gray(self, tmp_path, monkeypatch):
+        import src.inference.io as io_mod
+
+        color = (np.random.rand(48, 64, 3) * 255).astype(np.uint8)
+
+        class _FakeDS:
+            pixel_array = color
+
+            def __contains__(self, tag):  # PHI 字段一律不存在 → 跳过匿名化赋值
+                return False
+
+            def save_as(self, path):  # 落匿名化副本,不真写盘内容
+                open(path, "wb").close()
+
+        class _FakePydicom:
+            @staticmethod
+            def dcmread(path):
+                return _FakeDS()
+
+        # 顶层 import 在本地无 pydicom 时未绑定 io_mod.pydicom,raising=False 兜底
+        monkeypatch.setattr(io_mod, "pydicom", _FakePydicom, raising=False)
+        monkeypatch.setattr(io_mod, "HAS_PYDICOM", True, raising=False)
+
+        dcm_path = tmp_path / "color.dcm"
+        dcm_path.write_bytes(b"placeholder")  # 仅需扩展名触发 DICOM 分支
+
+        img, is_dicom, err = io_mod.load_input_image(str(dcm_path), str(tmp_path))
+        assert err is None, f"彩色单帧 DICOM 读取失败: {err}"
+        assert is_dicom is True
+        assert img is not None and img.ndim == 2, "彩色单帧未收敛为 2D 灰度(下游会 5 维崩溃)"
+        assert img.dtype == np.uint8
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 视频解码往返(codec 缺失则跳过)+ 格式守卫
 # ═════════════════════════════════════════════════════════════════════════════
 

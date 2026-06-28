@@ -9,29 +9,14 @@ import os
 import cv2
 import numpy as np
 
-from src.inference.io import _PHI_FIELDS, HAS_PYDICOM
+from src.inference.io import _PHI_FIELDS, HAS_PYDICOM, _rescale_to_uint8, _to_gray
 from src.inference.video_aggregate import uniform_sample_indices
 
 _VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
 _DICOM_EXTS = (".dcm", ".dicom")
 
-
-def _rescale_to_uint8(arr: np.ndarray) -> np.ndarray:
-    """单帧 min-max 归一化到 8-bit 灰度(对齐 io.load_input_image 的 DICOM 处理)。"""
-    arr = arr.astype(np.float32)
-    lo, hi = float(arr.min()), float(arr.max())
-    return ((arr - lo) / (hi - lo + 1e-8) * 255.0).astype(np.uint8)
-
-
-def _to_gray(frame: np.ndarray) -> np.ndarray:
-    """统一转单通道灰度 uint8。"""
-    if frame.ndim == 3 and frame.shape[2] == 3:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    elif frame.ndim == 3 and frame.shape[2] == 1:
-        frame = frame[:, :, 0]
-    if frame.dtype != np.uint8:
-        frame = _rescale_to_uint8(frame)
-    return frame
+# 通道/位深归一化工具(_rescale_to_uint8 / _to_gray)已下沉至 io.py,静/动两路径共用,
+# 此处 re-import 保持向后兼容(test_video.py 等仍从 video_io 命名空间引用)。
 
 
 def load_video_frames(path: str, output_dir: str, max_frames: int = 32):

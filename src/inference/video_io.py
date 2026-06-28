@@ -57,7 +57,8 @@ def _load_cv_video(path: str, max_frames: int):
     if not raw:
         return None, [], False, f"No frames decoded from video: {path}"
     idxs = uniform_sample_indices(len(raw), max_frames)
-    frames = [_to_gray(raw[i]) for i in idxs]
+    # OpenCV cap.read() 解码帧为 BGR 序,显式告知 _to_gray 以正确加权(多普勒伪彩)
+    frames = [_to_gray(raw[i], channel_order="bgr") for i in idxs]
     return frames, idxs, False, None
 
 
@@ -77,9 +78,10 @@ def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
             arr = arr[None, ...]  # 单帧 → (1,H,W)
         n_total = arr.shape[0]
         idxs = uniform_sample_indices(n_total, max_frames)
-        # 经 _to_gray 统一兜底:彩色/多普勒 cine 的帧为 (H,W,3),需转灰度并对齐视频路径,
-        # 否则 3 通道帧喂入 preprocess_image 会让模型前向形状报错。
-        frames = [_to_gray(arr[i]) for i in idxs]
+        # 经 _to_gray 统一兜底:彩色/多普勒 cine 帧为 (H,W,3),需转灰度对齐视频路径,
+        # 否则 3 通道帧喂入 preprocess_image 会让模型前向形状报错。DICOM 像素为 RGB 序
+        # (默认 channel_order="rgb"),与 OpenCV 视频帧的 BGR 区分。
+        frames = [_to_gray(arr[i], channel_order="rgb") for i in idxs]
 
         for tag, anon in _PHI_FIELDS.items():
             if tag in ds:

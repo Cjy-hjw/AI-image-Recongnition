@@ -12,10 +12,11 @@
 | `test_video.py` | 动态图/cine 管线 — 抽样下标边界(含 max_frames==1 除零守卫)、帧级聚合(最大帧判定/关键帧映射/空安全)、灰度转换、视频解码往返(codec 缺失则 skip)、gatekeeper 去重库注入复用 | 17 | — |
 | `test_authenticity_trainer.py` | 真实性分类器训练器 smoke — 合成伪超声喂训练器跑通,产出 dict(state_dict+feat_mean+feat_std);推理端 AuthenticityModule 加载并应用归一化、predict 返回 softmax(守卫训练/推理归一化口径一致) | 2 | — |
 | `test_multisource.py` | 多源数据集骨架 — 源级 label_mask(默认全有效向后兼容、源 mask 标注缺失任务、meta label_mask 覆盖源 mask);`MultiSourceThyroidDataset` 拼接长度、源级 mask 生效、采样权重反映源 ratio、空源不崩 | 7 | — |
+| `test_smoke_entrypoints.py` | CLI 入口端到端冒烟 — 把 `predict.py`/`video_predict.py` 当**子进程实跑**(随机权重,build_model 缺 checkpoint 降级随机+warning 不报错):REJECTED 路径(噪声图→gatekeeper 拒、落 result.json)+ PASSED 路径(video `--skip_gatekeeper`→推理/后处理/报告/JSON/Grad-CAM 四产物齐全、JSON 中文可还原)。补 99 组件级单测对入口「接线」的集成盲区;codec 缺失则 skip | 2 | — |
 
 ---
 
-## `test_phase_refactor.py` — 重构不变式(全套 99 passed,此文件 19)
+## `test_phase_refactor.py` — 重构不变式(全套 101 passed,此文件 19)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

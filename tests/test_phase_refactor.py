@@ -9,15 +9,18 @@ import inspect
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import numpy as np
 
 from src.models.multi_task_model import MultiTaskThyroidModel, ModelOutputs
 from src.models.cbm_head import ConceptEmbeddingCBMHead, CBMHeadOutput
 from src.models.loss import MultiTaskLoss
 from src.inference.model_runner import run_forward
 from src.inference.export import _resolve_gradcam_target_layer
+from src.utils.grad_cam import GradCAM
 from src.inference.io import _PHI_FIELDS
 from src.training.loop import validate_step
 from scripts.data.split_tn3k import _split_samples
+from predict import main as predict_main
 
 
 # ── Phase A: 解耦 + 死代码清理 ────────────────────────────────────────────────
@@ -111,6 +114,41 @@ def test_gradcam_dual_backbone_branches():
     seg_layer = _resolve_gradcam_target_layer(model, "seg")
     assert cls_layer is not None and seg_layer is not None
     assert cls_layer is not seg_layer
+
+
+def test_gradcam_generates_valid_heatmap_end_to_end():
+    """端到端:Grad-CAM 真跑前向+反向,产出 [0,1] 归一化、与输入同尺寸的热图。
+
+    堵集成盲区——此前只测了目标层可解析,从未验证 backward 路径能跑通(梯度
+    经分类主干回流到目标层激活)。注意:GradCAM 内部自带 forward+backward,
+    必须在 inference_mode 之外、用普通张量调用。
+    """
+    model = MultiTaskThyroidModel(pretrained=False).eval()
+    target_layer = _resolve_gradcam_target_layer(model, "cls")
+    gradcam = GradCAM(model, target_layer)
+    try:
+        x = torch.rand(1, 1, 512, 512)  # 普通张量,可参与 autograd;模型要求 512×512
+        heatmap = gradcam.generate_heatmap(x, target_class=1)
+    finally:
+        gradcam.remove_hooks()
+    assert heatmap.shape == (512, 512), "热图须与输入空间尺寸一致"
+    assert float(heatmap.min()) >= 0.0 and float(heatmap.max()) <= 1.0, "热图须归一化到 [0,1]"
+    assert not np.isnan(heatmap).any(), "热图不得含 NaN"
+
+
+def test_predict_passes_gradcam_flag_outside_inference_mode():
+    """守卫:predict.py 的 Grad-CAM 调用必须在 inference_mode 块之外。
+
+    inference_mode 下创建/使用的张量无法参与 autograd,若 save_gradcam_overlay
+    被包进 run_forward 的 inference_mode,backward 会失败。此测试静态校验源码
+    结构:gradcam 调用出现在 run_forward 之后的顶层流程,且有 enable_gradcam 开关。
+    """
+    src = inspect.getsource(predict_main)
+    assert "--enable_gradcam" in src or "enable_gradcam" in src, "缺 enable_gradcam 开关"
+    assert "save_gradcam_overlay" in src, "predict 未接入 Grad-CAM"
+    # gradcam 调用须在 run_forward 之后(同一函数体顶层,不在 inference_mode 内)
+    assert src.index("run_forward") < src.index("save_gradcam_overlay"), (
+        "Grad-CAM 须在 run_forward(inference_mode)之后调用")
 
 
 def test_phi_fields_expanded():

@@ -57,10 +57,15 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `data/pseudo_labels.py` — TI-RADS pseudo-label extraction
   - `data/split_tn3k.py` — 纯随机图像级 train/val/holdout 划分(Phase D)
 
-### `tests/` — 回归测试套件
+### `tests/` — 回归测试套件(全套 99 tests)
   - `test_physical_prior.py` — DifferentiablePhysicalPriorExtractor (14 tests)
   - `test_cbm_head.py` — ConceptEmbeddingCBMHead (15 tests)
   - `test_phase_refactor.py` — Phase A/B/C/D 重构回归守卫 (19 tests)
+  - `test_gatekeeper.py` — 合成引擎/dedup/copy-move/authenticity/splicing 几何判据 (15 tests)
+  - `test_masked_loss.py` — Masked Task-Specific Loss 无效样本零梯度 (10 tests)
+  - `test_video.py` — 动态图/cine 管线(抽样/聚合/灰度/解码/去重注入) (17 tests)
+  - `test_authenticity_trainer.py` — 真实性分类器训练器 smoke (2 tests)
+  - `test_multisource.py` — 多源混训骨架 + 源级 label_mask (7 tests)
 
 **Backward Compatibility**: All decomposed modules maintain `__init__.py` re-export shims to preserve existing import paths.
 

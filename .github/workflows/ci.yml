@@ -1,0 +1,47 @@
+name: CI
+
+# PR 到 main 时自动跑;push 到 main 也跑(合并后再保一道)。
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 同一分支新 push 取消旧的在跑任务,省额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 铁律 1:架构分层契约(import-linter)。纯静态分析,不装重依赖,秒级反馈。
+  import-linter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install import-linter
+        run: pip install import-linter==2.12
+      - name: Check architecture contracts
+        run: lint-imports
+
+  # 铁律 2:Gate 1(verify_model.py 七门)+ 全套 pytest 回归。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU torch first (avoid pulling CUDA wheels)
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Install runtime + test deps
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Gate 1 - verify_model (7 gates)
+        run: python scripts/verify_model.py
+      - name: Full pytest regression
+        run: pytest -q

@@ -1,0 +1,47 @@
+[importlinter]
+# Architecture layering contracts (rules.md section 6).
+# A broken contract = CI red = merge blocked.
+# Verified-clean edges: inference !-> training, models has no reverse deps,
+# gatekeeper !-> upper layers, utils is a standalone leaf.
+root_package = src
+include_external_packages = False
+
+[importlinter:contract:1]
+name = inference must not depend on training (inference container ships no training code)
+type = forbidden
+source_modules =
+    src.inference
+forbidden_modules =
+    src.training
+
+[importlinter:contract:2]
+name = models is the bottom layer, no reverse dependency on any upper layer
+type = forbidden
+source_modules =
+    src.models
+forbidden_modules =
+    src.inference
+    src.training
+    src.gatekeeper
+    src.dataset
+
+[importlinter:contract:3]
+name = gatekeeper must not depend on training/inference (callable by them, not the reverse)
+type = forbidden
+source_modules =
+    src.gatekeeper
+forbidden_modules =
+    src.inference
+    src.training
+
+[importlinter:contract:4]
+name = utils is a leaf utility layer, no dependency on any src business module
+type = forbidden
+source_modules =
+    src.utils
+forbidden_modules =
+    src.inference
+    src.training
+    src.models
+    src.gatekeeper
+    src.dataset

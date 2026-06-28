@@ -93,3 +93,5 @@ Before any code modification is merged, submitted, or deployed:
 2.  **Forward/Backward Test execution**: Run `python scripts/verify_model.py` and verify all Gate checks pass.
 3.  **Checklist Audit**: Perform a self-review or spawn a `reviewer` subagent pointing to this protocol.
 4.  **Zero Placeholder Rule**: Do not use placeholders or mocked outputs. All code must be fully operational.
+
+**CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 七门)+ 全套 pytest 回归。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。

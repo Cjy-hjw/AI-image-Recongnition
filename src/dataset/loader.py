@@ -9,11 +9,17 @@ class ThyroidDataset(Dataset):
     """
     Thyroid Ultrasound Dataset for Multi-task Segmentation, Detection, and classification.
     Loads images, masks, and clinical labels from structured directories.
+
+    source_label_mask: 可选 dict,提供**源级**标签有效性默认值(键为 composition/
+        echogenicity/shape/margin/foci/malignancy/mask,值 0/1)。用于多源混训时
+        声明"本数据源整体缺哪类标签"(如 TN3K 缺 malignancy),免去逐样本写
+        label_mask。优先级:样本 meta.json 的 label_mask > source_label_mask > 默认 1。
     """
-    def __init__(self, data_dir, img_size=256, transform=None):
+    def __init__(self, data_dir, img_size=256, transform=None, source_label_mask=None):
         self.data_dir = data_dir
         self.img_size = img_size
         self.transform = transform
+        self.source_label_mask = source_label_mask or {}
         
         self.samples = []
         if os.path.exists(data_dir):
@@ -79,13 +85,15 @@ class ThyroidDataset(Dataset):
         }
 
         # Label validity mask: 1 = label available, 0 = label absent (skip gradient)
-        # Read from meta.json "label_mask" dict; default all tasks valid (=1)
+        # 优先级:样本 meta.json 的 label_mask > 源级 source_label_mask > 默认 1。
+        # 源级默认让多源混训可直接声明"本源整体缺某类标签",无需逐样本标注。
         lm = meta.get("label_mask", {})
+        slm = self.source_label_mask
         concept_tasks = ("composition", "echogenicity", "shape", "margin", "foci", "malignancy")
         for task in concept_tasks:
-            labels[f"valid_{task}"] = int(lm.get(task, 1))
+            labels[f"valid_{task}"] = int(lm.get(task, slm.get(task, 1)))
         # Segmentation mask validity
-        labels["valid_mask"] = int(lm.get("mask", 1))
+        labels["valid_mask"] = int(lm.get("mask", slm.get("mask", 1)))
         
         # Apply data augmentations if specified
         if self.transform is not None:
@@ -96,3 +104,47 @@ class ThyroidDataset(Dataset):
         mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
         
         return img_tensor, mask_tensor, labels
+
+
+class MultiSourceThyroidDataset(Dataset):
+    """多源甲状腺数据集骨架:拼接多个 `ThyroidDataset`,各源带自己的源级标签有效性。
+
+    为开赛后"多公开数据集混训 + 部分标签(SSCBM)"预留,**当前不接真数据**。
+    每个 source 配置: {name, path, label_mask(源级缺标签声明), ratio(加权采样权重,可选)}。
+    缺标签样本经 ThyroidDataset 的 source_label_mask 标 valid_*=0,下游 masked loss
+    自动零梯度——与现有单源路径完全兼容,无需改损失。
+
+    设计取舍:沿用 ThyroidDataset 的目录契约(image.png/mask.png/meta.json),不假设
+    官方数据形态;真实接入时只需把各公开集转成该目录结构即可。
+    """
+    def __init__(self, sources, img_size=256, transform=None):
+        self.sources = sources
+        self.datasets = []
+        self.source_names = []
+        self.index_map = []  # 全局 idx → (ds_pos, local_idx)
+        self.sample_weights = []  # 供 WeightedRandomSampler(按源 ratio 均摊到样本)
+        for src in sources:
+            ds = ThyroidDataset(
+                src["path"], img_size=img_size, transform=transform,
+                source_label_mask=src.get("label_mask"),
+            )
+            ds_pos = len(self.datasets)
+            self.datasets.append(ds)
+            self.source_names.append(src.get("name", f"source{ds_pos}"))
+            n = len(ds)
+            ratio = float(src.get("ratio", 1.0))
+            per_sample_w = (ratio / n) if n > 0 else 0.0
+            for local_idx in range(n):
+                self.index_map.append((ds_pos, local_idx))
+                self.sample_weights.append(per_sample_w)
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        ds_pos, local_idx = self.index_map[idx]
+        return self.datasets[ds_pos][local_idx]
+
+    def get_sample_weights(self):
+        """返回与样本对齐的采样权重(源 ratio 均摊),供 WeightedRandomSampler 实现按源配比。"""
+        return list(self.sample_weights)

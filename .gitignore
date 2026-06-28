@@ -1,6 +1,8 @@
 # Ignore dataset and weights
-data/
-checkpoints/
+# 注:必须用前导 / 锚定到仓库根,否则无锚定的 data/ 会匹配任意层级的 data 目录,
+#     误伤 scripts/data/ 源码包(曾导致 CI 因缺 pseudo_labels.py 等文件而 collect 失败)。
+/data/
+/checkpoints/
 
 # Python cache and temporary files
 __pycache__/

@@ -14,6 +14,6 @@
 
 ## 项目要点
 
-- **比赛约束**:赛道七**仅「自有模型组」**,交付为离线推理容器(`predict.py`),打包 gatekeeper + TaskAlignmentAdaptor + CBM 报告生成器。
+- **比赛约束**:赛道七**仅「自有模型组」**,交付为离线推理容器(`predict.py` 单图 + `video_predict.py` 动态图,`entrypoint.sh` 按扩展名自动分发),打包 gatekeeper + TaskAlignmentAdaptor + CBM 报告生成器。
 - **当前卡点**:官方数据 **2026-08-01 初赛启动**后才可用、**禁本地、JPG、含动静态图**;在此之前核心三项(真实性 / 规范性 / 良恶性)无法真训。进度见 `docs/之前表现.md`、`docs/比赛对齐与风险.md`。
 - **环境**:训练在服务器 A800;本地 Python 见全局 `~/.claude/CLAUDE.md`。

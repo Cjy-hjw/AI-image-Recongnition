@@ -91,6 +91,7 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 ### `save_gradcam_overlay(model, img_tensor, img_np, output_path, branch="cls")`
 - 双主干显式分支:`branch="cls"`(默认)→ `cls_backbone`(EfficientNet-B2,解释恶性分类);`branch="seg"` → `seg_backbone`(ConvNeXt-Nano,解释分割)。经 `_resolve_gradcam_target_layer(model, branch)` 取 `blocks[-1][-1]` 或末个 Conv2d。
 - Generates heatmap overlay via `GradCAM` + `overlay_heatmap`.
+- **由 `predict.py --enable_gradcam` 触发**。GradCAM 内部自带前向+反向,**必须在 `run_forward` 的 `inference_mode` 块之外**、用 `preprocess_image` 产出的普通张量调用(inference tensor 不能参与 autograd);成功后 `result.json` 的 `gradcam_generated` 置 1 并在报告追加引用。失败由 `save_gradcam_overlay` 内部兜底,不阻断主流程。
 
 ---
 

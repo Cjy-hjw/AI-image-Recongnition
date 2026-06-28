@@ -7,7 +7,7 @@ from src.inference.io import load_input_image
 from src.inference.gatekeeper_runner import run_gatekeeper_audit
 from src.inference.model_runner import build_model, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
-from src.inference.export import save_prediction_artifacts, save_rejection_json
+from src.inference.export import save_prediction_artifacts, save_rejection_json, save_gradcam_overlay
 from src.utils.report_generator import generate_report
 
 
@@ -20,6 +20,8 @@ def main():
     p.add_argument("--output_dir", type=str, default="data/output")
     p.add_argument("--precision", type=str, default="fp16",
                    choices=["fp32", "fp16", "bf16"], help="Inference precision")
+    p.add_argument("--enable_gradcam", action="store_true",
+                   help="生成 Grad-CAM 恶性热图(可解释性);需在 inference_mode 外重跑前向+反向,略增耗时")
     args = p.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     with open(args.config, "r") as f:
@@ -61,12 +63,24 @@ def main():
         image_id=image_name,
         patient_id="ANONYMOUS_PACS_PATIENT" if is_dicom else "ANONYMOUS",
         breakdown=breakdown, malignancy_prob=preds["mal_prob"])
+
+    # 5b. Grad-CAM 可解释热图(可选)。必须在 run_forward 的 inference_mode 块之外,
+    # 用 preprocess_image 产出的普通张量重跑前向+反向(grad_cam 内部自带前向),
+    # 否则 inference tensor 无法参与 autograd。失败不阻断主流程(save_gradcam_overlay 已内部兜底)。
+    gradcam_done = 0
+    if args.enable_gradcam:
+        gradcam_path = os.path.join(args.output_dir, "gradcam_cls.png")
+        save_gradcam_overlay(model, img_tensor, img_np, gradcam_path, branch="cls")
+        if os.path.exists(gradcam_path):
+            gradcam_done = 1
+            report_txt += "\n\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(恶性激活热图)"
+
     out_json = {
         "status": "PASSED", "malignancy_probability": preds["mal_prob"],
         "is_malignant": int(preds["mal_prob"] >= 0.5),
         "tirads_points": breakdown["total_points"],
         "tirads_level": breakdown["tr_level"], "risk_percentage": breakdown["risk"],
-        "foci_probabilities": preds["foci_prob"].tolist(), "gradcam_generated": 0,
+        "foci_probabilities": preds["foci_prob"].tolist(), "gradcam_generated": gradcam_done,
     }
     save_prediction_artifacts(args.output_dir, mask_resized, report_txt, out_json)
     print(f"--> Inference completed! Outputs saved to {args.output_dir}")

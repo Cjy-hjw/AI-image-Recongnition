@@ -27,7 +27,7 @@
 | `gatekeeper_runner.py` | `run_gatekeeper_audit()` — 4-layer gatekeeper (auth + dedup + copy-move + splicing). **predict.py only** |
 | `model_runner.py` | `build_model()`, `preprocess_image()`, `run_forward()` — `torch.inference_mode()` + autocast + clamp [-15,15] |
 | `postprocess.py` | `decode_predictions()`, `build_tirads_breakdown()` |
-| `export.py` | `save_prediction_artifacts()`, `save_rejection_json()`, `save_gradcam_overlay()` |
+| `export.py` | `save_prediction_artifacts()`, `save_rejection_json()`, `save_gradcam_overlay()`, `maybe_save_gradcam()`(predict/video 共用) |
 
 **Gatekeeper scope**: Runs in `predict.py` only. `evaluate.py` MUST NOT import from `gatekeeper_runner.py`.
 

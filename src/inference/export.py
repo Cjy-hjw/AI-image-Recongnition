@@ -68,3 +68,16 @@ def save_gradcam_overlay(model, img_tensor, img_np, output_path, branch="cls"):
     finally:
         if gradcam is not None:
             gradcam.remove_hooks()
+
+
+def maybe_save_gradcam(model, img_tensor, img_np, output_dir, branch="cls"):
+    """收敛 predict / video_predict 共用的 Grad-CAM 落盘+存在性判定。
+
+    在 output_dir 下生成 gradcam_cls.png 并返回 (gradcam_done, gradcam_path)。
+    gradcam_done=1 仅当文件确实写出(save_gradcam_overlay 内部失败兜底不抛)。
+    报告附注文字因单图/关键帧语义不同,由各调用方自行追加。
+    """
+    gradcam_path = os.path.join(output_dir, "gradcam_cls.png")
+    save_gradcam_overlay(model, img_tensor, img_np, gradcam_path, branch=branch)
+    gradcam_done = 1 if os.path.exists(gradcam_path) else 0
+    return gradcam_done, gradcam_path

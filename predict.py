@@ -7,7 +7,7 @@ from src.inference.io import load_input_image
 from src.inference.gatekeeper_runner import run_gatekeeper_audit
 from src.inference.model_runner import build_model, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
-from src.inference.export import save_prediction_artifacts, save_rejection_json, save_gradcam_overlay
+from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
 from src.utils.report_generator import generate_report
 
 
@@ -69,10 +69,8 @@ def main():
     # 否则 inference tensor 无法参与 autograd。失败不阻断主流程(save_gradcam_overlay 已内部兜底)。
     gradcam_done = 0
     if args.enable_gradcam:
-        gradcam_path = os.path.join(args.output_dir, "gradcam_cls.png")
-        save_gradcam_overlay(model, img_tensor, img_np, gradcam_path, branch="cls")
-        if os.path.exists(gradcam_path):
-            gradcam_done = 1
+        gradcam_done, _ = maybe_save_gradcam(model, img_tensor, img_np, args.output_dir)
+        if gradcam_done:
             report_txt += "\n\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(恶性激活热图)"
 
     out_json = {

@@ -23,7 +23,7 @@ from src.inference.video_aggregate import aggregate_frame_predictions
 from src.inference.gatekeeper_runner import run_gatekeeper_audit, build_seeded_deduplicator
 from src.inference.model_runner import build_model, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
-from src.inference.export import save_prediction_artifacts, save_gradcam_overlay
+from src.inference.export import save_prediction_artifacts, maybe_save_gradcam
 from src.utils.report_generator import generate_report
 
 
@@ -122,10 +122,8 @@ def main():
     # 5b. 关键帧 Grad-CAM(可选,inference_mode 外复用关键帧张量)
     gradcam_done = 0
     if args.enable_gradcam:
-        gradcam_path = os.path.join(args.output_dir, "gradcam_cls.png")
-        save_gradcam_overlay(model, kf_tensor, kf_frame_np, gradcam_path, branch="cls")
-        if os.path.exists(gradcam_path):
-            gradcam_done = 1
+        gradcam_done, _ = maybe_save_gradcam(model, kf_tensor, kf_frame_np, args.output_dir)
+        if gradcam_done:
             report_txt += "\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(关键帧恶性激活热图)"
 
     out_json = {

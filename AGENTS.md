@@ -80,8 +80,10 @@ The project follows strict functional decomposition (see `rules.md` §6):
 ### 2.2 PACS DICOM Metadata Anonymization
 - **Privacy Standard**: 21 PHI fields overwritten (HIPAA Safe Harbor). 完整字段清单与脱敏规则见 `QA_VP.md §1.6` 及 `src/inference/io.py` 的 `_PHI_FIELDS`(日期类置 `"00000101"`,其余置 `"ANONYMIZED"`)。
 
-### 2.3 Container Checksum Verification
-- `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth` and `predict.py`. `PRODUCTION=1` → hard exit on hash mismatch.
+### 2.3 Container Checksum Verification & Entrypoint Dispatch
+- `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth`, `predict.py`, **and `video_predict.py`** (both delivery entrypoints). `PRODUCTION=1` → hard exit on any hash mismatch.
+- **入口按输入扩展名自动分发**:`.mp4/.avi/.mov/.mkv/.dcm/.dicom` → `video_predict.py --input_video`(DICOM 单帧亦安全,内部 `_load_dicom_cine` 视作 1 帧);其余静态图 → `predict.py --input_image`。第一个位置参数为输入路径,其余 flag 透传。
+- Dockerfile `COPY` 同时拷入 `predict.py` 与 `video_predict.py`;`requirements.txt` 显式声明 torch/torchvision/numpy/safetensors + faiss-cpu(去重加速,缺失自动降级 numpy 检索),paramiko 仅训练需要不入容器。
 
 ---
 

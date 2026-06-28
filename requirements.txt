@@ -1,8 +1,22 @@
-timm>=0.9.0
-pydicom>=2.4.0
+# === 离线推理容器运行时依赖 ===
+# 基础镜像 pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime 已自带 torch/torchvision,
+# 这里仍显式声明并 pin 下限,防止镜像漂移导致版本不可控(API/权重加载行为变化)。
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+safetensors>=0.4.0          # load_local_safetensors 加载离线骨干权重
+
+timm>=0.9.0                 # EfficientNet-B2 / ConvNeXt-Nano 骨干
+pydicom>=2.4.0              # DICOM/cine 解码 + PHI 脱敏
 opencv-python-headless>=4.8.0
 pyyaml>=6.0
 scikit-learn>=1.2.0
 scikit-image>=0.20.0
 albumentations>=1.3.0
-paramiko>=3.0.0
+
+# 去重加速(gatekeeper Deduplicator)。缺失时 deduplication.py 自动降级为 numpy
+# 暴力余弦检索(有 ImportError fallback,不会崩),装上则用 FAISS IndexFlatIP 加速。
+faiss-cpu>=1.7.0
+
+# 注:paramiko(SSH 传文件)仅训练流水线需要,推理容器不依赖,故不在此声明。
+#     如需训练环境,另装 paramiko>=3.0.0。

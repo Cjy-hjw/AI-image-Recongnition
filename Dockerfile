@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua
 COPY configs/ /workspace/configs/
 COPY src/ /workspace/src/
 COPY predict.py /workspace/predict.py
+COPY video_predict.py /workspace/video_predict.py
 COPY scripts/entrypoint.sh /workspace/scripts/entrypoint.sh
 
 # 建立数据输出和 checkpoints 目录

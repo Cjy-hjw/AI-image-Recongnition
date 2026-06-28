@@ -4,10 +4,14 @@
 
 | File | Responsibility |
 |:---|:---|
+| `__init__.py` | 包标记,使 `scripts.data.*` 可被 import(测试与 CLI 依赖) |
 | `pseudo_labels.py` | `extract_features_from_mask_and_image()` — 从原图+mask 提取 TI-RADS 伪标签(composition, echogenicity, shape, margin, foci) |
 | `split_tn3k.py` | `format_split()` + `_split_samples()` — 数据集格式化与划分 |
+| `convert_ddti.py` | DDTI 数据集(XML 标注)→ 统一图像+mask+CSV 格式转换 |
 
 `format_tn3k.py`(项目根)是 thin CLI,从 `scripts/data/` 导入。
+
+> **⚠ .gitignore 防坑**:`.gitignore` 中忽略数据集目录必须写**锚定**的 `/data/`(前导斜杠),不可写裸 `data/`——后者无锚定,会匹配**任意层级**的 `data/`,曾误伤本目录 `scripts/data/` 导致源文件未入库、CI 因 `ModuleNotFoundError: scripts.data.pseudo_labels` 崩溃(2026-06 已修,commit 21d8cd9)。
 
 ---
 

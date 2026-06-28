@@ -5,6 +5,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+# 真实性特征维度(ELA+GLCM+freq 共 8 维),与 AuthenticityClassifier(input_dim)、
+# 空集占位 zeros(FEAT_DIM) 必须一致——改特征提取器维度时只改这一处。
+FEAT_DIM = 8
+NUM_CLASSES = 3  # real / phantom / synthetic
+NUM_EPOCHS = 40
+BATCH_SIZE = 64
+LR = 1e-3
+# val 合成样本 seed 偏移,避开与 train seed(0..)碰撞,保证两集合成样本不同源
+VAL_SEED_OFFSET = 10000
+
 
 def _tensor_to_gray_uint8(img_tensor):
     """将 [C,H,W] 或 [H,W] float tensor (0~1) 转为灰度 uint8 HxW numpy 数组。"""
@@ -49,8 +59,8 @@ def _build_feature_set(dataset, max_samples, synth_ratio=0.5, label_offset=0):
                     feat_ph = extract_authenticity_features(phantom)
                     features.append(feat_ph)
                     labels.append(1)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[authenticity] phantom 合成失败 i={i}: {type(e).__name__}: {e}")
 
                 # Synthetic 样本 (label=2)
                 try:
@@ -58,10 +68,11 @@ def _build_feature_set(dataset, max_samples, synth_ratio=0.5, label_offset=0):
                     feat_syn = extract_authenticity_features(synthetic)
                     features.append(feat_syn)
                     labels.append(2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[authenticity] synthetic 合成失败 i={i}: {type(e).__name__}: {e}")
 
-        except Exception:
+        except Exception as e:
+            print(f"[authenticity] 样本 i={i} 特征提取失败,跳过: {type(e).__name__}: {e}")
             continue
 
     return features, labels
@@ -77,13 +88,13 @@ def train_authenticity_classifier(train_dataset, val_dataset, device, save_path)
 
     print("--> 构建真实图像特征集 (val) ...")
     val_feats, val_labels = _build_feature_set(
-        val_dataset, max_samples=100, synth_ratio=0.5, label_offset=10000
+        val_dataset, max_samples=100, synth_ratio=0.5, label_offset=VAL_SEED_OFFSET
     )
 
     # 若样本极少，至少保证能运行
     if len(train_feats) == 0:
         print("[WARNING] train_dataset 为空，使用随机初始化特征作为占位。")
-        train_feats = [np.zeros(8, dtype=np.float32)]
+        train_feats = [np.zeros(FEAT_DIM, dtype=np.float32)]
         train_labels = [0]
 
     X_train = np.stack(train_feats, axis=0).astype(np.float32)  # (N, 8)
@@ -114,14 +125,14 @@ def train_authenticity_classifier(train_dataset, val_dataset, device, save_path)
     yv = torch.from_numpy(y_val).to(device)
 
     # 初始化模型
-    clf = AuthenticityClassifier(input_dim=8, num_classes=3)
+    clf = AuthenticityClassifier(input_dim=FEAT_DIM, num_classes=NUM_CLASSES)
     clf.to(device)
 
-    optimizer = optim.Adam(clf.parameters(), lr=1e-3)
+    optimizer = optim.Adam(clf.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
-    num_epochs = 40
-    batch_size = 64
+    num_epochs = NUM_EPOCHS
+    batch_size = BATCH_SIZE
     n_train = Xt.shape[0]
 
     print(f"--> 开始训练 AuthenticityClassifier，epochs={num_epochs} ...")

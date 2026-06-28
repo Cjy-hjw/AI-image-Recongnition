@@ -45,17 +45,46 @@ def _rescale_to_uint8(arr: np.ndarray) -> np.ndarray:
     return ((arr - lo) / (hi - lo + 1e-8) * 255.0).astype(np.uint8)
 
 
-def _to_gray(frame: np.ndarray) -> np.ndarray:
-    """统一转单通道灰度 uint8。
+def _to_gray(frame: np.ndarray, channel_order: str = "rgb") -> np.ndarray:
+    """统一转单通道灰度 uint8(覆盖所有通道形态,杜绝 3D 漏过)。
 
-    彩色多普勒等 3 通道帧若不转灰度,送入 preprocess_image 会 unsqueeze 成
-    5 维张量 (B,1,H,W,3) 触发模型前向 `too many values to unpack` 崩溃。
+    彩色多普勒等多通道帧若不转灰度,送入 preprocess_image 会 unsqueeze 成
+    5 维张量 (B,1,H,W,C) 触发模型前向 `too many values to unpack` 崩溃。
     静(io)/动(video_io)两条路径共用本函数,口径一致。
+
+    Args:
+        channel_order: 3 通道彩色帧的通道序。DICOM 像素为 RGB("rgb",默认);
+            OpenCV `cap.read()` 解码的视频帧为 BGR("bgr")。用错会令多普勒
+            红/蓝血流的灰度亮度系统性偏移(R/B 加权对调),故按来源显式区分。
+
+    收敛规则(按 ndim/通道数):
+        (H,W)             → 直通
+        (H,W,1)           → 去掉单通道轴
+        (H,W,3)           → cvtColor(按 channel_order 选 RGB/BGR→GRAY)
+        (H,W,4)           → 取前 3 通道(丢 alpha)再按 channel_order 转灰度
+        (H,W,C) 其它 C    → 取首通道兜底(罕见,如多光谱),避免静默返回 3D
+        (C,H,W) channel-first(C∈{1,3,4}) → 转置为 (H,W,C) 后按上述处理
+    非 uint8(如 16-bit 灰度 DICOM)→ min-max 归一化到 8-bit。
     """
-    if frame.ndim == 3 and frame.shape[2] == 3:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    elif frame.ndim == 3 and frame.shape[2] == 1:
-        frame = frame[:, :, 0]
+    rgb2gray = cv2.COLOR_RGB2GRAY if channel_order == "rgb" else cv2.COLOR_BGR2GRAY
+
+    # channel-first (C,H,W) → (H,W,C):仅当首轴是通道数(1/3/4)且非方阵歧义时
+    if frame.ndim == 3 and frame.shape[0] in (1, 3, 4) and frame.shape[2] not in (1, 3, 4):
+        frame = np.transpose(frame, (1, 2, 0))
+
+    if frame.ndim == 3:
+        c = frame.shape[2]
+        if c == 1:
+            frame = frame[:, :, 0]
+        elif c == 3:
+            frame = cv2.cvtColor(frame, rgb2gray)
+        elif c == 4:
+            frame = cv2.cvtColor(frame[:, :, :3], rgb2gray)
+        else:
+            frame = frame[:, :, 0]  # 未知通道数兜底,绝不返回 3D
+    elif frame.ndim != 2:
+        raise ValueError(f"_to_gray 不支持的维度 ndim={frame.ndim} shape={frame.shape}")
+
     if frame.dtype != np.uint8:
         frame = _rescale_to_uint8(frame)
     return frame

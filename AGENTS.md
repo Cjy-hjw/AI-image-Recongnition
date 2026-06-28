@@ -15,7 +15,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Inference Pipeline** | `/src/AGENTS.md` §2 | Shared inference modules: io, model_runner, postprocess, export. |
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
-| **Tests** | `/tests/AGENTS.md` | 全套 102 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss + 18 video(动态图/cine 管线 + 彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端). |
+| **Tests** | `/tests/AGENTS.md` | 全套 105 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss + 21 video(动态图/cine 管线 + 通道形态/通道序/彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端). |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---
@@ -57,13 +57,13 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `data/pseudo_labels.py` — TI-RADS pseudo-label extraction
   - `data/split_tn3k.py` — 纯随机图像级 train/val/holdout 划分(Phase D)
 
-### `tests/` — 回归测试套件(全套 102 tests)
+### `tests/` — 回归测试套件(全套 105 tests)
   - `test_physical_prior.py` — DifferentiablePhysicalPriorExtractor (14 tests)
   - `test_cbm_head.py` — ConceptEmbeddingCBMHead (15 tests)
   - `test_phase_refactor.py` — Phase A/B/C/D 重构回归守卫 (19 tests)
   - `test_gatekeeper.py` — 合成引擎/dedup/copy-move/authenticity/splicing 几何判据 (15 tests)
   - `test_masked_loss.py` — Masked Task-Specific Loss 无效样本零梯度 (10 tests)
-  - `test_video.py` — 动态图/cine 管线(抽样/聚合/灰度/解码/去重注入)+ 彩色单图 DICOM 收敛 2D 回归 (18 tests)
+  - `test_video.py` — 动态图/cine 管线(抽样/聚合/灰度/解码/去重注入)+ 通道形态全覆盖/RGB-BGR 通道序/彩色单图 DICOM 收敛 2D 回归 (21 tests)
   - `test_authenticity_trainer.py` — 真实性分类器训练器 smoke (2 tests)
   - `test_multisource.py` — 多源混训骨架 + 源级 label_mask (7 tests)
   - `test_smoke_entrypoints.py` — CLI 入口端到端冒烟(子进程实跑 predict/video_predict:REJECTED+PASSED 两路径,产物齐全+JSON可解析) (2 tests)

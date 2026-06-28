@@ -110,6 +110,35 @@ class TestGrayUtils:
         assert out.dtype == np.uint8
         assert out.min() == 0 and out.max() == 255
 
+    def test_all_channel_shapes_collapse_to_2d(self):
+        """杜绝任何通道形态漏成 3D(漏过会令 preprocess_image 5 维崩溃)。"""
+        cases = [
+            np.zeros((10, 12), np.uint8),            # (H,W)
+            np.zeros((10, 12, 1), np.uint8),         # (H,W,1)
+            np.zeros((10, 12, 3), np.uint8),         # (H,W,3)
+            np.zeros((10, 12, 4), np.uint8),         # (H,W,4) RGBA
+            np.zeros((3, 10, 12), np.uint8),         # (3,H,W) channel-first
+            np.zeros((10, 12, 5), np.uint8),         # 多光谱兜底
+        ]
+        for arr in cases:
+            out = _to_gray(arr)
+            assert out.ndim == 2, f"{arr.shape} 未收敛 2D -> {out.shape}"
+            assert out.dtype == np.uint8
+
+    def test_channel_order_rgb_vs_bgr_differ(self):
+        """RGB/BGR 加权对调:纯红帧 RGB(R=0.299)≈76,BGR(B权重)≈29,必须不同。"""
+        red = np.zeros((8, 8, 3), np.uint8)
+        red[:, :, 0] = 255  # 数组首通道置满
+        g_rgb = int(_to_gray(red, channel_order="rgb")[0, 0])
+        g_bgr = int(_to_gray(red, channel_order="bgr")[0, 0])
+        assert g_rgb == 76 and g_bgr == 29, f"通道序未生效: rgb={g_rgb} bgr={g_bgr}"
+
+    def test_16bit_grayscale_rescaled(self):
+        """16-bit 灰度 DICOM 经 min-max 归一化到 8-bit,且仍为 2D。"""
+        arr16 = (np.random.rand(10, 12) * 4095).astype(np.uint16)
+        out = _to_gray(arr16)
+        assert out.ndim == 2 and out.dtype == np.uint8
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 单图 DICOM 彩色帧回归:彩色多普勒单帧 (H,W,3) 必须经 _to_gray 收敛为 2D,

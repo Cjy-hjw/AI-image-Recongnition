@@ -27,24 +27,19 @@ jobs:
         run: lint-imports
 
   # 铁律 2:Gate 1(verify_model.py 七门)+ 全套 pytest 回归。
+  # 直接跑在交付基镜像内 —— torch 2.1.0 / Python 3.10 / weights_only 默认 False,
+  # 与离线推理容器完全一致。避免 GitHub runner 临时拼装的 torch 版本漂移
+  # (如 torch≥2.6 翻转 weights_only 默认值)导致测出非交付环境的假故障。
   test:
     runs-on: ubuntu-latest
+    container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install CPU torch first (avoid pulling CUDA wheels)
-        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
       - name: Install runtime + test deps
         run: |
-          # 过滤两类行,容器构建仍按 requirements.txt 完整安装:
-          #   1) torch/torchvision —— 上一步已装 CPU 版,避免本步从默认源重装 CUDA wheel。
-          #   2) faiss-cpu —— gatekeeper 去重的可选加速项,缺失时 deduplication.py 自动降级为
-          #      numpy 暴力余弦检索(有 ImportError fallback)。其 PyPI wheel 对 Python 3.12
-          #      覆盖不全,CI 装不上且非必需。
-          grep -vE '^(faiss-cpu|torch|torchvision)' requirements.txt | pip install -r /dev/stdin
+          # 镜像已自带 torch/torchvision 2.1.0,requirements 里的 torch>=2.1.0 已满足
+          # (无 --upgrade,pip 跳过不重装)。faiss-cpu 在 py3.10 有 wheel,正常安装。
+          pip install -r requirements.txt
           pip install pytest
       - name: Gate 1 - verify_model (7 gates)
         run: python scripts/verify_model.py

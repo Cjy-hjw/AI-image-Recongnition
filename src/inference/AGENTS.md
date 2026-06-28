@@ -8,7 +8,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 | File | Responsibility |
 |:---|:---|
-| `io.py` | Image loading (DICOM + PNG/JPG) and PHI anonymization |
+| `io.py` | Image loading (DICOM + PNG/JPG) and PHI anonymization;通道/位深归一化工具 `_to_gray`/`_rescale_to_uint8` 下沉于此(静/动两路径共用,video_io re-import)。单图 DICOM 经 `_to_gray` 收敛灰度——彩色多普勒单帧 (H,W,3) 不转灰度会令下游 `preprocess_image` 产出 5 维张量崩溃 |
 | `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline (**predict.py only**) |
 | `model_runner.py` | Model build, image preprocessing, forward pass |
 | `postprocess.py` | Prediction decoding and TI-RADS breakdown |

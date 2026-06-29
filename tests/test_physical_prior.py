@@ -12,6 +12,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
 import torch
 
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
@@ -208,6 +209,11 @@ class TestDifferentiablePhysicalPriorExtractor:
         assert mask.grad is not None, "mask.grad is None under fp16"
         _assert_no_nan_inf(mask.grad.float(), "mask.grad (fp16)")
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="FP16 autocast 仅 CUDA 支持(torch 2.1.0 CPU autocast 只接受 bfloat16);"
+               "本测试复现 GPU FP16 梯度溢出场景,交付容器为 cuda12.1,CPU CI 非其合法运行环境",
+    )
     def test_backward_fp16_degenerate_mask_autocast(self):
         """
         Under torch.cuda.amp.autocast (FP16/AMP), an all-zero / degenerate mask
@@ -219,8 +225,7 @@ class TestDifferentiablePhysicalPriorExtractor:
         mask = torch.zeros(2, 1, IMG_SIZE, IMG_SIZE, requires_grad=True)
         img = torch.rand(2, 1, IMG_SIZE, IMG_SIZE)
 
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=(device_type == "cuda")):
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
             v_phys = extractor(mask, img)
             _assert_no_nan_inf(v_phys.float(), "v_phys (autocast degenerate)")
             loss = v_phys.float().sum()

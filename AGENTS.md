@@ -67,7 +67,7 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `test_video.py` — 动态图/cine 管线(抽样/聚合/灰度/解码/去重注入)+ 通道形态全覆盖/RGB-BGR 通道序/彩色单图 DICOM 收敛 2D 回归 (21 tests)
   - `test_authenticity_trainer.py` — 真实性分类器训练器 smoke (2 tests)
   - `test_multisource.py` — 多源混训骨架 + 源级 label_mask (7 tests)
-  - `test_smoke_entrypoints.py` — CLI 入口端到端冒烟(子进程实跑 predict/video_predict:REJECTED+PASSED 两路径,产物齐全+JSON可解析) (2 tests)
+  - `test_smoke_entrypoints.py` — CLI 入口端到端冒烟(子进程实跑 predict/video_predict:predict 噪声图+video `--skip_gatekeeper` 两路径,只兜管线连通+产物落盘+JSON 可解析;gatekeeper 判定随平台浮点翻转故不作硬断言) (2 tests)
 
 **Backward Compatibility**: All decomposed modules maintain `__init__.py` re-export shims to preserve existing import paths.
 

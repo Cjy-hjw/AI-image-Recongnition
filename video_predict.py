@@ -23,15 +23,16 @@ from src.inference.video_aggregate import aggregate_frame_predictions
 from src.inference.gatekeeper_runner import run_gatekeeper_audit, build_seeded_deduplicator
 from src.inference.model_runner import build_model, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
+from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, maybe_save_gradcam
 from src.utils.report_generator import generate_report
 
 
-def diagnose_frame(model, frame_np, precision, device, img_size):
+def diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None):
     """单帧前向 → 解码,返回 (preds, img_tensor)。img_tensor 留作关键帧 Grad-CAM 复用。"""
     img_tensor = preprocess_image(frame_np, img_size, device)
     outputs = run_forward(model, img_tensor, precision, device)
-    return decode_predictions(outputs), img_tensor
+    return decode_predictions(outputs, calibrator=calibrator), img_tensor
 
 
 def main():
@@ -51,7 +52,7 @@ def main():
                    help="跳过逐帧 gatekeeper 审计(仅调试/无训练权重时用)")
     args = p.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(args.config, "r") as f:
+    with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     device = torch.device(
         config["environment"]["device"] if torch.cuda.is_available() else "cpu")
@@ -66,6 +67,9 @@ def main():
     print(f"--> Decoded {len(frames)} sampled frames from {os.path.basename(args.input_video)}")
 
     model = build_model(config, args.weights, device)
+    # 校准器构造一次,跨帧复用(缺参数文件即全 T=1.0 降级,逐帧行为不变)
+    cal_path = config.get("calibration", {}).get("param_file", "checkpoints/calibration.json")
+    calibrator = TemperatureScaler.from_file(cal_path)
 
     # 2. 逐帧 gatekeeper(一票否决,任一帧失败整段拒绝)
     if not args.skip_gatekeeper:
@@ -87,7 +91,8 @@ def main():
     per_frame = []
     key_tensors = {}  # pos → img_tensor(供关键帧 Grad-CAM 复用,避免重算)
     for list_pos, (orig_idx, frame_np) in enumerate(zip(frame_indices, frames)):
-        preds, img_tensor = diagnose_frame(model, frame_np, args.precision, device, img_size)
+        preds, img_tensor = diagnose_frame(
+            model, frame_np, args.precision, device, img_size, calibrator=calibrator)
         per_frame.append({
             "frame_index": int(orig_idx),
             "mal_prob": float(preds["mal_prob"]),

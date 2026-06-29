@@ -7,6 +7,7 @@ from src.inference.io import load_input_image
 from src.inference.gatekeeper_runner import run_gatekeeper_audit
 from src.inference.model_runner import build_model, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
+from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
 from src.utils.report_generator import generate_report
 
@@ -24,7 +25,7 @@ def main():
                    help="生成 Grad-CAM 恶性热图(可解释性);需在 inference_mode 外重跑前向+反向,略增耗时")
     args = p.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(args.config, "r") as f:
+    with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     device = torch.device(
         config["environment"]["device"] if torch.cuda.is_available() else "cpu")
@@ -49,7 +50,9 @@ def main():
     outputs = run_forward(model, img_tensor, args.precision, device)
 
     # 4. Postprocess
-    preds = decode_predictions(outputs)
+    cal_path = config.get("calibration", {}).get("param_file", "checkpoints/calibration.json")
+    calibrator = TemperatureScaler.from_file(cal_path)
+    preds = decode_predictions(outputs, calibrator=calibrator)
     mask_resized = cv2.resize(
         preds["mask_binary"], (img_np.shape[1], img_np.shape[0]),
         interpolation=cv2.INTER_NEAREST)

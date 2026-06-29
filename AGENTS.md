@@ -12,11 +12,11 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Loss Functions** | `/src/models/losses/` | Decomposed loss modules: segmentation, classification, concepts, multitask, components. |
 | **Training Pipeline** | `/src/training/AGENTS.md` | Three-stage progressive training, parameter freezing, NaN sentinels. |
 | **Data Loading & Augmentation** | `/src/dataset/AGENTS.md` | Static normalization, MixUp/CutMix, patient ID grouping. |
-| **Inference Pipeline** | `/src/AGENTS.md` §2 | Shared inference modules: io, model_runner, postprocess, export. |
+| **Inference Pipeline** | `/src/AGENTS.md` §2 | Shared inference modules: io, model_runner, postprocess, calibration, export. |
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
 | **CI / 架构铁律** | `/.github/workflows/ci.yml` + `/.importlinter` | PR/push 到 main 自动跑两 job:① import-linter 4 契约(inference⊄training、models 无反向依赖、gatekeeper⊄上层、utils 叶子层)② Gate 1 七门 + 全套 pytest。任一红则挡合并。 |
-| **Tests** | `/tests/AGENTS.md` | 全套 105 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss + 21 video(动态图/cine 管线 + 通道形态/通道序/彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端). |
+| **Tests** | `/tests/AGENTS.md` | 全套 116 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 15 gatekeeper + 10 masked_loss + 21 video(动态图/cine 管线 + 通道形态/通道序/彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端) + 11 calibration(温度缩放降级/单调/ECE/拟合). |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---
@@ -43,7 +43,8 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `io.py` — Image loading + DICOM PHI anonymization
   - `gatekeeper_runner.py` — 4-layer gatekeeper audit (predict.py only)
   - `model_runner.py` — Model build + preprocess + forward (inference_mode + autocast)
-  - `postprocess.py` — Prediction decoding + TI-RADS breakdown
+  - `postprocess.py` — Prediction decoding(可选 `calibrator` 温度缩放)+ TI-RADS breakdown
+  - `calibration.py` — Post-hoc 温度缩放(`TemperatureScaler` 缺参数 T=1.0 降级 + `fit_temperature`/`fit_ordinal_temperature` + `compute_ece`/`reliability_diagram`)
   - `export.py` — Artifact saving + Grad-CAM overlay
   - `video_io.py` — 动态图/cine 抽帧(MP4/AVI/MOV/MKV + 多帧 DICOM);`video_aggregate.py` — 抽样下标 + 帧级聚合(恶性取最大帧)。驱动:根目录 `video_predict.py`
 
@@ -58,7 +59,7 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `data/pseudo_labels.py` — TI-RADS pseudo-label extraction
   - `data/split_tn3k.py` — 纯随机图像级 train/val/holdout 划分(Phase D)
 
-### `tests/` — 回归测试套件(全套 105 tests)
+### `tests/` — 回归测试套件(全套 116 tests)
   - `test_physical_prior.py` — DifferentiablePhysicalPriorExtractor (14 tests)
   - `test_cbm_head.py` — ConceptEmbeddingCBMHead (15 tests)
   - `test_phase_refactor.py` — Phase A/B/C/D 重构回归守卫 (19 tests)
@@ -68,6 +69,7 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `test_authenticity_trainer.py` — 真实性分类器训练器 smoke (2 tests)
   - `test_multisource.py` — 多源混训骨架 + 源级 label_mask (7 tests)
   - `test_smoke_entrypoints.py` — CLI 入口端到端冒烟(子进程实跑 predict/video_predict:predict 噪声图+video `--skip_gatekeeper` 两路径,只兜管线连通+产物落盘+JSON 可解析;gatekeeper 判定随平台浮点翻转故不作硬断言) (2 tests)
+  - `test_calibration.py` — 温度缩放校准骨架(缺参数 T=1.0 降级逐位等价 / T>1 压低置信度不改 argmax / ECE 数值正确 / 拟合返正温度) (11 tests)
 
 **Backward Compatibility**: All decomposed modules maintain `__init__.py` re-export shims to preserve existing import paths.
 

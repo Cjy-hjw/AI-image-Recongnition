@@ -13,6 +13,11 @@ data:
   batch_size: 64              # Reduced from 128 to prevent NaN accumulation
   img_size: 512             # Resized resolution (set to 512 or 1024 for A800 80GB)
 
+# Post-hoc 置信度校准(温度缩放)。param_file 缺失时全任务 T=1.0(不校准,输出不变);
+# 初赛真实数据到位后用 src/inference/calibration.fit_temperature 在独立验证集拟合 T 写入。
+calibration:
+  param_file: "checkpoints/calibration.json"
+
 gatekeeper:
   fpr_threshold: 0.01
   precision_threshold: 0.98

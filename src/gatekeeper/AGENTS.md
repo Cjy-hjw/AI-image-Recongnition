@@ -69,6 +69,8 @@ Two-stage duplicate detection:
 
 **可插拔 + 降级**(沿用 dedup 范式):`CatNetTamperingDetector` 探测 `checkpoints/catnet_v2.torchscript.pt` 深度 HRNet 权重——存在则 `backend_name="catnet"` 加载 TorchScript;缺失/torch 不可用则安静降级 `backend_name="dct-bag"`(纯 NumPy/cv2 BAG 取证)。`detect()` 统一入口 = 深度CAT-Net ∪ BAG相位 ∪ 既有几何(copy-move/splice)三路并集。离线无权重环境零破坏既有检测器。
 
+> **Gate2 跟进项(待真实数据验证)**:并集对误报率单调不减(P(任一命中)≥max各路),红线安全依赖每路各自保守。BAG 单路对干净单次 JPEG 由「全图弃权门 + 局部窗弃权 + `min_flag_blocks` 聚类」三重把守(全图同一栅格 → 局部相位恒等全图相位 → 零命中);但**重采样/缩放后的 JPEG** 会破坏 8×8 栅格对齐使局部相位散乱,属并集 FP 理论敞口(通常先被全图低 `grid_strength` 弃权门拦下)。**2026-08-01 官方真实 JPG 数据到位后须实测**:BAG 单路真图误报率 + copy-move/splice 两路几何检测器红线表现。
+
 ---
 
 ## 4. GATEKEEPER SCOPE

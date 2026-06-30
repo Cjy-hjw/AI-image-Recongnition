@@ -16,9 +16,7 @@ Before deploying or starting full training, you **MUST** execute the double-gate
 *   **Zero-Hallucination Diagnostic Loop (自诊断闭环)**:
     * If `verify_model.py` fails any Gate (Exit Code != 0), the AI agent **MUST NOT** output standard raw stack tracebacks to the human developer. Instead, it must print a structured diagnostic report (containing the failed Gate, numerical discrepancy evidence, and recovery guidance), execute patches locally in a sandbox, and verify correctness before requesting a git diff review.
 * **Rule**: Never run standard training without both Gate 1 (Test verification) and Gate 2 (Subagent review) passing first.
-* **Rule (CI 只验证已 push 的 commit · 禁止冒充)**: GitHub CI 只对**已推送的 commit** 生效。**本地未提交/未 push 的改动,CI 从未跑过**——不得用「本地 pytest 全绿」或「某次历史 commit 的 CI 绿灯」冒充本轮代码已过 CI。
-  - **声称「CI 通过」前必须自证**:跑 `gh run list --branch <branch> --limit 1`(走临时代理),核对返回的 commit message / SHA **正是本轮工作所在的 commit**,且 `conclusion=success`。message 对不上 = 本轮没过 CI,如实说明「本地绿、CI 未覆盖本轮」。
-  - **打勾即实证原则(self-check 不可闭眼打勾)**:任何 todolist / Gate / 「完成」对号,落笔前必须有可复现的硬证据(实跑的测试计数、`gh run` 的 SHA、代码里可 grep 到的修复行)。查不到证据宁可不打勾——本轮正是闭眼打勾才漏掉 40/41 计数差与维度注释残留。
+* **Rule (CI 只验证已 push 的 commit)**: 声称「CI 通过」前,必须跑 `gh run list --branch <branch> --limit 1`(走代理)核对其 `headSha` **正是本轮 commit** 且 `conclusion=success`——`pull_request` 事件的 run message 取自 PR 而非最新 commit,只能凭 SHA 判定。本地未 push 的改动 CI 从未覆盖,不得用本地 pytest 全绿或历史 commit 绿灯冒充;对不上则如实说明「本地绿、CI 未覆盖本轮」。
 * **OOM Preventative Rule → `src/models/AGENTS.md` §4**: See model architecture constraints for spatial attention resolution limits.
 
 ## 3. Early Failure & Short-circuiting (Early Stopping Validation)

@@ -7,7 +7,7 @@
 | `test_physical_prior.py` | `DifferentiablePhysicalPriorExtractor` — 形态学腐蚀、软圆形度、EMA 熵门控 | 14 | — |
 | `test_cbm_head.py` | `ConceptEmbeddingCBMHead` — 输出 dataclass 字段、vCLUB forward、latent 维度 | 15 | — |
 | `test_phase_refactor.py` | 重构回归守卫 — 解耦/死代码/评估尺子/数据划分/续训态持久化/Grad-CAM 端到端 | 19 | Phase A/B/C/D |
-| `test_gatekeeper.py` | 合成引擎确定性+输出契约、dedup 近重复检测、copy-move 检测(召回~20-40%、干净图零误报)、authenticity 特征三类可分;splicing 检测器「轴对齐长直缝+角点正交相交」几何判据(干净图 0/80 零误报、真实组织拼接召回~84%、返回契约) | 15 | — |
+| `test_gatekeeper.py` | 合成引擎确定性+输出契约、dedup 近重复检测、copy-move 检测(召回~20-40%、干净图零误报)、authenticity 特征三类可分(含 DND/TAI 物理散斑 13 维 + Rayleigh m≈1 方向锁定);splicing 检测器「轴对齐长直缝+角点正交相交」几何判据(干净图 0/80 零误报、真实组织拼接召回~84%、返回契约);**dedup 后端可插拔**(SSCD 权重探测降级 + 输出维度 fail-fast + 按后端余弦阈值映射 sscd 0.86 / resnet18 0.995,守一票否决红线);**CAT-Net v2 DCT/BAG 取证**(块级 DCT 可逆性、JPEG 栅格显著度>未压缩、BAG 相位不一致定位、可插拔降级 dct-bag、干净 JPEG 8 seed 零误报 + 未压缩弃权 + 非整倍 stride 红线回归、三路并集契约);**合成引擎升级**(泊松/羽化拼接 `make_splice_poisson` 无硬缝+小图守卫;域随机化 `domain_randomize` = Nakagami 散斑+模糊 k∈{3,5,7}+JPEG Q∈[15,75],确定性+JPEG 栅格植入) | 41 | — |
 | `test_masked_loss.py` | Masked Task-Specific Loss — 无效样本零梯度贡献、全有效与旧路径数值一致(向后兼容) | 10 | — |
 | `test_video.py` | 动态图/cine 管线 — 抽样下标边界(含 max_frames==1 除零守卫)、帧级聚合(最大帧判定/关键帧映射/空安全)、灰度转换、视频解码往返(codec 缺失则 skip)、gatekeeper 去重库注入复用;**`_to_gray` 通道鲁棒性**((H,W)/(H,W,1)/(H,W,3)/RGBA(H,W,4)/channel-first(3,H,W)/多光谱 全收敛 2D,杜绝 3D 漏过致 5 维崩溃;RGB vs BGR 通道序加权区分;16-bit 归一化);**彩色单图 DICOM 回归**(monkeypatch 伪造 pydicom,守 io.py 单图路径经 `_to_gray` 收敛 (H,W,3)→2D) | 21 | — |
 | `test_authenticity_trainer.py` | 真实性分类器训练器 smoke — 合成伪超声喂训练器跑通,产出 dict(state_dict+feat_mean+feat_std);推理端 AuthenticityModule 加载并应用归一化、predict 返回 softmax(守卫训练/推理归一化口径一致) | 2 | — |
@@ -17,7 +17,7 @@
 
 ---
 
-## `test_phase_refactor.py` — 重构不变式(全套 116 passed,此文件 19)
+## `test_phase_refactor.py` — 重构不变式(全套 142 passed,此文件 19)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

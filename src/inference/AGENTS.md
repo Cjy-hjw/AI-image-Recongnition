@@ -40,10 +40,11 @@ This package provides reusable inference modules shared by `predict.py` (product
 - **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
 
 Pipeline:
-1. **Authenticity** — `AuthenticityModule` (GLCM + ELA MLP) → phantom/synthetic detection
+1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection
 2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set
 3. **Copy-Move** — `detect_copy_move()` dense block-matching
-4. **Splicing** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)
+4. **Splicing(硬粘贴)** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)
+5. **Splicing(羽化/泊松)** — `tampering_catnet.CatNetTamperingDetector` CAT-Net v2 DCT/BAG 取证(块伪影栅格相位错位),可插拔降级 dct-bag;`detect()` = 深度CAT-Net ∪ BAG ∪ 几何三路并集
 
 **Rejection JSON** (on failure):
 ```json

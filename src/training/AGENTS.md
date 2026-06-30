@@ -59,7 +59,7 @@ print(f"  [Val Diag] pred_prob: mean={pred_mean:.4f}, std={pred_std:.4f}, min={.
 
 ## 3. AUTHENTICITY CLASSIFIER (`authenticity_trainer.py`)
 
-Lightweight MLP trained on GLCM+ELA features. Runs **before** main training by default. Saves to `checkpoints/authenticity_model.pth`. Main model weights MUST NOT include these parameters.
+Lightweight MLP trained on 13-dim features (GLCM + freq + ELA + DND speckle + TAI anisotropy). Runs **before** main training by default. Saves to `checkpoints/authenticity_model.pth`. Main model weights MUST NOT include these parameters.
 
 Use `python train.py --skip-auth` to skip when `checkpoints/authenticity_model.pth` already exists. If the flag is set but weights are missing, training logs a warning and runs authenticity training anyway.
 

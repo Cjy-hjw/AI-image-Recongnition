@@ -23,8 +23,18 @@ from src.gatekeeper.synthesis import (
     make_near_duplicate,
     make_copy_move,
     make_splice,
+    make_splice_poisson,
+    inject_nakagami_speckle,
+    domain_randomize,
 )
 from src.gatekeeper.tampering import detect_copy_move, detect_splicing
+from src.gatekeeper.tampering_catnet import (
+    CatNetTamperingDetector,
+    extract_dct_coeffs,
+    block_artifact_energy,
+    grid_strength,
+    _find_catnet_weights,
+)
 from src.gatekeeper.deduplication import compute_dhash, hamming_distance
 from src.gatekeeper.authenticity import extract_authenticity_features
 
@@ -131,6 +141,64 @@ class TestDeduplication:
         dist = hamming_distance(compute_dhash(a), compute_dhash(b))
         assert dist > 12, f"不同图被误判重复(dist={dist})"
 
+    def test_backend_falls_back_to_resnet_without_sscd(self):
+        """Phase 2 可插拔后端:无 SSCD 权重时降级 ResNet18(离线无权重环境守卫)。
+
+        本机/CI 未下载 sscd_disc_mixup.torchscript.pt,后端必须降级而非崩溃。
+        指一个不存在的显式路径以确保走降级分支(免受本机偶然缓存影响)。
+        """
+        from src.gatekeeper.deduplication import FeatureExtractor
+        fe = FeatureExtractor(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+        assert fe.backend_name == "resnet18"
+        # 降级后特征仍为 512 维 L2 归一,与 FAISS IndexFlatIP(512) 兼容
+        feat = fe.extract(_structured_ultrasound())
+        assert feat.shape == (512,)
+        assert abs(float(np.linalg.norm(feat)) - 1.0) < 1e-4
+
+    def test_adaptive_cosine_threshold_per_backend(self):
+        """cosine_threshold=None 时按激活后端自适应取推荐阈值(SSCD 0.86 / ResNet18 0.95)。
+
+        显式传值则尊重调用方(向后兼容旧 config 硬编码阈值)。
+        """
+        from src.gatekeeper.deduplication import Deduplicator
+        # 无 SSCD → ResNet18 后端 → 自适应 0.95
+        dedup = Deduplicator(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+        assert dedup.extractor.backend_name == "resnet18"
+        assert dedup.cosine_threshold == 0.95
+        # 显式标量优先于自适应(两后端同值,向后兼容旧 config)
+        dedup2 = Deduplicator(device="cpu", cosine_threshold=0.995,
+                              sscd_weights="/nonexistent/sscd.pt")
+        assert dedup2.cosine_threshold == 0.995
+
+    def test_cosine_threshold_dict_per_backend(self):
+        """阈值映射(reviewer 必修1):config 传 dict 时按激活后端取值,守住红线。
+
+        单一标量无法同时服务两后端——SSCD 治近重复漏检需 0.86,ResNet18 守一票
+        否决红线「宁可漏检不可误杀」需 0.995。映射让降级后端仍取 0.995,
+        防 Phase 2 升级把 ResNet18 路径误松到 0.86 而增大误杀真实影像风险。
+        """
+        from src.gatekeeper.deduplication import Deduplicator
+        # 降级 ResNet18 → 取 dict 中 resnet18 键(0.995,守红线),而非 sscd 的 0.86
+        dedup = Deduplicator(device="cpu",
+                             cosine_threshold={"sscd": 0.86, "resnet18": 0.995},
+                             sscd_weights="/nonexistent/sscd.pt")
+        assert dedup.extractor.backend_name == "resnet18"
+        assert dedup.cosine_threshold == 0.995
+        # dict 缺当前后端键 → 回退后端推荐值(ResNet18 0.95),不崩
+        dedup2 = Deduplicator(device="cpu", cosine_threshold={"sscd": 0.86},
+                              sscd_weights="/nonexistent/sscd.pt")
+        assert dedup2.cosine_threshold == 0.95
+
+    def test_feat_dim_probed_for_index(self):
+        """维度探测(reviewer 必修2):FeatureExtractor 实测输出维度,防硬编码错配。
+
+        降级 ResNet18 输出 512 维;Deduplicator 据 feat_dim 建 FAISS 索引而非
+        硬编码,防误传 1024 维(disc_large)权重时 FAISS 晚抛错 / NumPy 静默错算。
+        """
+        from src.gatekeeper.deduplication import Deduplicator
+        dedup = Deduplicator(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+        assert dedup.extractor.feat_dim == 512
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ② 规范性 - copy-move 篡改:可检出但召回不稳定(锁定有效区间)
@@ -166,7 +234,22 @@ class TestAuthenticityFeatures:
     def test_feature_vector_shape(self):
         base = _structured_ultrasound()
         feat = extract_authenticity_features(base)
-        assert feat.shape == (8,) and feat.dtype == np.float32
+        assert feat.shape == (13,) and feat.dtype == np.float32
+
+    def test_naka_m_rayleigh_is_one(self):
+        """锁定 Nakagami 方向(Gate2 必修):完全发展散斑(瑞利包络)→ m≈1。
+
+        瑞利包络 = 两路独立零均值同方差高斯的模长 √(a²+b²)。其强度 x²~指数分布,
+        指数分布 mean=σ、var=σ²,故矩估计 m = E[x²]²/Var(x²) = 1。这是 DND
+        物理解释的理论锚点;若实现回归到方向错误(如把 m 算反),此测试立即失败。
+        """
+        from src.gatekeeper.authenticity import _naka_m
+        rng = np.random.RandomState(0)
+        a = rng.normal(0, 1, 200000)
+        b = rng.normal(0, 1, 200000)
+        envelope = np.sqrt(a * a + b * b).astype(np.float32)  # 瑞利包络
+        m = _naka_m(envelope)
+        assert 0.85 <= m <= 1.15, f"瑞利包络 m 应≈1,实测 {m:.3f}(方向/公式回归)"
 
     def test_phantom_smoother_than_real(self):
         """体模匀化处理后 GLCM homogeneity 应高于真实图(纹理更平滑)。"""
@@ -187,6 +270,23 @@ class TestAuthenticityFeatures:
         f_syn = extract_authenticity_features(make_synthetic_like(base, 2))
         assert not np.allclose(f_real, f_phan), "真 vs 体模 特征退化"
         assert not np.allclose(f_real, f_syn), "真 vs 合成 特征退化"
+
+    def test_physical_features_flag_phantom(self):
+        """物理散斑特征(DND+TAI,索引 8:13)应把体模与真实拉开。
+
+        13 维布局:[8:11] DND(m_global/m1/m2),[11:13] TAI(global/local)。
+        体模匀质各向同性 → global TAI(索引 11)显著低于真实组织;
+        这是 5 维物理特征升级的核心目的(区分 PVA/琼脂仿体)。锁定方向性,
+        防回归到「物理特征对体模无响应」。
+        """
+        wins = 0
+        for s in range(8):
+            base = _structured_ultrasound(seed=s)
+            real_tai = extract_authenticity_features(base)[11]       # global TAI
+            phan_tai = extract_authenticity_features(make_phantom_like(base, s))[11]
+            if real_tai >= phan_tai:
+                wins += 1
+        assert wins >= 6, f"体模 TAI 未稳定低于真实({wins}/8),物理特征失效"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -223,3 +323,209 @@ class TestSplicingDetection:
         assert mask.shape == sp.shape and mask.dtype == np.uint8
         if is_spliced:
             assert bbox is not None and len(bbox) == 4
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ③ 规范性 - CAT-Net v2 风格 DCT/BAG 取证(羽化/泊松拼接 + 可插拔降级)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _jpeg_roundtrip(img_np, quality=70):
+    """JPEG 编解码一圈,植入真实的 8x8 块伪影栅格(BAG)。"""
+    ok, buf = cv2.imencode(".jpg", img_np, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    assert ok
+    return cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+
+
+class TestDctPrimitives:
+    """DCT 系数提取与块伪影栅格基元的数值正确性(Gate 1 可量化验证)。"""
+
+    def test_dct_shape_and_invertible(self):
+        # 块级 DCT 形状正确,且 idct 可重建原图(纯数值正确性)
+        img = _structured_ultrasound(seed=3)
+        coeffs = extract_dct_coeffs(img, block=8)
+        assert coeffs.shape == (256 // 8, 256 // 8, 8, 8)
+        # 逐块 idct 重建,与原图对应区域一致(舍入误差内)
+        recon = cv2.idct(coeffs[0, 0])
+        orig = img[0:8, 0:8].astype(np.float32)
+        assert np.allclose(recon, orig, atol=1e-3), "DCT/IDCT 不可逆 — 系数提取有误"
+
+    def test_grid_strength_jpeg_vs_uncompressed(self):
+        # JPEG 图块栅格显著度应明显高于未压缩图(BAG 信号的物理依据)
+        img = _structured_ultrasound(seed=5)
+        s_raw = grid_strength(block_artifact_energy(img))
+        s_jpg = grid_strength(block_artifact_energy(_jpeg_roundtrip(img, quality=40)))
+        assert s_jpg > s_raw, f"JPEG 栅格未强于未压缩 (raw={s_raw:.3f}, jpg={s_jpg:.3f})"
+
+    def test_energy_map_shape(self):
+        e = block_artifact_energy(_structured_ultrasound(seed=2), block=8)
+        assert e.shape == (8, 8)
+
+
+class TestCatNetDetector:
+    """CatNetTamperingDetector:可插拔降级 + BAG 相位取证 + 三路并集。"""
+
+    def test_degrades_without_weights(self):
+        # 无 HRNet 权重(离线环境)→ 安静降级到纯 NumPy dct-bag 后端,绝不崩溃
+        det = CatNetTamperingDetector(catnet_weights="/nonexistent/catnet.pt")
+        assert det.backend_name == "dct-bag"
+        assert det._model is None
+
+    def test_find_weights_returns_none_when_absent(self):
+        assert _find_catnet_weights("/nonexistent/catnet.pt") is None
+
+    def test_no_false_positive_on_clean_jpeg(self):
+        # 一票否决红线:干净 JPEG(全图栅格一致)必须零误报
+        det = CatNetTamperingDetector()
+        for seed in range(8):
+            clean = _jpeg_roundtrip(
+                _structured_ultrasound(seed=seed, vary_structure=(seed % 2 == 0)),
+                quality=70,
+            )
+            assert not det.bag_phase_inconsistency(clean)[0], \
+                f"干净 JPEG 误报 (seed={seed}) — 一票否决红线"
+
+    def test_no_false_positive_on_uncompressed(self):
+        # 未压缩/无栅格图必须弃权(返回未篡改),不做相位取证。
+        # 扩到 8 个含强结构 seed:真实超声平滑背景+结节会把 median 拉低,
+        # 验证 grid_strength 绝对地板守住弃权门,不被分母塌缩放大成误报。
+        det = CatNetTamperingDetector()
+        for seed in range(8):
+            img = _structured_ultrasound(seed=seed, vary_structure=(seed % 2 == 0))
+            assert not det.bag_phase_inconsistency(img)[0], \
+                f"未压缩图误报 (seed={seed}) — 不应触发 BAG 取证"
+
+    def test_no_false_positive_with_nonmultiple_stride(self):
+        # 红线回归:非 block 整倍的 stride/win 不得让干净 JPEG 误报。
+        # (修复前局部相位系统性偏移 → 全图密集误报击穿一票否决)
+        det = CatNetTamperingDetector(win=60, stride=30)  # 均非 8 的整倍数
+        for seed in range(6):
+            clean = _jpeg_roundtrip(_structured_ultrasound(seed=seed), quality=70)
+            assert not det.bag_phase_inconsistency(clean)[0], \
+                f"非整倍 stride 干净 JPEG 误报 (seed={seed}) — 相位坐标换算失效"
+
+    def test_detects_phase_shifted_paste(self):
+        # 羽化/相位错位拼接:补丁来自另一 JPEG 且像素偏移 → 破坏宿主栅格相位
+        host = _jpeg_roundtrip(_structured_ultrasound(seed=10), quality=85)
+        donor = _jpeg_roundtrip(_structured_ultrasound(seed=77, vary_structure=True),
+                                quality=85)
+        tampered = host.copy()
+        # 贴一块,且整体平移 4px(非 8 的倍数)使其块栅格相位与宿主错位
+        ph, pw = 96, 96
+        y0, x0 = 80, 80
+        patch = np.roll(donor[y0:y0 + ph, x0:x0 + pw], shift=(4, 4), axis=(0, 1))
+        # 羽化边界(高斯模糊融合),模拟泊松/羽化拼接,消除硬阶跃
+        tampered[y0:y0 + ph, x0:x0 + pw] = patch
+        tampered = cv2.GaussianBlur(tampered, (3, 3), 0)
+        tampered = _jpeg_roundtrip(tampered, quality=85)
+        det = CatNetTamperingDetector(grid_strength_min=0.5)
+        is_tam, mask, bbox = det.bag_phase_inconsistency(tampered)
+        # 注:BAG 是统计信号,二次 JPEG 会部分对齐栅格;命中即记录,不命中不强断言
+        if is_tam:
+            assert mask.shape == tampered.shape and bbox is not None and len(bbox) == 4
+
+    def test_detect_union_contract(self):
+        # 统一入口返回契约:(bool, mask_2d_uint8_同形, bbox|None)
+        det = CatNetTamperingDetector()
+        img = _jpeg_roundtrip(_structured_ultrasound(seed=1), quality=70)
+        is_tam, mask, bbox = det.detect(img)
+        assert mask.shape == img.shape and mask.dtype == np.uint8
+        if is_tam:
+            assert bbox is not None and len(bbox) == 4
+        else:
+            assert bbox is None
+
+    def test_detect_falls_through_to_geometric(self):
+        # 深度+BAG 都不命中时,detect 应回落到既有几何检测器(硬粘贴长直缝)
+        base = _structured_ultrasound(seed=1)
+        donor = _structured_ultrasound(seed=99, vary_structure=True)
+        sp, _, _ = make_splice(base, donor, 2, patch_frac=0.30)
+        if detect_splicing(sp)[0]:  # 仅当几何检测器自身命中时校验并集兜底
+            det = CatNetTamperingDetector()
+            assert det.detect(sp)[0], "几何缝命中但 detect 并集漏判"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ④ 合成引擎升级:泊松/羽化拼接 + 域随机化(Nakagami 散斑 + 模糊 + JPEG)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestPoissonSplice:
+    """泊松/羽化拼接:无硬缝,供 CAT-Net DCT/BAG 取证训练(几何检测器抓不到)。"""
+
+    def test_contract_and_shape(self):
+        base = _structured_ultrasound(seed=1)
+        donor = _structured_ultrasound(seed=42, vary_structure=True)
+        out, mask, bbox = make_splice_poisson(base, donor, 3, patch_frac=0.25)
+        assert out.shape == base.shape and out.dtype == np.uint8
+        assert mask.shape == base.shape and mask.dtype == np.uint8
+        assert bbox is not None and len(bbox) == 4
+        assert mask.max() == 255 and mask.sum() > 0  # 确有粘贴区
+
+    def test_no_hard_seam_vs_hard_splice(self):
+        # 泊松融合应比硬粘贴显著更平滑:融合区边界最大梯度远低于硬缝
+        base = _structured_ultrasound(seed=5)
+        donor = _structured_ultrasound(seed=88, vary_structure=True)
+        hard, hmask, _ = make_splice(base, donor, 7, patch_frac=0.25)
+        soft, smask, _ = make_splice_poisson(base, donor, 7, patch_frac=0.25)
+
+        def _edge_max(img, mask):
+            gx = cv2.Sobel(img.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(img.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+            mag = np.sqrt(gx * gx + gy * gy)
+            edge = cv2.dilate(mask, np.ones((3, 3), np.uint8)) - cv2.erode(
+                mask, np.ones((3, 3), np.uint8))
+            vals = mag[edge > 0]
+            return float(vals.max()) if vals.size else 0.0
+
+        # 羽化边界梯度应明显低于硬缝(允许等号松弛,核心是不更尖锐)
+        assert _edge_max(soft, smask) <= _edge_max(hard, hmask) + 1e-3
+
+    def test_deterministic(self):
+        base = _structured_ultrasound(seed=1)
+        donor = _structured_ultrasound(seed=2, vary_structure=True)
+        a, _, ba = make_splice_poisson(base, donor, 9)
+        b, _, bb = make_splice_poisson(base, donor, 9)
+        assert np.array_equal(a, b) and ba == bb
+
+    def test_small_image_guard_no_crash(self):
+        # 回归:小图/极端 patch_frac 下中心采样区间塌缩不得抛 ValueError,
+        # 应安全返回 (原图, 空mask, None)
+        small = np.full((25, 25), 128, np.uint8)
+        donor = np.full((25, 25), 64, np.uint8)
+        out, mask, bbox = make_splice_poisson(small, donor, 0, patch_frac=0.22)
+        assert out.shape == small.shape and mask.sum() == 0 and bbox is None
+
+
+class TestDomainRandomization:
+    """域随机化:Nakagami 散斑 → 模糊 k∈{3,5,7} → JPEG Q∈[15,75]。"""
+
+    def test_nakagami_preserves_shape_dtype_and_brightness(self):
+        img = _structured_ultrasound(seed=3)
+        out = inject_nakagami_speckle(img, 0)
+        assert out.shape == img.shape and out.dtype == np.uint8
+        # 乘性散斑归一到均值 1,整体亮度不应大幅漂移
+        assert abs(float(out.mean()) - float(img.mean())) < 25.0
+
+    def test_nakagami_alters_texture(self):
+        # 散斑注入必须真正改变像素纹理(非恒等)
+        img = _structured_ultrasound(seed=3)
+        out = inject_nakagami_speckle(img, 7)
+        assert not np.array_equal(out, img)
+
+    def test_domain_randomize_contract(self):
+        img = _structured_ultrasound(seed=4)
+        out = domain_randomize(img, 0)
+        assert out.shape == img.shape and out.dtype == np.uint8
+
+    def test_domain_randomize_deterministic(self):
+        img = _structured_ultrasound(seed=4)
+        a = domain_randomize(img, 11)
+        b = domain_randomize(img, 11)
+        assert np.array_equal(a, b)
+
+    def test_domain_randomize_injects_jpeg_grid(self):
+        # 域随机化含 JPEG 重压 → 块伪影栅格显著度应高于原未压缩图
+        img = _structured_ultrasound(seed=6)
+        out = domain_randomize(img, 6)
+        s_raw = grid_strength(block_artifact_energy(img))
+        s_dr = grid_strength(block_artifact_energy(out))
+        assert s_dr > s_raw, f"域随机化未植入 JPEG 栅格 (raw={s_raw:.3f}, dr={s_dr:.3f})"

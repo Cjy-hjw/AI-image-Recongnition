@@ -56,8 +56,8 @@ def test_authenticity_trainer_end_to_end(tmp_path):
     # 契约:必须含 state_dict + feat_mean + feat_std(归一化参数随权重保存)
     assert "state_dict" in ckpt
     assert "feat_mean" in ckpt and "feat_std" in ckpt
-    assert np.asarray(ckpt["feat_mean"]).shape == (8,)
-    assert np.asarray(ckpt["feat_std"]).shape == (8,)
+    assert np.asarray(ckpt["feat_mean"]).shape == (13,)
+    assert np.asarray(ckpt["feat_std"]).shape == (13,)
 
 
 def test_authenticity_module_loads_and_normalizes(tmp_path):
@@ -71,7 +71,7 @@ def test_authenticity_module_loads_and_normalizes(tmp_path):
     module.load_weights(save_path)
     # 归一化参数确实被加载(此前 bug:训练存了但推理没用 → 训练/推理分布不一致)
     assert module.feat_mean is not None and module.feat_std is not None
-    assert np.asarray(module.feat_mean).shape == (8,)
+    assert np.asarray(module.feat_mean).shape == (13,)
 
     # predict 端到端可跑,返回 (类别, 概率向量[3])
     img = (np.clip(

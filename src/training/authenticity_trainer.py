@@ -5,9 +5,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# 真实性特征维度(ELA+GLCM+freq 共 8 维),与 AuthenticityClassifier(input_dim)、
-# 空集占位 zeros(FEAT_DIM) 必须一致——改特征提取器维度时只改这一处。
-FEAT_DIM = 8
+# 真实性特征维度(8 维取证 ELA+GLCM+freq + 5 维散斑物理 DND3+TAI2 = 13;
+# 原 DND w_low 维经 Gate2 认定恒≈0.5 死特征已删,14→13),
+# 与 AuthenticityClassifier(input_dim)、空集占位 zeros(FEAT_DIM)、test_gatekeeper
+# 断言必须一致——改特征提取器维度时只改这一处。
+FEAT_DIM = 13
 NUM_CLASSES = 3  # real / phantom / synthetic
 NUM_EPOCHS = 40
 BATCH_SIZE = 64
@@ -97,7 +99,7 @@ def train_authenticity_classifier(train_dataset, val_dataset, device, save_path)
         train_feats = [np.zeros(FEAT_DIM, dtype=np.float32)]
         train_labels = [0]
 
-    X_train = np.stack(train_feats, axis=0).astype(np.float32)  # (N, 8)
+    X_train = np.stack(train_feats, axis=0).astype(np.float32)  # (N, FEAT_DIM)
     y_train = np.array(train_labels, dtype=np.int64)
 
     # 特征标准化：以训练集均值/方差为基准

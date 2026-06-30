@@ -22,8 +22,17 @@ gatekeeper:
   fpr_threshold: 0.01
   precision_threshold: 0.98
   phash_threshold: 1        # Hamming distance limit
-  cosine_threshold: 0.995   # Cosine similarity limit for deep features
-  faiss_dim: 512            # ResNet18 feature dimension
+  # 余弦近重复阈值,按激活后端分别取值(单一标量无法同时服务两后端):
+  #   sscd 0.86     — SSCD 描述符对裁切/水印/色调偏移近似不变,0.86 治近重复漏检
+  #                   (官方 README 给 0.75@90%精度,取更严的 0.86 压误报);
+  #   resnet18 0.995 — 降级后端守一票否决红线「宁可漏检不可误杀真实影像」,故调严。
+  cosine_threshold:
+    sscd: 0.86
+    resnet18: 0.995
+  faiss_dim: 512            # 描述符维度(SSCD/ResNet18 均 512;实际以后端实测维度建索引)
+  # sscd_weights:           # 可选,显式指定 SSCD TorchScript 路径;缺省自动探测 checkpoints/
+  # catnet_weights:         # 可选,CAT-Net v2 TorchScript 路径;缺省探测 checkpoints/catnet_v2.torchscript.pt
+                            #   缺失则降级 dct-bag(纯 NumPy 块伪影栅格取证),detect() 仍含几何检测器并集
   tamper_threshold: 0.5
 
 model:

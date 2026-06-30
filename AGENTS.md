@@ -16,7 +16,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
 | **CI / 架构铁律** | `/.github/workflows/ci.yml` + `/.importlinter` | PR/push 到 main 自动跑两 job:① import-linter 4 契约(inference⊄training、models 无反向依赖、gatekeeper⊄上层、utils 叶子层)② Gate 1 七门 + 全套 pytest。任一红则挡合并。 |
-| **Tests** | `/tests/AGENTS.md` | 全套 142 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 41 gatekeeper + 10 masked_loss + 21 video(动态图/cine 管线 + 通道形态/通道序/彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端) + 11 calibration(温度缩放降级/单调/ECE/拟合). |
+| **Tests** | `/tests/AGENTS.md` | 全套 161 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 41 gatekeeper + 10 masked_loss + 21 video(动态图/cine 管线 + 通道形态/通道序/彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端) + 11 calibration(温度缩放降级/单调/ECE/拟合) + 19 entrypoint_dispatch(容器扩展名分发 + PRODUCTION 防篡改阻断 + src 树指纹 bash/Python 字节级一致). |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---
@@ -59,7 +59,7 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `data/pseudo_labels.py` — TI-RADS pseudo-label extraction
   - `data/split_tn3k.py` — 纯随机图像级 train/val/holdout 划分(Phase D)
 
-### `tests/` — 回归测试套件(全套 142 tests)
+### `tests/` — 回归测试套件(全套 161 tests)
   - `test_physical_prior.py` — DifferentiablePhysicalPriorExtractor (14 tests)
   - `test_cbm_head.py` — ConceptEmbeddingCBMHead (15 tests)
   - `test_phase_refactor.py` — Phase A/B/C/D 重构回归守卫 (19 tests)
@@ -70,6 +70,7 @@ The project follows strict functional decomposition (see `rules.md` §6):
   - `test_multisource.py` — 多源混训骨架 + 源级 label_mask (7 tests)
   - `test_smoke_entrypoints.py` — CLI 入口端到端冒烟(子进程实跑 predict/video_predict:predict 噪声图+video `--skip_gatekeeper` 两路径,只兜管线连通+产物落盘+JSON 可解析;gatekeeper 判定随平台浮点翻转故不作硬断言) (2 tests)
   - `test_calibration.py` — 温度缩放校准骨架(缺参数 T=1.0 降级逐位等价 / T>1 压低置信度不改 argmax / ECE 数值正确 / 拟合返正温度) (11 tests)
+  - `test_entrypoint_dispatch.py` — 容器入口 entrypoint.sh:按扩展名分发(mp4/avi/mov/mkv/dcm/dicom→video_predict、其余→predict)+ flag 透传 + PRODUCTION=1 防篡改阻断(predict/src 树哈希不符在 exec 前 exit 1)+ src 树聚合指纹 bash(`_src_tree_hash.sh`)与 Python(`seal_container.py`)字节级一致 (19 tests)
 
 **Backward Compatibility**: All decomposed modules maintain `__init__.py` re-export shims to preserve existing import paths.
 
@@ -85,9 +86,11 @@ The project follows strict functional decomposition (see `rules.md` §6):
 - **Privacy Standard**: 21 PHI fields overwritten (HIPAA Safe Harbor). 完整字段清单与脱敏规则见 `QA_VP.md §1.6` 及 `src/inference/io.py` 的 `_PHI_FIELDS`(日期类置 `"00000101"`,其余置 `"ANONYMIZED"`)。
 
 ### 2.3 Container Checksum Verification & Entrypoint Dispatch
-- `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth`, `predict.py`, **and `video_predict.py`** (both delivery entrypoints). `PRODUCTION=1` → hard exit on any hash mismatch.
+- `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth`, `predict.py`, `video_predict.py`, **and the entire `src/` tree** (核心推理逻辑,原仅校验入口脚本是防篡改盲区,现闭合)。`PRODUCTION=1` → hard exit on any hash mismatch.
+- **打包密封**:`scripts/seal_container.py` 交付前算 predict/video_predict/**src 全树**/best_model 的 SHA-256,正则注入 entrypoint.sh 的 `EXPECTED_*` 占位位。src 树聚合指纹算法(find *.py → POSIX 相对路径 → LC_ALL=C 字节序排序 → 逐文件 `sha  path\n` 拼接 → SHA-256)由 `scripts/_src_tree_hash.sh`(bash)与 `seal_container.py`(Python)**字节级配对**,单一事实源避免 drift,测试反向验证改坏函数必 FAIL。`.gitattributes` 锁 `.py` 为 LF 防 Win 构建/Linux 运行行尾哈希假阳性。
+- **防护边界**:此机制为「自包含篡改检测」非密码学防篡改——EXPECTED_* 写死在 entrypoint 自身且 src 树不含 entrypoint,能改 src 者可重算哈希绕过;真防篡改需信任锚外移(镜像签名 + cosign 外部验签)。详见 entrypoint.sh 顶部威胁模型注释。
 - **入口按输入扩展名自动分发**:`.mp4/.avi/.mov/.mkv/.dcm/.dicom` → `video_predict.py --input_video`(DICOM 单帧亦安全,内部 `_load_dicom_cine` 视作 1 帧);其余静态图 → `predict.py --input_image`。第一个位置参数为输入路径,其余 flag 透传。
-- Dockerfile `COPY` 同时拷入 `predict.py` 与 `video_predict.py`;`requirements.txt` 显式声明 torch/torchvision/numpy/safetensors + faiss-cpu(去重加速,缺失自动降级 numpy 检索),paramiko 仅训练需要不入容器。
+- Dockerfile `COPY` 同时拷入 `predict.py` 与 `video_predict.py`;`requirements.txt` 显式声明 torch/torchvision/numpy/safetensors + faiss-cpu(去重加速,缺失自动降级 numpy 检索),paramiko 仅训练需要不入容器(`scripts/deploy.py` SSH 凭证经 `DEPLOY_*` 环境变量注入,严禁写死入库)。
 
 ---
 

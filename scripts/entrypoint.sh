@@ -1,12 +1,26 @@
 #!/bin/bash
 # entrypoint.sh - 离线容器防篡改自检与推理启动入口
+#
+# 防护边界(威胁模型,reviewer D):本机制是「自包含的篡改检测」,非密码学防篡改。
+#   能挡:容器运行时 src/入口/权重被替换或损坏(入口脚本烤进只读镜像层、
+#         src/权重经可写 volume 落地的典型场景)、不完整拷贝。
+#   挡不住:EXPECTED_* 写死在本脚本自身,且 src 树指纹不含 entrypoint.sh ——
+#         能改 src 的攻击者通常也能改本脚本(重算哈希填回/删校验块)即可绕过。
+#   真防篡改需信任锚外移:镜像签名 + 外部验签(cosign/attestation)。此处自检
+#   仅作交付完整性兜底,不构成对抗强攻击者的安全承诺(医疗审计场景须知此边界)。
 
 # 1. 预设安全哈希指纹（防篡改签名）
 # 在生产交付前，由打包流水线算出并在此写死。运行时自检对比。
 # predict.py(单图)与 video_predict.py(动态图/cine)同为交付入口,均纳入完整性校验。
 EXPECTED_PREDICT_SHA256="4d7c50a1d62c9adb5a9513e72c4dedafc1cb2d4c5236c9a6957ec7dfd5a9ca22" # 示例哈希
 EXPECTED_VIDEO_PREDICT_SHA256="0000000000000000000000000000000000000000000000000000000000000000" # 打包时由流水线写死
+EXPECTED_SRC_TREE_SHA256="0000000000000000000000000000000000000000000000000000000000000000" # src/ 全树聚合指纹,由 seal_container.py 写死
 EXPECTED_WEIGHTS_SHA256="ef7c29e0625c9adb5a9513e72c4dedafc1cb2d4c5236c9a6957ec7dfd5a9c2222" # 示例哈希
+
+# src/ 全树聚合指纹函数:从独立文件 source(与 tests 共用单一事实来源,杜绝 drift)。
+# 算法与 scripts/seal_container.py 字节级配对,边界说明见 _src_tree_hash.sh。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_src_tree_hash.sh"
 
 echo "============================================="
 echo "   Medical PACS Sandbox Container Initialization"
@@ -42,6 +56,12 @@ if [ "$PRODUCTION" = "1" ]; then
     fi
     if [ "$ACTUAL_VIDEO_PREDICT_SHA" != "$EXPECTED_VIDEO_PREDICT_SHA256" ]; then
         echo "CRITICAL ERROR: video_predict.py integrity hash mismatch! Sandbox code has been tampered with." >&2
+        exit 1
+    fi
+    ACTUAL_SRC_TREE_SHA=$(compute_src_tree_sha256)
+    echo "--> src/ tree SHA-256: $ACTUAL_SRC_TREE_SHA"
+    if [ "$ACTUAL_SRC_TREE_SHA" != "$EXPECTED_SRC_TREE_SHA256" ]; then
+        echo "CRITICAL ERROR: src/ tree integrity hash mismatch! Core inference code has been tampered with." >&2
         exit 1
     fi
     if [ ! -f "checkpoints/best_model.pth" ]; then

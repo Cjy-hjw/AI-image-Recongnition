@@ -1,11 +1,30 @@
 import os
+import sys
 import paramiko
 
-host = "182.91.14.5"
-port = 22038
-user = "cjy"
-password = "LIUpeng!@2026"
-remote_base = "/home/cjy/AI_image_Recognition"
+# === 服务器连接凭证:必须经环境变量注入,严禁写死入库 ===
+# 用法(本机临时设置,不进 git):
+#   DEPLOY_HOST=... DEPLOY_PORT=... DEPLOY_USER=... DEPLOY_PASSWORD=... python scripts/deploy.py
+# 任一缺失即 fail-fast,不留默认值(防止误连/凭证泄漏)。
+host = os.environ.get("DEPLOY_HOST")
+port = os.environ.get("DEPLOY_PORT")
+user = os.environ.get("DEPLOY_USER")
+password = os.environ.get("DEPLOY_PASSWORD")
+remote_base = os.environ.get("DEPLOY_REMOTE_BASE", "/home/cjy/AI_image_Recognition")
+
+_missing = [
+    name for name, val in (
+        ("DEPLOY_HOST", host), ("DEPLOY_PORT", port),
+        ("DEPLOY_USER", user), ("DEPLOY_PASSWORD", password),
+    ) if not val
+]
+if _missing:
+    sys.exit(
+        "[deploy] 缺少环境变量: " + ", ".join(_missing) + "\n"
+        "  用法: DEPLOY_HOST=<ip> DEPLOY_PORT=<port> DEPLOY_USER=<user> "
+        "DEPLOY_PASSWORD=<pwd> python scripts/deploy.py"
+    )
+port = int(port)
 
 ignore_dirs = {
     ".git",

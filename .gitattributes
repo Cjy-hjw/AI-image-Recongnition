@@ -1,0 +1,16 @@
+# 锁定文本文件行尾,保证容器密封链(scripts/seal_container.py 算 src 树 SHA-256)
+# 在 Windows 构建、Linux 运行时不因 CRLF/LF 差异产生哈希假阳性(reviewer A3)。
+* text=auto eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+
+# 二进制文件不做行尾转换
+*.pth binary
+*.pt binary
+*.png binary
+*.jpg binary
+*.dcm binary
+*.torchscript.pt binary

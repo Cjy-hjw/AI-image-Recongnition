@@ -36,7 +36,7 @@ This protocol defines the 3-layer gatekeeper pipeline for detecting fake, duplic
 - **Feature extraction**: 13 维真实特征:GLCM(4)+ 频域(2)+ ELA(2)+ DND 双纳卡甘米散斑 m_global/m1/m2(3)+ TAI 结构张量各向异性 global/local(2)。前 8 维区分 GAN/合成,后 5 维(DND+TAI)区分物理体模(PVA/琼脂)的声学物理本质。改维度须同步 `authenticity.py`、`authenticity_trainer.FEAT_DIM`、test 断言。
 - **训练数据**: 从真实训练图提取 label=0(真实)、`make_phantom_like` 生成 label=1(体模)、`make_synthetic_like` 生成 label=2(合成),特征标准化后 40 epoch 训练。
 - **Model**: Shallow MLP 三分类器(`AuthenticityClassifier`)。
-- **Weights**: Trained during `train.py` startup, saved to `checkpoints/authenticity_model.pth`.
+- **Weights**: Trained during `train.py` startup, saved to `checkpoints/authenticity_model.pth`. 推理端因 ckpt 含 numpy `feat_mean/feat_std`,torch≥2.6 必须 `torch.load(..., weights_only=False)`;该路径只允许加载本项目自产可信权重。正式训练出固定权重后须同步 `AuthenticityModule.EXPECTED_CKPT_SHA256`,否则 `weights_only=False` 缺少完整性约束会重新暴露 pickle 任意代码执行风险。
 - **验证**: 训练结束在验证集报告三类准确率。
 - **Red-line**: MLP weights MUST NOT be altered without retraining on physical phantom datasets.
 

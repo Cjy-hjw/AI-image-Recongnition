@@ -59,3 +59,35 @@
 ### MixUp Target Interpolation Protection
 - AUCM dual variables (`a`, `b`, `alpha`) MUST use **un-interpolated** target arrays.
 - Enforced in `multitask.py` (see `src/models/AGENTS.md` §3).
+
+---
+
+## 3. PHASE 4 新增组件（官方数据前预备）
+
+### JPEG压缩增强 (`augmentation/jpeg_augment.py`) — 抵抗JPG域偏移
+- **背景**: 官方数据采用有损JPG压缩,公开数据多为PNG。调研报告实证PNG→JPG迁移导致25-26%性能崩塌。
+- **实现**:
+  - `JPEGCompressionAugment(prob=0.7, quality_range=(30,95))`: 训练时动态JPEG重压缩,Q~U(30,95),强制网络学习鲁棒特征
+  - `AdaptiveJPEGAugment(stage='early'/'mid'/'late')`: 阶段感知版,early温和(60-95),mid全范围(30-95),late聚焦官方可能区间(40-80)
+  - 集成: `get_train_transforms_with_jpeg(stage, jpeg_prob)`在几何变换后、归一化前插入
+- **使用**: 仅对PNG/DICOM源应用,原生JPG数据（如ThyUS2Path）跳过避免二次退化
+
+### 多源适配器 (`multiset_adapter.py`) — 统一异构标注格式
+- **抽象基类** `ThyroidDatasetAdapter`:
+  - 运行时动态适配原始格式→项目统一接口(image, mask, labels, task_mask)
+  - 子类: `ThyroidXLAdapter`(HF格式), `ThyUS2PathAdapter`(Figshare JPG), `StandardAdapter`(项目标准)
+  - 自动生成`task_mask`指示标注可用性
+- **PyTorch包装** `AdaptedThyroidDataset`:
+  - 接受任意Adapter,返回torch Dataset
+  - 与现有`ThyroidDataset`接口兼容,可直接替换
+- **零拷贝**: 保持原始数据不变,仅运行时转换
+
+### 动态采样器 (`stage_sampler.py`) — 防止小样本遗忘
+- **背景**: 多源样本规模悬殊(99例 vs 17,412帧),均匀采样导致小样本每epoch仅访问1-2次
+- **实现**:
+  - `StageAwareSampler`: Epoch 1-50采样70%大样本+30%小样本(稳定编码器),51+调整为50%-50%(防遗忘)
+  - `ProportionalStageSampler`: 按源配置ratio直接加权采样
+  - 支持过采样(小样本重复)和欠采样(大样本随机子集)
+- **使用**: 配合`MultiSourceThyroidDataset`的`get_sample_weights()`
+
+**注意**: 以上组件等ThyroidXL/ThyUS2Path数据到位后激活,当前为框架预备。

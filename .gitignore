@@ -3,6 +3,17 @@
 #     误伤 scripts/data/ 源码包(曾导致 CI 因缺 pseudo_labels.py 等文件而 collect 失败)。
 /data/
 /checkpoints/
+# 预训练权重本地缓存(546MB),禁止入库——过大导致 push 经代理超时;
+# 权重由 scripts/download_pretrain_weights.py 按需重新下载。
+/.cache_weights/
+*.pth
+*.pt
+
+# Claude 本地会话/计划文件
+/.claude/plan.md
+
+# 账号密码(含 HF token 等敏感凭据),严禁入库
+/账号密码/
 
 # Python cache and temporary files
 __pycache__/

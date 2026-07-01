@@ -1,5 +1,27 @@
 # src/training/AGENTS.md - Training Pipeline Specifications
 
+## 0. PHASE 4 新增组件
+
+### PCGrad优化器 (`pcgrad.py`) — 梯度冲突消解
+- **背景**: 分割(几何驱动) vs 分类(纹理驱动)对共享编码器的梯度更新方向可能冲突(余弦<0),导致负迁移
+- **原理**:
+  - 计算各任务梯度g_i, g_j
+  - 若g_i·g_j<0(冲突),投影g_i到g_j正交超平面: `g_i' = g_i - (g_i·g_j/||g_j||²)*g_j`
+  - 消除冲突方向,保留一致方向
+- **实现**:
+  - `PCGrad(optimizer)`: 包装Adam/SGD,在step()前拦截梯度投影
+  - `pc_backward(losses)`: 内部逐任务backward+清零提取独立梯度,两两投影,聚合后赋值参数梯度
+  - **关键修复(d4c00ff)**: 旧版假设外部已backward导致梯度累加无法投影,新版内部自动处理
+- **使用**:
+  ```python
+  pcgrad = PCGrad(optimizer)
+  pcgrad.pc_backward([loss_seg, loss_cls])  # 自动backward+投影
+  pcgrad.step()
+  ```
+- **显存**: <5%额外开销,适合官方32G约束
+
+---
+
 ## 1. THREE-STAGE PROGRESSIVE TRAINING (`stages.py` + `MultiTaskThyroidModel`)
 
 | Stage | Epochs | Strategy | Learning Rate |

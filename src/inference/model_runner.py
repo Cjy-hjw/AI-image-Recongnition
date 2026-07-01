@@ -15,7 +15,10 @@ def build_model(config: dict, weights: str, device: torch.device):
         config=config,
     ).to(device)
     if os.path.exists(weights):
-        model.load_state_dict(torch.load(weights, map_location=device), strict=False)
+        # weights_only=True:best_model.pth 按设计是纯 model state_dict(续训态另存
+        # training_state.pth),torch≥2.6 下安全加载并消除 FutureWarning。
+        model.load_state_dict(
+            torch.load(weights, map_location=device, weights_only=True), strict=False)
         print(f"Loaded model weights from {weights}")
     else:
         print(

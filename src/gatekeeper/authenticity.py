@@ -189,7 +189,10 @@ class AuthenticityModule:
 
     def load_weights(self, path):
         if os.path.exists(path):
-            ckpt = torch.load(path, map_location='cpu')
+            # weights_only=False:ckpt 含 numpy 标准化统计(feat_mean/feat_std),
+            # torch≥2.6 默认 weights_only=True 会拒绝反序列化 numpy 对象而报错。
+            # 权重由本项目 authenticity_trainer 自产(可信来源),显式关闭安全限制。
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 self.model.load_state_dict(ckpt["state_dict"])
                 fm, fs = ckpt.get("feat_mean"), ckpt.get("feat_std")

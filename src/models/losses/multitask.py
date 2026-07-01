@@ -68,8 +68,31 @@ class MultiTaskLoss(nn.Module):
         spin_l1_weight=0.0,
         label_smoothing=0.0,
         enable_mal_loss=True,
+        task_mask=None,
     ):
-        # 1. Segmentation Loss
+        """
+        Args:
+            task_mask: dict of binary masks (B,) indicating label availability
+                {
+                    'mask': Tensor[B],       # 1 if has segmentation mask, 0 otherwise
+                    'composition': Tensor[B],
+                    'echogenicity': Tensor[B],
+                    'shape': Tensor[B],
+                    'margin': Tensor[B],
+                    'foci': Tensor[B],
+                    'malignancy': Tensor[B],
+                }
+                If None, assumes all labels available (backward compat)
+
+                Note: Segmentation already supports valid_mask via targets['valid_mask'],
+                      so we pass task_mask['mask'] -> targets['valid_mask']
+        """
+        # 注入task_mask到targets（利用现有valid_mask支持）
+        if task_mask is not None:
+            if 'mask' in task_mask and 'valid_mask' not in targets:
+                targets = {**targets, 'valid_mask': task_mask['mask'].float()}
+
+        # 1. Segmentation Loss (自动应用valid_mask)
         loss_seg = compute_segmentation_loss(
             self.bce_seg, self.dice_seg, outputs, targets
         )

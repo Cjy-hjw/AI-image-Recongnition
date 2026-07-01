@@ -1,4 +1,5 @@
 import cv2
+import hashlib
 import os
 import numpy as np
 import torch
@@ -180,6 +181,9 @@ class AuthenticityClassifier(nn.Module):
 
 class AuthenticityModule:
     """High-level class wrapping feature extraction and prediction."""
+    # SHA256 of trusted authenticity_model.pth (更新训练后需同步此哈希)
+    EXPECTED_CKPT_SHA256 = None  # 首次训练后设置;None 时跳过校验(开发态)
+
     def __init__(self):
         self.model = AuthenticityClassifier()
         self.model.eval()
@@ -189,6 +193,18 @@ class AuthenticityModule:
 
     def load_weights(self, path):
         if os.path.exists(path):
+            # 完整性校验:防御 pickle 任意代码执行攻击(weights_only=False 必须配套)
+            if self.EXPECTED_CKPT_SHA256 is not None:
+                with open(path, 'rb') as f:
+                    actual_sha = hashlib.sha256(f.read()).hexdigest()
+                if actual_sha != self.EXPECTED_CKPT_SHA256:
+                    raise RuntimeError(
+                        f"Checkpoint {path} integrity check failed.\n"
+                        f"Expected SHA256: {self.EXPECTED_CKPT_SHA256}\n"
+                        f"Actual SHA256:   {actual_sha}\n"
+                        "Possible causes: file corruption, malicious replacement, or "
+                        "EXPECTED_CKPT_SHA256 not updated after retraining."
+                    )
             # weights_only=False:ckpt 含 numpy 标准化统计(feat_mean/feat_std),
             # torch≥2.6 默认 weights_only=True 会拒绝反序列化 numpy 对象而报错。
             # 权重由本项目 authenticity_trainer 自产(可信来源),显式关闭安全限制。

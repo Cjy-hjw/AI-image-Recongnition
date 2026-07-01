@@ -82,7 +82,10 @@ class FeatureExtractor:
                 "~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth"
             )
             if os.path.exists(local_weights):
-                self.model.load_state_dict(torch.load(local_weights, map_location='cpu'))
+                # weights_only=True:纯张量 state_dict,torch≥2.6 下安全加载(拒绝
+                # 任意代码执行)且消除 FutureWarning;旧版 torch 同样支持该参数。
+                self.model.load_state_dict(
+                    torch.load(local_weights, map_location='cpu', weights_only=True))
             else:
                 self.model = models.resnet18(pretrained=True)
             self.model.fc = torch.nn.Identity()

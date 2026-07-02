@@ -22,7 +22,7 @@
 - 多源数据标注异质化：ThyroidXL全标注，ThyUS2Path仅病理，DDTI仅分割
 - 训练时需自动屏蔽无标注任务的梯度，避免负梯度惩罚
 
-### 实现1：组件内部支持（推荐）
+### 实现1：组件内部支持（唯一正确路径）
 **分割损失** (`components/segmentation.py`):
 - `targets['valid_mask']`: Tensor[B]，1=有分割mask，0=无
 - per-sample计算BCE/Dice后`sum() / valid_count`
@@ -30,35 +30,36 @@
 
 **概念损失** (`components/concepts.py`):
 - 暂未实现per-sample mask（P1待办）
-- 当前全batch计算，异构源需wrapper缩放
+- 当前全batch计算，异构源暂靠 adapter 层 `task_mask` valid=0 从源头不产假标签
 
 **良恶性损失** (`components/malignancy.py`):
 - 已支持`label_validity`参数（line 31-57）
 - 无效样本不进入AUCM dual variables更新
 
-### 实现2：包装器（过渡方案）
-**MaskedMultiTaskLoss** (`masked_multitask.py`):
-- 包装`MultiTaskLoss`，后处理缩放损失权重
-- **局限**：后处理无法真正零梯度（梯度已流入encoder）
-- 用途：快速验证task_mask逻辑，等待组件内部mask完善
+### 已废弃：MaskedMultiTaskLoss 后处理包装器（commit 54f0302 删除）
+- 原 `masked_multitask.py` 用后处理缩放损失权重实现 task_mask，但 `base_loss` 返回时
+  计算图已构建、per-task loss 已 reduce 成标量，**再乘 valid_ratio 只缩小损失量级，
+  无标注样本的梯度仍经标量 loss 回传污染 encoder**——不是真屏蔽。且它重算 total_loss
+  时绕过了 FAMO 动态加权。故整体删除。
+- 唯一保留：任务名→loss key 映射表 `TASK_TO_LOSS_KEYS`，已搬入 `multitask.py` 作模块常量
+  （仅文档性/调试用，非屏蔽逻辑）。
+- 正确做法统一走「实现1」：`multitask.py` forward 把 `task_mask['mask']` 注入
+  `targets['valid_mask']`，由 components 在 per-sample 层真正零梯度屏蔽。
 
 ### 使用方式
 ```python
-# 方式1：利用现有valid_mask支持（分割+良恶性）
-targets['valid_mask'] = task_mask['mask'].float()  # 分割
-targets['label_validity'] = task_mask['malignancy']  # 良恶性
+# 唯一路径：利用组件内 valid_mask / label_validity 支持
+targets['valid_mask'] = task_mask['mask'].float()        # 分割 per-sample 屏蔽
+targets['label_validity'] = task_mask['malignancy']      # 良恶性 AUCM 屏蔽
 
 loss_fn = MultiTaskLoss(...)
-total_loss, loss_dict = loss_fn(outputs, targets)
-
-# 方式2：包装器（过渡）
-base_loss = MultiTaskLoss(...)
-masked_loss = MaskedMultiTaskLoss(base_loss)
-total_loss, loss_dict = masked_loss(outputs, targets, task_mask=task_mask)
+total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
+# multitask.py forward 内部自动把 task_mask['mask'] 注入 targets['valid_mask']
 ```
 
-### Gate2审查结果（commit d4c00ff）
+### Gate2审查结果（commit d4c00ff → 54f0302 清理）
 - **P0-1修复**：multitask.py利用现有`valid_mask`支持，避免后处理梯度泄漏
+- **54f0302 清理**：删除劣质的 MaskedMultiTaskLoss 后处理路径（已被上述真屏蔽取代）
 - **待办**：概念损失per-sample mask（P1）
 
 ---

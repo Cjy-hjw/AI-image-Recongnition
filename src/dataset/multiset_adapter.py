@@ -16,13 +16,18 @@
         └─ StandardAdapter (项目标准格式：image.png/mask.png/meta.json)
 """
 
-import os
+# TODO(官方数据后): 按 rules.md §6 拆分为 adapters/{base,thyroidxl,thyus2path}.py + adapted_dataset.py
+# 当前 adapter 为空壳骨架(_load_metadata/get_labels 未真实实现),等官方 schema 落地后按真实格式重写再拆分。
+
 import json
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple, Any
 from pathlib import Path
+
 import numpy as np
 import cv2
+import torch
+from torch.utils.data import Dataset as TorchDataset
 
 
 class ThyroidDatasetAdapter(ABC):
@@ -264,12 +269,15 @@ class ThyroidXLAdapter(ThyroidDatasetAdapter):
     def get_task_mask(self, sample_meta: dict) -> Dict[str, int]:
         annot = self.annotations[sample_meta['image_id']]
 
+        # TI-RADS→细粒度概念(composition/echogenicity/shape/margin)当前为编造占位映射
+        # (全部用同一 min(tirads-1,3)),非真实标签。
+        # 官方 schema 未定,标注 valid=0 避免假标签污染,数据到位后补真实映射。
         return {
             'mask': 1 if sample_meta['mask_path'].exists() else 0,
-            'composition': 1 if 'tirads_level' in annot else 0,
-            'echogenicity': 1 if 'tirads_level' in annot else 0,
-            'shape': 1 if 'tirads_level' in annot else 0,
-            'margin': 1 if 'tirads_level' in annot else 0,
+            'composition': 0,
+            'echogenicity': 0,
+            'shape': 0,
+            'margin': 0,
             'foci': 0,  # ThyroidXL暂无细粒度钙化
             'malignancy': 1 if 'pathology' in annot else 0,
         }
@@ -349,7 +357,10 @@ class ThyUS2PathAdapter(ThyroidDatasetAdapter):
         }
 
     def get_task_mask(self, sample_meta: dict) -> Dict[str, int]:
-        # ThyUS2Path仅有图像级病理标签，无其他细粒度标注
+        # ThyUS2Path 理论上仅有图像级病理标签,但 _load_metadata 尚未实现(返回 {}),
+        # get_labels 的 malignancy 仍是硬编码 dummy 0,并非从 metadata 映射的真标签。
+        # 官方 schema 未定,标注 valid=0 避免假标签污染,数据到位后补真实映射
+        # (metadata.csv 读取 + malignancy 映射实现后,此处 malignancy 改回 1)。
         return {
             'mask': 0,
             'composition': 0,
@@ -357,14 +368,11 @@ class ThyUS2PathAdapter(ThyroidDatasetAdapter):
             'shape': 0,
             'margin': 0,
             'foci': 0,
-            'malignancy': 1,  # 仅病理可用
+            'malignancy': 0,
         }
 
 
 # ========== 包装为PyTorch Dataset ==========
-
-from torch.utils.data import Dataset as TorchDataset
-import torch
 
 
 class AdaptedThyroidDataset(TorchDataset):
@@ -409,17 +417,4 @@ class AdaptedThyroidDataset(TorchDataset):
 
         return img_tensor, mask_tensor, labels
 
-
-# ========== 使用示例 ==========
-
-if __name__ == '__main__':
-    # 示例：加载ThyroidXL
-    # adapter = ThyroidXLAdapter(data_root='data/public_datasets/ThyroidXL')
-    # dataset = AdaptedThyroidDataset(adapter, img_size=512)
-    # img, mask, labels = dataset[0]
-    # print(f"Image: {img.shape}, Mask: {mask.shape}")
-    # print(f"Labels: {labels}")
-    # print(f"Task mask: {[(k, v) for k, v in labels.items() if k.startswith('valid_')]}")
-
-    print("[OK] 多源数据集适配器模块已创建")
-    print("等待实际数据下载后进行完整测试")
+# 注: 冒烟测试应在 tests/ 补充(官方数据到位、adapter 按真实 schema 重写后)。

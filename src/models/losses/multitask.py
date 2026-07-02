@@ -14,6 +14,22 @@ from src.models.losses.components import (
 )
 
 
+# 任务名 → loss_dict key 映射（多源异构标注的 task_mask 屏蔽路径参考）。
+# 说明：per-sample 真屏蔽已由本模块 forward 的 valid_mask 注入 + components 内部
+# label_validity 处理实现（无效样本不进入计算图，真正零梯度）；此表仅作为
+# 「任务名对应哪些 loss 分项」的文档性常量，供上层构建 task_mask / 调试查阅。
+# （原 masked_multitask.py 的后处理缩放 wrapper 已删除，其缩放法只改量级不屏蔽梯度。）
+TASK_TO_LOSS_KEYS = {
+    'mask': ['seg'],
+    'composition': ['comp', 'concepts_ce', 'prior'],
+    'echogenicity': ['echo', 'concepts_ce', 'prior'],
+    'shape': ['shape', 'concepts_ce', 'prior'],
+    'margin': ['margin', 'concepts_ce', 'prior'],
+    'foci': ['foci', 'concepts_ce', 'prior'],
+    'malignancy': ['malignancy', 'supcon'],
+}
+
+
 class MultiTaskLoss(nn.Module):
     """
     Combined multi-task loss function.

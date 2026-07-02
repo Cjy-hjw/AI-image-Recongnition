@@ -50,5 +50,11 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
 ## 7. Official Category Constraint (Project-Level Business Rule)
 * **Rule (Official Category Constraint)**: As per 2026 official regulations, Track 7 does NOT offer a "Self-built Model Group" (自建模型组). Our team is strictly registered under the **"Own Model Group" (自有模型组)**. The deployment must package our custom gatekeeper, TaskAlignmentAdaptor cross-task alignment, and ConceptEmbedding CBM report generator into a standard offline inference container via `predict.py`.
 
-## 8. 子Agent模型选择策略
-* **Rule**: 不重要或低风险的子任务(如搜索文件、简单检查、格式化)创建子agent时使用便宜模型(`model="sonnet"`);重要任务(如代码审查、逻辑验证、复杂重构)使用主会话同型号(默认)。节省 token 预算。
+## 8. 子Agent委派策略(强制优先,勿事必躬亲)
+* **Rule (默认委派 Delegate-by-Default)**: 遇到**可独立界定的子任务**——搜索/定位文件、批量读取多文件后归纳、代码审查、文档冗余排查、格式化、跑测试并汇总——**必须优先派子agent处理**,不得默认亲历亲为。理由有三,缺一不可:
+  1. **省额度**:简单/低风险子任务用便宜模型(`model="sonnet"或"haiku"`),把 Opus 额度留给主线决策;
+  2. **不污染主上下文**:子agent 只回传结论,大量文件内容/中间过程不进主会话窗口,避免主线被稀释、触发压缩;
+  3. **并行提速**:相互独立的子任务在同一条消息里一次性并发派发(多个 Agent 调用同发),墙钟时间取最慢的一个,而非串行累加。
+* **Rule (模型选型)**: 低风险子任务(搜索、简单检查、格式化、跑既有测试)→ `model="sonnet"`;高风险子任务(数学管道/梯度路由/优化器绑定审查、复杂重构、逻辑正确性验证)→ 主会话同型号(默认 Opus)。见 §2 Gate2 必须派 `reviewer` 子agent 的硬性要求。
+* **Rule (何时才自己做)**: 仅当任务**极短**(1-2 步可完成)、**强依赖主线实时上下文**(拆出去反而要重新灌大量背景)、或**需连续交互决策**时,才在主会话直接做。其余一律优先委派。
+* **反例(必须避免)**:一次性顺序读十几个文件做审查、把整个代码库/多文档拉进主上下文人工比对冗余、串行跑多组独立测试——这些都应拆成并行子agent,否则既费额度又污染上下文。

@@ -63,6 +63,11 @@ class JPEGCompressionAugment:
             (img_aug, mask): 压缩后图像和原始mask
         """
         if random.random() < self.prob:
+            # cv2.imencode('.jpg', ...) 对非 uint8 输入会静默失败(返回 False/空),
+            # 且 JPEG 语义本就针对 8bit 像素,故断言防止归一化后的 float 图误入。
+            assert img.dtype == np.uint8, \
+                f"JPEG增强要求uint8输入(归一化前),当前{img.dtype}"
+
             # 随机采样质量因子
             quality = random.randint(*self.quality_range)
 
@@ -113,46 +118,14 @@ class AdaptiveJPEGAugment:
 
         self.quality_range = self.stage_quality_map[stage]
 
+        # 组合优于复制: 复用 JPEGCompressionAugment 的编解码逻辑,仅 quality_range 来源不同
+        # (此处由 stage 决定),避免两份 __call__ 逐行重复。
+        self._compressor = JPEGCompressionAugment(
+            prob=prob, quality_range=self.quality_range
+        )
+
     def __call__(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if random.random() < self.prob:
-            quality = random.randint(*self.quality_range)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-            _, encoded = cv2.imencode('.jpg', img, encode_param)
-            img_decoded = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
-
-            if img_decoded.shape != img.shape:
-                img_decoded = cv2.resize(img_decoded, (img.shape[1], img.shape[0]))
-
-            return img_decoded, mask
-
-        return img, mask
-
-
-def visualize_jpeg_degradation(img: np.ndarray, qualities: list = [30, 50, 70, 90]) -> dict:
-    """
-    可视化不同JPEG质量的退化效果（用于验证增强效果）
-
-    Args:
-        img: 原始图像
-        qualities: 质量因子列表
-
-    Returns:
-        dict: {quality: degraded_image}
-
-    Usage:
-        >>> results = visualize_jpeg_degradation(img, [30, 50, 70, 90])
-        >>> for q, img_q in results.items():
-        ...     cv2.imwrite(f'img_q{q}.jpg', img_q)
-    """
-    results = {'original': img.copy()}
-
-    for q in qualities:
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), q]
-        _, encoded = cv2.imencode('.jpg', img, encode_param)
-        img_q = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
-        results[f'Q{q}'] = img_q
-
-    return results
+        return self._compressor(img, mask)
 
 
 # ========== 集成到现有transform pipeline ==========
@@ -194,24 +167,4 @@ def get_train_transforms_with_jpeg(stage: str = 'mid', jpeg_prob: float = 0.7):
         AdaptiveJPEGAugment(stage=stage, prob=jpeg_prob),
     ])
 
-
-# ========== 单元测试 ==========
-
-if __name__ == '__main__':
-    # 测试基础功能
-    img = np.random.randint(0, 256, (512, 512), dtype=np.uint8)
-    mask = np.zeros((512, 512), dtype=np.float32)
-
-    aug = JPEGCompressionAugment(prob=1.0, quality_range=(30, 95))
-    img_aug, mask_aug = aug(img, mask)
-
-    print(f"原始图像shape: {img.shape}, dtype: {img.dtype}")
-    print(f"增强后shape: {img_aug.shape}, dtype: {img_aug.dtype}")
-    print(f"mask保持不变: {np.array_equal(mask, mask_aug)}")
-    print(f"图像内容改变: {not np.array_equal(img, img_aug)}")
-
-    # 测试可视化
-    results = visualize_jpeg_degradation(img, [30, 50, 70, 90])
-    print(f"\n可视化结果: {list(results.keys())}")
-
-    print("\n[OK] JPEG压缩增强模块测试通过")
+# 注: JPEG 编解码不变性冒烟测试应在 tests/ 补充(输入须 uint8,见 __call__ 断言)。

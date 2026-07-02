@@ -125,9 +125,14 @@ class StageAwareSampler(Sampler):
         # 归一化（确保总和=total_samples）
         actual_total = sum(source_samples.values())
         if actual_total != total_samples:
-            # 调整最大源的样本数以匹配
+            # 调整最大源的样本数以匹配。
+            # 边界防护: 当某源 ratio 缺失走默认 1/len 时,各源配额之和可能 > total_samples,
+            # 差额 (total_samples - actual_total) 为负,直接相减会把最大源扣成负数,
+            # 导致后续 np.random.choice(size<0) 崩溃。故 clamp 到 >=0。
             largest_source = max(source_samples, key=source_samples.get)
-            source_samples[largest_source] += (total_samples - actual_total)
+            source_samples[largest_source] = max(
+                0, source_samples[largest_source] + (total_samples - actual_total)
+            )
 
         # 从各源采样
         sampled_indices = []
@@ -200,110 +205,5 @@ class ProportionalStageSampler(Sampler):
     def __len__(self):
         return self.num_samples
 
-
-# ========== 辅助工具 ==========
-
-def compute_source_statistics(dataset, sampler: StageAwareSampler, num_iterations: int = 1000):
-    """
-    统计采样器在多个epoch中的实际采样分布
-
-    Args:
-        dataset: 数据集
-        sampler: 采样器实例
-        num_iterations: 模拟epoch数
-
-    Returns:
-        dict: {epoch: {source_name: count}}
-    """
-    stats = {}
-
-    for epoch in range(num_iterations):
-        sampler.set_epoch(epoch)
-        indices = list(iter(sampler))
-
-        # 统计各源样本数
-        source_counts = {name: 0 for name in sampler.source_indices.keys()}
-        for idx in indices:
-            ds_pos, _ = dataset.index_map[idx]
-            source_name = dataset.source_names[ds_pos]
-            source_counts[source_name] += 1
-
-        stats[epoch] = source_counts
-
-    return stats
-
-
-def visualize_sampling_distribution(stats: dict, stage1_epochs: int = 50):
-    """
-    可视化采样分布变化（打印统计）
-
-    Args:
-        stats: compute_source_statistics返回的统计结果
-        stage1_epochs: Stage 1的epoch数
-    """
-    print("\n[采样分布统计]")
-    print(f"Stage 1 (Epoch 1-{stage1_epochs}):")
-
-    # Stage 1平均
-    stage1_stats = {k: v for k, v in stats.items() if k < stage1_epochs}
-    if stage1_stats:
-        source_names = list(next(iter(stage1_stats.values())).keys())
-        for name in source_names:
-            avg_count = np.mean([epoch_stat[name] for epoch_stat in stage1_stats.values()])
-            print(f"  {name}: 平均 {avg_count:.1f} 样本/epoch")
-
-    # Stage 2平均
-    stage2_stats = {k: v for k, v in stats.items() if k >= stage1_epochs}
-    if stage2_stats:
-        print(f"\nStage 2 (Epoch {stage1_epochs+1}+):")
-        for name in source_names:
-            avg_count = np.mean([epoch_stat[name] for epoch_stat in stage2_stats.values()])
-            print(f"  {name}: 平均 {avg_count:.1f} 样本/epoch")
-
-
-# ========== 单元测试 ==========
-
-if __name__ == '__main__':
-    # Mock数据集（模拟MultiSourceThyroidDataset）
-    class MockDataset:
-        def __init__(self):
-            self.source_names = ['ThyroidXL', 'DDTI']
-            # ThyroidXL: 10000样本，DDTI: 100样本
-            self.index_map = []
-            for i in range(10000):
-                self.index_map.append((0, i))  # ds_pos=0 -> ThyroidXL
-            for i in range(100):
-                self.index_map.append((1, i))  # ds_pos=1 -> DDTI
-
-        def __len__(self):
-            return len(self.index_map)
-
-    dataset = MockDataset()
-
-    # 创建采样器
-    sampler = StageAwareSampler(
-        dataset,
-        stage1_epochs=50,
-        stage1_ratios={'ThyroidXL': 0.7, 'DDTI': 0.3},
-        stage2_ratios={'ThyroidXL': 0.5, 'DDTI': 0.5},
-    )
-
-    # 模拟100个epoch的采样
-    print("\n[测试] 模拟100个epoch...")
-    stats = compute_source_statistics(dataset, sampler, num_iterations=100)
-
-    # 可视化
-    visualize_sampling_distribution(stats, stage1_epochs=50)
-
-    # 验证
-    stage1_ddti_avg = np.mean([stats[e]['DDTI'] for e in range(50)])
-    stage2_ddti_avg = np.mean([stats[e]['DDTI'] for e in range(50, 100)])
-
-    print(f"\n[验证]")
-    print(f"Stage 1 DDTI占比: {stage1_ddti_avg / len(dataset) * 100:.1f}% (预期~30%)")
-    print(f"Stage 2 DDTI占比: {stage2_ddti_avg / len(dataset) * 100:.1f}% (预期~50%)")
-
-    assert 25 <= stage1_ddti_avg / len(dataset) * 100 <= 35, "Stage1比例不符合预期"
-    assert 45 <= stage2_ddti_avg / len(dataset) * 100 <= 55, "Stage2比例不符合预期"
-
-    print("\n[OK] 比例动态采样器测试通过")
+# 注: 采样分布统计/可视化及比例正确性冒烟测试应在 tests/ 补充
+# (原内联 __main__ 及仅供其调用的 compute_source_statistics/visualize_sampling_distribution 已删除)。

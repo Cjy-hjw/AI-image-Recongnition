@@ -37,28 +37,47 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from typing import List, Optional
-import numpy as np
-import copy
 
 
 class PCGrad:
     """
     PCGrad优化器包装器
 
+    ⚠️ 实验性,未接入训练主循环(train.py 当前用 FAMO,不调用本类)。
+       - 与 FAMO 互斥(二选一多任务权衡方案,叠加语义未定义);
+       - 当前不兼容项目强制的 AMP/GradScaler:pc_backward 手工 backward + grad.copy_
+         绕过了 scaler.scale()/unscale_,启用需切 fp32 或额外处理缩放;
+       - 激活前必须过 Gate2 复审。
+
     Args:
         optimizer: 基础优化器（如Adam）
         reduction: 梯度聚合方式 'mean'/'sum'
+        shared_parameters: 仅对这些参数(共享编码器)做冲突投影的可选参数列表。
+            PCGrad 理论只应对**共享参数**投影(对各任务私有 head 投影是错的)。
+            未传时退化为对 optimizer 全部参数投影 —— 此行为不严格正确,
+            真正接入时**必须**传入共享编码器参数。
     """
 
-    def __init__(self, optimizer: Optimizer, reduction: str = 'mean'):
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        reduction: str = 'mean',
+        shared_parameters: Optional[List[torch.nn.Parameter]] = None,
+    ):
         self.optimizer = optimizer
         self.reduction = reduction
 
         # 获取所有需要梯度的参数
         self._param_groups = optimizer.param_groups
-        self._params = []
+        self._all_params = []
         for group in self._param_groups:
-            self._params.extend(group['params'])
+            self._all_params.extend(group['params'])
+
+        # 投影作用域: 仅共享参数(正确);未传则退回全模型参数(不严格正确,见类 docstring)
+        if shared_parameters is not None:
+            self._params = list(shared_parameters)
+        else:
+            self._params = self._all_params
 
     def zero_grad(self):
         """清零梯度"""
@@ -187,7 +206,7 @@ class PCGradWrapper(nn.Module):
 
     Usage:
         >>> model = ThyroidMultiTaskModel(...)
-        >>> loss_fn = MaskedMultiTaskLoss(...)
+        >>> loss_fn = MultiTaskLoss(...)
         >>> optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         >>> pcgrad = PCGradWrapper(optimizer)
         >>>
@@ -235,107 +254,5 @@ class PCGradWrapper(nn.Module):
     def pc_backward(self, task_losses: List[torch.Tensor]):
         self.pcgrad.pc_backward(task_losses)
 
-
-# ========== 辅助工具：梯度冲突分析 ==========
-
-def compute_gradient_cosine(grad1: torch.Tensor, grad2: torch.Tensor) -> float:
-    """
-    计算两个梯度向量的余弦相似度
-
-    Args:
-        grad1, grad2: 展平的梯度向量
-
-    Returns:
-        cosine: 余弦值，[-1, 1]
-            >0: 方向一致
-            <0: 冲突
-    """
-    dot = torch.dot(grad1, grad2)
-    norm1 = torch.norm(grad1)
-    norm2 = torch.norm(grad2)
-
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-
-    return (dot / (norm1 * norm2)).item()
-
-
-def analyze_gradient_conflicts(model: nn.Module, task_losses: List[torch.Tensor]) -> dict:
-    """
-    分析多任务梯度冲突情况（用于监控训练）
-
-    Args:
-        model: 模型
-        task_losses: 任务损失列表
-
-    Returns:
-        dict: {
-            'conflict_pairs': [(i, j, cosine), ...],  # 冲突对及余弦值
-            'conflict_rate': float,  # 冲突比例
-            'mean_cosine': float,    # 平均余弦
-        }
-    """
-    num_tasks = len(task_losses)
-    if num_tasks <= 1:
-        return {'conflict_pairs': [], 'conflict_rate': 0.0, 'mean_cosine': 1.0}
-
-    # 提取梯度
-    task_grads = []
-    for i, loss in enumerate(task_losses):
-        model.zero_grad()
-        loss.backward(retain_graph=True)
-
-        # 展平梯度
-        grad_flat = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
-        task_grads.append(grad_flat)
-
-    # 两两计算余弦
-    conflict_pairs = []
-    cosines = []
-
-    for i in range(num_tasks):
-        for j in range(i+1, num_tasks):
-            cosine = compute_gradient_cosine(task_grads[i], task_grads[j])
-            cosines.append(cosine)
-
-            if cosine < 0:
-                conflict_pairs.append((i, j, cosine))
-
-    conflict_rate = len(conflict_pairs) / len(cosines) if cosines else 0.0
-    mean_cosine = np.mean(cosines) if cosines else 0.0
-
-    return {
-        'conflict_pairs': conflict_pairs,
-        'conflict_rate': conflict_rate,
-        'mean_cosine': mean_cosine,
-    }
-
-
-# ========== 单元测试 ==========
-
-if __name__ == '__main__':
-    print("[测试] PCGrad梯度投影")
-
-    # 测试1: 梯度投影逻辑
-    grad_i = torch.tensor([1.0, 2.0, 3.0])
-    grad_j = torch.tensor([-1.0, -1.0, 0.0])
-
-    # 计算余弦
-    cosine = compute_gradient_cosine(grad_i, grad_j)
-    print(f"原始梯度余弦: {cosine:.4f} (< 0则冲突)")
-
-    # 创建PCGrad实例（mock optimizer）
-    mock_model = nn.Linear(3, 1)
-    optimizer = torch.optim.SGD(mock_model.parameters(), lr=0.01)
-    pcgrad = PCGrad(optimizer)
-
-    # 投影
-    grad_i_proj = pcgrad._project_conflicting(grad_i, grad_j)
-    cosine_proj = compute_gradient_cosine(grad_i_proj, grad_j)
-    print(f"投影后梯度余弦: {cosine_proj:.4f} (应>=0)")
-
-    assert cosine < 0, "测试用例应构造冲突梯度"
-    assert cosine_proj >= -1e-6, "投影后应消除冲突"
-
-    print("\n[OK] PCGrad核心逻辑测试通过")
-    print("完整测试需真实训练环境（多任务损失backward）")
+# 注: 梯度冲突分析/可视化工具及冒烟测试应在需要时于 tests/ 或独立分析脚本补充
+# (原内联 __main__ 及未被调用的 analyze_gradient_conflicts/compute_gradient_cosine 已删除)。

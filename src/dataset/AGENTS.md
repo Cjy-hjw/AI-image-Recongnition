@@ -81,6 +81,14 @@
   - 接受任意Adapter,返回torch Dataset
   - 与现有`ThyroidDataset`接口兼容,可直接替换
 - **零拷贝**: 保持原始数据不变,仅运行时转换
+- **⚠️ 当前为空壳骨架(官方 schema 未定)**: 具体子类的标签映射(如 ThyroidXL 的
+  TI-RADS→细粒度概念、ThyUS2Path 的 metadata→malignancy)尚未实现真实逻辑。
+  **凡未实现真实映射的任务,其 `get_task_mask` 对应位置一律返回 0(声明无效)**,
+  由下游 `valid_mask`/`label_validity` 在 per-sample 层零梯度屏蔽,**从源头杜绝假标签污染**
+  (宁可少声明有效,不可用 dummy 0/编造映射污染 concept/malignancy 头)。数据到位后按真实
+  schema 补映射,并把对应 valid 改回 1。
+- **拆分待办**: 文件 425 行超 `rules.md §6` 上限,但空壳期重写在即,暂缓拆分(顶部有 TODO
+  标注:数据到位后拆为 `adapters/{base,thyroidxl,thyus2path}.py` + `adapted_dataset.py`)。
 
 ### 动态采样器 (`stage_sampler.py`) — 防止小样本遗忘
 - **背景**: 多源样本规模悬殊(99例 vs 17,412帧),均匀采样导致小样本每epoch仅访问1-2次

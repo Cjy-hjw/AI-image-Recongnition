@@ -1,6 +1,14 @@
 # Gate2验证与文档同步完成报告
 
-## 验证状态：✅ 通过
+> **⚠️ 历史记录 · 结论已被后续复审推翻(2026-07-01 更新)**
+> 本报告记录的是**首轮** Gate2(Sonnet reviewer)的审查与"修复",当时判定"✅ 通过"。
+> 但**二轮 Opus 深度复审**发现首轮修复仍是半成品含 P0 缺陷(测试通过但集成层错误):
+> - `masked_multitask.py` 的 mask 是错误近似(只缩小损失量级、不屏蔽梯度),且绕过 FAMO → **已整体删除**;
+> - PCGrad 对全模型(含私有 head)投影错误、且不兼容 AMP/与 FAMO 互斥 → **已修 shared_parameters + 标注实验性未接入**;
+> - adapter dummy 假标签会污染 malignancy/concept 头 → **已改 valid=0**。
+> 真实最终状态见 `docs/Phase4实施进度报告.md` 第二节与各 `AGENTS.md`。本报告仅存档首轮审查过程,勿据其"通过"结论下判断。
+
+## 验证状态：✅ 通过（首轮口径,已过时,见上方警示）
 
 ### 1. Gate2代码审查（Reviewer Subagent）
 - **Reviewer**: a6b94fc9dc011e880 (Sonnet 4, 56s)

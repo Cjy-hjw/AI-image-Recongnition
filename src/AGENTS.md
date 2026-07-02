@@ -23,7 +23,7 @@
 
 | File | Responsibility |
 |:---|:---|
-| `io.py` | `load_input_image()` — DICOM PHI anonymization (5 fields) + standard image loading |
+| `io.py` | `load_input_image()` — DICOM PHI anonymization (21 PHI fields, HIPAA Safe Harbor) + standard image loading |
 | `gatekeeper_runner.py` | `run_gatekeeper_audit()` — 4-layer gatekeeper (auth + dedup + copy-move + splicing). **predict.py only** |
 | `model_runner.py` | `build_model()`, `preprocess_image()`, `run_forward()` — `torch.inference_mode()` + autocast + clamp [-15,15] |
 | `postprocess.py` | `decode_predictions()`, `build_tirads_breakdown()` |

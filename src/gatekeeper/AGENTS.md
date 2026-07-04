@@ -38,7 +38,7 @@ This protocol defines the 3-layer gatekeeper pipeline for detecting fake, duplic
 - **Model**: Shallow MLP 三分类器(`AuthenticityClassifier`)。
 - **Weights**: Trained during `train.py` startup, saved to `checkpoints/authenticity_model.pth`. 推理端因 ckpt 含 numpy `feat_mean/feat_std`,torch≥2.6 必须 `torch.load(..., weights_only=False)`;该路径只允许加载本项目自产可信权重。正式训练出固定权重后须同步 `AuthenticityModule.EXPECTED_CKPT_SHA256`,否则 `weights_only=False` 缺少完整性约束会重新暴露 pickle 任意代码执行风险。
 - **验证**: 训练结束在验证集报告三类准确率。
-- **Red-line**: MLP weights MUST NOT be altered without retraining on physical phantom datasets.
+- **Red-line**: authenticity MLP 权重变更须重新在物理体模数据集上全量训练；不可仅调参或微调已有权重。
 
 > **历史说明**: 旧版用 `torch.randn` 随机噪声 + 随机标签做假训练(完全无用占位),已于本次重写为真实特征训练流程。
 
@@ -76,4 +76,4 @@ Two-stage duplicate detection:
 ## 4. GATEKEEPER SCOPE
 
 - **Production inference only**: Gatekeeper runs in `predict.py` for deployment safety.
-- **Offline evaluation bypass**: Gatekeeper is NOT run during `evaluate.py` (holdout benchmarking) — all holdout samples are known-clean ground truth, and running GLCM+FAST/RANSAC on 614 samples would add ~15 minutes with no diagnostic value.
+- **Offline evaluation bypass**: evaluate.py 路径跳过 gatekeeper（holdout 为已知干净真值，详见 src/inference/AGENTS.md Usage Contract）。

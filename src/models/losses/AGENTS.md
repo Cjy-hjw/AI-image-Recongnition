@@ -75,7 +75,7 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
 - NaN Sentinel打印到stdout（flush=True）
 
 ### 优化器隔离
-- vCLUB使用独立optimizer，禁止主optimizer更新vCLUB参数
+- vCLUB 参数由专属 vclub_optimizer 更新，主 optimizer 的参数组中显式排除 vclub 模块
 - 见`src/training/AGENTS.md §1`
 
 ---

@@ -5,7 +5,7 @@
 ### PCGrad优化器 (`pcgrad.py`) — 梯度冲突消解 ⚠️实验性,未接入训练主循环
 - **⚠️ 边界约束(激活前必读)**:
   - **未接入 `train.py`**: 当前训练主循环用 FAMO 动态加权,不调用本类。
-  - **与 FAMO 互斥**: PCGrad 与 FAMO 是两套多任务权衡方案,二选一,叠加语义未定义,禁止同时启用。
+  - **与 FAMO 互斥**: PCGrad/FAMO 二选一：启用 PCGrad 前须先从 train.py 移除 FAMO 调用，并过 Gate2 复审。
   - **不兼容 AMP/GradScaler**: `pc_backward` 手工 `backward()`+`grad.copy_()`,GradScaler 感知不到这些
     手工梯度,会与 `scaler.step()` 冲突(inf/nan 静默跳步)。启用需 fp32 或额外适配。
   - **激活前必须过 Gate2 复审**(`rules.md §2`)。
@@ -44,7 +44,7 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 
 ### Critical Freezing Rules
 
-- **vCLUB isolation**: `model.vclub` optimized by **separate** `vclub_optimizer` (lr=1e-4), never by main optimizer.
+- **vCLUB isolation**: vCLUB 使用专属 vclub_optimizer(lr=1e-4) 独立优化；主 optimizer 参数组显式排除 vclub 参数。
 - **Stage 1**: `loss_mal` and `loss_supcon` multiplied by 0.0 to prevent classification gradient leakage.
 - **Stage 3**: FAMO disabled (`update_famo_weights=False`).
 - **BatchNorm auto-eval**: After `model.train()`, modules with all-frozen params are set to `.eval()` (see `loop/bn_freeze.py`).

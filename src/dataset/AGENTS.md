@@ -98,4 +98,16 @@
   - 支持过采样(小样本重复)和欠采样(大样本随机子集)
 - **使用**: 配合`MultiSourceThyroidDataset`的`get_sample_weights()`
 
+### PathologyDataset (`pathology_dataset.py`) — 病理良恶性预训练数据集
+
+- **用途**: 官方数据(2026-08-01)到位前,用 ThyUS2Path(figshare 27021604)8500张原生JPG预训 malignancy 分支。
+- **数据形态**: A800 `/home/cjy/AI_image_Recognition/data/27021604_extract/`，batch1(6005 Jpg, 601患者) + batch2(2503 Jpg, 241患者)，患者级 histo_label(0良/1恶)。
+- **关键设计**:
+  - `build_pathology_samples(root)`: **扫目录**而非依赖 image.csv 枚举(batch1 CSV序号跳空约43%，扫目录可用全部磁盘文件)；从文件名首段提取 patient_id；患者级标签广播到图像级。
+  - `patient_grouped_split(samples, val_frac, seed)`: 按 `patient_key` 分组 + 分层(按label)划分 train/val，**同一患者所有图像必须在同侧**，防超声连续帧泄漏。seed 固定可复现。
+  - batch1/batch2 患者编号数值完全重叠(各自从0独立编号)，用 `b1_`/`b2_` 前缀隔离，防误并。
+- **输出接口**: 与 `ThyroidDataset` 完全同构 `(img[1,H,W]f32∈[0,1], mask[1,H,W]全零, labels)`；仅 `valid_malignancy=1`，其余 `valid_*=0`，`valid_mask=0`——下游 masked loss 对无标签任务自动零梯度，可无缝接现有训练循环。
+- **预训练脚本**: `scripts/pretrain_malignancy.py`，单任务CE+AdamW+bf16 AMP(无GradScaler)；按患者分组train/val；含早停(epoch≥3 且 val_auc<0.55 中止)；best-AUC checkpoint存 `checkpoints/malignancy_pretrain_best.pth`。
+- **测试覆盖**: `tests/test_pathology_dataset.py`，20个测试(标签广播、列顺序容错、无泄漏、分层、可复现、输出形状/dtype/valid键)，全部 PASS。
+
 **注意**: 以上组件等ThyroidXL/ThyUS2Path数据到位后激活,当前为框架预备。

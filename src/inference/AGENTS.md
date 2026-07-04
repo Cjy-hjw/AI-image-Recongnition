@@ -34,7 +34,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 ### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None)` → `(passed, rejection_json)`
 
-**Scope**: Production inference only. `evaluate.py` MUST NOT import this module.
+**Scope**: Production inference only. evaluate.py 仅导入 model_runner/postprocess/export 三模块；gatekeeper_runner 由 predict.py 专属使用。
 
 - `deduplicator` 可选:传入预先用 `build_seeded_deduplicator(config, device)` 播种好的实例,供**视频逐帧复用**(否则每帧重复读取+ResNet 编码最多 200 张训练图,O(帧数×200) 拖慢延迟)。为 None 时即时构建,单图路径行为不变(向后兼容)。
 - **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
@@ -70,7 +70,7 @@ Pipeline:
 - `cv2.resize` to `img_size`, normalize `/255.0`, shape `[1, 1, H, W]`.
 
 ### `run_forward(model, img_tensor, precision, device)` → `dict`
-- **`torch.inference_mode()`** — never `torch.no_grad()`.
+- **`torch.inference_mode()`** — 所有推理前向统一使用 `torch.inference_mode()`，替代 no_grad。
 - **`torch.autocast`** with device-adaptive dtype:
   - CPU + fp16 → fallback to fp32 with `[WARNING]`.
 - **Safety clamp**: `torch.clamp(outputs["malignancy"].float(), min=-15.0, max=15.0)` under fp16/bf16.
@@ -136,4 +136,4 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 | `predict.py` | `io`, `gatekeeper_runner`, `model_runner`, `postprocess`, `export` | — |
 | `evaluate.py` | `model_runner`(含 `run_forward`), `postprocess`, `export` | `gatekeeper_runner` (holdout = clean ground truth) |
 
-**前向一致性**: `evaluate.py` 必须经 `run_forward(model, img, precision, device)` 跑前向(与 `predict.py` 同一 precision + malignancy clamp),不得直接 `model(img)`,否则 holdout AUC 与生产数值路径不一致、基准失真。`evaluate.py` 提供 `--precision {fp32,fp16,bf16}`,评估生产指标时应与部署精度一致。
+**前向一致性**: evaluate.py 必须经 run_forward(model, img, precision, device) 调用前向，保证与生产数值路径一致。`evaluate.py` 提供 `--precision {fp32,fp16,bf16}`,评估生产指标时应与部署精度一致。

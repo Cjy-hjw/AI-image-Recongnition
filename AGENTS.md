@@ -16,74 +16,34 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
 | **CI / 架构铁律** | `/.github/workflows/ci.yml` + `/.importlinter` | PR/push 到 main 自动跑两 job:① import-linter 4 契约(inference⊄training、models 无反向依赖、gatekeeper⊄上层、utils 叶子层)② Gate 1 七门 + 全套 pytest。任一红则挡合并。 |
-| **Tests** | `/tests/AGENTS.md` | 全套 161 passed:14 physical_prior + 15 cbm_head + 19 phase_refactor(Phase A/B/C/D regression) + 41 gatekeeper + 10 masked_loss + 21 video(动态图/cine 管线 + 通道形态/通道序/彩色单图 DICOM 回归) + 2 authenticity_trainer(smoke) + 7 multisource(多源混训骨架) + 2 smoke_entrypoints(CLI 入口端到端) + 11 calibration(温度缩放降级/单调/ECE/拟合) + 19 entrypoint_dispatch(容器扩展名分发 + PRODUCTION 防篡改阻断 + src 树指纹 bash/Python 字节级一致). |
+| **Tests** | `/tests/AGENTS.md` | 全套 **181 passed**:14 physical_prior + 15 cbm_head + 19 phase_refactor + 41 gatekeeper + 10 masked_loss + 21 video + 2 authenticity_trainer + 7 multisource + 2 smoke_entrypoints + 11 calibration + 19 entrypoint_dispatch + **20 pathology_dataset**(标签广播/患者分组/valid键契约). |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---
 
 ## 1. MODULAR CODE ARCHITECTURE
 
-The project follows strict functional decomposition (see `rules.md` §6):
+模块文件结构与职责详见各子目录 AGENTS.md；此处仅列顶层导航。
 
-### `src/models/` — Model architecture definitions
-  - `multi_task_model.py` — Main model assembly (dual-backbone, stage freeze registry)
-  - `pretrained_loader.py` — `load_local_safetensors()` for offline backbone weights
-  - `physical_prior.py` — Differentiable physical feature extraction
-  - `cbm_head.py` — Concept bottleneck model head
-  - `losses/` — Decomposed loss functions (segmentation, classification, concepts)
-  - `losses/components/` — MultiTaskLoss computation modules (segmentation, concepts, malignancy, famo_mix, regularizers)
+- **`src/models/`** — 双主干模型 + CBM 头 + 物理先验 + 损失：见 `src/models/AGENTS.md`
+- **`src/training/`** — 三阶段渐进训练 + GradScaler 协议 + vCLUB 隔离：见 `src/training/AGENTS.md`
+- **`src/inference/`** — 推理管线（io / model_runner / postprocess / calibration / export / video）：见 `src/inference/AGENTS.md`
+- **`src/dataset/`** — 数据加载 + 增强 + PathologyDataset 病理预训练：见 `src/dataset/AGENTS.md`
+- **`src/gatekeeper/`** — 真实性 / 去重 / 篡改四层门控：见 `src/gatekeeper/AGENTS.md`
+- **`scripts/`** — 7-Gate verify_model.py + 数据格式化 + 预训练管道：见 `scripts/AGENTS.md`
+- **`tests/`** — 181 tests（含 20 pathology_dataset 新增）：见 `tests/AGENTS.md`
 
-### `src/training/` — Training pipeline logic
-  - `stages.py` — Three-stage parameter freezing strategy
-  - `trainer.py` — Training/validation epoch orchestrators
-  - `loop/` — Per-batch computation (train_step, validate_step, slr, vclub, bn_freeze)
-  - `authenticity_trainer.py` — Authenticity classifier training
-
-### `src/inference/` — Shared inference pipeline (predict.py + evaluate.py)
-  - `io.py` — Image loading + DICOM PHI anonymization
-  - `gatekeeper_runner.py` — 4-layer gatekeeper audit (predict.py only)
-  - `model_runner.py` — Model build + preprocess + forward (inference_mode + autocast)
-  - `postprocess.py` — Prediction decoding(可选 `calibrator` 温度缩放)+ TI-RADS breakdown
-  - `calibration.py` — Post-hoc 温度缩放(`TemperatureScaler` 缺参数 T=1.0 降级 + `fit_temperature`/`fit_ordinal_temperature` + `compute_ece`/`reliability_diagram`)
-  - `export.py` — Artifact saving + Grad-CAM overlay
-  - `video_io.py` — 动态图/cine 抽帧(MP4/AVI/MOV/MKV + 多帧 DICOM);`video_aggregate.py` — 抽样下标 + 帧级聚合(恶性取最大帧)。驱动:根目录 `video_predict.py`
-
-### `src/dataset/` — Data pipeline
-  - `loader.py` — ThyroidDataset with PatientID grouping
-  - `augmentation/transforms.py` — 7 ultrasound-specific transforms + `get_train_transforms()`
-  - `augmentation/mixup.py` — Dominant-Region CutMix + standard MixUp
-
-### `scripts/` — Verification & data formatting
-  - `verify/gates/` — 7 individual gate modules (gate1_shapes..gate7_optimizer_lr)
-  - `verify/runner.py` — Gate orchestrator (`verify()`)
-  - `data/pseudo_labels.py` — TI-RADS pseudo-label extraction
-  - `data/split_tn3k.py` — 纯随机图像级 train/val/holdout 划分(Phase D)
-
-### `tests/` — 回归测试套件(全套 161 tests)
-  - `test_physical_prior.py` — DifferentiablePhysicalPriorExtractor (14 tests)
-  - `test_cbm_head.py` — ConceptEmbeddingCBMHead (15 tests)
-  - `test_phase_refactor.py` — Phase A/B/C/D 重构回归守卫 (19 tests)
-  - `test_gatekeeper.py` — 合成引擎(含泊松拼接/域随机化)/dedup/copy-move/authenticity/splicing 几何判据 + SSCD 可插拔后端 + CAT-Net v2 DCT/BAG 取证(可插拔降级) (41 tests)
-  - `test_masked_loss.py` — Masked Task-Specific Loss 无效样本零梯度 (10 tests)
-  - `test_video.py` — 动态图/cine 管线(抽样/聚合/灰度/解码/去重注入)+ 通道形态全覆盖/RGB-BGR 通道序/彩色单图 DICOM 收敛 2D 回归 (21 tests)
-  - `test_authenticity_trainer.py` — 真实性分类器训练器 smoke (2 tests)
-  - `test_multisource.py` — 多源混训骨架 + 源级 label_mask (7 tests)
-  - `test_smoke_entrypoints.py` — CLI 入口端到端冒烟(子进程实跑 predict/video_predict:predict 噪声图+video `--skip_gatekeeper` 两路径,只兜管线连通+产物落盘+JSON 可解析;gatekeeper 判定随平台浮点翻转故不作硬断言) (2 tests)
-  - `test_calibration.py` — 温度缩放校准骨架(缺参数 T=1.0 降级逐位等价 / T>1 压低置信度不改 argmax / ECE 数值正确 / 拟合返正温度) (11 tests)
-  - `test_entrypoint_dispatch.py` — 容器入口 entrypoint.sh:按扩展名分发(mp4/avi/mov/mkv/dcm/dicom→video_predict、其余→predict)+ flag 透传 + PRODUCTION=1 防篡改阻断(predict/src 树哈希不符在 exec 前 exit 1)+ src 树聚合指纹 bash(`_src_tree_hash.sh`)与 Python(`seal_container.py`)字节级一致 (19 tests)
-
-**Backward Compatibility**: All decomposed modules maintain `__init__.py` re-export shims to preserve existing import paths.
+所有拆分模块通过 `__init__.py` re-export shim 保持旧导入路径兼容。
 
 ---
 
 ## 2. PRODUCTION INFERENCE & CONTAINER DEPLOYMENT
 
 ### 2.1 Inference Optimizations
-- **Inference Mode**: All forward passes run under `torch.inference_mode()` (via `src/inference/model_runner.py`).
-- **Adaptive Precision**: `--precision` choices `fp32`, `fp16`, `bf16`. Half-precisions apply `torch.clamp(..., min=-15.0, max=15.0)` on malignancy predictions.
+见 `src/inference/AGENTS.md` §3（`torch.inference_mode()` + clamp ±15 规范）。
 
 ### 2.2 PACS DICOM Metadata Anonymization
-- **Privacy Standard**: 21 PHI fields overwritten (HIPAA Safe Harbor). 完整字段清单与脱敏规则见 `QA_VP.md §1.6` 及 `src/inference/io.py` 的 `_PHI_FIELDS`(日期类置 `"00000101"`,其余置 `"ANONYMIZED"`)。
+21 PHI 字段脱敏（HIPAA Safe Harbor）。字段清单与规则见 `src/inference/AGENTS.md` §1 及 `QA_VP.md §1.6`。
 
 ### 2.3 Container Checksum Verification & Entrypoint Dispatch
 - `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth`, `predict.py`, `video_predict.py`, **and the entire `src/` tree** (核心推理逻辑,原仅校验入口脚本是防篡改盲区,现闭合)。`PRODUCTION=1` → hard exit on any hash mismatch.
@@ -101,20 +61,11 @@ The project follows strict functional decomposition (see `rules.md` §6):
 - **EMA Entropy Gating**: EMA-tracked median entropy in `cbm_head.py`, 5% leakage floor.
 - **SupCon Projection Remapping**: 352-dim pooled backbone features (not 288-dim concept features).
 
-### 3.2 Dual-Backbone Architecture (Implemented)
-- **Heterogeneous Dual-Backbone**: `ConvNeXt-Nano` for Segmentation (high frequency, spatial), `EfficientNet-B2` for Classification (global semantics).
-- **Task-Alignment Adaptor**: Unidirectional cross-layer spatial alignment using `f_seg_detached` as a soft attention gate for classification features at Stage 3 and Stage 4.
+### 3.2 Dual-Backbone Architecture
+ConvNeXt-Nano（分割）+ EfficientNet-B2（分类）+ TaskAlignmentAdaptor 跨任务对齐。见 `src/models/AGENTS.md` §1。
 
 ### 3.3 Loss & Training Changes
-- **5-Task FAMO**: segmentation, concepts, prior, malignancy, supcon — independent channels prevent gradient cancellation.
-- **3-Stage Progressive Training**: Stage 1 (1-40) seg+concepts only; Stage 2 (41-100) full; Stage 3 (101-120) backbone frozen, AUC fine-tuning.
-- **Stage 1 Gradient Masking**: `loss_mal` and `loss_supcon` zeroed when `stage=1`.
-- **AUCM Dual Params**: `no_decay_params` group (weight_decay=0.0).
+5-Task FAMO + 3 阶段渐进 + Stage 1 梯度遮蔽 + AUCM 对偶参数。见 `src/models/AGENTS.md` §7 和 `src/training/AGENTS.md` §1。
 
 ### 3.4 Verification
-- **7-Gate Test Suite**: `python scripts/verify_model.py` — all gates must pass.
-- **Automatic BatchNorm Eval**: Frozen modules auto-set to `.eval()` after `model.train()`.
-
-See `src/models/AGENTS.md` §6-9 and `src/training/AGENTS.md` §1 for detailed specifications.
-
-服务器项目在home/cjy下；该搜索时就搜索；
+`python scripts/verify_model.py` — 7 门全过（shapes / vCLUB / AUC-margin / FAMO / data-leakage / stage1-masking / optimizer-lr）。见 `scripts/AGENTS.md` §2。

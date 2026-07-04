@@ -10,7 +10,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~190 lines |
 | `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor, decoder, stage freeze registry) | ~300 lines |
 | `losses/` | Decomposed loss function subpackage | See below |
-| `loss.py` | Backward-compatible re-export shim (DO NOT add new code here) | ~35 lines |
+| `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
 | `famo.py` | FAMO dynamic loss weight scheduler | ~50 lines |
 | `pretrained_loader.py` | `load_local_safetensors()` — offline backbone weight loader (ConvNeXt seg + EfficientNet cls) | ~36 lines |
 
@@ -35,7 +35,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |
 | `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` |
 
-**Rule**: New loss functions MUST go into the appropriate `losses/` submodule or `losses/components/` file, NOT into `loss.py` or `multitask.py` directly. `loss.py` is a shim only.
+**Rule**: 新损失函数放入 losses/ 子模块或 losses/components/ 文件，由 multitask.py 调用。`loss.py` is a shim only.
 
 ---
 

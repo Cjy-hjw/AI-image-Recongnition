@@ -12,7 +12,45 @@
 - `QA_VP.md` — 代码审查 / 验证门细则,由 `rules.md §2` 在跑 Gate 2 时触发去读。
 - 各目录 `AGENTS.md` — 模块级规则(架构 / 训练 / 推理 / 数据 / 测试 / gatekeeper),**改某模块前先读其 `AGENTS.md`**;总索引见根目录 `AGENTS.md`。
 
-## 项目要点
+## 开发命令（AI 无法从代码推断）
+
+```bash
+# 完整测试套件（本地 Windows 须用 A800/CI，GBK bug 见 memory/gate1-windows-gbk-bug.md）
+pytest tests/ -v
+
+# 单文件测试
+pytest tests/test_pathology_dataset.py -v
+
+# Gate1 模型验证（仅服务器/CI，本地 GBK 会报错）
+python scripts/verify_model.py
+
+# 病理预训练（A800，随机初始化，全量8500张）
+python scripts/pretrain_malignancy.py --no-pretrained --epochs 30 --batch-size 32
+
+# 冒烟验证管道（快速3epoch）
+python scripts/pretrain_malignancy.py --smoke --no-pretrained --batch-size 8
+```
+
+## Git 规范（AI 无法从 git log 推断格式约定）
+
+**分支命名**：`feat/<功能>` / `fix/<问题>` / `chore/<维护>` / `refactor/<模块>` / `docs/<文档>`
+
+**Commit message 格式**（Conventional Commits）：
+```
+feat(模块): 简短描述（≤70字）
+
+详细说明（可选）
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+```
+
+**PR 规范**：
+- 标题 ≤ 70 字，用 Conventional Commits 前缀
+- 描述包含：改动摘要 / 测试说明 / 是否影响推理容器
+
+**CI 验证**（rules.md §2 强制）：push 后用 `gh run list --branch <branch> --limit 1`（走代理）核对 headSha 匹配且 `conclusion=success`。
+
+
 
 - **比赛约束**:赛道七**仅「自有模型组」**,交付为离线推理容器(`predict.py` 单图 + `video_predict.py` 动态图,`entrypoint.sh` 按扩展名自动分发),打包 gatekeeper + TaskAlignmentAdaptor + CBM 报告生成器。
 - **当前卡点**:官方数据 **2026-08-01 初赛启动**后才可用、**禁本地、JPG、含动静态图**;在此之前核心三项(真实性 / 规范性 / 良恶性)无法真训。进度见 `docs/之前表现.md`、`docs/比赛对齐与风险.md`。

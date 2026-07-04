@@ -1,12 +1,27 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/proxy_check.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
-        "matcher": "Write|Edit",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "python .claude/hooks/post_edit_check.py"
+          },
+          {
+            "type": "command",
+            "command": "python .claude/hooks/gate2_reminder.py"
           }
         ]
       }

@@ -1,19 +1,18 @@
 """门控注意力多示例学习(Gated-Attention MIL)——患者级良恶性聚合。
 
 动机(见 memory/patient-leakage-and-probe-trap.md + reference/…MIL深度方案.md):
-    ThyUS2Path 是**患者级弱标签**:一个患者一个病理 histo_label,广播到其所有
-    超声帧。但一个患者几十帧里只有少数帧拍到病灶靶区,大量帧是正常腺体/伪影。
-    单帧强监督 → 梯度被背景帧污染 → 无泄漏患者级 AUC 卡在 ~0.50(已对拍证实)。
+    ThyUS2Path 是**患者级弱标签**。MIL 把全部帧作为 bag,门控注意力自动挑病灶帧。
 
-    MIL 把一个患者的全部帧当作一个「包(bag)」,门控注意力自动学习每帧对最终
-    诊断的贡献权重(压制背景帧、放大病灶帧),加权聚合成**患者级**特征向量再分类。
+架构演进(见 reference/甲状腺超声图像弱监督多实例学习良恶性分类研究与骨干网络微调瓶颈分析报告.md):
+    原始版:backbone(num_classes=0) → GAP → [N,1408] → GatedAttentionPooling。
+    GAP 将 16×16 空间图均值化,微钙化等高频特征被稀释 256 倍,是 Phase1 AUC 卡
+    在 0.5653(vs 官方基准 0.735-0.754)的根本原因。
 
-阶段1(本文件当前用法):冻结 ImageNet backbone,只训 mil_pooling + classifier。
-    目标:无泄漏患者级 AUC 从 0.50 突破到 0.65-0.70,验证 MIL 路线成立。
+    改进版(当前):backbone.forward_features() → [N,1408,16,16]
+        → SpatialAttentionModule(保留空间判别性) → [N,1408]
+        → GatedAttentionPooling → [1,1408] → classifier → [1,2]
 
-架构:Ilse et al. (2018) "Attention-based Deep MIL" 的门控注意力变体。
-    独立 timm EfficientNet-B2(in_chans=1, num_classes=0 → 1408 维标准 pooled 特征),
-    不复用 MultiTaskThyroidModel(去掉无关 seg/CBM 分支,省显存)。
+阶段1:冻结 ImageNet backbone,只训 spatial_attn + mil_pooling + classifier。
 """
 
 import torch
@@ -27,6 +26,37 @@ from src.models.pretrained_loader import load_local_safetensors
 EFFNET_B2_FEATURE_DIM = 1408
 # ImageNet 权重(A800 已上传;缺失时 load_local_safetensors 静默返回 False 走随机初始化)。
 _DEFAULT_BACKBONE_WEIGHTS = "checkpoints/efficientnet_b2_pretrained.safetensors"
+
+
+class SpatialAttentionModule(nn.Module):
+    """帧内空间注意力:保留微钙化等高频特征,避免 GAP 均值化稀释。
+
+    输入: [N, C, H, W]  (backbone.forward_features 空间特征图)
+    输出: [N, C]        (空间注意力加权平均,保留局部判别性激活)
+
+    用 1×1 Conv 两层在通道维度生成空间注意力分数 [N,1,H,W],
+    sigmoid 归一化后对特征图做空间加权平均,代替朴素 GAP。
+
+    理论依据:报告 §图像分辨率与特征损耗 — GAP 把 16×16=256 个空间位置取均值,
+    微钙化等 1×1-2×2 高亮激活被稀释 256 倍,是 Phase1 AUC 上界受限的根本原因。
+    空间注意力允许模型专注于病灶局部激活,不被背景均值稀释。
+    """
+
+    def __init__(self, channels: int = EFFNET_B2_FEATURE_DIM, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 32)
+        self.score = nn.Sequential(
+            nn.Conv2d(channels, mid, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, kernel_size=1, bias=True),   # → [N, 1, H, W]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [N, C, H, W] → [N, C]"""
+        attn = torch.sigmoid(self.score(x))                          # [N, 1, H, W]
+        attn = attn / (attn.sum(dim=[-2, -1], keepdim=True) + 1e-6)  # 归一化为概率
+        out = (x * attn).sum(dim=[-2, -1])                           # [N, C]
+        return out
 
 
 class GatedAttentionPooling(nn.Module):
@@ -58,10 +88,13 @@ class GatedAttentionPooling(nn.Module):
 
 
 class ThyroidMILNet(nn.Module):
-    """端到端 MIL 网络:逐帧 backbone 提特征 → 门控注意力聚合 → 患者级分类。
+    """端到端 MIL 网络:逐帧 backbone 提特征 → 空间注意力 → 帧级聚合 → 患者级分类。
 
     输入一个患者的 bag [N, 1, H, W],输出 (logits[1, 2], weights[N, 1])。
     weights 可视化每帧对诊断的贡献,供临床解释。
+
+    改进:backbone.forward_features() 输出 [N, C, H, W] 空间图,经 SpatialAttentionModule
+    后再进 GatedAttentionPooling——保留微钙化等空间判别信息,不被 GAP 均值化稀释。
     """
 
     def __init__(
@@ -76,7 +109,7 @@ class ThyroidMILNet(nn.Module):
     ):
         super().__init__()
         self.feature_dim = feature_dim
-        # 独立单通道 backbone,num_classes=0 → 输出 pooled 特征(EfficientNet-B2=1408)。
+        # 独立单通道 backbone；forward_features() 输出未池化空间图 [N, C, H, W]。
         self.backbone = timm.create_model(
             backbone_name, pretrained=False, in_chans=1, num_classes=0
         )
@@ -90,12 +123,13 @@ class ThyroidMILNet(nn.Module):
                     "走随机/timm 默认初始化。",
                     flush=True,
                 )
-        # 阶段1:冻结 backbone,只训聚合头 + 分类头。
+        # 阶段1:冻结 backbone,只训 spatial_attn + mil_pooling + classifier。
         self.backbone_frozen = freeze_backbone
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
+        self.spatial_attn = SpatialAttentionModule(feature_dim)   # 新增:替代 GAP
         self.mil_pooling = GatedAttentionPooling(feature_dim, attn_dim)
         self.classifier = nn.Sequential(
             nn.Dropout(p=0.3),
@@ -103,12 +137,19 @@ class ThyroidMILNet(nn.Module):
         )
 
     def _extract_features(self, bag: torch.Tensor) -> torch.Tensor:
-        """bag [N,1,H,W] → 实例特征 [N, feature_dim]。冻结时 backbone 不建图省显存。"""
+        """bag [N,1,H,W] → 实例特征 [N, feature_dim]。
+
+        改进:用 forward_features() 取 [N,C,H,W] 空间图,经 SpatialAttentionModule
+        加权平均后输出 [N,C]——保留微钙化等局部判别信息,不被 GAP 稀释。
+        冻结时 backbone 不建计算图,省显存。
+        """
         if self.backbone_frozen:
-            self.backbone.eval()  # 冻结:BN 用 running stats,前向不更新统计量
+            self.backbone.eval()  # 冻结:BN 用 running stats
             with torch.no_grad():
-                return self.backbone(bag)
-        return self.backbone(bag)
+                feat_map = self.backbone.forward_features(bag)  # [N, C, H, W]
+        else:
+            feat_map = self.backbone.forward_features(bag)      # [N, C, H, W]
+        return self.spatial_attn(feat_map)                      # [N, C]
 
     def forward(self, bag: torch.Tensor):
         """bag: [N, 1, H, W] 单患者所有帧。返回 (logits[1, num_classes], weights[N, 1])。"""
@@ -166,10 +207,11 @@ class ThyroidMILNet(nn.Module):
         backbone_base_lr = head_lr * backbone_lr_scale
 
         groups: list = []
-        # head 参数(mil_pooling + classifier)使用最高 lr
+        # head 参数(spatial_attn + mil_pooling + classifier)使用最高 lr
         groups.append({
             "params": (
-                list(self.mil_pooling.parameters())
+                list(self.spatial_attn.parameters())
+                + list(self.mil_pooling.parameters())
                 + list(self.classifier.parameters())
             ),
             "lr": head_lr,

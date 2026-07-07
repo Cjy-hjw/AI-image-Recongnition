@@ -107,7 +107,16 @@
   - `patient_grouped_split(samples, val_frac, seed)`: 按 `patient_key` 分组 + 分层(按label)划分 train/val，**同一患者所有图像必须在同侧**，防超声连续帧泄漏。seed 固定可复现。
   - batch1/batch2 患者编号数值完全重叠(各自从0独立编号)，用 `b1_`/`b2_` 前缀隔离，防误并。
 - **输出接口**: 与 `ThyroidDataset` 完全同构 `(img[1,H,W]f32∈[0,1], mask[1,H,W]全零, labels)`；仅 `valid_malignancy=1`，其余 `valid_*=0`，`valid_mask=0`——下游 masked loss 对无标签任务自动零梯度，可无缝接现有训练循环。
-- **预训练脚本**: `scripts/pretrain_malignancy.py`，单任务CE+AdamW+bf16 AMP(无GradScaler)；按患者分组train/val；含早停(epoch≥3 且 val_auc<0.55 中止)；best-AUC checkpoint存 `checkpoints/malignancy_pretrain_best.pth`。
+- **预训练脚本**: `scripts/pretrain_malignancy.py`，单任务CE+AdamW+bf16 AMP(无GradScaler)；按患者分组train/val；默认走ImageNet迁移学习(加载`checkpoints/{efficientnet_b2,convnext_nano}_pretrained.safetensors`，无权重时`--no-pretrained`退回随机初始化)。
+  - **⚠️当前状态(2026-07-07)：预训练未成功，无泄漏 val AUC ≈ 0.50，等于没学到可泛化判别力。** 方案调研中(见 `docs/提示词_malignancy预训练调研.md`)，勿据此 checkpoint 下游微调。
+  - **血泪教训(详见 `memory/patient-leakage-and-probe-trap.md`)**: 曾用随机 KFold 做 linear-probe 得 AUC=0.705，误判"backbone特征好、是CBM头损耗0.18"，遂在分类头上一路瞎改(绕CBM→临时linear_head→BatchNorm→冻结backbone)全是错方向。**对拍实验证实 0.705 是 patient 泄漏虚高**(同患者帧被随机分进train+val)；按患者分组的无泄漏真值仅 **0.5012**。头没问题，是 backbone 没学到东西。对拍脚本 `scripts/data/duipai_probe_vs_head.py`。
+  - **评估铁律**: 患者级标签，所有评估**必须** `patient_grouped_split`/`GroupKFold(patient_id)`，**禁随机KFold**。
+  - **脚本现有开关**: `--freeze-backbone`(LP模式,冻结cls_backbone只训头)；linear_head=`BatchNorm1d(352)+Linear(352,2)`(绕CBM,产物只保backbone)；分层LR(early=lr/8,late=lr*3/8,head=lr*2,默认lr=8e-5)；weight_decay=0.05；早停val_loss patience=7。**注：这些开关已验证无法突破0.50上界——根因在数据/任务(患者级弱标签,单帧未必反映结节良恶性)，非超参。下一步方向:全量FT/自监督/MIL,待调研结论。**
 - **测试覆盖**: `tests/test_pathology_dataset.py`，20个测试(标签广播、列顺序容错、无泄漏、分层、可复现、输出形状/dtype/valid键)，全部 PASS。
+- **MIL 组件** (`src/dataset/pathology_mil_dataset.py`):
+  - `build_patient_bags(samples)` — 把 flat 单帧 samples 按 `patient_key` 聚合成 bag 列表 `[{patient_key, label, img_paths}]`。
+  - `PathologyMILDataset(bags, img_size, transform, max_frames_per_bag=32, random_frames=True)` — `__getitem__` 返回 `(bag[N,1,H,W]f32, label:int, patient_key:str)`；train 随机采样帧、val 固定前 N 帧（可复现）；`patient_class_counts()` 返回患者级计数。
+  - **评估铁律**：MIL 天然患者级——一个 bag 一个预测，AUC 在患者上算，不退回帧级。
+- **MIL 测试覆盖** (`tests/test_pathology_mil_dataset.py`)：11 个测试（bag 聚合/label/顺序/形状/截断/患者级计数/无泄漏/门控注意力/模型前向+冻结）全部 PASS。
 
 **注意**: 以上组件等ThyroidXL/ThyUS2Path数据到位后激活,当前为框架预备。

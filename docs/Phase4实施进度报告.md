@@ -1,6 +1,6 @@
 # Phase 4 实施进度报告
 
-> **当前日期**: 2026-07-01 · **距官方数据发布**: 31 天（2026-08-01 初赛启动后才有真数据）
+> **当前日期**: 2026-07-07 · **距官方数据发布**: 25 天（2026-08-01 初赛启动后才有真数据）
 > **性质说明**: 本阶段所有数据管道/损失组件均为**官方数据到位前的框架预备**,尚未用真实数据训练验证。
 > 详细规格见各模块 `AGENTS.md`,权重清单见 `docs/预训练权重打包清单.md`。
 
@@ -24,6 +24,21 @@
 
 ---
 
+## 一·五、预训练进展
+
+### 单帧CE预训练：已证无效 ❌
+- 无泄漏 val AUC ≈ 0.50，患者级弱标签天花板，无继续推进价值。
+- 根因：同患者多帧随机 KFold 泄漏虚高（probe AUC 0.71），去泄漏后真值 0.50（详见 `memory/patient-leakage-and-probe-trap.md`）。
+- **不再走单帧CE路线**；相关 checkpoint 不作为微调基础。
+
+### MIL预训练（患者级良恶性）：Phase1 完成 ✅
+- 方法：多示例学习（MIL），患者级聚合，冻结backbone，GroupKFold 按 patient_id 严格划分。
+- 结果：`best_patient_val_auc = 0.5653`（epoch 15 早停）。
+- 意义：MIL 方向有效——相比单帧CE已显著高于随机基线，后续解冻可继续提升。
+- **Phase2（解冻backbone + LLRD，目标 patient AUC > 0.65）待启动**。
+
+---
+
 ## 二、本轮代码质量清理(commit 54f0302 后续)
 
 前一版 Phase4 代码经 Gate2 复审发现是**半成品含 P0 缺陷**(测试通过但集成层错误),已清理:
@@ -39,6 +54,7 @@
 
 | 项 | 状态 | 说明 |
 |---|---|---|
+| MIL Phase2（解冻backbone+LLRD） | ⏳ 待启动 | 目标 patient AUC > 0.65；在 Phase1 checkpoint 基础上解冻backbone，使用分层学习率衰减（LLRD） |
 | ThyroidXL 获取 | ⏸️ 阻塞 | 需人工申请 HF 访问(1-3 天);`docs/ThyroidXL数据集获取指南.md` |
 | ThyUS2Path 获取 | ⏸️ 待定 | 原生 JPG,用于域适应;公开集是否真有用**待官方数据到位后再判** |
 | 概念损失 per-sample mask | P1 | 当前全 batch,暂靠 adapter valid=0 兜底 |

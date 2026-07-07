@@ -43,6 +43,10 @@ python scripts/pretrain_malignancy_mil.py --epochs 30 --batch-size 4 --data-root
 # 一键同步本地代码到A800服务器（跳过data/.git/__pycache__/.md，按文件大小增量上传）
 # 须先设环境变量：DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_PASSWORD
 python scripts/deploy.py
+
+# 重训 AuthenticityClassifier（修复 gatekeeper 维度失配 / 特征维度变更后必跑）
+# A800 上运行；产出 checkpoints/authenticity_model.pth (13维 + 标准化参数)
+python scripts/retrain_authenticity.py --data-root data/27021604_extract
 ```
 
 ## Git 规范（AI 无法从 git log 推断格式约定）

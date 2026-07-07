@@ -192,6 +192,8 @@ def main():
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location=device)
         model.backbone.load_state_dict(ckpt["backbone"])
+        if "spatial_attn" in ckpt:
+            model.spatial_attn.load_state_dict(ckpt["spatial_attn"])
         model.mil_pooling.load_state_dict(ckpt["mil_pooling"])
         model.classifier.load_state_dict(ckpt["classifier"])
         print(
@@ -289,6 +291,7 @@ def main():
             best_auc = val_auc
             torch.save({
                 "backbone": model.backbone.state_dict(),
+                "spatial_attn": model.spatial_attn.state_dict(),
                 "mil_pooling": model.mil_pooling.state_dict(),
                 "classifier": model.classifier.state_dict(),
                 "epoch": epoch, "patient_val_auc": val_auc, "img_size": args.img_size,

@@ -141,7 +141,8 @@ def test_mil_net_forward_and_freeze():
     model = ThyroidMILNet(pretrained=False, freeze_backbone=True)
     # backbone 全冻
     assert all(not p.requires_grad for p in model.backbone.parameters())
-    # 头可训
+    # spatial_attn + mil_pooling + classifier 可训
+    assert any(p.requires_grad for p in model.spatial_attn.parameters())
     assert any(p.requires_grad for p in model.mil_pooling.parameters())
     assert any(p.requires_grad for p in model.classifier.parameters())
     # 前向:一个 5 帧 bag → [1,2]
@@ -150,6 +151,15 @@ def test_mil_net_forward_and_freeze():
     logits, weights = model(bag)
     assert logits.shape == (1, 2)
     assert weights.shape == (5, 1)
+
+
+def test_spatial_attention_module_shape():
+    """SpatialAttentionModule: [N,C,H,W] → [N,C],注意力权重归一化。"""
+    from src.models.mil_pooling import SpatialAttentionModule
+    mod = SpatialAttentionModule(channels=1408)
+    x = torch.randn(4, 1408, 16, 16)  # 4帧, 16×16空间图
+    out = mod(x)
+    assert out.shape == (4, 1408), f"期望 (4,1408),得 {out.shape}"
 
 
 def test_mil_net_trainable_params_exclude_backbone():

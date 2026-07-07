@@ -24,11 +24,16 @@ pytest tests/test_pathology_dataset.py -v
 # Gate1 模型验证（仅服务器/CI，本地 GBK 会报错）
 python scripts/verify_model.py
 
-# 病理预训练（A800，随机初始化，全量8500张）
-python scripts/pretrain_malignancy.py --no-pretrained --epochs 30 --batch-size 32
+# 病理预训练（A800，ImageNet迁移学习，全量8500张）
+# 依赖 checkpoints/{efficientnet_b2,convnext_nano}_pretrained.safetensors；缺权重时才加 --no-pretrained 走随机初始化
+# ⚠️预训练当前未成功：无泄漏val AUC≈0.50(patient级弱标签难题)，方案调研中，勿据此checkpoint微调；详见 src/dataset/AGENTS.md + memory/patient-leakage-and-probe-trap.md
+python scripts/pretrain_malignancy.py --epochs 30 --batch-size 32
 
 # 冒烟验证管道（快速3epoch）
-python scripts/pretrain_malignancy.py --smoke --no-pretrained --batch-size 8
+python scripts/pretrain_malignancy.py --smoke --batch-size 8
+
+# MIL（多示例学习）患者级良恶性预训练（阶段1：冻结backbone，目标patient级AUC>0.65）
+python scripts/pretrain_malignancy_mil.py --epochs 30 --batch-size 4 --data-root data/27021604_extract
 ```
 
 ## Git 规范（AI 无法从 git log 推断格式约定）
@@ -62,3 +67,4 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   $env:NODE_OPTIONS="--dns-result-order=ipv4first"
   ```
   适用场景:`pip install`、`huggingface_hub` 下载、`git push/fetch`(见 `rules.md` §5 已有临时环境变量规则)、`curl`/`wget` 等。
+

@@ -29,6 +29,9 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
 * **Rule (Long-term Runs)**: If a training session is confirmed to be stable (i.e. model compiles, gradient flows, and metrics like Dice/Loss improve steadily over the first 5+ epochs), you **MAY** yield and stop the task session to save token resource. If it is a quick test, you must wait and monitor it inline.
 * **Rule (Deep Research Gate)**: Before any major architectural iteration or complex optimization strategy change, the agent **MUST** generate a `提示词.md` and instruct the user to run a Deep Research query (via o1/o3-mini or specialized agents) to fetch the latest medical imaging constraints.
 * **Rule (Deep Research Grounding)**: Deep Research 查询必须附带相关代码片段（形态学 renderer 实现、数据形状、tensor 切片索引）作为 grounding 上下文，确保数学公式、grid/shape 对齐、numpy/pytorch 类型强制均基于实际实现。
+* **Rule (长输出落文件)**: 凡**调研提示词、Deep Research 结论、大段方案/报告**，一律创建 `.md` 文件（提示词进 `docs/提示词_<主题>.md`，调研结论进 `docs/`），**不直接刷屏输出到对话**。理由：① 可复用、可 diff、可追溯；② 不污染对话上下文触发压缩。对话里只留一句"已写入 `<路径>`"+关键结论摘要。
+* **Rule (先证后改·别猜)**: 遇到**反常数字或矛盾现象**（如 probe 0.71 vs 训练 0.50、指标与预期不符），**第一反应必须是对拍实验/质疑评估协议/Deep Research 查经典坑，用数字锁死根因后再动手**，严禁逐个改超参/改结构盲试。血泪教训：malignancy 预训练曾因轻信随机 KFold 的 probe 0.705（实为 patient 泄漏虚高，无泄漏真值 0.50），一路在分类头上瞎改（绕CBM→linear_head→BatchNorm→冻结backbone）全是错方向，折腾大半天；一次对拍实验（同特征只换划分方式，0.71→0.50）即锁死真相。详见 `memory/patient-leakage-and-probe-trap.md`。
+  - **医学影像评估铁律**: 患者级标签的数据，**所有评估一律按患者分组**（`patient_grouped_split` / `GroupKFold(patient_id)`），**禁用随机 KFold / train_test_split**——同患者多帧分进 train+val 会造成泄漏、AUC 虚高，是最常见的自欺陷阱。
 * **Rule (Dynamic Maintenance 代码-文档同步)**: `rules.md` 与各级 `AGENTS.md` 必须随依赖、路径、约束的演进动态更新。**任何改变模块行为/接口/测试数/检测方案的代码改动,在同一提交内必须同步更新所有引用该行为的文档**(模块 `AGENTS.md`、根 `AGENTS.md` 索引、`docs/` 技术报告、测试统计等);**提交前必须自检**:`grep` 受影响的关键词(如算法名、旧测试数、旧 xfail/能力描述),确认无文档仍停留在改动前的旧状态。漏同步等同未完成改动。
   - 反例(必须避免):重写 `detect_splicing` 后只改了实现,却遗漏 `tests/AGENTS.md`、根 `AGENTS.md`、`src/gatekeeper/AGENTS.md` 三处仍写「xfail / 68 passed / Sobel 方差」的旧记录。正确做法:改完代码立即全仓 `grep` 旧关键词,一并修正再提交。
   - **过时文档三态处置(改动后必判)**:代码改动后,对受影响文档(`docs/`、各级 `AGENTS.md`、`reference/` 等)逐份判定并执行三选一——① **该改则改**:仍有价值但叙述/数值过时(如测试数、能力描述、主结论被新结论推翻),原地更新使其与现状一致(遵循「细节优先」不丢硬约束);② **该删则删**:整份内容已被取代且无独立历史价值(如已落地功能的临时提示词、被新报告完全覆盖的旧调研),连同其全仓引用一并删除;③ **不该动则保持**:官方原文(赛题/答疑)、自带「旧口径警告」的历史记录、与本次改动无关的文档,一律不动。**判定有疑则归为「改」或「保持」,不轻易删**——删除是不可逆动作,宁可留过时标注也不误删有用历史。
@@ -55,7 +58,7 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
   1. **省额度**:简单/低风险子任务用便宜模型(`model="sonnet"或"haiku"`),把 Opus 额度留给主线决策;
   2. **不污染主上下文**:子agent 只回传结论,大量文件内容/中间过程不进主会话窗口,避免主线被稀释、触发压缩;
   3. **并行提速**:相互独立的子任务在同一条消息里一次性并发派发(多个 Agent 调用同发),墙钟时间取最慢的一个,而非串行累加。
-* **Rule (模型选型)**: 低风险子任务(搜索、简单检查、格式化、跑既有测试)→ `model="sonnet"`;高风险子任务(数学管道/梯度路由/优化器绑定审查、复杂重构、逻辑正确性验证)→ 主会话同型号(默认 Opus)。见 §2 Gate2 必须派 `reviewer` 子agent 的硬性要求。
+* **Rule (模型选型)**: 低风险子任务(搜索、简单检查、格式化、跑既有测试)→ `model="sonnet"或"haiku:`;高风险子任务(数学管道/梯度路由/优化器绑定审查、复杂重构、逻辑正确性验证)→ 主会话同型号(默认 Opus)。见 §2 Gate2 必须派 `reviewer` 子agent 的硬性要求。
 * **Rule (何时才自己做)**: 仅当任务**极短**(1-2 步可完成)、**强依赖主线实时上下文**(拆出去反而要重新灌大量背景)、或**需连续交互决策**时,才在主会话直接做。其余一律优先委派。
 * **Rule (并行写代码 worktree 隔离)**: 多个**互不依赖的代码模块**需同时编写时(如同时补测试、同时改多个独立 AGENTS.md、同时写不相关的工具脚本),派子agent 并行写代码并传入 `isolation="worktree"` 参数——每个子agent 在独立 git worktree 分支上操作,互不冲突;主线收到结论后合并。**不需要 worktree 的情况**:有依赖顺序、或改动量极小(1-2 文件)的任务,直接串行更简洁。
 * **反例(必须避免)**:一次性顺序读十几个文件做审查、把整个代码库/多文档拉进主上下文人工比对冗余、串行跑多组独立测试、主线亲自写低风险辅助脚本——这些都应拆成并行子agent,否则既费额度又污染上下文。

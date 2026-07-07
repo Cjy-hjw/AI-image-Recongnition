@@ -32,8 +32,17 @@ python scripts/pretrain_malignancy.py --epochs 30 --batch-size 32
 # 冒烟验证管道（快速3epoch）
 python scripts/pretrain_malignancy.py --smoke --batch-size 8
 
-# MIL（多示例学习）患者级良恶性预训练（阶段1：冻结backbone，目标patient级AUC>0.65）
+# MIL 阶段1（冻结backbone，目标patient级AUC>0.65）Phase1 best=0.5653
 python scripts/pretrain_malignancy_mil.py --epochs 30 --batch-size 4 --data-root data/27021604_extract
+
+# MIL 阶段2（LLRD解冻backbone，从Phase1 checkpoint热启动，目标AUC>0.65）
+python scripts/pretrain_malignancy_mil.py --epochs 30 --batch-size 4 --data-root data/27021604_extract \
+    --unfreeze-backbone --resume-from checkpoints/malignancy_mil_best.pth \
+    --backbone-lr-scale 0.1 --llrd-eta 0.75 --out checkpoints/malignancy_mil_phase2_best.pth
+
+# 一键同步本地代码到A800服务器（跳过data/.git/__pycache__/.md，按文件大小增量上传）
+# 须先设环境变量：DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_PASSWORD
+python scripts/deploy.py
 ```
 
 ## Git 规范（AI 无法从 git log 推断格式约定）

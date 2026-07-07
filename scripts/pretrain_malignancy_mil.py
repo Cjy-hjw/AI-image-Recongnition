@@ -1,17 +1,29 @@
-"""MIL(多示例学习)患者级 malignancy 预训练——阶段1。
+"""MIL(多示例学习)患者级 malignancy 预训练——阶段1 & 阶段2。
 
 背景(见 memory/patient-leakage-and-probe-trap.md):单帧强监督在患者级弱标签下
 无泄漏 AUC 卡 0.50(梯度被背景帧污染,已对拍证实)。本脚本用门控注意力 MIL:
 一个患者的全部帧 = 一个 bag,注意力自动挑病灶帧,患者级预测+评估。
 
-阶段1:冻结 ImageNet backbone,只训 mil_pooling + classifier。
+阶段1(默认):冻结 ImageNet backbone,只训 mil_pooling + classifier。
     目标:无泄漏患者级 AUC 从 0.50 突破到 0.65-0.70,验证 MIL 路线。
+    结果:best_patient_val_auc=0.5653(epoch 15 早停)。
+
+阶段2(--unfreeze-backbone):从阶段1 checkpoint 热启动,LLRD 解冻 backbone。
+    目标:patient_val_auc > 0.65-0.70。
+    --resume-from 指定阶段1 checkpoint,--backbone-lr-scale 控制 backbone 顶层
+    lr 相对 head lr 的倍率(默认 0.1),--llrd-eta 控制层间衰减(默认 0.75)。
 
 与 pretrain_malignancy.py(单帧 CE 基线,保留)相互独立,互不干扰。
 
 用法(A800):
+    # 阶段1
     python scripts/pretrain_malignancy_mil.py --data-root data/27021604_extract \\
         --epochs 30 --lr 1e-3 --max-frames-per-bag 32
+    # 阶段2
+    python scripts/pretrain_malignancy_mil.py --data-root data/27021604_extract \\
+        --epochs 30 --lr 1e-3 --unfreeze-backbone \\
+        --resume-from checkpoints/malignancy_mil_best.pth \\
+        --backbone-lr-scale 0.1 --llrd-eta 0.75
 冒烟:
     python scripts/pretrain_malignancy_mil.py --smoke
 """
@@ -118,6 +130,15 @@ def main():
                     help="不加载 backbone ImageNet 权重(随机初始化)")
     ap.add_argument("--smoke", action="store_true",
                     help="冒烟:各类少量患者、3 epoch、关早停,仅验证管道")
+    # ── Phase2 参数 ──────────────────────────────────────────────────────────
+    ap.add_argument("--resume-from", default=None,
+                    help="Phase2: 从指定 checkpoint 热启动(路径)")
+    ap.add_argument("--unfreeze-backbone", action="store_true",
+                    help="Phase2: 解冻 backbone，启用 LLRD 分层学习率")
+    ap.add_argument("--backbone-lr-scale", type=float, default=0.1,
+                    help="Phase2: backbone 顶层 lr = lr * backbone_lr_scale(默认0.1)")
+    ap.add_argument("--llrd-eta", type=float, default=0.75,
+                    help="Phase2: LLRD 层间衰减系数 η(默认0.75)")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -157,25 +178,62 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, collate_fn=_mil_collate)
 
-    # ── 模型:独立 backbone(冻结)+ 门控注意力 MIL 头 ────────────────────
+    # ── 模型:独立 backbone + 门控注意力 MIL 头 ──────────────────────────
     model = ThyroidMILNet(
         backbone_name="efficientnet_b2",
         pretrained=(not args.no_pretrained),
         feature_dim=EFFNET_B2_FEATURE_DIM,
         attn_dim=args.mil_attn_dim,
         num_classes=2,
-        freeze_backbone=True,
+        freeze_backbone=(not args.unfreeze_backbone),
     ).to(device)
-    n_train = sum(p.numel() for p in model.trainable_parameters())
+
+    # Phase2: 从 Phase1 checkpoint 热启动
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location=device)
+        model.backbone.load_state_dict(ckpt["backbone"])
+        model.mil_pooling.load_state_dict(ckpt["mil_pooling"])
+        model.classifier.load_state_dict(ckpt["classifier"])
+        print(
+            f"[mil] 热启动: {args.resume_from} "
+            f"(Phase1 best_auc={ckpt.get('patient_val_auc', 'N/A'):.4f})",
+            flush=True,
+        )
+
+    # Phase2: 解冻 backbone（若 --unfreeze-backbone，ThyroidMILNet 已在构造时不冻，
+    # 此处仅做状态确认日志；若从 Phase1 ckpt 热启动，backbone 参数已被覆盖）
+    if args.unfreeze_backbone:
+        # 构造时 freeze_backbone=False，unfreeze_backbone() 同样会确保状态一致
+        model.unfreeze_backbone()
+        print("[mil] Phase2: backbone 已解冻（LLRD 分层 lr）", flush=True)
+
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
-    print(f"[mil] 可训参数 {n_train:,}/{n_total:,}(仅 mil_pooling+classifier,backbone冻结)", flush=True)
+    phase_tag = "Phase2(backbone解冻)" if args.unfreeze_backbone else "Phase1(backbone冻结)"
+    print(f"[mil] {phase_tag} 可训参数 {n_train:,}/{n_total:,}", flush=True)
 
     class_w = build_class_weight(train_bags, device)
     print(f"[mil] CE class_weight(benign,malignant)={class_w.tolist()}", flush=True)
     criterion = nn.CrossEntropyLoss(weight=class_w)
 
-    optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    # optimizer: Phase1 只训 head; Phase2 LLRD 分层 lr
+    if args.unfreeze_backbone:
+        param_groups = model.get_llrd_param_groups(
+            head_lr=args.lr,
+            backbone_lr_scale=args.backbone_lr_scale,
+            eta=args.llrd_eta,
+        )
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+        lrs = [g["lr"] for g in param_groups]
+        print(
+            f"[mil] LLRD optimizer: {len(param_groups)} 组, "
+            f"lr 范围 [{min(lrs):.2e}, {max(lrs):.2e}]",
+            flush=True,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.trainable_parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -202,7 +260,9 @@ def main():
                 loss.backward()
                 batch_loss += loss.item()
                 seen += 1
-            torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), max_norm=1.0)
+            # Phase2 解冻后 trainable 包含 backbone 参数，统一用 requires_grad 筛选
+            _trainable = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(_trainable, max_norm=1.0)
             optimizer.step()
             run_loss += batch_loss * len(batch)
 

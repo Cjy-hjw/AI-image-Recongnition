@@ -121,3 +121,90 @@ class ThyroidMILNet(nn.Module):
     def trainable_parameters(self):
         """阶段1 供 optimizer 用:只含 mil_pooling + classifier(backbone 已冻)。"""
         return [p for p in self.parameters() if p.requires_grad]
+
+    # ── Phase2 接口 ───────────────────────────────────────────────────────────
+
+    def unfreeze_backbone(self) -> None:
+        """Phase2: 解冻 backbone，使其参与梯度更新（配合 LLRD optimizer 使用）。
+
+        调用后 backbone_frozen=False；_extract_features 将正常建计算图。
+        """
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+        self.backbone_frozen = False
+        self.backbone.train()
+
+    def get_llrd_param_groups(
+        self,
+        head_lr: float,
+        backbone_lr_scale: float = 0.1,
+        eta: float = 0.75,
+    ) -> list:
+        """Phase2 LLRD 参数组:深层 lr 高、浅层 lr 低，head 用 head_lr。
+
+        backbone_base_lr = head_lr * backbone_lr_scale（conv_head 等最深层）。
+        每往输入方向一层，lr 乘以 eta（标准 LLRD，Sun et al. 2019）。
+
+        EfficientNet-B2 层序（深→浅，depth_idx 0 最深）:
+            conv_head/bn2/global_pool → blocks[6] → ... → blocks[0] → conv_stem/bn1/act1
+
+        Returns:
+            list of dicts，可直接传给 torch.optim.AdamW。
+        """
+        # 深→浅排列；depth_idx=0 最深，lr = backbone_base_lr * eta^0 = backbone_base_lr
+        _backbone_layer_prefixes = [
+            ["conv_head", "bn2", "act2", "global_pool"],  # 最深输出端
+            ["blocks.6"],
+            ["blocks.5"],
+            ["blocks.4"],
+            ["blocks.3"],
+            ["blocks.2"],
+            ["blocks.1"],
+            ["blocks.0"],
+            ["conv_stem", "bn1", "act1"],                  # 最浅输入端
+        ]
+        backbone_base_lr = head_lr * backbone_lr_scale
+
+        groups: list = []
+        # head 参数(mil_pooling + classifier)使用最高 lr
+        groups.append({
+            "params": (
+                list(self.mil_pooling.parameters())
+                + list(self.classifier.parameters())
+            ),
+            "lr": head_lr,
+            "name": "head",
+        })
+
+        # backbone 分层参数，按深度分组
+        assigned: set = set()
+        for depth_idx, prefixes in enumerate(_backbone_layer_prefixes):
+            lr = backbone_base_lr * (eta ** depth_idx)
+            params = []
+            for name, param in self.backbone.named_parameters():
+                if id(param) not in assigned and any(
+                    name.startswith(pfx) for pfx in prefixes
+                ):
+                    params.append(param)
+                    assigned.add(id(param))
+            if params:
+                groups.append({
+                    "params": params,
+                    "lr": lr,
+                    "name": f"backbone_d{depth_idx}",
+                })
+
+        # 兜底：未被前面分组覆盖的 backbone 参数（防漏）
+        remaining = [
+            p for _, p in self.backbone.named_parameters()
+            if id(p) not in assigned
+        ]
+        if remaining:
+            deepest_lr = backbone_base_lr * (eta ** (len(_backbone_layer_prefixes) - 1))
+            groups.append({
+                "params": remaining,
+                "lr": deepest_lr,
+                "name": "backbone_remaining",
+            })
+
+        return groups

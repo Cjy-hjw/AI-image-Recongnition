@@ -118,5 +118,10 @@
   - `PathologyMILDataset(bags, img_size, transform, max_frames_per_bag=32, random_frames=True)` — `__getitem__` 返回 `(bag[N,1,H,W]f32, label:int, patient_key:str)`；train 随机采样帧、val 固定前 N 帧（可复现）；`patient_class_counts()` 返回患者级计数。
   - **评估铁律**：MIL 天然患者级——一个 bag 一个预测，AUC 在患者上算，不退回帧级。
 - **MIL 测试覆盖** (`tests/test_pathology_mil_dataset.py`)：11 个测试（bag 聚合/label/顺序/形状/截断/患者级计数/无泄漏/门控注意力/模型前向+冻结）全部 PASS。
+- **MIL 训练进展（截至 2026-07-07）**：
+  - Phase 1（冻结 backbone）：best_patient_val_auc = **0.5653**（epoch 15 早停），当前最优，checkpoint: `checkpoints/malignancy_mil_best.pth`。
+  - Phase 2（LLRD 解冻 backbone）：不稳定，AUC 在 0.46–0.56 震荡，未突破 Phase 1；根因：GAP 预池化 + 弱监督梯度稀疏，解冻后 backbone 灾难性遗忘。
+  - 空间注意力版（SpatialAttentionModule 替代 GAP）：best_auc = **0.5000**（epoch 8 早停），双注意力模块冷启动失败——从零初始化产生噪声权重，弱监督信号无法同时收敛两模块。
+  - **结论**：等官方精确帧级标注数据（2026-08-01）到位后，空间注意力 + 解冻联合训练才真正有用；在此之前任何架构改造须先小实验验证。
 
 **注意**: 以上组件等ThyroidXL/ThyUS2Path数据到位后激活,当前为框架预备。

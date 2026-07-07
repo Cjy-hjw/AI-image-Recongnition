@@ -289,13 +289,15 @@ def main():
 
         if val_auc is not None and val_auc > best_auc:
             best_auc = val_auc
-            torch.save({
+            ckpt = {
                 "backbone": model.backbone.state_dict(),
-                "spatial_attn": model.spatial_attn.state_dict(),
                 "mil_pooling": model.mil_pooling.state_dict(),
                 "classifier": model.classifier.state_dict(),
                 "epoch": epoch, "patient_val_auc": val_auc, "img_size": args.img_size,
-            }, args.out)
+            }
+            if model.spatial_attn is not None:
+                ckpt["spatial_attn"] = model.spatial_attn.state_dict()
+            torch.save(ckpt, args.out)
             print(f"  ↳ 保存 best (patient_val_auc={val_auc:.4f}) → {args.out}", flush=True)
 
     print(f"[done] best_patient_val_auc={best_auc:.4f}", flush=True)

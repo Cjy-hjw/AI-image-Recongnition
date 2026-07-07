@@ -137,12 +137,11 @@ def test_gated_attention_pooling_shape_and_norm():
 
 def test_mil_net_forward_and_freeze():
     from src.models.mil_pooling import ThyroidMILNet
-    # pretrained=False 避免测试依赖权重文件
     model = ThyroidMILNet(pretrained=False, freeze_backbone=True)
-    # backbone 全冻
+    # backbone 全冻，spatial_attn 默认关闭(None)
     assert all(not p.requires_grad for p in model.backbone.parameters())
-    # spatial_attn + mil_pooling + classifier 可训
-    assert any(p.requires_grad for p in model.spatial_attn.parameters())
+    assert model.spatial_attn is None
+    # mil_pooling + classifier 可训
     assert any(p.requires_grad for p in model.mil_pooling.parameters())
     assert any(p.requires_grad for p in model.classifier.parameters())
     # 前向:一个 5 帧 bag → [1,2]
@@ -151,6 +150,18 @@ def test_mil_net_forward_and_freeze():
     logits, weights = model(bag)
     assert logits.shape == (1, 2)
     assert weights.shape == (5, 1)
+
+
+def test_mil_net_spatial_attn_opt_in():
+    """use_spatial_attn=True 时 SpatialAttentionModule 存在且可训。"""
+    from src.models.mil_pooling import ThyroidMILNet
+    model = ThyroidMILNet(pretrained=False, freeze_backbone=True, use_spatial_attn=True)
+    assert model.spatial_attn is not None
+    assert any(p.requires_grad for p in model.spatial_attn.parameters())
+    bag = torch.randn(3, 1, 64, 64)
+    model.eval()
+    logits, weights = model(bag)
+    assert logits.shape == (1, 2)
 
 
 def test_spatial_attention_module_shape():

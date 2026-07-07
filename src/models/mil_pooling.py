@@ -106,10 +106,11 @@ class ThyroidMILNet(nn.Module):
         num_classes: int = 2,
         freeze_backbone: bool = True,
         backbone_weights: str = _DEFAULT_BACKBONE_WEIGHTS,
+        use_spatial_attn: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
-        # 独立单通道 backbone；forward_features() 输出未池化空间图 [N, C, H, W]。
+        self.use_spatial_attn = use_spatial_attn
         self.backbone = timm.create_model(
             backbone_name, pretrained=False, in_chans=1, num_classes=0
         )
@@ -123,13 +124,15 @@ class ThyroidMILNet(nn.Module):
                     "走随机/timm 默认初始化。",
                     flush=True,
                 )
-        # 阶段1:冻结 backbone,只训 spatial_attn + mil_pooling + classifier。
         self.backbone_frozen = freeze_backbone
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
-        self.spatial_attn = SpatialAttentionModule(feature_dim)   # 新增:替代 GAP
+        # 空间注意力(实验性，默认关闭)：use_spatial_attn=True 时才启用。
+        # 默认走 GAP(backbone forward)，对应 Phase1 best_auc=0.5653。
+        # 空间注意力在患者级弱监督下冷启动失效(best=0.5000)，等精确标注数据再开。
+        self.spatial_attn = SpatialAttentionModule(feature_dim) if use_spatial_attn else None
         self.mil_pooling = GatedAttentionPooling(feature_dim, attn_dim)
         self.classifier = nn.Sequential(
             nn.Dropout(p=0.3),
@@ -139,17 +142,20 @@ class ThyroidMILNet(nn.Module):
     def _extract_features(self, bag: torch.Tensor) -> torch.Tensor:
         """bag [N,1,H,W] → 实例特征 [N, feature_dim]。
 
-        改进:用 forward_features() 取 [N,C,H,W] 空间图,经 SpatialAttentionModule
-        加权平均后输出 [N,C]——保留微钙化等局部判别信息,不被 GAP 稀释。
-        冻结时 backbone 不建计算图,省显存。
+        默认(use_spatial_attn=False): backbone.forward() → GAP → [N, C]
+            对应 Phase1 best_auc=0.5653，稳定可靠。
+        实验性(use_spatial_attn=True): forward_features() → SpatialAttentionModule → [N, C]
+            在患者级弱监督下冷启动失效，等精确标注数据再用。
         """
         if self.backbone_frozen:
-            self.backbone.eval()  # 冻结:BN 用 running stats
+            self.backbone.eval()
             with torch.no_grad():
-                feat_map = self.backbone.forward_features(bag)  # [N, C, H, W]
-        else:
-            feat_map = self.backbone.forward_features(bag)      # [N, C, H, W]
-        return self.spatial_attn(feat_map)                      # [N, C]
+                if self.use_spatial_attn:
+                    return self.spatial_attn(self.backbone.forward_features(bag))
+                return self.backbone(bag)
+        if self.use_spatial_attn:
+            return self.spatial_attn(self.backbone.forward_features(bag))
+        return self.backbone(bag)
 
     def forward(self, bag: torch.Tensor):
         """bag: [N, 1, H, W] 单患者所有帧。返回 (logits[1, num_classes], weights[N, 1])。"""
@@ -207,16 +213,13 @@ class ThyroidMILNet(nn.Module):
         backbone_base_lr = head_lr * backbone_lr_scale
 
         groups: list = []
-        # head 参数(spatial_attn + mil_pooling + classifier)使用最高 lr
-        groups.append({
-            "params": (
-                list(self.spatial_attn.parameters())
-                + list(self.mil_pooling.parameters())
-                + list(self.classifier.parameters())
-            ),
-            "lr": head_lr,
-            "name": "head",
-        })
+        # head 参数：spatial_attn（若启用）+ mil_pooling + classifier 用 head_lr
+        head_params = (
+            (list(self.spatial_attn.parameters()) if self.spatial_attn else [])
+            + list(self.mil_pooling.parameters())
+            + list(self.classifier.parameters())
+        )
+        groups.append({"params": head_params, "lr": head_lr, "name": "head"})
 
         # backbone 分层参数，按深度分组
         assigned: set = set()

@@ -81,5 +81,5 @@ Two-stage duplicate detection:
 
 ## 4. GATEKEEPER SCOPE
 
-- **Production inference only**: Gatekeeper runs in `predict.py` for deployment safety.
+- **Production inference only**: Gatekeeper runs in `predict.py` (单图) and `video_predict.py` (动态图) for deployment safety.
 - **Offline evaluation bypass**: evaluate.py 路径跳过 gatekeeper（holdout 为已知干净真值，详见 src/inference/AGENTS.md Usage Contract）。

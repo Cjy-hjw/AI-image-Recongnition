@@ -11,8 +11,6 @@ from src.utils.grad_cam import GradCAM, overlay_heatmap
 
 def save_prediction_artifacts(output_dir, mask_resized, report_txt, out_json):
     """Save mask image, clinical report text, and result JSON."""
-    cv2.imwrite(os.path.join(output_dir, "mask_predicted.png"), mask_resized)
-
     with open(
         os.path.join(output_dir, "clinical_report.txt"), "w", encoding="utf-8"
     ) as f:
@@ -20,6 +18,10 @@ def save_prediction_artifacts(output_dir, mask_resized, report_txt, out_json):
 
     with open(os.path.join(output_dir, "result.json"), "w") as f:
         json.dump(out_json, f, indent=2)
+
+    mask_path = os.path.join(output_dir, "mask_predicted.png")
+    if not cv2.imwrite(mask_path, mask_resized):
+        raise RuntimeError(f"cv2.imwrite failed: {mask_path} (check permissions or non-ASCII path)")
 
 
 def save_rejection_json(output_dir, rejection_json):

@@ -117,7 +117,7 @@
   - `build_patient_bags(samples)` — 把 flat 单帧 samples 按 `patient_key` 聚合成 bag 列表 `[{patient_key, label, img_paths}]`。
   - `PathologyMILDataset(bags, img_size, transform, max_frames_per_bag=32, random_frames=True)` — `__getitem__` 返回 `(bag[N,1,H,W]f32, label:int, patient_key:str)`；train 随机采样帧、val 固定前 N 帧（可复现）；`patient_class_counts()` 返回患者级计数。
   - **评估铁律**：MIL 天然患者级——一个 bag 一个预测，AUC 在患者上算，不退回帧级。
-- **MIL 测试覆盖** (`tests/test_pathology_mil_dataset.py`)：11 个测试（bag 聚合/label/顺序/形状/截断/患者级计数/无泄漏/门控注意力/模型前向+冻结）全部 PASS。
+- **MIL 测试覆盖** (`tests/test_pathology_mil_dataset.py`)：13 个测试（bag 聚合/label/顺序/形状/截断/患者级计数/无泄漏/门控注意力/模型前向+冻结）全部 PASS。
 - **MIL 训练进展（截至 2026-07-07）**：
   - Phase 1（冻结 backbone）：best_patient_val_auc = **0.5653**（epoch 15 早停），当前最优，checkpoint: `checkpoints/malignancy_mil_best.pth`。
   - Phase 2（LLRD 解冻 backbone）：不稳定，AUC 在 0.46–0.56 震荡，未突破 Phase 1；根因：GAP 预池化 + 弱监督梯度稀疏，解冻后 backbone 灾难性遗忘。

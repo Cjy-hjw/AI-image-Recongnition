@@ -434,14 +434,21 @@ class TestCatNetDetector:
         else:
             assert bbox is None
 
-    def test_detect_falls_through_to_geometric(self):
-        # 深度+BAG 都不命中时,detect 应回落到既有几何检测器(硬粘贴长直缝)
+    def test_detect_geometric_is_soft_flag_in_degraded_mode(self):
+        # 降级模式(无 CAT-Net 权重)下,几何检测器(copy_move/splice)在超声自相似纹理
+        # 上误报过高(实测 copy_move 27.3%),违反「宁可漏检不可误杀」红线。
+        # 故几何命中降级为**软 flag**(记录到 last_soft_flags,不硬拒绝);
+        # 待 CAT-Net 深度权重落地后才升级为硬拒绝。
         base = _structured_ultrasound(seed=1)
         donor = _structured_ultrasound(seed=99, vary_structure=True)
         sp, _, _ = make_splice(base, donor, 2, patch_frac=0.30)
-        if detect_splicing(sp)[0]:  # 仅当几何检测器自身命中时校验并集兜底
-            det = CatNetTamperingDetector()
-            assert det.detect(sp)[0], "几何缝命中但 detect 并集漏判"
+        if detect_splicing(sp)[0]:  # 仅当几何检测器自身命中时校验软 flag 语义
+            det = CatNetTamperingDetector()  # dct-bag 降级(无 catnet 权重)
+            is_tampered, _, _ = det.detect(sp)
+            # 红线:降级模式几何命中不得硬拒绝(除非 BAG 相位也命中)
+            if not is_tampered:
+                assert any(f == "splice" for f, _ in det.last_soft_flags), \
+                    "几何缝命中应记录为软 flag"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

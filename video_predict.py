@@ -20,7 +20,10 @@ import yaml
 
 from src.inference.video_io import load_video_frames
 from src.inference.video_aggregate import aggregate_frame_predictions
-from src.inference.gatekeeper_runner import run_gatekeeper_audit, build_seeded_deduplicator
+from src.inference.gatekeeper_runner import (
+    run_gatekeeper_audit, build_seeded_deduplicator,
+    build_auth_module, build_tamper_detector,
+)
 from src.inference.model_runner import build_model, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
 from src.inference.calibration import TemperatureScaler
@@ -73,12 +76,16 @@ def main():
 
     # 2. 逐帧 gatekeeper(一票否决,任一帧失败整段拒绝)
     if not args.skip_gatekeeper:
-        # 去重库只播种一次,跨帧复用(避免每帧重复 ResNet 编码训练集)
+        # 三个重型对象只构建一次,跨帧复用(避免每帧重复加载权重/播种训练集)
         deduplicator = build_seeded_deduplicator(config, device)
+        auth_module = build_auth_module(args.weights)
+        tamper_detector = build_tamper_detector(config)
         for pos, frame_np in zip(frame_indices, frames):
             passed, rejection_json = run_gatekeeper_audit(
                 frame_np, config, device, args.weights, args.output_dir,
-                deduplicator=deduplicator)
+                deduplicator=deduplicator,
+                auth_module=auth_module,
+                tamper_detector=tamper_detector)
             if not passed:
                 rejection_json["rejected_frame_index"] = int(pos)
                 with open(os.path.join(args.output_dir, "result.json"), "w") as f:

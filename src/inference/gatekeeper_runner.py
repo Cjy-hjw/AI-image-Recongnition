@@ -38,23 +38,48 @@ def build_seeded_deduplicator(config, device):
     return deduplicator
 
 
-def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
-                         deduplicator=None):
-    """Run full gatekeeper audit (authenticity, dedup, tampering).
+def build_auth_module(weights_path):
+    """构建并加载 AuthenticityModule，供视频逐帧复用（只加载一次权重）。
 
-    Args:
-        deduplicator: 可选,预先播种好的 Deduplicator(视频逐帧复用以省去重复播种)。
-            为 None 时按训练集即时构建(单图路径行为不变,向后兼容)。
-
-    Returns:
-        (passed: bool, rejection_json: dict|None)
+    单图 predict.py 无需调用——run_gatekeeper_audit 内部按需懒建；
+    视频 video_predict.py 在帧循环前调用此函数，传入 auth_module 参数。
     """
-    print("Running Gatekeeper Audit...")
     auth_module = AuthenticityModule()
     auth_weights_path = os.path.join(
         os.path.dirname(weights_path), "authenticity_model.pth"
     )
     auth_module.load_weights(auth_weights_path)
+    return auth_module
+
+
+def build_tamper_detector(config):
+    """构建 CatNetTamperingDetector，供视频逐帧复用（避免每帧重探 weights 文件）。
+
+    单图 predict.py 无需调用——run_gatekeeper_audit 内部按需懒建；
+    视频 video_predict.py 在帧循环前调用此函数，传入 tamper_detector 参数。
+    """
+    return CatNetTamperingDetector(
+        catnet_weights=config["gatekeeper"].get("catnet_weights")
+    )
+
+
+def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
+                         deduplicator=None, auth_module=None,
+                         tamper_detector=None):
+    """Run full gatekeeper audit (authenticity, dedup, tampering).
+
+    Args:
+        deduplicator:    可选，预建 Deduplicator（视频复用，省去重复播种）。
+        auth_module:     可选，预建 AuthenticityModule（视频复用，省去重复加载权重）。
+        tamper_detector: 可选，预建 CatNetTamperingDetector（视频复用，省去重复文件探测）。
+        三者均为 None 时内部即时构建——单图路径行为不变，向后兼容。
+
+    Returns:
+        (passed: bool, rejection_json: dict|None)
+    """
+    print("Running Gatekeeper Audit...")
+    if auth_module is None:
+        auth_module = build_auth_module(weights_path)
     is_phantom, auth_probs = auth_module.predict(img_np)
 
     if deduplicator is None:
@@ -62,11 +87,9 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
 
     is_duplicate, dup_reason = deduplicator.is_duplicate(img_np)
     # CAT-Net v2 取证检测器:detect() = 深度CAT-Net ∪ BAG相位 ∪ 几何(copy-move/splice)
-    # 三路并集,缺权重时降级 dct-bag(纯 NumPy)。函数内构造:无权重时仅 3 次
-    # os.path.isfile 探测,廉价;视频逐帧若需复用可后续提为参数。
-    tamper_detector = CatNetTamperingDetector(
-        catnet_weights=config["gatekeeper"].get("catnet_weights")
-    )
+    # 三路并集,缺权重时降级 dct-bag(纯 NumPy)。
+    if tamper_detector is None:
+        tamper_detector = build_tamper_detector(config)
     is_tampered, _tam_mask, _tam_bbox = tamper_detector.detect(img_np)
 
     audit_failed = (is_phantom > 0) or is_duplicate or is_tampered

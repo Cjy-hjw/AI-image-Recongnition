@@ -63,6 +63,16 @@ All deep learning implementations MUST be verified by quantifiable automated tes
     - 医师与操作者: `ReferringPhysicianName`/`PerformingPhysicianName`/`OperatorsName`
     - 日期类置 `"00000101"`,其余置 `"ANONYMIZED"` 或空串;仅覆盖 DICOM 中已存在的标签。
 
+### 1.7 推理容器交付红线（Inference-Side Gates）
+
+项目重心已从「训练」扩展到「离线推理容器交付」，以下推理侧红线与训练红线同等强制：
+
+*   **Gatekeeper 误报一票否决**: gatekeeper 任一检测器**误杀真实图 = 一票否决**（拒掉合法输入直接沉赛道）。**任何 gatekeeper 检测器改动后，MUST 用全量 holdout 真实图实测硬拒绝误报率，零误报是红线**。误报与召回不可兼得时遵守「宁可漏检不可误杀」，将不可靠检测器降为软 flag 而非硬拒绝。血泪教训：`detect_copy_move` 曾在 359 张真实图误报 27.3%，AGENTS.md 却写「零误报」——**别信文档声称，用数字实测**。见 `memory/gatekeeper-copymove-softflag.md`。
+*   **权重维度契约**: checkpoint 维度必须与当前模型定义一致。**特征/结构维度变更后，MUST 立即重训并重新导出权重**，否则推理容器 `size mismatch` 崩溃。改维度须同步所有引用点（特征提取器 / 分类器 `input_dim` / 训练器 `FEAT_DIM` / test 断言）。见 `memory/authenticity-weight-mismatch.md`。
+*   **降级路径即生产路径**: 可插拔检测器（SSCD/CAT-Net）的深度权重若未落地交付，则降级路径就是实际生产路径，必须按降级路径实测红线，不得假设深度权重存在。判定以 `docs/预训练权重打包清单.md` + `.cache_weights/` 实际内容为准。
+*   **端到端验证**: 推理侧改动 MUST 实跑 `predict.py`（单图）完整链路，不能只跑单元测试（见 `memory/phase4-was-halfbaked.md`）。
+*   **容器封印时机**: `seal_container.py` 只在**交付最后一步**（最终权重就位后）跑，提前封印会埋雷。见 `memory/seal-container-timing.md`。
+
 ---
 
 ## 2. SUBAGENT CODE REVIEW CHECKLIST (NON-QUANTIFIABLE LOGIC GATES)
@@ -91,7 +101,7 @@ Audit all PyTorch/training code changes against this checklist:
 Before any code modification is merged, submitted, or deployed:
 1.  **Ruff & Pyright Validation**: Ensure no syntax, typing, or formatting errors exist.
 2.  **Forward/Backward Test execution**: Run `python scripts/verify_model.py` and verify all Gate checks pass.
-3.  **Checklist Audit**: Perform a self-review or spawn a `reviewer` subagent pointing to this protocol.
+3.  **Checklist Audit**: 逐条核对本协议 §1/§2 中**改动触及的**领域项(未触及的跳过)。审查流程与 skill 搭配见 `rules.md §2`。
 4.  **Zero Placeholder Rule**: Do not use placeholders or mocked outputs. All code must be fully operational.
 
 **CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 七门)+ 全套 pytest 回归。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。

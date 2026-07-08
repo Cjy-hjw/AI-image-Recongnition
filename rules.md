@@ -13,6 +13,11 @@ Before deploying or starting full training, you **MUST** execute the double-gate
 1. **Gate 1: Quantifiable Code Verification (Test Scripts)**: Run `verify_model.py` to perform a single forward/backward pass with standard normalized input dummy tensors. It must successfully check tensor shape compatibility and verify valid, non-zero, non-NaN gradient generation.
 2. **Gate 2: Non-quantifiable Logic Review (Subagent Review)**: For complex mathematical pipelines (such as dual minimax optimization, variational mutual information decoupling, parameter registration in optimizers, gradient leaking across subnets), the agent **MUST** spawn a specialist `reviewer` subagent to audit code changes and confirm dynamic logic correctness.
 *   **Protocol Reference**: The detailed quality gates, assertion guidelines, and review templates for dynamic gradient routing, optimizer binding, and BatchNorm freeze are defined in **`QA_VP.md`**. You MUST read and enforce `QA_VP.md` as the safety sub-protocol of this rulebook.
+*   **Gate2 审查搭配规范（`/code-review` skill × `QA_VP.md` 清单，二者互补，缺一都漏）**:
+    - **第一步** → `/code-review` skill（`effort=high` 或 `max`）: 通用多角度扫描——8 角度(行级 / 移除行为 / 跨文件调用 / 复用 / 简化 / 效率 / altitude / CLAUDE.md 约定)，擅长抓通用缺陷(反转条件/off-by-one/调用契约破坏/死代码)，但**不懂本项目领域红线**。
+    - **第二步** → `QA_VP.md §1/§2` 领域清单: skill 扫完后，对照 §1.1 梯度隔离 / §1.2 优化器绑定 / §1.3 FP16 数值 / §1.4 患者泄漏 / §1.5 损失维度 / §1.6 DICOM 脱敏 / **§1.7 推理侧红线**（误报/维度契约/降级路径） / §2.1 符号极性 / §2.2 广播，逐条核对**改动触及的**项（未触及的跳过）。
+    - **谁做**: 高风险改动（梯度路由/优化器绑定/损失数学/gatekeeper 降级路径）→ 派 `model="sonnet"` 及以上子 agent 审；低风险改动 → 主会话自审。**Gate2 禁用 haiku**（能力不足）。
+    - **反例（本次教训）**: 只跑 skill 跳过 QA 清单 = 漏领域红线；只走清单跳过 skill = 漏通用缺陷。
 *   **Zero-Hallucination Diagnostic Loop (自诊断闭环)**:
     * If `verify_model.py` fails any Gate (Exit Code != 0), the AI agent **MUST** print a structured diagnostic report (containing the failed Gate, numerical discrepancy evidence, and recovery guidance), execute patches locally in a sandbox, and verify correctness before requesting a git diff review.
 * **Rule**: Gate 1（`python scripts/verify_model.py` 全通过）**且** Gate 2（reviewer 子agent 审核通过）后，才启动正式训练。

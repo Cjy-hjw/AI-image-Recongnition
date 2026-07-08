@@ -43,23 +43,39 @@ def load_video_frames(path: str, output_dir: str, max_frames: int = 32):
 
 
 def _load_cv_video(path: str, max_frames: int):
-    """OpenCV 解码视频。先读全部帧再均匀采样(超声 cine 通常帧数有限)。"""
+    """OpenCV 解码视频，seek 采样避免全量读入 OOM。"""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return None, [], False, f"Could not open video: {path}"
-    raw = []
-    while True:
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        # 某些编码器帧数未知，回退全量读入（超声 cine 通常极短）
+        raw = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            raw.append(frame)
+        cap.release()
+        if not raw:
+            return None, [], False, f"No frames decoded from video: {path}"
+        idxs = uniform_sample_indices(len(raw), max_frames)
+        frames = [_to_gray(raw[i], channel_order="bgr") for i in idxs]
+        return frames, idxs, False, None
+    idxs = uniform_sample_indices(total, max_frames)
+    frames = []
+    decoded_idxs = []
+    for idx in idxs:
+        if not cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx)):
+            continue  # codec 不支持 seek → 跳过该帧，不污染其他帧
         ok, frame = cap.read()
-        if not ok:
-            break
-        raw.append(frame)
+        if ok:
+            frames.append(_to_gray(frame, channel_order="bgr"))
+            decoded_idxs.append(int(idx))
     cap.release()
-    if not raw:
+    if not frames:
         return None, [], False, f"No frames decoded from video: {path}"
-    idxs = uniform_sample_indices(len(raw), max_frames)
-    # OpenCV cap.read() 解码帧为 BGR 序,显式告知 _to_gray 以正确加权(多普勒伪彩)
-    frames = [_to_gray(raw[i], channel_order="bgr") for i in idxs]
-    return frames, idxs, False, None
+    return frames, decoded_idxs, False, None
 
 
 def _load_dicom_cine(path: str, output_dir: str, max_frames: int):

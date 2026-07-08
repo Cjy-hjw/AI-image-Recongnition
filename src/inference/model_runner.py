@@ -30,6 +30,7 @@ def build_model(config: dict, weights: str, device: torch.device):
 
 def preprocess_image(img_np, img_size: int, device: torch.device):
     """Resize grayscale image and convert to normalized tensor [B,1,H,W]."""
+    assert img_np.ndim == 2, f"preprocess_image expects 2D grayscale, got shape {img_np.shape}"
     img_resized = cv2.resize(img_np, (img_size, img_size))
     img_tensor = (
         torch.tensor(img_resized, dtype=torch.float32)

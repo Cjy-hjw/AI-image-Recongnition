@@ -111,6 +111,7 @@ def main():
     agg = aggregate_frame_predictions(
         [{"frame_index": f["frame_index"], "mal_prob": f["mal_prob"]} for f in per_frame])
     kf_pos = agg["keyframe_index"]
+    assert kf_pos >= 0, f"keyframe_index={kf_pos}: per_frame is unexpectedly empty"
     kf = per_frame[kf_pos]
     kf_preds = kf["preds"]
     kf_tensor, kf_frame_np = key_tensors[kf_pos]

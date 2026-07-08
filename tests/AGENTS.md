@@ -14,11 +14,12 @@
 | `test_multisource.py` | 多源数据集骨架 — 源级 label_mask(默认全有效向后兼容、源 mask 标注缺失任务、meta label_mask 覆盖源 mask);`MultiSourceThyroidDataset` 拼接长度、源级 mask 生效、采样权重反映源 ratio、空源不崩 | 7 | — |
 | `test_smoke_entrypoints.py` | CLI 入口端到端冒烟 — 把 `predict.py`/`video_predict.py` 当**子进程实跑**(随机权重,build_model 缺 checkpoint 降级随机+warning 不报错):predict 噪声图路径(进程正常退出、落 result.json、status∈{REJECTED,PASSED})+ video `--skip_gatekeeper` 路径(推理/后处理/报告/JSON/Grad-CAM 四产物齐全、JSON 中文可还原)。**只兜「管线连通+产物落盘+JSON 可解析」,不把 gatekeeper 在随机噪声上的判定当硬断言**——该判定依赖 GLCM/频域统计浮点细节,随平台(numpy 1.x 容器 vs 2.x 本地+不同 BLAS)翻转,本地拒、容器可能放行;TODO 真实数据复核其平台稳定性。补 99 组件级单测对入口「接线」的集成盲区;codec 缺失则 skip | 2 | — |
 | `test_calibration.py` | Post-hoc 温度缩放骨架 — **降级正确性**(缺参数/损坏文件/全 T=1.0 → `decode_predictions` 输出与无校准逐位相等)、**单调性**(T>1 压低 max 概率向 0.5 收缩但不改 argmax)、**ECE 数值**(完美校准≈0、过度自信全错=1.0、一维正类概率自动补两列)、**拟合**(`fit_temperature` 返正温度、`from_file` roundtrip);非法温度(≤0)拒绝降级 T=1.0 | 11 | — |
-| `test_pathology_dataset.py` | PathologyDataset — 标签广播(患者级→图像级)、患者分组无泄漏、batch列顺序容错(path,patient_name反列)、分层划分、valid键契约(`valid_malignancy=1`/`valid_mask=0`/其余`valid_*=0`)、输出形状dtype | 20 | — |— **扩展名分发**(mp4/avi/mov/mkv/dcm/dicom 含大写→video_predict、png/jpg/… →predict、flag 透传,用假 python shim 拦 exec 不真跑推理)、**PRODUCTION=1 防篡改阻断**(predict 哈希不符 / src 树哈希不符均在 `exec python` 前 `exit 1`,`SHIM_ARGS not in stdout` 实证「exec 前退出」;开发模式正确绕过)、**src 树指纹 parity**(source `_src_tree_hash.sh` 真函数 vs `seal_container.py` Python 实现字节级一致,反向验证改坏函数必 FAIL 防 drift 假绿) | 19 | — |
+| `test_pathology_dataset.py` | PathologyDataset — 标签广播(患者级→图像级)、患者分组无泄漏、batch列顺序容错(path,patient_name反列)、分层划分、valid键契约(`valid_malignancy=1`/`valid_mask=0`/其余`valid_*=0`)、输出形状dtype | 20 | — |
+| `test_pathology_mil_dataset.py` | PathologyMILDataset + MIL模型 — bag聚合(同patient同bag)、label一致性、顺序确定性、形状`[N,1,H,W]`、max_frames截断、患者级class_counts、train/val无泄漏、GatedAttentionPooling输出`[1,1408]`+weights和≈1、ThyroidMILNet前向`[N,1,512,512]→[1,2]`、冻结后backbone无梯度 | 13 | — |— **扩展名分发**(mp4/avi/mov/mkv/dcm/dicom 含大写→video_predict、png/jpg/… →predict、flag 透传,用假 python shim 拦 exec 不真跑推理)、**PRODUCTION=1 防篡改阻断**(predict 哈希不符 / src 树哈希不符均在 `exec python` 前 `exit 1`,`SHIM_ARGS not in stdout` 实证「exec 前退出」;开发模式正确绕过)、**src 树指纹 parity**(source `_src_tree_hash.sh` 真函数 vs `seal_container.py` Python 实现字节级一致,反向验证改坏函数必 FAIL 防 drift 假绿) | 19 | — |
 
 ---
 
-## `test_phase_refactor.py` — 重构不变式(全套 **181 passed**，此文件 19)
+## `test_phase_refactor.py` — 重构不变式(全套 **194 passed**，此文件 19)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

@@ -10,6 +10,9 @@ def compute_dhash(img_np, hash_size=8):
     Computes difference hash (dHash) for fast image similarity screening.
     Resizes image to (hash_size + 1) x hash_size, then compares horizontal gradients.
     """
+    if img_np.ndim == 3:
+        code = cv2.COLOR_BGRA2GRAY if img_np.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+        img_np = cv2.cvtColor(img_np, code)
     resized = cv2.resize(img_np, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
     # Compare left and right pixels
     diff = resized[:, 1:] > resized[:, :-1]

@@ -9,7 +9,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 | File | Responsibility |
 |:---|:---|
 | `io.py` | Image loading (DICOM + PNG/JPG) and PHI anonymization;通道/位深归一化工具 `_to_gray`/`_rescale_to_uint8` 下沉于此(静/动两路径共用,video_io re-import)。`_to_gray` 覆盖全部通道形态((H,W)/(H,W,1)/(H,W,3)/RGBA/channel-first/多光谱 均收敛 2D,杜绝 3D 漏过致下游 `preprocess_image` 5 维崩溃),并以 `channel_order` 区分 RGB(DICOM 像素)与 BGR(OpenCV 视频帧)避免多普勒伪彩加权错位。单图 DICOM 经 `_to_gray` 收敛灰度 |
-| `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline (**predict.py only**) |
+| `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline (predict.py 单图 + video_predict.py 动态图) |
 | `model_runner.py` | Model build, image preprocessing, forward pass |
 | `postprocess.py` | Prediction decoding and TI-RADS breakdown(可选接 `calibration.TemperatureScaler` 做温度缩放) |
 | `calibration.py` | Post-hoc 置信度校准(温度缩放):`TemperatureScaler`(每任务标量 T,缺参数即 T=1.0 降级)+ 离线拟合 `fit_temperature`/`fit_ordinal_temperature` + 诊断 `compute_ece`/`reliability_diagram`。真实数据 2026-08-01 初赛才到,现仅骨架 |
@@ -32,11 +32,15 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 ## 2. `gatekeeper_runner.py` — 4-Layer Audit
 
-### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None)` → `(passed, rejection_json)`
+### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None, auth_module=None, tamper_detector=None)` → `(passed, rejection_json)`
 
-**Scope**: Production inference only. evaluate.py 仅导入 model_runner/postprocess/export 三模块；gatekeeper_runner 由 predict.py 专属使用。
+**Scope**: Production inference only. evaluate.py 仅导入 model_runner/postprocess/export 三模块；gatekeeper_runner 由 predict.py(单图) 和 video_predict.py(动态图) 使用。
 
-- `deduplicator` 可选:传入预先用 `build_seeded_deduplicator(config, device)` 播种好的实例,供**视频逐帧复用**(否则每帧重复读取+ResNet 编码最多 200 张训练图,O(帧数×200) 拖慢延迟)。为 None 时即时构建,单图路径行为不变(向后兼容)。
+- 三个可选预建对象(视频逐帧复用,避免每帧重复加载权重/播种训练集):
+  - `deduplicator`: 用 `build_seeded_deduplicator(config, device)` 预建；
+  - `auth_module`: 用 `build_auth_module(weights_path)` 预建(单图路径懒建,跳过 `authenticity_model.pth` 每帧重复加载)；
+  - `tamper_detector`: 用 `build_tamper_detector(config)` 预建(避免每帧重探 catnet 权重文件)。
+- 三者均为 None 时内部即时构建——单图 predict.py 路径行为不变(向后兼容)。
 - **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
 
 Pipeline:
@@ -134,6 +138,7 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 | Entry Point | Uses | Does NOT Use |
 |:---|:---|:---|
 | `predict.py` | `io`, `gatekeeper_runner`, `model_runner`, `postprocess`, `export` | — |
+| `video_predict.py` | `video_io`, `video_aggregate`, `gatekeeper_runner`, `model_runner`, `postprocess`, `export` | — |
 | `evaluate.py` | `model_runner`(含 `run_forward`), `postprocess`, `export` | `gatekeeper_runner` (holdout = clean ground truth) |
 
 **前向一致性**: evaluate.py 必须经 run_forward(model, img, precision, device) 调用前向，保证与生产数值路径一致。`evaluate.py` 提供 `--precision {fp32,fp16,bf16}`,评估生产指标时应与部署精度一致。

@@ -167,7 +167,9 @@ class CatNetTamperingDetector:
         Returns:
             (is_tampered, mask uint8 (H,W), bbox [x1,y1,x2,y2] | None)
         """
-        h, w = img_np.shape
+        h, w = img_np.shape[:2]
+        if img_np.ndim == 3:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
         mask = np.zeros((h, w), dtype=np.uint8)
 
         g_energy = block_artifact_energy(img_np, block)
@@ -218,7 +220,8 @@ class CatNetTamperingDetector:
             out = self._model(ten)
         prob = out.squeeze().cpu().numpy()
         if prob.ndim == 3:                       # (C,H,W) → 取篡改通道
-            prob = prob[-1]
+            assert prob.shape[0] == 2, f"CAT-Net output expected 2 channels, got {prob.shape[0]}"
+            prob = prob[1]                        # channel 0=clean, channel 1=tampered
         prob = cv2.resize(prob, (img_np.shape[1], img_np.shape[0]))
         mask = (prob > 0.5).astype(np.uint8) * 255
         if mask.sum() == 0:
@@ -283,4 +286,4 @@ class CatNetTamperingDetector:
             print(f"--> [Gatekeeper 软 flag] 降级模式块级篡改疑似(不拒绝,仅记录): "
                   f"{[f for f, _ in self.last_soft_flags]}", flush=True)
 
-        return False, np.zeros(img_np.shape, dtype=np.uint8), None
+        return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None

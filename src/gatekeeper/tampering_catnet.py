@@ -146,6 +146,7 @@ class CatNetTamperingDetector:
         self.min_flag_blocks = int(min_flag_blocks)
         self._model = None
         self.backend_name = "dct-bag"
+        self.last_soft_flags = []  # 最近一次 detect 的软 flag 命中(降级模式块级疑似)
 
         weights = _find_catnet_weights(catnet_weights)
         if weights is not None:
@@ -227,13 +228,28 @@ class CatNetTamperingDetector:
         tx, ty, tw, th = cv2.boundingRect(biggest)
         return True, mask, [tx, ty, tx + tw, ty + th]
 
-    # ── 统一入口:三路取并集 ─────────────────────────────────────────────
+    # ── 统一入口:硬拒绝路 ∪ 软 flag 路 ──────────────────────────────────
     def detect(self, img_np):
-        """篡改判定 = 深度CAT-Net(若有) ∪ BAG相位 ∪ 几何(copy-move/splice)。
+        """篡改判定。返回签名向后兼容:(is_tampered, mask, bbox)。
+
+        **硬拒绝路（is_tampered=True，触发 REJECT）**:
+            深度CAT-Net(若权重在) ∪ BAG相位不一致。
+            二者均有红线保护:CAT-Net 是学习式判据;BAG 有"无 JPEG 栅格则弃权"门。
+
+        **软 flag 路（记录但不拒绝，is_tampered 不受影响）**:
+            copy_move / splice 几何块级判据。经全量 holdout 实测(359张真实图):
+            copy_move 误报 27.3%、splice 亦在超声自相似纹理上不可靠——经典块匹配
+            在超声模态无法兼顾零误报与有效召回(详见 duipai 实验 + AGENTS.md §3)。
+            **红线「宁可漏检不可误杀」要求:降级模式下此二路不得硬拒绝真实图**,
+            故仅作软 flag 审计输出(stdout);待 CAT-Net 深度权重(catnet_v2)落地后升级为硬拒绝。
+            `self.last_soft_flags` 暴露最近一次 detect 的软命中详情(供调用方按需读取
+            接入报告;当前 gatekeeper_runner 仅取 is_tampered 放行,软 flag 走 stdout)。
 
         Returns:
             (is_tampered, mask uint8 (H,W), bbox [x1,y1,x2,y2] | None)
         """
+        self.last_soft_flags = []  # 每次 detect 重置:软 flag 命中清单(可审计)
+
         if self._model is not None:
             try:
                 hit, mask, bbox = self._catnet_forward(img_np)
@@ -242,16 +258,29 @@ class CatNetTamperingDetector:
             except Exception:
                 pass  # 深度路出错 → 降级到下方纯 NumPy 取证,不中断审计
 
+        # 硬拒绝路:BAG 相位(有弃权红线保护)
         hit, mask, bbox = self.bag_phase_inconsistency(img_np)
         if hit:
             return True, mask, bbox
 
+        # 深度 CAT-Net 权重在时,块级几何判据可信 → 参与硬拒绝;
+        # 否则(dct-bag 降级)块级判据在超声上误报过高 → 降级为软 flag,不拒绝。
+        block_level_hard = self._model is not None
+
         is_cm, cm_mask, cm_bbox = detect_copy_move(img_np)
         if is_cm:
-            return True, cm_mask, cm_bbox
+            if block_level_hard:
+                return True, cm_mask, cm_bbox
+            self.last_soft_flags.append(("copy_move", cm_bbox))
 
         is_sp, sp_mask, sp_bbox = detect_splicing(img_np)
         if is_sp:
-            return True, sp_mask, sp_bbox
+            if block_level_hard:
+                return True, sp_mask, sp_bbox
+            self.last_soft_flags.append(("splice", sp_bbox))
+
+        if self.last_soft_flags:
+            print(f"--> [Gatekeeper 软 flag] 降级模式块级篡改疑似(不拒绝,仅记录): "
+                  f"{[f for f, _ in self.last_soft_flags]}", flush=True)
 
         return False, np.zeros(img_np.shape, dtype=np.uint8), None

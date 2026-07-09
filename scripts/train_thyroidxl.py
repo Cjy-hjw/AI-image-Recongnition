@@ -21,7 +21,7 @@ import torch.optim as optim
 import yaml
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from src.dataset.multiset_adapter import ThyroidXLAdapter, AdaptedThyroidDataset
@@ -125,10 +125,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, config):
             # malignancy head
             loss = torch.tensor(0.0, device=device)
             if valid_mal.any():
-                mal_logits = out["mal_logits"][valid_mal.bool()]
+                mal_logits = out["malignancy"][valid_mal.bool()]
                 loss = loss + ce(mal_logits, mal_labels[valid_mal.bool()])
             # segmentation head
-            seg_logits = out.get("seg_logits")
+            seg_logits = out.get("mask")
             if seg_logits is not None:
                 loss = loss + 0.5 * dice_loss_fn(seg_logits, masks)
 
@@ -151,7 +151,7 @@ def evaluate(model, loader, val_patients, device):
     for i, (imgs, masks, labels) in enumerate(loader):
         imgs = imgs.to(device)
         out = model(imgs)
-        mal_probs = torch.softmax(out["mal_logits"], dim=1)[:, 1].cpu().numpy()
+        mal_probs = torch.softmax(out["malignancy"], dim=1)[:, 1].cpu().numpy()
         mal_labels = labels["malignancy"].numpy()
         batch_patients = val_patients[i * loader.batch_size: (i + 1) * loader.batch_size]
 
@@ -159,7 +159,7 @@ def evaluate(model, loader, val_patients, device):
             patient_probs[pid].append(float(prob))
             patient_labels[pid] = int(lbl)
 
-        seg_logits = out.get("seg_logits")
+        seg_logits = out.get("mask")
         if seg_logits is not None:
             pred = (torch.sigmoid(seg_logits.cpu()) > 0.5).float()
             intersection = (pred * masks).sum(dim=(1, 2, 3))

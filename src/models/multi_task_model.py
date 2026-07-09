@@ -110,7 +110,15 @@ class MultiTaskThyroidModel(nn.Module):
         "adaptor_stage4",
     )
 
-    def __init__(self, backbone_name="efficientnet_b2", pretrained=True, config=None):
+    def __init__(
+        self,
+        backbone_name="efficientnet_b2",
+        pretrained=True,
+        config=None,
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+    ):
         super().__init__()
 
         self.img_size = 512
@@ -156,6 +164,20 @@ class MultiTaskThyroidModel(nn.Module):
                 "checkpoints/efficientnet_b2_pretrained.safetensors",
                 stem_key="conv_stem.weight",
             )
+
+        # LoRA 注入：在预训练权重加载完成后，替换目标 1x1 Conv2d 层
+        if use_lora:
+            from src.models.lora_utils import apply_lora
+            n_cls = apply_lora(self.cls_backbone, r=lora_r, alpha=lora_alpha)
+            n_seg = apply_lora(self.seg_backbone, r=lora_r, alpha=lora_alpha)
+            print(f"--> LoRA 注入: cls_backbone {n_cls} 层, seg_backbone {n_seg} 层 (r={lora_r}, alpha={lora_alpha})")
+            # 冻结所有非 LoRA 参数
+            for name, p in self.cls_backbone.named_parameters():
+                if "lora_" not in name:
+                    p.requires_grad = False
+            for name, p in self.seg_backbone.named_parameters():
+                if "lora_" not in name:
+                    p.requires_grad = False
 
         seg_channels = list(self.seg_backbone.feature_info.channels())
         self.seg_stage_channels = seg_channels

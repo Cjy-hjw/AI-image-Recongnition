@@ -33,6 +33,7 @@ class LoRAConv2d(nn.Module):
         self.groups = conv.groups
         self.r = r
         self.scale = alpha / r
+        assert self.scale <= 16.0, f"LoRA scale={self.scale} (alpha={alpha}/r={r}) > 16 在 fp16 下有溢出风险"
 
         # 冻结原始权重
         self.weight = nn.Parameter(conv.weight.data.clone(), requires_grad=False)

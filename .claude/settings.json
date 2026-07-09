@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "python .claude/hooks/proxy_check.py"
+          },
+          {
+            "type": "command",
+            "command": "python .claude/hooks/gate2_enforce.py"
           }
         ]
       }

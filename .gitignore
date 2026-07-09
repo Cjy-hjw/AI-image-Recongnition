@@ -26,3 +26,6 @@ __pycache__/
 # System files
 desktop.ini
 .DS_Store
+
+# Gate2 审查标记(运行时状态,不入库)
+/.claude/.gate2_pass.json

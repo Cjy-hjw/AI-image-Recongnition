@@ -95,25 +95,16 @@ def build_dataloaders(args, img_size: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def build_head_optimizer(model, lr: float, weight_decay: float = 1e-4):
-    """LP 阶段：只训 backbone 以外的头部参数（backbone 已冻结）。"""
-    head_params = [p for n, p in model.named_parameters()
-                   if p.requires_grad and "cls_backbone" not in n and "seg_backbone" not in n]
-    return optim.AdamW(head_params, lr=lr, weight_decay=weight_decay)
-
-
-def build_lora_optimizer(model, lora_lr: float, head_lr: float = 3e-4, weight_decay: float = 1e-4):
-    """FT 阶段：头部 + LoRA A/B，各自独立 lr。"""
-    lora_params = get_lora_params(model)
-    lora_ids = {id(p) for p in lora_params}
+# ─────────────────────────────────────────────────────────────────────────────
+def build_optimizer(model, head_lr: float, weight_decay: float = 1e-4):
+    """创建单一 optimizer，LP 阶段只含头部参数。
+    FT 阶段通过 add_param_group 追加 LoRA 组，保留头部 Adam 状态（§1.2 fix）。
+    """
+    lora_ids = {id(p) for p in get_lora_params(model)}
     head_params = [p for n, p in model.named_parameters()
                    if p.requires_grad and id(p) not in lora_ids
                    and "cls_backbone" not in n and "seg_backbone" not in n]
-    groups = [
-        {"params": head_params, "lr": head_lr, "weight_decay": weight_decay},
-        {"params": lora_params, "lr": lora_lr, "weight_decay": 0.0},
-    ]
-    return optim.AdamW(groups)
+    return optim.AdamW(head_params, lr=head_lr, weight_decay=weight_decay)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,16 +218,22 @@ def main():
         is_lp = epoch <= args.lp_epochs
         stage_name = "LP" if is_lp else "FT-LoRA"
 
-        # 切换 optimizer
+        # 切换 optimizer / 阶段
         if epoch == 1:
-            optimizer = build_head_optimizer(model, lr=args.lr)
+            optimizer = build_optimizer(model, head_lr=args.lr)
         elif epoch == args.lp_epochs + 1:
-            # 切到 FT 阶段：激活 LoRA 参数（骨干原始权重保持冻结）
+            # FT 阶段：解冻 LoRA 参数，add_param_group 保留头部 Adam 状态（§1.2 fix）
             for n, p in model.named_parameters():
                 if "lora_A" in n or "lora_B" in n:
                     p.requires_grad = True
-            optimizer = build_lora_optimizer(model, lora_lr=args.lora_lr)
-            print(f"[Epoch {epoch}] 切换到 FT-LoRA 阶段")
+            # §1.1 断言：骨干非LoRA参数仍冻结
+            backbone_trainable = [n for n, p in model.named_parameters()
+                                  if p.requires_grad and "lora_A" not in n and "lora_B" not in n
+                                  and ("cls_backbone" in n or "seg_backbone" in n)]
+            assert len(backbone_trainable) == 0, f"骨干原始权重意外解冻：{backbone_trainable[:3]}"
+            lora_params = get_lora_params(model)
+            optimizer.add_param_group({"params": lora_params, "lr": args.lora_lr, "weight_decay": 0.0})
+            print(f"[Epoch {epoch}] 切换到 FT-LoRA 阶段（add_param_group，头部Adam状态保留）")
 
         train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, config)
         auc, dice = evaluate(model, val_loader, val_patients, device)

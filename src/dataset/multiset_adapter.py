@@ -156,70 +156,65 @@ class ThyroidDatasetAdapter(ABC):
 
 class ThyroidXLAdapter(ThyroidDatasetAdapter):
     """
-    ThyroidXL数据集适配器（HuggingFace格式）
+    ThyroidXL数据集适配器（真实 HuggingFace 格式）
 
-    数据集结构（假设）：
+    数据集结构：
     ThyroidXL/
-        images/
-            patient_001_nodule_1.png
-            patient_001_nodule_2.png
-            ...
-        masks/
-            patient_001_nodule_1.png
-            ...
-        annotations.json  # 或 annotations.csv
-            [{
-                "image_id": "patient_001_nodule_1",
-                "patient_id": "001",
-                "age": 45,
-                "gender": "F",
-                "tirads_level": 4,
-                "pathology": "malignant",  # or "benign"
-                "bbox": [x, y, w, h],  # 可选
-                ...
-            }]
+        train/
+            images/   {patient_id}_{hash}_{idx}.png
+            masks/    对应分割mask
+            labels_orig/  {stem}.json（label越南语：lanhtinh=良性/ung_thu=恶性）
+        test/
+            images/
+            masks/
+            test_annotations.json  ← 唯一标注文件（覆盖全数据集）
+
+    标注JSON顶层结构：
+    {"info": {patient_id: {age, gender, conclusion, nodule_1: {TIRADS, Conclusion, ...}, images:[...]}}}
 
     标注映射：
-    - tirads_level (1-5) → composition/echogenicity/shape/margin/foci
-      （简化：TI-RADS 4-5 → 高风险特征，1-3 → 低风险）
-    - pathology → malignancy (benign=0, malignant=1)
+    - nodule_1.Conclusion（字符串）含"Malignant" → 1，否则 → 0
+    - 细粒度概念（composition/echogenicity/shape/margin/foci）ThyroidXL无此标注，task_mask全0
     """
 
-    def __init__(self, data_root: str, annotations_file: str = "annotations.json"):
+    def __init__(self, data_root: str, annotations_file: str = "test/test_annotations.json"):
         super().__init__(data_root)
         self.annotations_file = self.data_root / annotations_file
         self.annotations = self._load_annotations()
 
-    def _load_annotations(self) -> Dict[str, dict]:
-        """加载标注文件"""
+    def _load_annotations(self) -> Dict[str, tuple]:
+        """加载标注，建立 image_filename -> (patient_id, nodule_record) 反查表。"""
         if not self.annotations_file.exists():
             raise FileNotFoundError(f"标注文件不存在: {self.annotations_file}")
 
         with open(self.annotations_file, 'r', encoding='utf-8') as f:
-            if self.annotations_file.suffix == '.json':
-                annots_list = json.load(f)
-            else:
-                raise NotImplementedError("仅支持JSON格式，CSV待实现")
+            data = json.load(f)
 
-        # 转为字典索引
-        return {item['image_id']: item for item in annots_list}
+        lookup: Dict[str, tuple] = {}
+        for pid, pdata in data.get("info", {}).items():
+            nodule = pdata.get("nodule_1") or {}
+            for img_name in pdata.get("images", []):
+                lookup[img_name] = (pid, nodule)
+        return lookup
 
     def _load_samples(self) -> list:
-        """扫描images目录"""
-        images_dir = self.data_root / 'images'
-        if not images_dir.exists():
-            raise FileNotFoundError(f"图像目录不存在: {images_dir}")
-
+        """扫描 train/ 和 test/ 两个 images 目录，过滤有标注的图像。"""
         samples = []
-        for img_file in sorted(images_dir.glob('*.png')):
-            image_id = img_file.stem
-            if image_id in self.annotations:
+        for split in ('train', 'test'):
+            images_dir = self.data_root / split / 'images'
+            if not images_dir.exists():
+                continue
+            for img_file in sorted(images_dir.glob('*.png')):
+                if img_file.name not in self.annotations:
+                    continue
+                pid, nodule = self.annotations[img_file.name]
                 samples.append({
-                    'image_id': image_id,
+                    'image_id': img_file.stem,
                     'image_path': img_file,
-                    'mask_path': self.data_root / 'masks' / f'{image_id}.png',
+                    'mask_path': self.data_root / split / 'masks' / img_file.name,
+                    'patient_id': pid,
+                    'nodule': nodule,
                 })
-
         return samples
 
     def get_image(self, sample_meta: dict) -> np.ndarray:
@@ -232,54 +227,40 @@ class ThyroidXLAdapter(ThyroidDatasetAdapter):
         mask_path = sample_meta['mask_path']
         if not mask_path.exists():
             return None
-
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             return None
-
-        # 归一化到[0, 1]
         return (mask > 127).astype(np.float32)
 
     def get_labels(self, sample_meta: dict) -> Dict[str, Any]:
-        annot = self.annotations[sample_meta['image_id']]
-
-        # 病理标签
-        pathology = annot.get('pathology', 'unknown').lower()
-        malignancy = 1 if pathology == 'malignant' else 0
-
-        # TI-RADS简化映射（待根据实际数据调整）
-        tirads = annot.get('tirads_level', 0)
-        # 暂时用dummy值，真实映射需根据ThyroidXL的schema
-        composition = min(tirads - 1, 3) if tirads > 0 else 0
-        echogenicity = min(tirads - 1, 3) if tirads > 0 else 0
+        nodule = sample_meta['nodule']
+        conclusion = nodule.get('Conclusion') or ''
+        malignancy = 1 if 'Malignant' in conclusion or 'malignant' in conclusion else 0
 
         return {
-            'composition': composition,
-            'echogenicity': echogenicity,
-            'shape': 1 if tirads >= 4 else 0,  # 高TI-RADS倾向不规则
-            'margin': min(tirads - 1, 3) if tirads > 0 else 0,
-            'foci': [0, 0, 0, 0],  # ThyroidXL若无细粒度钙化，默认全0
+            'composition': 0,   # ThyroidXL 无细粒度概念标注，占位
+            'echogenicity': 0,
+            'shape': 0,
+            'margin': 0,
+            'foci': [0, 0, 0, 0],
             'malignancy': malignancy,
-            'patient_id': annot.get('patient_id', 'UNKNOWN'),
-            'authenticity': 1,  # 公开数据假设真实
+            'patient_id': sample_meta['patient_id'],
+            'authenticity': 1,
             'is_duplicate': 0,
             'is_tampered': 0,
         }
 
     def get_task_mask(self, sample_meta: dict) -> Dict[str, int]:
-        annot = self.annotations[sample_meta['image_id']]
-
-        # TI-RADS→细粒度概念(composition/echogenicity/shape/margin)当前为编造占位映射
-        # (全部用同一 min(tirads-1,3)),非真实标签。
-        # 官方 schema 未定,标注 valid=0 避免假标签污染,数据到位后补真实映射。
+        nodule = sample_meta['nodule']
+        has_conclusion = 1 if nodule.get('Conclusion') else 0
         return {
             'mask': 1 if sample_meta['mask_path'].exists() else 0,
-            'composition': 0,
+            'composition': 0,   # 无细粒度标注
             'echogenicity': 0,
             'shape': 0,
             'margin': 0,
-            'foci': 0,  # ThyroidXL暂无细粒度钙化
-            'malignancy': 1 if 'pathology' in annot else 0,
+            'foci': 0,
+            'malignancy': has_conclusion,
         }
 
 

@@ -73,12 +73,24 @@ def configure_stage_parameters(
             param.requires_grad = True
 
     # ── 构建活跃参数组 ──
+    # LoRA A/B 矩阵单独收集，使用固定 lr（不参与 LLRD 衰减）
+    lora_param_ids = {
+        id(p) for n, p in model.named_parameters()
+        if ('lora_A' in n or 'lora_B' in n) and p.requires_grad
+    }
+    lora_params = [
+        p for n, p in model.named_parameters()
+        if ('lora_A' in n or 'lora_B' in n) and p.requires_grad
+    ]
+
     active_decay = []
     active_no_decay = []
 
     for name, param in model.named_parameters():
         if "vclub" in name or not param.requires_grad:
             continue
+        if id(param) in lora_param_ids:
+            continue  # LoRA 参数由独立组管理
         if "bias" in name or "bn" in name or "norm" in name:
             active_no_decay.append(param)
         else:
@@ -109,5 +121,8 @@ def configure_stage_parameters(
         {"params": active_decay, "weight_decay": weight_decay, "lr": lr},
         {"params": active_no_decay, "weight_decay": 0.0, "lr": lr},
     ]
+    # LoRA A/B 矩阵固定 lr=1e-4，不随 LLRD/Cosine 衰减（Opus建议：独立组防lr冲突）
+    if lora_params:
+        param_groups.append({"params": lora_params, "weight_decay": 0.0, "lr": 1e-4})
 
     return param_groups, lr, stage_name

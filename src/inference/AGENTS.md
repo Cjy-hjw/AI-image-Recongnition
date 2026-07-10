@@ -67,8 +67,23 @@ Pipeline:
 ## 3. `model_runner.py` — Model Build & Forward
 
 ### `build_model(config, weights_path, device)` → `MultiTaskThyroidModel`
-- Loads checkpoint with `strict=False` (allows missing/extra keys).
-- Falls back to random init with `[WARNING]` if weights not found.
+- 构建**不感知 LoRA** 的普通模型（`use_lora` 恒为 `False`）。训练侧若用 `use_lora=True`
+  产出 checkpoint（如 `scripts/train_thyroidxl.py`），部署前必须先跑
+  `scripts/merge_lora_checkpoint.py` 把 LoRA A/B 数学合并回普通 Conv2d，本函数才能
+  加载——这样 LoRA 这个训练期 PEFT 技巧完全不泄漏进推理侧代码。
+- **兼容两种 checkpoint 格式**：裸 `state_dict`（`train.py` 的
+  `torch.save(model.state_dict(), ...)` 约定）与包装格式
+  `{"epoch":, "stage":, "state_dict":, ...}`（`train_thyroidxl.py` 另存训练元信息）——
+  按 `raw["state_dict"] if "state_dict" in raw else raw` 统一解包。
+- **`load_state_dict(strict=False)` 后硬校验 missing/unexpected keys，非空则 `raise
+  RuntimeError`**（2026-07-10 由 `strict=False` 静默容忍改为硬报错）。
+  **背景（血泪教训）**：旧版 `strict=False` 且不检查返回值，曾导致两类静默降级：
+  ①不解包包装格式时，710 个真实参数全部 key 不匹配、模型等于纯随机初始化；
+  ②LoRA checkpoint 误喂非 LoRA 模型时，144 个 `lora_A`/`lora_B` key 全部静默丢弃，
+  FT-LoRA 阶段学到的适配完全不生效——两种情况均无任何报错提示，训练产出的
+  checkpoint 实际从未在推理侧生效过。**调用方必须 `try/except RuntimeError` 兜底**
+  （见下方 Usage Contract 后的「失败契约」），否则交付容器会在权重不匹配时零输出崩溃。
+- Falls back to random init with `[WARNING]` **only** when checkpoint file 不存在（此分支不受本次改动影响）。
 
 ### `preprocess_image(img_np, img_size, device)` → `torch.Tensor`
 - `cv2.resize` to `img_size`, normalize `/255.0`, shape `[1, 1, H, W]`.
@@ -142,3 +157,11 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 | `evaluate.py` | `model_runner`(含 `run_forward`), `postprocess`, `export` | `gatekeeper_runner` (holdout = clean ground truth) |
 
 **前向一致性**: evaluate.py 必须经 run_forward(model, img, precision, device) 调用前向，保证与生产数值路径一致。`evaluate.py` 提供 `--precision {fp32,fp16,bf16}`,评估生产指标时应与部署精度一致。
+
+### `build_model()` 失败契约（2026-07-10 新增，交付入口必须遵守）
+
+`build_model()` 现在会在 checkpoint 与模型结构不匹配时 `raise RuntimeError`（见上）。
+`predict.py`/`video_predict.py` 作为交付容器入口，**必须** `try/except RuntimeError`
+把这个异常兜成 `status="ERROR"` 的 `result.json`（复用 `export.save_rejection_json`），
+不能让异常裸传播——否则该次提交零输出（比赛评分管线大概率直接判零分，比"预测错误"
+更差）。`evaluate.py` 是开发者本地诊断脚本、非交付入口，不需要兜底，崩溃即可暴露问题。

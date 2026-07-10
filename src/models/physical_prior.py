@@ -15,13 +15,20 @@ class DifferentiablePhysicalPriorExtractor(nn.Module):
         self.eps = eps
 
         # 预先生成空间网格坐标，注册为 buffer 避免不必要的显存重建
+        # .contiguous()：indexing="ij" 的 meshgrid 返回按行/列各自广播的 0-stride 视图
+        # （见 stride=(0,1)/(1,0)，多个逻辑坐标共享同一段内存）。register_buffer 直接存视图，
+        # state_dict() 仍能读出正确数值，但 load_state_dict() 往回拷贝到"新建模型的同构视图"时，
+        # PyTorch 检测到目标 tensor 存在别名内存（同一存储多处写入）会报
+        # "unsupported operation: more than one element of the written-to tensor refers to
+        # a single memory location" 而崩溃——导致任何 checkpoint（含无 LoRA 的旧 best_model.pth）
+        # 都无法被 predict.py/build_model() 加载，此 bug 与 LoRA 无关，是更早的阻断性根因。
         y_coords, x_coords = torch.meshgrid(
             torch.arange(img_size, dtype=torch.float32),
             torch.arange(img_size, dtype=torch.float32),
             indexing="ij",
         )
-        self.register_buffer("x_coords", x_coords)
-        self.register_buffer("y_coords", y_coords)
+        self.register_buffer("x_coords", x_coords.contiguous())
+        self.register_buffer("y_coords", y_coords.contiguous())
 
     def forward(self, mask, img):
         """

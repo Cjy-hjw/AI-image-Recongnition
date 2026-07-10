@@ -8,7 +8,12 @@ from src.models.multi_task_model import MultiTaskThyroidModel
 
 
 def build_model(config: dict, weights: str, device: torch.device):
-    """Build MultiTaskThyroidModel and load weights if available."""
+    """Build MultiTaskThyroidModel and load weights if available.
+
+    推理侧模型**不感知 LoRA**——训练脚本（如 train_thyroidxl.py）产出的 LoRA 结构
+    checkpoint 必须先用 scripts/merge_lora_checkpoint.py 合并（LoRAConv2d.merge_weights()
+    数学等价合并回普通 Conv2d）再喂给这里，保持 model_runner.py 对训练期 PEFT 技巧无感。
+    """
     model = MultiTaskThyroidModel(
         backbone_name=config["model"]["backbone"],
         pretrained=False,
@@ -17,8 +22,25 @@ def build_model(config: dict, weights: str, device: torch.device):
     if os.path.exists(weights):
         # weights_only=True:best_model.pth 按设计是纯 model state_dict(续训态另存
         # training_state.pth),torch≥2.6 下安全加载并消除 FutureWarning。
-        model.load_state_dict(
-            torch.load(weights, map_location=device, weights_only=True), strict=False)
+        raw = torch.load(weights, map_location=device, weights_only=True)
+        # 兼容训练脚本另存的包装格式 {"epoch":, "stage":, "state_dict":, ...}
+        # （如 train_thyroidxl.py）——不解包会把整个 dict 当 state_dict 喂进去，
+        # 710 个参数全部 key 不匹配，静默变成随机初始化（本次事故根因之一）。
+        state_dict = raw["state_dict"] if isinstance(raw, dict) and "state_dict" in raw else raw
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # strict=False 静默吞掉不匹配 key 是本次事故的核心教训：LoRA checkpoint 误喂
+        # 非 LoRA 模型时，144 个 lora_A/lora_B key 全部落入 unexpected 却不报错，
+        # backbone 实际只剩原始冻结预训练权重。改为硬校验——一旦有 missing/unexpected，
+        # 说明 checkpoint 与模型结构不匹配（如喂了未合并的 LoRA checkpoint），直接报错，
+        # 不允许静默降级为部分/随机权重进入生产推理。
+        if missing or unexpected:
+            raise RuntimeError(
+                f"[FATAL] 权重与模型结构不匹配，拒绝静默部分加载：{weights}\n"
+                f"  missing keys ({len(missing)}): {missing[:10]}\n"
+                f"  unexpected keys ({len(unexpected)}): {unexpected[:10]}\n"
+                "  若 unexpected 中含 'lora_' 前缀：说明喂了未合并的 LoRA 训练 checkpoint，"
+                "先跑 scripts/merge_lora_checkpoint.py 合并后再用。"
+            )
         print(f"Loaded model weights from {weights}")
     else:
         print(

@@ -50,7 +50,7 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 | 脚本 | 用途 | 关键参数/产出 | 注意事项 |
 |:---|:---|:---|:---|
 | `deploy.py` | 通过 SSH/SFTP 将本地代码增量同步到 A800 服务器（按文件大小差异跳过未改动文件） | 环境变量：`DEPLOY_HOST` `DEPLOY_PORT` `DEPLOY_USER` `DEPLOY_PASSWORD`；跳过 `data/` `.git/` `__pycache__` `.md` 等 | 凭证必须用环境变量注入，严禁写死；`.md` 文件不会被同步到服务器 |
-| `seal_container.py` | 计算 `predict.py`、`video_predict.py`、`src/` 全树、`checkpoints/best_model.pth` 的 SHA-256 并注入 `entrypoint.sh`，构成防篡改签名链 | `--dry-run` 只打印不写入；产出：`entrypoint.sh` 中 `EXPECTED_*` 四个占位符被真实指纹替换 | **只在最终交付前跑一次**；提前封印会导致后续任何代码改动使容器启动校验失败；权重缺失时注入零值占位会使生产容器必然失败 |
+| `seal_container.py` | 计算 `predict.py`、`video_predict.py`、`src/` 全树、`checkpoints/best_model.pth` 的 SHA-256 并注入 `entrypoint.sh`，构成防篡改签名链 | `--dry-run` 只打印不写入；产出：`entrypoint.sh` 中 `EXPECTED_*` 四个占位符被真实指纹替换 | **只在最终交付前跑一次**；提前封印会导致后续任何代码改动使容器启动校验失败；权重缺失时注入零值占位会使生产容器必然失败；**误跑了怎么办**：`git checkout scripts/entrypoint.sh` 回退占位哈希 |
 
 ---
 
@@ -70,3 +70,6 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 | `pretrain_malignancy.py` | MultiTaskThyroidModel malignancy 通路单帧 CE 预训练基线（绕 CBM 用临时线性头） | `--data-root` `--epochs`(30) `--batch-size`(32) `--smoke` 快速3epoch；产出 `checkpoints/malignancy_pretrain_best.pth` | 无泄漏 val AUC ≈ 0.50（患者级弱标签瓶颈，已确认），**勿据此 checkpoint 微调**；评估强制 `patient_grouped_split` |
 | `pretrain_malignancy_mil.py` | 门控注意力 MIL 患者级 malignancy 预训练（一患者所有帧=一个 bag） | 阶段1（冻结backbone）：`--epochs --batch-size --max-frames-per-bag`；阶段2加 `--unfreeze-backbone --resume-from --backbone-lr-scale --llrd-eta`；产出 `checkpoints/malignancy_mil_best.pth` | Phase1 best AUC=0.5653，**低于 0.65 退出判据，当前已暂停**；Phase2 待 Phase1 突破后启动 |
 | `retrain_authenticity.py` | 重训 AuthenticityClassifier（修复特征维度变更后的 gatekeeper 崩溃） | `--data-root` `--out`(默认 `checkpoints/authenticity_model.pth`)；产出含 `state_dict` + `feat_mean`/`feat_std` | **特征维度变更后必须重跑**；必须在 A800 上运行；输入维度断言==13 |
+| `train_thyroidxl.py` | ThyroidXL LP-FT-LoRA 训练入口（LP 10epoch 只训头部 → FT-LoRA 40epoch 解冻 LoRA A/B）；患者级 GroupKFold(fold0) 评估 patient-AUC(Max聚合)+Dice | `--use-lora`(默认True) `--lora-r`(8) `--lora-alpha`(16) `--lp-epochs`(10) `--ft-epochs`(40) `--batch-size`(16)；产出 `checkpoints/thyroidxl_best.pth`（`{"epoch","stage","state_dict","patient_val_auc","dice"}` 包装格式，非裸 state_dict，供续训用） | **必须每 epoch 调用 `set_frozen_modules_eval()`**（2026-07-10 血泪教训：遗漏此调用导致冻结 backbone 的 BN running stats 漂移，50 epoch 后数值病态、checkpoint 报废，详见 `src/training/AGENTS.md`）；训练循环内部报告的 AUC **不能直接采信**，必须先跑 `merge_lora_checkpoint.py` 合并后用 `predict.py`/`evaluate.py` 真实推理链路重测；只用 ThyroidXL 单一数据源，不与 27021604/ThyUS2Path 混训 |
+| `merge_lora_checkpoint.py` | 把 `train_thyroidxl.py` 产出的 LoRA 结构 checkpoint 合并为纯 Conv2d 部署权重（`disable_lora`/`merge_weights` 数学合并，fp32、非 autocast） | `--in`(源LoRA checkpoint) `--out`(合并后裸 state_dict路径) `--lora-r`/`--lora-alpha`(须与训练时一致，否则 `strict=True` 加载直接报错) | 产出可被 `model_runner.build_model()` 直接 strict 加载（无需推理侧感知 LoRA）；**合并脚本本身无罪**——若合并前后模型输出差异巨大，先怀疑 backbone 数值病态（退化 BatchNorm），不要怀疑合并数学（已用单层测试 diff~1e-7 验证正确性） |
+

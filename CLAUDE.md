@@ -47,6 +47,16 @@ python scripts/deploy.py
 # 重训 AuthenticityClassifier（修复 gatekeeper 维度失配 / 特征维度变更后必跑）
 # A800 上运行；产出 checkpoints/authenticity_model.pth (13维 + 标准化参数)
 python scripts/retrain_authenticity.py --data-root data/27021604_extract
+
+# ThyroidXL LP-FT-LoRA 训练（A800，官方数据前的管道验证实验）
+# --out 显式指定版本化文件名，勿用默认 checkpoints/thyroidxl_best.pth
+# （首版同名产物因训练脚本曾漏调 BN freeze 已判定报废，见 src/dataset/AGENTS.md）
+# ⚠️训练循环内部报告的 patient-AUC 不可直接采信，须先合并再用 predict.py 真实链路重测
+python scripts/train_thyroidxl.py --data-root data/public_datasets/ThyroidXL --lp-epochs 10 --ft-epochs 40 --batch-size 16 --out checkpoints/thyroidxl_best_v2.pth
+
+# 合并 LoRA checkpoint 为部署用纯 Conv2d 权重（predict.py/evaluate.py 直接可加载）
+# v2 已通过验收（CPU/GPU一致性+LoRA-vs-合并一致性+真实predict.py链路AUC=0.8514），可信
+python scripts/merge_lora_checkpoint.py --in checkpoints/thyroidxl_best_v2.pth --out checkpoints/thyroidxl_merged_v2.pth --lora-r 8 --lora-alpha 16
 ```
 
 ## Git 规范（AI 无法从 git log 推断格式约定）

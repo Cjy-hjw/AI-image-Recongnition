@@ -89,6 +89,8 @@ print(f"  [Val Diag] pred_prob: mean={pred_mean:.4f}, std={pred_std:.4f}, min={.
 
 **AMP 精度选择（fp16+GradScaler vs bf16 无 scaler）**：主训练管道（`train.py`）用 fp16 + GradScaler（上述协议）。但 **LoRA 微调（`scripts/train_thyroidxl.py`）与 malignancy 预训练（`pretrain_malignancy.py`）用 bf16 AMP、无 GradScaler**——bf16 指数范围同 fp32，无需 loss scaling。**血泪教训**：`train_thyroidxl.py` 曾用 fp16 默认 autocast，FT-LoRA 阶段 backbone LoRA 扰动把激活顶穿 fp16 的 65504 天花板，GradScaler scale 从 65536 一路减半仍失守，loss 爆到 1e99（epoch 13）。改 bf16 后 1300 步诊断无溢出。**凡 backbone 参与微调/存在深层扰动的训练，优先用 bf16**；纯冻结 backbone 的浅层训练 fp16 尚可。bf16 路径下仍保留 `clip_grad_norm_(max_norm=1.0)`。
 
+**冻结 backbone 必须同时冻结其 BatchNorm running stats（2026-07-10 血泪教训）**：`train_thyroidxl.py` 的 LP-FT-LoRA 训练曾**遗漏**调用 `set_frozen_modules_eval()`——虽然 backbone 原始权重 `requires_grad=False`，但 `model.train()` 递归下去后其内部 `BatchNorm` 仍处于训练模式，`running_mean`/`running_var` **只受 `module.training` 控制、与 `requires_grad` 无关**，会持续随每个 batch 的真实激活值漂移（本地 A800 实测：单个 batch 就能让某层 `running_var` 漂移 22.98）。50 epoch 下来把一个训练前就已临界（`running_var` 低至 3.5e-42，EfficientNet-B2 预训练权重自带）的 BN 通道冲向数值病态区间，经 backbone 逐层复合放大，导致 CPU/GPU、LoRA-结构/合并-结构两种等价 forward 之间相对误差炸到 70%~1240%，checkpoint 因此报废重训。**规则**：任何训练脚本只要有"参数冻结但仍 `model.train()`"的 backbone/子模块，必须在 `train_one_epoch`（或等价逐 epoch 入口）里紧跟 `model.train()` 之后调用 `from src.training.loop.bn_freeze import set_frozen_modules_eval; set_frozen_modules_eval(model)`——`train.py` 主管线的 `trainer.py:35` 早已采用这个模式，新训练脚本必须照抄，不能假设"冻结 = 完全不变"。验收方法：跑几个训练 step，`assert torch.equal(bn.running_var_before, bn.running_var_after)` 直接断言冻结子模块的 BN buffer 零漂移。
+
 ---
 
 ## 3. AUTHENTICITY CLASSIFIER (`authenticity_trainer.py`)

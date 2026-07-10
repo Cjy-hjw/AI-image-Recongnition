@@ -75,20 +75,22 @@
 ### 多源适配器 (`multiset_adapter.py`) — 统一异构标注格式
 - **抽象基类** `ThyroidDatasetAdapter`:
   - 运行时动态适配原始格式→项目统一接口(image, mask, labels, task_mask)
-  - 子类: `ThyroidXLAdapter`(HF格式), `ThyUS2PathAdapter`(Figshare JPG), `StandardAdapter`(项目标准)
+  - 子类: `ThyroidXLAdapter`(HF格式,**真实映射已实现**), `ThyUS2PathAdapter`(Figshare JPG,骨架), `StandardAdapter`(项目标准)
   - 自动生成`task_mask`指示标注可用性
 - **PyTorch包装** `AdaptedThyroidDataset`:
   - 接受任意Adapter,返回torch Dataset
   - 与现有`ThyroidDataset`接口兼容,可直接替换
 - **零拷贝**: 保持原始数据不变,仅运行时转换
-- **⚠️ 当前为空壳骨架(官方 schema 未定)**: 具体子类的标签映射(如 ThyroidXL 的
-  TI-RADS→细粒度概念、ThyUS2Path 的 metadata→malignancy)尚未实现真实逻辑。
-  **凡未实现真实映射的任务,其 `get_task_mask` 对应位置一律返回 0(声明无效)**,
-  由下游 `valid_mask`/`label_validity` 在 per-sample 层零梯度屏蔽,**从源头杜绝假标签污染**
-  (宁可少声明有效,不可用 dummy 0/编造映射污染 concept/malignancy 头)。数据到位后按真实
-  schema 补映射,并把对应 valid 改回 1。
-- **拆分待办**: 文件 425 行超 `rules.md §6` 上限,但空壳期重写在即,暂缓拆分(顶部有 TODO
-  标注:数据到位后拆为 `adapters/{base,thyroidxl,thyus2path}.py` + `adapted_dataset.py`)。
+- **`ThyroidXLAdapter` 真实 schema(2026-07-10 实测确认,不再是空壳)**:
+  - **train/test 两个 split 标注来源完全不同**,不可混用同一份反查表:
+    - `test/test_annotations.json`(唯一文件,`{"info": {patient_id: {nodule_1: {Conclusion, TIRADS, ...}, images:[...]}}}`)覆盖 test split 全部 2094 张图,739 患者。
+    - `train/labels_orig/{stem}.json` 是**每图独立标注**(`{"label": "actinh"(恶性)/"lanhtinh"(良性), bbox, polygon}`,越南语),覆盖 train split 9538 张图,3353 患者。**patient_id 从文件名首段提取**(`stem.split('_')[0]`)。
+  - 实测 train/test 患者 id 编号体系互斥(0 重叠),`build_dataloaders` 的 GroupKFold 泄漏自检(`assert len(train_pids & val_pids) == 0`)是防线关键位置。
+  - `_load_train_labels` 对未知 label 值(非 actinh/lanhtinh)显式 `continue` 跳过,不产出空 Conclusion 污染样本。
+  - 细粒度概念(composition/echogenicity/shape/margin/foci)ThyroidXL 无此标注,`task_mask` 对应位置固定为 0(声明无效),仅 `malignancy`/`mask` 两任务有效。
+  - **全量 LP-FT-LoRA 训练已跑通**(`scripts/train_thyroidxl.py`,9305 train / 2327 val,患者级 GroupKFold fold0),epoch1 patient-AUC≈0.75、Dice 有真实波动(非死锁常量)。
+- **拆分待办**: 文件超 `rules.md §6` 上限,ThyroidXLAdapter 已转正式实现,拆分优先级提升(拆为
+  `adapters/{base,thyroidxl,thyus2path}.py` + `adapted_dataset.py`),暂未执行。
 
 ### 动态采样器 (`stage_sampler.py`) — 防止小样本遗忘
 - **背景**: 多源样本规模悬殊(99例 vs 17,412帧),均匀采样导致小样本每epoch仅访问1-2次

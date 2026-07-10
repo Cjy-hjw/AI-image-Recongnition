@@ -87,6 +87,8 @@ print(f"  [Val Diag] pred_prob: mean={pred_mean:.4f}, std={pred_std:.4f}, min={.
 - `clip_grad_norm_(model.parameters(), max_norm=1.0)` after every backward
 - Dual optimization is encapsulated: `criterion.mal_loss_fn.step_dual_variable("pre")` before `optimizer.step()`, and `"post"` afterwards.
 
+**AMP 精度选择（fp16+GradScaler vs bf16 无 scaler）**：主训练管道（`train.py`）用 fp16 + GradScaler（上述协议）。但 **LoRA 微调（`scripts/train_thyroidxl.py`）与 malignancy 预训练（`pretrain_malignancy.py`）用 bf16 AMP、无 GradScaler**——bf16 指数范围同 fp32，无需 loss scaling。**血泪教训**：`train_thyroidxl.py` 曾用 fp16 默认 autocast，FT-LoRA 阶段 backbone LoRA 扰动把激活顶穿 fp16 的 65504 天花板，GradScaler scale 从 65536 一路减半仍失守，loss 爆到 1e99（epoch 13）。改 bf16 后 1300 步诊断无溢出。**凡 backbone 参与微调/存在深层扰动的训练，优先用 bf16**；纯冻结 backbone 的浅层训练 fp16 尚可。bf16 路径下仍保留 `clip_grad_norm_(max_norm=1.0)`。
+
 ---
 
 ## 3. AUTHENTICITY CLASSIFIER (`authenticity_trainer.py`)

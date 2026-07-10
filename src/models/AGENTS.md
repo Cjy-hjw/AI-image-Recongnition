@@ -13,6 +13,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
 | `famo.py` | FAMO dynamic loss weight scheduler | ~50 lines |
 | `pretrained_loader.py` | `load_local_safetensors()` — offline backbone weight loader (ConvNeXt seg + EfficientNet cls) | ~36 lines |
+| `lora_utils.py` | `LoRAConv2d`(1x1 conv 低秩包装) + `apply_lora`/`get_lora_params`/`disable_lora` — LP-FT-LoRA 微调用 | ~140 lines |
 
 ### losses/ Subpackage Structure
 
@@ -42,6 +43,8 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 ## 1. HETEROGENEOUS DUAL-BACKBONE ARCHITECTURE (Decoupled)
 
 Stage freeze registry: `MultiTaskThyroidModel.STAGE3_FROZEN_PREFIXES`, `STAGE1_FROZEN_CBM_SUBMODULES`, plus `set_training_stage(stage)` / `is_param_trainable(name, stage)`.
+
+**LoRA 微调路径（`use_lora=True`，LP-FT-LoRA 训练用，见 `scripts/train_thyroidxl.py`）**：`__init__` 里 `apply_lora` 注入后，**双主干全部参数（含 LoRA A/B）默认 `requires_grad=False`**——模型以"LoRA 未激活"状态构建。LP 阶段只训任务头；FT 阶段由训练脚本显式解冻 `lora_A`/`lora_B` 并 `add_param_group`。**关键教训**：LoRA 参数若默认可训练但不在 optimizer 内，其梯度跨 batch 永不清零、累积至溢出（`§1.1` requires_grad 必须与 optimizer 参数集合严格对齐）。`is_param_trainable`/`set_training_stage` 是 LoRA-blind 的（不识别 `lora_` 前缀），仅供 `train.py` 的非 LoRA 三阶段管道用；**不可对 `use_lora=True` 模型调用 `set_training_stage`**，否则会解冻被冻结的原始骨干权重。
 
 Offline pretrained weights: `src/models/pretrained_loader.py` (`load_local_safetensors`) loads `checkpoints/convnext_nano_pretrained.safetensors` (seg) and `checkpoints/efficientnet_b2_pretrained.safetensors` (cls).
 

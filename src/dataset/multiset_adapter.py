@@ -158,22 +158,24 @@ class ThyroidXLAdapter(ThyroidDatasetAdapter):
     """
     ThyroidXL数据集适配器（真实 HuggingFace 格式）
 
-    数据集结构：
+    数据集结构（两个 split 标注来源完全不同，不可混用同一份反查表）：
     ThyroidXL/
         train/
-            images/   {patient_id}_{hash}_{idx}.png
-            masks/    对应分割mask
-            labels_orig/  {stem}.json（label越南语：lanhtinh=良性/ung_thu=恶性）
+            images/       {patient_id}_{hash}_{idx}.png
+            masks/        对应分割mask
+            labels_orig/  {同stem}.json，每图独立标注：{"label": "actinh"(恶性)/"lanhtinh"(良性), bbox, polygon}
         test/
             images/
             masks/
-            test_annotations.json  ← 唯一标注文件（覆盖全数据集）
+            test_annotations.json  ← 唯一标注文件，仅覆盖 test split
 
-    标注JSON顶层结构：
+    test_annotations.json 顶层结构：
     {"info": {patient_id: {age, gender, conclusion, nodule_1: {TIRADS, Conclusion, ...}, images:[...]}}}
 
     标注映射：
-    - nodule_1.Conclusion（字符串）含"Malignant" → 1，否则 → 0
+    - test: nodule_1.Conclusion（字符串）含"Malignant" → 1，否则 → 0
+    - train: label=="actinh" → Conclusion="Malignant"；label=="lanhtinh" → Conclusion="Benign"
+      （合成同形状的 nodule dict，使下游 get_labels/get_task_mask 无需区分 split）
     - 细粒度概念（composition/echogenicity/shape/margin/foci）ThyroidXL无此标注，task_mask全0
     """
 
@@ -181,9 +183,10 @@ class ThyroidXLAdapter(ThyroidDatasetAdapter):
         super().__init__(data_root)
         self.annotations_file = self.data_root / annotations_file
         self.annotations = self._load_annotations()
+        self.train_labels = self._load_train_labels()
 
     def _load_annotations(self) -> Dict[str, tuple]:
-        """加载标注，建立 image_filename -> (patient_id, nodule_record) 反查表。"""
+        """加载 test split 标注，建立 image_filename -> (patient_id, nodule_record) 反查表。"""
         if not self.annotations_file.exists():
             raise FileNotFoundError(f"标注文件不存在: {self.annotations_file}")
 
@@ -197,21 +200,56 @@ class ThyroidXLAdapter(ThyroidDatasetAdapter):
                 lookup[img_name] = (pid, nodule)
         return lookup
 
-    def _load_samples(self) -> list:
-        """扫描 train/ 和 test/ 两个 images 目录，过滤有标注的图像。"""
-        samples = []
-        for split in ('train', 'test'):
-            images_dir = self.data_root / split / 'images'
-            if not images_dir.exists():
+    def _load_train_labels(self) -> Dict[str, dict]:
+        """加载 train/labels_orig/*.json（每图独立标注），建立 image_stem -> nodule_record。"""
+        labels_dir = self.data_root / "train" / "labels_orig"
+        result: Dict[str, dict] = {}
+        if not labels_dir.exists():
+            return result
+        for label_file in labels_dir.glob("*.json"):
+            with open(label_file, 'r', encoding='utf-8') as f:
+                rec = json.load(f)
+            label = rec.get("label", "")
+            if label == "actinh":
+                conclusion = "Malignant"
+            elif label == "lanhtinh":
+                conclusion = "Benign"
+            else:
+                # 未知 label 值：不声明该样本有效，避免静默产出空 Conclusion
+                # 混入训练集（宁可少声明有效，不可编造映射，见 rules.md §5）
                 continue
-            for img_file in sorted(images_dir.glob('*.png')):
+            result[label_file.stem] = {"Conclusion": conclusion}
+        return result
+
+    def _load_samples(self) -> list:
+        """扫描 train/ 和 test/ 两个 images 目录，分别用各自的标注来源过滤。"""
+        samples = []
+
+        test_images_dir = self.data_root / 'test' / 'images'
+        if test_images_dir.exists():
+            for img_file in sorted(test_images_dir.glob('*.png')):
                 if img_file.name not in self.annotations:
                     continue
                 pid, nodule = self.annotations[img_file.name]
                 samples.append({
                     'image_id': img_file.stem,
                     'image_path': img_file,
-                    'mask_path': self.data_root / split / 'masks' / img_file.name,
+                    'mask_path': self.data_root / 'test' / 'masks' / img_file.name,
+                    'patient_id': pid,
+                    'nodule': nodule,
+                })
+
+        train_images_dir = self.data_root / 'train' / 'images'
+        if train_images_dir.exists():
+            for img_file in sorted(train_images_dir.glob('*.png')):
+                nodule = self.train_labels.get(img_file.stem)
+                if nodule is None:
+                    continue
+                pid = img_file.stem.split('_')[0]
+                samples.append({
+                    'image_id': img_file.stem,
+                    'image_path': img_file,
+                    'mask_path': self.data_root / 'train' / 'masks' / img_file.name,
                     'patient_id': pid,
                     'nodule': nodule,
                 })

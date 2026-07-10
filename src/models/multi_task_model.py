@@ -171,13 +171,14 @@ class MultiTaskThyroidModel(nn.Module):
             n_cls = apply_lora(self.cls_backbone, r=lora_r, alpha=lora_alpha)
             n_seg = apply_lora(self.seg_backbone, r=lora_r, alpha=lora_alpha)
             print(f"--> LoRA 注入: cls_backbone {n_cls} 层, seg_backbone {n_seg} 层 (r={lora_r}, alpha={lora_alpha})")
-            # 冻结所有非 LoRA 参数
-            for name, p in self.cls_backbone.named_parameters():
-                if "lora_" not in name:
-                    p.requires_grad = False
-            for name, p in self.seg_backbone.named_parameters():
-                if "lora_" not in name:
-                    p.requires_grad = False
+            # 冻结所有参数（含 LoRA A/B）：模型以"LoRA 未激活"状态构建，
+            # 训练脚本在 FT 阶段显式解冻 lora_A/lora_B（见 train_thyroidxl.py）。
+            # 若不冻结 LoRA 参数，LP 阶段它们不在 optimizer 内、梯度永不清零，
+            # 会跨 batch 累积直至数值溢出（§1.1 教训：LP/FT 参数集合必须与 requires_grad 严格对齐）。
+            for p in self.cls_backbone.parameters():
+                p.requires_grad = False
+            for p in self.seg_backbone.parameters():
+                p.requires_grad = False
 
         seg_channels = list(self.seg_backbone.feature_info.channels())
         self.seg_stage_channels = seg_channels

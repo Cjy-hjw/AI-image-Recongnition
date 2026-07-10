@@ -14,6 +14,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `famo.py` | FAMO dynamic loss weight scheduler | ~50 lines |
 | `pretrained_loader.py` | `load_local_safetensors()` — offline backbone weight loader (ConvNeXt seg + EfficientNet cls) | ~36 lines |
 | `lora_utils.py` | `LoRAConv2d`(1x1 conv 低秩包装) + `apply_lora`/`get_lora_params`/`disable_lora` — LP-FT-LoRA 微调用 | ~140 lines |
+| `physical_prior.py` 的 `x_coords`/`y_coords` buffer | **2026-07-10 修复**：`torch.meshgrid` 返回的 0-stride 广播视图直接 `register_buffer` 会导致*任何* checkpoint 的 `load_state_dict()` 崩溃（PyTorch 检测目标 tensor 内存别名），已加 `.contiguous()` 修复。此 bug 与 LoRA 无关，早于且独立于下面的 LoRA 部署问题，是 `predict.py`/`evaluate.py` 此前从未能真正加载训练权重的根因之一，详见 `memory/`（如已生成）或 `src/inference/AGENTS.md` §3。 | — |
 
 ### losses/ Subpackage Structure
 
@@ -45,6 +46,8 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 Stage freeze registry: `MultiTaskThyroidModel.STAGE3_FROZEN_PREFIXES`, `STAGE1_FROZEN_CBM_SUBMODULES`, plus `set_training_stage(stage)` / `is_param_trainable(name, stage)`.
 
 **LoRA 微调路径（`use_lora=True`，LP-FT-LoRA 训练用，见 `scripts/train_thyroidxl.py`）**：`__init__` 里 `apply_lora` 注入后，**双主干全部参数（含 LoRA A/B）默认 `requires_grad=False`**——模型以"LoRA 未激活"状态构建。LP 阶段只训任务头；FT 阶段由训练脚本显式解冻 `lora_A`/`lora_B` 并 `add_param_group`。**关键教训**：LoRA 参数若默认可训练但不在 optimizer 内，其梯度跨 batch 永不清零、累积至溢出（`§1.1` requires_grad 必须与 optimizer 参数集合严格对齐）。`is_param_trainable`/`set_training_stage` 是 LoRA-blind 的（不识别 `lora_` 前缀），仅供 `train.py` 的非 LoRA 三阶段管道用；**不可对 `use_lora=True` 模型调用 `set_training_stage`**，否则会解冻被冻结的原始骨干权重。
+
+**LoRA 部署解耦（`disable_lora`/`merge_weights`，2026-07-10 起正式接线）**：推理侧（`src/inference/model_runner.py` 的 `build_model()`）**永远不感知 LoRA**——训练产出的 LoRA 结构 checkpoint 必须先用 `scripts/merge_lora_checkpoint.py`（内部调用 `disable_lora`）把 `lora_A`/`lora_B` 数学合并回原始 Conv2d（`merged.weight = base.weight + (lora_B @ lora_A) * scale`），产出裸 `state_dict` 才能喂给 `build_model()`。**数值稳定性教训**：合并本身在单层测试下数值等价（fp32 下 diff~1e-7），但若 backbone 存在退化 BatchNorm（`running_var` 接近 0，常见于冻结 backbone 训练时忘记调用 `set_frozen_modules_eval()` 导致 running stats 漂移，见 `src/training/AGENTS.md` GradScaler Protocol 节），LoRA 双路计算与合并单路计算之间的 fp32 舍入误差会被逐层放大，可致最终分类头输出相对误差达 70%~1000%+（本质是 checkpoint 本身数值病态，非合并逻辑错误——已用"同一合并模型 CPU vs GPU 对拍"排除法定位）。**merge 脚本本身不做数值防护**（不 clamp running_var、不改 eps），保持合并是忠实恒等变换；数值病态必须在训练阶段用 BN 冻结修复，不能在合并脚本里掩盖。
 
 Offline pretrained weights: `src/models/pretrained_loader.py` (`load_local_safetensors`) loads `checkpoints/convnext_nano_pretrained.safetensors` (seg) and `checkpoints/efficientnet_b2_pretrained.safetensors` (cls).
 

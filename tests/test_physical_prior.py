@@ -240,5 +240,30 @@ class TestDifferentiablePhysicalPriorExtractor:
         assert not torch.isinf(grad).any(), "mask.grad contains inf under AMP autocast"
         assert not torch.isnan(grad).any(), "mask.grad contains NaN under AMP autocast"
 
+    # ── Buffer Contiguity / state_dict Round-Trip (2026-07-10 回归测试) ─────
+
+    def test_coord_buffers_are_contiguous(self):
+        """x_coords/y_coords 必须 contiguous，否则 load_state_dict() 会因目标
+        tensor 内存别名而崩溃（torch.meshgrid indexing="ij" 默认返回 0-stride
+        广播视图，直接 register_buffer 不加 .contiguous() 就会踩这个坑）。"""
+        extractor = _make_extractor()
+        assert extractor.x_coords.is_contiguous(), "x_coords 不是 contiguous"
+        assert extractor.y_coords.is_contiguous(), "y_coords 不是 contiguous"
+
+    def test_state_dict_roundtrip_load_does_not_crash(self):
+        """回归测试（2026-07-10）：构造模型 → 取 state_dict → load_state_dict
+        进一个新实例，必须成功不崩溃。此前非 contiguous 的 buffer 会导致
+        PyTorch 报 "more than one element of the written-to tensor refers to
+        a single memory location"，致使 predict.py/evaluate.py 的 build_model()
+        对**任何**训练权重都无法真正加载（不仅仅是 LoRA 相关场景）。"""
+        extractor = _make_extractor()
+        state_dict = extractor.state_dict()
+
+        fresh = _make_extractor()
+        fresh.load_state_dict(state_dict, strict=True)  # 不能抛异常
+
+        assert torch.equal(fresh.x_coords, extractor.x_coords)
+        assert torch.equal(fresh.y_coords, extractor.y_coords)
+
 
 # ═════════════════════════════════════════════════════════════════════════════

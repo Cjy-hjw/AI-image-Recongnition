@@ -88,7 +88,8 @@
   - 实测 train/test 患者 id 编号体系互斥(0 重叠),`build_dataloaders` 的 GroupKFold 泄漏自检(`assert len(train_pids & val_pids) == 0`)是防线关键位置。
   - `_load_train_labels` 对未知 label 值(非 actinh/lanhtinh)显式 `continue` 跳过,不产出空 Conclusion 污染样本。
   - 细粒度概念(composition/echogenicity/shape/margin/foci)ThyroidXL 无此标注,`task_mask` 对应位置固定为 0(声明无效),仅 `malignancy`/`mask` 两任务有效。
-  - **全量 LP-FT-LoRA 训练已跑通**(`scripts/train_thyroidxl.py`,9305 train / 2327 val,患者级 GroupKFold fold0),epoch1 patient-AUC≈0.75、Dice 有真实波动(非死锁常量)。
+  - **全量 LP-FT-LoRA 训练已跑通管道**(`scripts/train_thyroidxl.py`,9305 train / 2327 val,患者级 GroupKFold fold0)。**⚠️首版 checkpoint(`thyroidxl_best.pth`,训练循环内部报告 patient-AUC≈0.8362)已判定报废**——诊断出 `train_one_epoch` 遗漏 BatchNorm 冻结(`set_frozen_modules_eval`,详见 `src/training/AGENTS.md`),50 epoch 内冻结 backbone 的 BN running stats 持续漂移致数值病态(CPU/GPU 与 LoRA/合并两种等价前向相对误差炸到 70%~1240%),训练循环自报的 AUC 不可复现、不可信。**永久弃用,不再使用 `thyroidxl_best.pth`/`thyroidxl_merged.pth`(首版产物)。**
+  - **✅ 2026-07-10 v2 重训 + 验收通过,当前权威权重**:修复 BN 冻结根因后在 A800 重训,产出 `checkpoints/thyroidxl_best_v2.pth`(LoRA结构,训练循环自报 best patient-AUC=0.8518 @ epoch39)。验收协议全通过:① `merge_lora_checkpoint.py` 合并出 `thyroidxl_merged_v2.pth`;② CPU/GPU 一致性 rel_err_max=4.49e-3(相比首版 70%~1240% 病态,量级级改善,深度 CNN 正常硬件浮点误差范围);③ LoRA-vs-合并一致性 rel_err_max=5.09e-7(机器精度级,合并数学正确);④ 用**真实 `predict.py` 推理链路**(`build_model`+`run_forward`,生产默认 fp16 精度)在同一 val fold0(819 患者,249 阳/570 阴,与 train 患者 0 重叠)重测,**patient-AUC=0.8514**,与训练内部自报值(0.8518)几乎一致,证实该数字可信、可复现。**下游可放心使用 `thyroidxl_merged_v2.pth` 部署。**
 - **拆分待办**: 文件超 `rules.md §6` 上限,ThyroidXLAdapter 已转正式实现,拆分优先级提升(拆为
   `adapters/{base,thyroidxl,thyus2path}.py` + `adapted_dataset.py`),暂未执行。
 

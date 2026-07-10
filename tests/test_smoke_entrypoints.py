@@ -124,3 +124,75 @@ class TestVideoPassedPath:
         # 临床报告含中文且非空
         rpt = (out / "clinical_report.txt").read_text(encoding="utf-8")
         assert len(rpt) > 100
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ERROR 路径:权重与模型结构不匹配 → build_model 硬报错须优雅降级为 result.json
+# （2026-07-10 code review 发现的真实回归：build_model 从 strict=False 静默容忍
+#  改为硬 raise 后，若无兜底会让容器裸崩溃、零输出，比预测错误更差）
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestBuildModelErrorFallback:
+    def test_video_predict_writes_error_json_on_checkpoint_mismatch(self, tmp_path):
+        import torch
+
+        vid = tmp_path / "clip.mp4"
+        if not _write_noise_mp4(vid):
+            pytest.skip("mp4v codec 不可用,跳过")
+
+        # 构造一个与模型结构不匹配的 checkpoint（模拟未合并的 LoRA checkpoint /
+        # 版本漂移场景），video_predict.py 里 build_model() 在 gatekeeper 之前
+        # 就会被调用，无需 --skip_gatekeeper 也能确定性触发这条路径。
+        bad_ckpt = tmp_path / "mismatched.pth"
+        torch.save({"some_bogus_key": torch.randn(2, 2)}, bad_ckpt)
+
+        out = tmp_path / "vout_err"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(vid),
+            "--output_dir", str(out),
+            "--weights", str(bad_ckpt),
+            "--precision", "fp32",
+            "--skip_gatekeeper",
+        ])
+        assert r.returncode == 0, \
+            f"权重不匹配时进程不应崩溃，必须优雅降级\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+        rj = out / "result.json"
+        assert rj.exists(), "权重不匹配时仍必须落 result.json（不能零输出）"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data["status"] == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"]
+
+    def test_predict_writes_error_json_on_checkpoint_mismatch(self, tmp_path):
+        """predict.py 与 video_predict.py 是同款 except Exception 兜底，但调用顺序
+        不同（predict.py 先 gatekeeper 后 build_model），此前只测了 video_predict.py
+        一侧，predict.py 这条新分支从未被验证过是否可达（2026-07-10 Gate2审查发现）。
+        """
+        import torch
+
+        img = tmp_path / "noise.png"
+        _write_noise_png(img)
+
+        bad_ckpt = tmp_path / "mismatched.pth"
+        torch.save({"some_bogus_key": torch.randn(2, 2)}, bad_ckpt)
+
+        out = tmp_path / "out_err"
+        r = _run_entry("predict.py", [
+            "--input_image", str(img),
+            "--output_dir", str(out),
+            "--weights", str(bad_ckpt),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"权重不匹配时进程不应崩溃，必须优雅降级\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+
+        rj = out / "result.json"
+        assert rj.exists(), "权重不匹配时仍必须落 result.json（不能零输出）"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        # gatekeeper 可能先一票否决（REJECTED，随机噪声图属正常业务结果），也可能
+        # 放行后触发 build_model 的权重不匹配 ERROR——两条都验证了「不裸崩溃、
+        # 必落 result.json」，只在真走到 ERROR 分支时才断言 reason 非空。
+        assert data.get("status") in ("REJECTED", "ERROR"), \
+            f"status 非法: {data.get('status')}\nSTDOUT:{r.stdout}"
+        if data.get("status") == "ERROR":
+            assert "reason" in data and data["reason"]

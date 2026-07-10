@@ -43,48 +43,58 @@ def main():
         save_rejection_json(args.output_dir, rejection_json)
         return
 
-    # 3. Model inference
+    # 3-5. 模型推理 + 后处理 + 报告导出。整体包一层 except Exception：离线推理
+    # 容器按提交产出 JSON 是硬契约，裸崩溃会让该次提交零输出（比预测错误更差，
+    # 大概率直接判零分）。只兜 build_model() 一处不够——torch.load 遇损坏
+    # checkpoint 会抛 pickle.UnpicklingError（不是 RuntimeError 子类，原 except
+    # RuntimeError 接不住）、CUDA OOM、decode_predictions/cv2/报告生成任一步
+    # 也都可能因边界数据崩溃。异常类型名随 str(e) 一起落盘，不靠拆分 except
+    # 分支也能区分"预期权重不匹配"和"其它意外故障"（2026-07-10 Gate2审查发现）。
     print(f"Running Multi-task Diagnosis under {args.precision.upper()} precision...")
-    model = build_model(config, args.weights, device)
-    img_tensor = preprocess_image(img_np, config["data"]["img_size"], device)
-    outputs = run_forward(model, img_tensor, args.precision, device)
+    try:
+        model = build_model(config, args.weights, device)
+        img_tensor = preprocess_image(img_np, config["data"]["img_size"], device)
+        outputs = run_forward(model, img_tensor, args.precision, device)
 
-    # 4. Postprocess
-    cal_path = config.get("calibration", {}).get("param_file", "checkpoints/calibration.json")
-    calibrator = TemperatureScaler.from_file(cal_path)
-    preds = decode_predictions(outputs, calibrator=calibrator)
-    mask_resized = cv2.resize(
-        preds["mask_binary"], (img_np.shape[1], img_np.shape[0]),
-        interpolation=cv2.INTER_NEAREST)
-    breakdown = build_tirads_breakdown(
-        preds["comp_idx"], preds["echo_idx"],
-        preds["shape_idx"], preds["margin_idx"], preds["foci_prob"])
+        cal_path = config.get("calibration", {}).get("param_file", "checkpoints/calibration.json")
+        calibrator = TemperatureScaler.from_file(cal_path)
+        preds = decode_predictions(outputs, calibrator=calibrator)
+        mask_resized = cv2.resize(
+            preds["mask_binary"], (img_np.shape[1], img_np.shape[0]),
+            interpolation=cv2.INTER_NEAREST)
+        breakdown = build_tirads_breakdown(
+            preds["comp_idx"], preds["echo_idx"],
+            preds["shape_idx"], preds["margin_idx"], preds["foci_prob"])
 
-    # 5. Report & export
-    image_name = os.path.basename(args.input_image)
-    report_txt = generate_report(
-        image_id=image_name,
-        patient_id="ANONYMOUS_PACS_PATIENT" if is_dicom else "ANONYMOUS",
-        breakdown=breakdown, malignancy_prob=preds["mal_prob"])
+        image_name = os.path.basename(args.input_image)
+        report_txt = generate_report(
+            image_id=image_name,
+            patient_id="ANONYMOUS_PACS_PATIENT" if is_dicom else "ANONYMOUS",
+            breakdown=breakdown, malignancy_prob=preds["mal_prob"])
 
-    # 5b. Grad-CAM 可解释热图(可选)。必须在 run_forward 的 inference_mode 块之外,
-    # 用 preprocess_image 产出的普通张量重跑前向+反向(grad_cam 内部自带前向),
-    # 否则 inference tensor 无法参与 autograd。失败不阻断主流程(save_gradcam_overlay 已内部兜底)。
-    gradcam_done = 0
-    if args.enable_gradcam:
-        gradcam_done, _ = maybe_save_gradcam(model, img_tensor, img_np, args.output_dir)
-        if gradcam_done:
-            report_txt += "\n\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(恶性激活热图)"
+        # Grad-CAM 可解释热图(可选)。必须在 run_forward 的 inference_mode 块之外,
+        # 用 preprocess_image 产出的普通张量重跑前向+反向(grad_cam 内部自带前向),
+        # 否则 inference tensor 无法参与 autograd。失败不阻断主流程(save_gradcam_overlay 已内部兜底)。
+        gradcam_done = 0
+        if args.enable_gradcam:
+            gradcam_done, _ = maybe_save_gradcam(model, img_tensor, img_np, args.output_dir)
+            if gradcam_done:
+                report_txt += "\n\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(恶性激活热图)"
 
-    out_json = {
-        "status": "PASSED", "malignancy_probability": preds["mal_prob"],
-        "is_malignant": int(preds["mal_prob"] >= 0.5),
-        "tirads_points": breakdown["total_points"],
-        "tirads_level": breakdown["tr_level"], "risk_percentage": breakdown["risk"],
-        "foci_probabilities": preds["foci_prob"].tolist(), "gradcam_generated": gradcam_done,
-    }
-    save_prediction_artifacts(args.output_dir, mask_resized, report_txt, out_json)
-    print(f"--> Inference completed! Outputs saved to {args.output_dir}")
+        out_json = {
+            "status": "PASSED", "malignancy_probability": preds["mal_prob"],
+            "is_malignant": int(preds["mal_prob"] >= 0.5),
+            "tirads_points": breakdown["total_points"],
+            "tirads_level": breakdown["tr_level"], "risk_percentage": breakdown["risk"],
+            "foci_probabilities": preds["foci_prob"].tolist(), "gradcam_generated": gradcam_done,
+        }
+        save_prediction_artifacts(args.output_dir, mask_resized, report_txt, out_json)
+        print(f"--> Inference completed! Outputs saved to {args.output_dir}")
+    except Exception as e:
+        print(f"[FATAL] Inference pipeline failed ({type(e).__name__}): {e}")
+        save_rejection_json(args.output_dir, {
+            "status": "ERROR", "reason": f"{type(e).__name__}: {e}",
+        })
 
 
 if __name__ == "__main__":

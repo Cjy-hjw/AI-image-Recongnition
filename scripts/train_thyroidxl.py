@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader, Subset
 from src.dataset.multiset_adapter import ThyroidXLAdapter, AdaptedThyroidDataset
 from src.models.multi_task_model import MultiTaskThyroidModel
 from src.models.lora_utils import get_lora_params
+from src.training.loop.bn_freeze import set_frozen_modules_eval
 
 # ThyroidXL train 实测前景占比：mean=0.0790, median=0.0508（结节远小于背景）
 # pos_weight = bg:fg ≈ 11.66，用于抵消 BCE 在类别不均衡下学到"全图判正/判负"trivial解的问题
@@ -127,6 +128,16 @@ def build_optimizer(model, head_lr: float, weight_decay: float = 1e-4):
 # ─────────────────────────────────────────────────────────────────────────────
 def train_one_epoch(model, loader, optimizer, device, config):
     model.train()
+    # §3 BATCHNORM STATE LOCKING（src/models/AGENTS.md）：backbone 原始权重全程
+    # requires_grad=False，但 model.train() 递归下去，其内部 BatchNorm 仍处于训练
+    # 模式——running_mean/running_var 只受 module.training 控制，与 requires_grad
+    # 无关，会持续随每个 batch 的真实激活值漂移。50 epoch 下来把本就临界的通道
+    # （如 blocks.0.1.bn1 预训练时 running_var 已达 3.5e-42）冲向数值病态区间，
+    # 经 cls_backbone 逐层复合放大，导致 CPU/GPU、LoRA/合并 forward 相对误差炸到
+    # 70%~1240%（Opus 诊断 + 本地 A800 实测锁定，checkpoint 因此报废重训）。
+    # train.py 主管线 trainer.py 已用 set_frozen_modules_eval() 锁定，此前
+    # train_thyroidxl.py 漏调——LP/FT 两阶段每个 epoch 都要补上。
+    set_frozen_modules_eval(model)
     ce = nn.CrossEntropyLoss()
     total_loss = 0.0
     for imgs, masks, labels in loader:
@@ -238,10 +249,12 @@ def main():
         is_lp = epoch <= args.lp_epochs
         stage_name = "LP" if is_lp else "FT-LoRA"
 
-        # 切换 optimizer / 阶段
+        # 切换 optimizer / 阶段。两个 if 独立（非 elif）：--lp-epochs 0 时
+        # epoch==1 与 epoch==lp_epochs+1(=1) 重合，必须都执行——否则 elif 只建头部
+        # optimizer、LoRA 解冻分支被跳过，训练全程静默不动 LoRA 参数且无报错。
         if epoch == 1:
             optimizer = build_optimizer(model, head_lr=args.lr)
-        elif epoch == args.lp_epochs + 1:
+        if epoch == args.lp_epochs + 1:
             # FT 阶段：解冻 LoRA 参数，add_param_group 保留头部 Adam 状态（§1.2 fix）
             for n, p in model.named_parameters():
                 if "lora_A" in n or "lora_B" in n:

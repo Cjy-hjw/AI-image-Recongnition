@@ -17,16 +17,33 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, Subset
 
 from src.dataset.multiset_adapter import ThyroidXLAdapter, AdaptedThyroidDataset
 from src.models.multi_task_model import MultiTaskThyroidModel
 from src.models.lora_utils import get_lora_params
+
+# ThyroidXL train 实测前景占比：mean=0.0790, median=0.0508（结节远小于背景）
+# pos_weight = bg:fg ≈ 11.66，用于抵消 BCE 在类别不均衡下学到"全图判正/判负"trivial解的问题
+SEG_POS_WEIGHT = 11.66
+
+
+def seg_combined_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """BCE(带pos_weight) + Differentiable Dice 组合损失，防止分割头收敛到trivial常量解。"""
+    pos_weight = torch.tensor([SEG_POS_WEIGHT], device=pred_logits.device)
+    bce = F.binary_cross_entropy_with_logits(pred_logits, target, pos_weight=pos_weight)
+    prob = torch.sigmoid(pred_logits)
+    flat_p = prob.flatten(1)
+    flat_t = target.flatten(1)
+    inter = (flat_p * flat_t).sum(1)
+    dice = 1 - (2 * inter + 1) / (flat_p.sum(1) + flat_t.sum(1) + 1)
+    return 0.5 * bce + 0.5 * dice.mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,10 +125,9 @@ def build_optimizer(model, head_lr: float, weight_decay: float = 1e-4):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, scaler, device, config):
+def train_one_epoch(model, loader, optimizer, device, config):
     model.train()
     ce = nn.CrossEntropyLoss()
-    dice_loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     for imgs, masks, labels in loader:
         imgs = imgs.to(device)
@@ -120,22 +136,27 @@ def train_one_epoch(model, loader, optimizer, scaler, device, config):
         valid_mal = labels.get("valid_malignancy", torch.ones_like(mal_labels)).to(device)
 
         optimizer.zero_grad()
-        with autocast():
+        # bf16 AMP（无 GradScaler），对齐项目既定规范（见 src/dataset/AGENTS.md pretrain_malignancy）。
+        # 根因锁定：fp16(autocast默认)在 FT-LoRA 阶段被 backbone LoRA 扰动顶穿 65504 天花板，
+        # GradScaler scale 从 65536 一路减半仍失守 → loss 爆 1e99。bf16 指数范围同 fp32，根除溢出。
+        with autocast(dtype=torch.bfloat16):
             out = model(imgs)
             # malignancy head
             loss = torch.tensor(0.0, device=device)
             if valid_mal.any():
                 mal_logits = out["malignancy"][valid_mal.bool()]
                 loss = loss + ce(mal_logits, mal_labels[valid_mal.bool()])
-            # segmentation head
+            # segmentation head：clamp 仍保留为数值安全边界（QA_VP.md §1.3）+ 压制 logit 单调爬升
             seg_logits = out.get("mask")
             if seg_logits is not None:
-                loss = loss + 0.5 * dice_loss_fn(seg_logits, masks)
+                seg_logits_c = seg_logits.clamp(-15, 15)
+                loss = loss + 0.5 * seg_combined_loss(seg_logits_c, masks)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        total_loss += loss.item()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        if torch.isfinite(loss):
+            total_loss += loss.item()
 
     return total_loss / max(len(loader), 1)
 
@@ -205,7 +226,6 @@ def main():
         lora_alpha=args.lora_alpha,
     ).to(device)
 
-    scaler = GradScaler()
     best_auc = -1.0
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
@@ -235,7 +255,7 @@ def main():
             optimizer.add_param_group({"params": lora_params, "lr": args.lora_lr, "weight_decay": 0.0})
             print(f"[Epoch {epoch}] 切换到 FT-LoRA 阶段（add_param_group，头部Adam状态保留）")
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, config)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, config)
         auc, dice = evaluate(model, val_loader, val_patients, device)
 
         print(f"[Epoch {epoch:3d}/{total_epochs} {stage_name}] "

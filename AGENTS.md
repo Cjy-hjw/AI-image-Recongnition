@@ -16,7 +16,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 8-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
 | **CI / 架构铁律** | `/.github/workflows/ci.yml` + `/.importlinter` | PR/push 到 main 自动跑两 job:① import-linter 4 契约(inference⊄training、models 无反向依赖、gatekeeper⊄上层、utils 叶子层)② Gate 1 八门(2026-07-11 补 Gate 8 cls→seg 梯度隔离审计)+ 全套 pytest。任一红则挡合并。 |
-| **Tests** | `/tests/AGENTS.md` | 全套 **227 passed**:16 physical_prior + 15 cbm_head + 19 phase_refactor + 42 gatekeeper + 10 masked_loss + 21 video + 3 authenticity_trainer + 7 multisource + **7 smoke_entrypoints**(2026-07-11 由4→7，新增输入加载失败 ERROR 兜底回归) + 11 calibration + 19 entrypoint_dispatch + 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 5 model_runner + 13 report_generator + **2 gate8_adaptor_isolation**(2026-07-11 新增，TaskAlignmentAdaptor cls→seg 梯度隔离正面+monkeypatch负面回归)。 |
+| **Tests** | `/tests/AGENTS.md` | 全套 **230 passed**:18 physical_prior(含2 e_prior→seg_backbone端到端梯度耦合,2026-07-11新增) + 15 cbm_head + 19 phase_refactor + 42 gatekeeper + 10 masked_loss + 21 video + 3 authenticity_trainer + 7 multisource + **8 smoke_entrypoints**(2026-07-11 由4→8，新增输入加载失败 ERROR 兜底回归) + 11 calibration + 19 entrypoint_dispatch + 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 5 model_runner + 13 report_generator + **2 gate8_adaptor_isolation**(2026-07-11 新增，TaskAlignmentAdaptor cls→seg 梯度隔离正面+monkeypatch负面回归)。 |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---
@@ -31,7 +31,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 - **`src/dataset/`** — 数据加载 + 增强 + PathologyDataset 病理预训练：见 `src/dataset/AGENTS.md`
 - **`src/gatekeeper/`** — 真实性 / 去重 / 篡改四层门控：见 `src/gatekeeper/AGENTS.md`
 - **`scripts/`** — 8-Gate verify_model.py + 数据格式化 + 预训练管道：见 `scripts/AGENTS.md`
-- **`tests/`** — 227 tests（含 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 5 model_runner + 2 gate8_adaptor_isolation）：见 `tests/AGENTS.md`
+- **`tests/`** — 230 tests（含 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 5 model_runner + 2 gate8_adaptor_isolation）：见 `tests/AGENTS.md`
 
 所有拆分模块通过 `__init__.py` re-export shim 保持旧导入路径兼容。
 

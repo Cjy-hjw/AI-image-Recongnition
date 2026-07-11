@@ -17,6 +17,8 @@ import torch
 
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead
+from src.models.multi_task_model import MultiTaskThyroidModel
+from src.models.loss import MultiTaskLoss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +266,106 @@ class TestDifferentiablePhysicalPriorExtractor:
 
         assert torch.equal(fresh.x_coords, extractor.x_coords)
         assert torch.equal(fresh.y_coords, extractor.y_coords)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# e_prior → seg_backbone 端到端梯度耦合(2026-07-11 Gate2 review 非阻塞建议补齐)
+#
+# 背景:Gate8(scripts/verify/gates/gate8_adaptor_isolation.py)审计 TaskAlignmentAdaptor
+# 的 cls→seg detach 隔离契约时,为了不被"物理先验"这条设计内合法通路(cbm_head 的
+# `e_prior = prior_mlp(v_phys) * gamma_prior`,v_phys 来自**未 detach** 的
+# seg_features 经 decoder 算出的 soft_mask)污染信号,显式用 gamma_prior=0.0 把这条
+# 通路精确清零、隔离掉——这对 Gate8 自身是正确且必要的测试设计。
+# 但这意味着 e_prior→seg_backbone 这条真实存在、训练时每一步都在发生的耦合
+# (Gate2 review 实测:gamma_prior=1.0 默认值下 seg_backbone 梯度 abs().sum()≈14.2~30.6,
+# 量级不可忽略),此前是**零端到端梯度测试覆盖**——`test_physical_prior.py` 里已有的
+# 用例只测 DifferentiablePhysicalPriorExtractor 独立模块(合成 leaf 张量,不经过
+# seg_backbone/decoder 完整链路),测不到这条路径本身是否真的按 gamma_prior 预期工作。
+# 本节补齐:验证 gamma_prior 确实能精确控制这条通路的开关,而非仅凭代码走读推断。
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_full_model_fixture():
+    """与 gate8_adaptor_isolation.py / test_gate8_adaptor_isolation.py 保持一致的
+    dummy 输入构造(见 scripts/verify/runner.py),确保结论可与 Gate8 的实测数字互相印证。"""
+    torch.manual_seed(0)
+    model = MultiTaskThyroidModel(backbone_name="efficientnet_b2", pretrained=False)
+    criterion = MultiTaskLoss()
+
+    x = torch.randn(2, 1, 512, 512)
+    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
+    targets = {
+        "mask": torch.randint(0, 2, (2, 1, 512, 512)).float(),
+        "composition": torch.tensor([0, 3]),
+        "echogenicity": torch.tensor([1, 2]),
+        "shape": torch.tensor([0, 1]),
+        "margin": torch.tensor([2, 0]),
+        "foci": torch.randn(2, 4).sigmoid(),
+        # 正负样本各 1 个,理由同 test_gate8_adaptor_isolation.py:避免 AUCMLossApprox
+        # 单类 batch 退化捷径(*0.0 恒零损失)吞掉本测试要观测的梯度信号。
+        "malignancy": torch.tensor([1, 0]),
+    }
+    return model, criterion, x, targets
+
+
+def _seg_backbone_grad_abs_sum(model):
+    total = 0.0
+    any_grad = False
+    for p in model.seg_backbone.parameters():
+        if p.grad is not None:
+            any_grad = True
+            total += p.grad.abs().sum().item()
+    return total, any_grad
+
+
+class TestEPriorSegBackboneGradientCoupling:
+    """e_prior(物理先验)→ seg_backbone 端到端梯度耦合:验证 gamma_prior 这个开关
+    真的按预期控制这条合法通路,而不是代码写了但从没实测过是否生效。"""
+
+    def test_gamma_prior_zero_gives_exact_zero_grad(self):
+        """gamma_prior=0.0 且新建模型 adaptor.gamma 恒为 0(零初始化,见
+        TaskAlignmentAdaptor 设计)时,loss_mal → seg_backbone 的两条已知路径
+        (adaptor injection + e_prior)均被精确清零,seg_backbone 应收到精确 0 梯度
+        (或从未参与图、grad 为 None,视具体 autograd 图连通性而定,两者都算通过)。"""
+        model, criterion, x, targets = _build_full_model_fixture()
+        model.train()
+        model.zero_grad()
+
+        out = model(x, gamma_prior=0.0)
+        _, loss_dict = criterion(out, targets, update_famo_weights=False)
+        loss_dict["malignancy"].backward()
+
+        total, _ = _seg_backbone_grad_abs_sum(model)
+        assert total == 0.0, (
+            f"gamma_prior=0.0 时 seg_backbone 梯度应精确为 0,实际 abs().sum()={total}"
+            "——说明 e_prior 通路没有被 gamma_prior 正确清零,该开关本身失效。"
+        )
+
+    def test_gamma_prior_one_gives_nonzero_finite_grad(self):
+        """gamma_prior=1.0(默认值,训练时实际使用的值)下,e_prior 通路应该是
+        真实连通、可微的——seg_backbone 必须收到非零、有限(无 NaN/Inf)的梯度。
+        如果这里测出精确 0,说明 e_prior→seg_backbone 这条设计内耦合实际上是断的
+        (比如某处意外多加了一次 .detach()),而不是 Gate8 场景里"有意隔离"的 0。"""
+        model, criterion, x, targets = _build_full_model_fixture()
+        model.train()
+        model.zero_grad()
+
+        out = model(x, gamma_prior=1.0)
+        _, loss_dict = criterion(out, targets, update_famo_weights=False)
+        loss_dict["malignancy"].backward()
+
+        total, any_grad = _seg_backbone_grad_abs_sum(model)
+        assert any_grad, "gamma_prior=1.0 时 seg_backbone 参数完全没有收到梯度(grad 全 None)"
+        assert total > 0.0, (
+            "gamma_prior=1.0 时 seg_backbone 梯度精确为 0——e_prior 这条设计内合法耦合"
+            "实际上是断开的(可能被意外 detach),不是预期行为。"
+        )
+        for p in model.seg_backbone.parameters():
+            if p.grad is not None:
+                assert not torch.isnan(p.grad).any(), "seg_backbone 梯度出现 NaN"
+                assert not torch.isinf(p.grad).any(), "seg_backbone 梯度出现 Inf"
+        # 量级健全性检查(非精确回归,只防真正的数值爆炸;Gate2 review 实测约
+        # 14.2~30.6 量级,给足余量避免 batch/种子波动导致假失败)。
+        assert total < 1e4, f"seg_backbone 梯度量级异常大(abs().sum()={total}),疑似数值不稳定"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

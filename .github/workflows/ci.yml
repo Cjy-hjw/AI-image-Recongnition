@@ -112,3 +112,84 @@ jobs:
           assert d.get('status') == 'PASSED', f'预期status=PASSED(random-init模型仍应完整跑完),实际:{d}'
           print('OK: 动态图路径冒烟测试通过')
           "
+
+      # ── P1(2026-07-11): 输入覆盖扩容 ────────────────────────────────────
+      # 上面 2 步只测了「标准 PNG + 标准 MP4」，8-1 官方数据格式未知(见
+      # docs/比赛对齐与风险.md「动态图交付格式未知风险」)，此前完全没有真实容器
+      # 验证过 DICOM/边界分辨率/损坏文件这几类同样可能出现的输入。以下 4 步用
+      # scripts/verify/gen_synthetic_dicom.py(同一份生成逻辑被
+      # tests/test_smoke_entrypoints.py::TestDicomInputPaths 本地单测复用)在
+      # host runner 生成真实可被 pydicom.dcmread() 解析的合成 DICOM，经真实容器
+      # 验证不崩溃 —— 与上面 2 步一样，只验证容器机制，不验证预测数值。
+      - name: Install pydicom (host runner, only for synthetic DICOM fixture generation)
+        run: pip install pydicom numpy
+      - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine)
+        run: |
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/single.dcm --frames 1 --rows 64 --cols 64
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/cine.dcm --frames 4 --rows 64 --cols 64
+      - name: Smoke test — DICOM single-frame (entrypoint 按内容嗅探路由到 video_predict.py)
+        # entrypoint.sh 把 .dcm 无条件路由到 video_predict.py(单帧也不例外,
+        # _load_dicom_cine 把 2D pixel_array 包装成 (1,H,W) 当单帧 cine 处理,
+        # 是设计意图非 bug,见 src/inference/video_io.py::_load_dicom_cine)。
+        run: |
+          mkdir -p /tmp/smoke_out_dcm1
+          docker run --rm \
+            -v /tmp/single.dcm:/workspace/single.dcm:ro \
+            -v /tmp/smoke_out_dcm1:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/single.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm1/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm1/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(单帧DICOM应完整跑完),实际:{d}'
+          print('OK: DICOM 单帧冒烟测试通过')
+          "
+      - name: Smoke test — DICOM multi-frame cine
+        run: |
+          mkdir -p /tmp/smoke_out_dcm4
+          docker run --rm \
+            -v /tmp/cine.dcm:/workspace/cine.dcm:ro \
+            -v /tmp/smoke_out_dcm4:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/cine.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm4/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm4/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(多帧DICOM cine应完整跑完),实际:{d}'
+          print('OK: DICOM 多帧cine冒烟测试通过')
+          "
+      - name: Smoke test — corrupted non-empty file (predict.py 必须 ERROR 不崩溃)
+        # 与上面标准 PNG 用例区分:这里是非空但内容不构成任何合法图像格式的垃圾
+        # 字节,验证 cv2.imread 失败路径同样被正确兜住,不裸崩溃、不零输出。
+        run: |
+          head -c 2048 /dev/urandom > /tmp/corrupted.png
+          mkdir -p /tmp/smoke_out_corrupted
+          docker run --rm \
+            -v /tmp/corrupted.png:/workspace/corrupted.png:ro \
+            -v /tmp/smoke_out_corrupted:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/corrupted.png
+          echo "--- result.json ---"; cat /tmp/smoke_out_corrupted/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_corrupted/result.json'))
+          assert d.get('status') == 'ERROR', f'预期status=ERROR(损坏文件不应被误判成功),实际:{d}'
+          assert d.get('reason'), f'reason不应为空: {d}'
+          print('OK: 损坏文件冒烟测试通过')
+          "
+      - name: Smoke test — extreme low resolution video (4x4)
+        # 验证 resize+模型前向不因极端分辨率崩溃(TaskAlignmentAdaptor 等模块对
+        # 极小特征图维度可能有隐含假设,真实容器实测比读代码猜测更可靠)。
+        run: |
+          ffmpeg -f lavfi -i testsrc=duration=1:size=4x4:rate=5 -y /tmp/tiny.mp4
+          mkdir -p /tmp/smoke_out_tiny
+          docker run --rm \
+            -v /tmp/tiny.mp4:/workspace/tiny.mp4:ro \
+            -v /tmp/smoke_out_tiny:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/tiny.mp4 --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_tiny/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_tiny/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(极小分辨率仍应完整跑完),实际:{d}'
+          print('OK: 极端低分辨率冒烟测试通过')
+          "

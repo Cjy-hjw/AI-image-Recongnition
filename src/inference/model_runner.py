@@ -3,8 +3,32 @@
 import os
 import cv2
 import torch
+import yaml
 
 from src.models.multi_task_model import MultiTaskThyroidModel
+
+
+def load_config(config_path: str) -> dict:
+    """Load YAML config and eagerly validate the keys run_forward/build_model 实际会用到。
+
+    2026-07-11 修复：predict.py/video_predict.py 此前在 try 块**外**直接
+    `open(args.config)` → `yaml.safe_load` → `config["environment"]["device"]`，
+    路径不存在(`FileNotFoundError`)/YAML 格式错误(`yaml.YAMLError`)/键缺失
+    (`KeyError`)/内容为空导致 `yaml.safe_load` 返回 `None`(`TypeError`：
+    `None["environment"]` 不可下标)都会导致进程裸崩溃、非零 exit code、零
+    输出——与 `io.py`/`video_io.py` 的输入加载失败是同一类"try 外裸操作"
+    问题，那次已修（见 `load_input_image` 契约），这次补上配置加载这一处。
+    调用方**必须** `try/except Exception`（不能只 `except KeyError`，上述
+    `TypeError` 等其它异常类型也要兜住）包裹本函数，兜成 `status="ERROR"`
+    的 `result.json`（复用 `export.save_rejection_json`），不能让异常裸传播。
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    # 提前触达下游实际会用到的键：让 KeyError 在这里发生，而不是推理中途才炸，
+    # 这样调用方的 try/except 边界能覆盖到（此处仅探测存在性，不改变 config）。
+    _ = config["environment"]["device"]
+    _ = config["data"]["img_size"]
+    return config
 
 
 def build_model(config: dict, weights: str, device: torch.device):

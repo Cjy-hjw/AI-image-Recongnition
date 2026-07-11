@@ -10,7 +10,7 @@ load_state_dict(strict=False) 后 missing/unexpected 非空则 raise RuntimeErro
 import torch
 import pytest
 
-from src.inference.model_runner import build_model, preprocess_image, run_forward
+from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
 from src.models.multi_task_model import MultiTaskThyroidModel
 
 # img_size 用小尺寸只为让 config 合法；这些测试只做 state_dict 层面操作，不跑 forward。
@@ -174,3 +174,42 @@ class TestRunForwardGpuPrecisionRegression:
         outputs = run_forward(model, img_tensor, precision=precision, device=device)
         assert "malignancy" in outputs
         assert torch.isfinite(outputs["malignancy"]).all()
+
+
+class TestLoadConfig:
+    """2026-07-11 修复：predict.py/video_predict.py 此前在 try 块外裸
+    open(args.config) → yaml.safe_load → config["environment"]["device"]，
+    路径不存在/YAML 格式错误/键缺失都会导致进程裸崩溃、非零 exit code、零输出
+    ——与图像/视频加载失败是同一类问题（2026-07-11 早前已修），这次补配置加载。
+    本测试锁死 load_config() 本身的契约：合法配置正常返回，三类异常各自可预期
+    地抛出（不是静默返回 None 或部分配置），供调用方 try/except Exception 统一
+    兜底。"""
+
+    def test_valid_config_loads(self, tmp_path):
+        cfg_path = tmp_path / "valid.yaml"
+        cfg_path.write_text(
+            "environment:\n  device: cuda:0\ndata:\n  img_size: 512\n",
+            encoding="utf-8",
+        )
+        config = load_config(str(cfg_path))
+        assert config["environment"]["device"] == "cuda:0"
+        assert config["data"]["img_size"] == 512
+
+    def test_missing_file_raises_file_not_found_error(self, tmp_path):
+        missing = tmp_path / "does_not_exist.yaml"
+        with pytest.raises(FileNotFoundError):
+            load_config(str(missing))
+
+    def test_malformed_yaml_raises(self, tmp_path):
+        cfg_path = tmp_path / "malformed.yaml"
+        # 双引号未闭合的非法 YAML,yaml.safe_load 必抛 YAMLError
+        cfg_path.write_text('environment: "device: cuda:0\n', encoding="utf-8")
+        with pytest.raises(Exception):
+            load_config(str(cfg_path))
+
+    def test_missing_required_key_raises_key_error(self, tmp_path):
+        """有效 YAML,但缺 environment.device 这个下游必用的键。"""
+        cfg_path = tmp_path / "incomplete.yaml"
+        cfg_path.write_text("data:\n  img_size: 512\n", encoding="utf-8")
+        with pytest.raises(KeyError):
+            load_config(str(cfg_path))

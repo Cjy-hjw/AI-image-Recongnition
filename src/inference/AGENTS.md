@@ -71,6 +71,11 @@ Pipeline:
 
 ## 3. `model_runner.py` — Model Build & Forward
 
+### `load_config(config_path)` → `dict`（2026-07-11 新增）
+- 读 YAML + 提前触达 `config["environment"]["device"]`/`config["data"]["img_size"]`
+  两个下游必用键，缺失/格式错误/文件不存在时立即抛异常。**调用方必须
+  `try/except Exception` 包裹**，详见下方「配置加载失败契约」。
+
 ### `build_model(config, weights_path, device)` → `MultiTaskThyroidModel`
 - 构建**不感知 LoRA** 的普通模型（`use_lora` 恒为 `False`）。训练侧若用 `use_lora=True`
   产出 checkpoint（如 `scripts/train_thyroidxl.py`），部署前必须先跑
@@ -197,16 +202,24 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 一起落盘，不靠拆分 except 分支也能区分故障类别。`video_predict.py` 的 gatekeeper
 审计循环本就在 try 块内，此次只需扩 `predict.py`。
 
-### 已知缺口（2026-07-11 审计发现，未修，待后续 PR）：config 加载仍在 try 外
+### 配置加载失败契约（2026-07-11 修复，`model_runner.load_config`）
 
-`predict.py:27-31`/`video_predict.py:56-60` 的 `os.makedirs(args.output_dir)` →
-`open(args.config)` 读 YAML → `config["environment"]["device"]` 取值这三步，仍在
-`try` 块（分别始于 `predict.py:52`/`video_predict.py:78`）**之外**。`--config` 路径
-不存在（`FileNotFoundError`）、YAML 格式错误、或键缺失（`KeyError`）会导致进程裸
-崩溃、非零 exit code、零输出——与本节修复的"图像/视频加载失败"是**同一类** try 外
-裸操作问题，但代码位置不同，2026-07-11 这轮 P0 修复**未触及**。风险低于图像/视频
-加载失败（`--config`/`--weights`/`--output_dir` 是部署方控制的启动参数，不是输入
-数据能触达的攻击面；且非零 exit code 至少不会被外部编排层误判为"成功"，比"假成功
-空目录"危害小一档），但仍与"result.json 必须总产出、exit code 恒为0"的既定不变式
-冲突。**留作已知缺口不阻塞当前提交，后续如需彻底封闭该不变式，把这三步也纳入更外
-层 try 即可**。
+`predict.py`/`video_predict.py` 此前 `open(args.config)` 读 YAML →
+`config["environment"]["device"]` 取值这几步在 `try` 块**之外**裸执行——
+`--config` 路径不存在（`FileNotFoundError`）、YAML 格式错误
+（`yaml.YAMLError`）、或键缺失（`KeyError`）都会导致进程裸崩溃、非零
+exit code、零输出，与本节修复的"图像/视频加载失败"是同一类 try 外裸操作
+问题，当时未触及（`os.makedirs(args.output_dir)` 本身仍留在 try 外——它一
+旦失败，output_dir 都不存在，没地方写 result.json，只能非零 exit code 退
+出，这是部署方控制的启动参数、非输入数据可触达的攻击面，风险可接受，不强
+求覆盖）。
+
+修复：新增 `model_runner.load_config(config_path)`，把 `open`→
+`yaml.safe_load`→`config["environment"]["device"]`/`config["data"]["img_size"]`
+键存在性校验都收进这一个函数，调用方（`predict.py`/`video_predict.py`）各自
+用一层 `try/except Exception` 包裹调用，兜成 `status="ERROR"` 的
+`result.json`（复用 `export.save_rejection_json`）。见
+`tests/test_model_runner.py::TestLoadConfig`（单元级：合法配置/文件缺失/
+格式错误/键缺失四态）+ `tests/test_smoke_entrypoints.py::TestConfigLoadFailureErrorFallback`
+（子进程级：`predict.py`/`video_predict.py` 真跑 `--config` 缺失/格式错误）。
+

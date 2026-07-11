@@ -159,10 +159,17 @@ jobs:
           print('OK: DICOM 多帧cine冒烟测试通过')
           "
       - name: Smoke test — corrupted non-empty file (predict.py 必须 ERROR 不崩溃)
-        # 与上面标准 PNG 用例区分:这里是非空但内容不构成任何合法图像格式的垃圾
-        # 字节,验证 cv2.imread 失败路径同样被正确兜住,不裸崩溃、不零输出。
+        # 与上面标准 PNG 用例区分:这里带合法 PNG 魔数 + IHDR chunk 头(与
+        # tests/test_entrypoint_dispatch.py::_write_png 同款构造 —— `file
+        # --mime-type` 的 magic 库需要看到 IHDR 才会判定 image/png,只有 8 字节
+        # 纯魔数不够,2026-07-11 首次提交只写了纯魔数,entrypoint.sh 内容嗅探判成
+        # unknown、在入口层就被"完全无法识别"分支拦下 exit 1,根本到不了
+        # predict.py,测的是入口层而非本步骤想测的 cv2.imread 失败路径,踩了这个
+        # 坑),IHDR 之后紧跟垃圾字节使其不构成合法 PNG 结构,验证 cv2.imread 解码
+        # 失败路径同样被正确兜住,不裸崩溃、不零输出。"完全无法识别"分支已由
+        # tests/test_entrypoint_dispatch.py::TestContentSniffFallback 覆盖,不重复测。
         run: |
-          head -c 2048 /dev/urandom > /tmp/corrupted.png
+          { printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR'; head -c 2048 /dev/urandom; } > /tmp/corrupted.png
           mkdir -p /tmp/smoke_out_corrupted
           docker run --rm \
             -v /tmp/corrupted.png:/workspace/corrupted.png:ro \

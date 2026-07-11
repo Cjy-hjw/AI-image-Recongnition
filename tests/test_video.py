@@ -245,7 +245,18 @@ class TestDeduplicatorInjection:
         assert created["n"] == 1  # 仅 build 时构建一次
 
         img = np.random.randint(0, 255, (256, 256), dtype=np.uint8)
+
+        # 本测试只关心 deduplicator 复用逻辑,与真实性检测无关——2026-07-10
+        # Gate2审查修复后 AuthenticityModule.load_weights 在权重缺失时硬报错
+        # (此前静默退化为随机初始化分类),本地/CI 无真实 checkpoints/authenticity_model.pth
+        # 会导致内部自建 auth_module 报错。注入一个最小 stub 隔离掉这个无关依赖,
+        # 保持测试范围聚焦在"deduplicator 是否被重复构建"这一个问题上。
+        class _StubAuthModule:
+            def predict(self, img_np):
+                return 0, np.array([0.9, 0.05, 0.05], dtype=np.float32)
+
         # 注入复用:不应再新建 Deduplicator(计数仍为 1)
         gr.run_gatekeeper_audit(
-            img, config, "cpu", "checkpoints/best_model.pth", ".", deduplicator=dedup)
+            img, config, "cpu", "checkpoints/best_model.pth", ".",
+            deduplicator=dedup, auth_module=_StubAuthModule())
         assert created["n"] == 1, "注入 deduplicator 时不应重复构建"

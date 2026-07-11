@@ -155,8 +155,17 @@ class CatNetTamperingDetector:
                 self._model = torch.jit.load(weights, map_location="cpu").eval()
                 self._torch = torch
                 self.backend_name = "catnet"
-            except Exception:
-                # 权重损坏/torch 缺失 → 安静降级到纯 NumPy BAG,绝不让审计崩溃
+            except Exception as e:
+                # 权重损坏/torch 缺失 → 安静降级到纯 NumPy BAG,绝不让审计崩溃；
+                # 但须打印留痕区分"权重损坏"与"权重原本不存在"——2026-07-10
+                # Gate2审查发现此前二者共享同一静默出口，权重损坏这种更严重的
+                # 部署事故完全无迹可查（与 deduplication.py SSCD 分支的
+                # fail-loud 哲学不一致）。
+                print(
+                    f"--> [Gatekeeper] CAT-Net 权重存在但加载失败"
+                    f"({type(e).__name__}: {e})，降级为纯 NumPy BAG 取证: {weights}",
+                    flush=True,
+                )
                 self._model = None
                 self.backend_name = "dct-bag"
 
@@ -253,22 +262,39 @@ class CatNetTamperingDetector:
         """
         self.last_soft_flags = []  # 每次 detect 重置:软 flag 命中清单(可审计)
 
+        catnet_ok_this_call = False
         if self._model is not None:
             try:
                 hit, mask, bbox = self._catnet_forward(img_np)
+                catnet_ok_this_call = True
                 if hit:
                     return True, mask, bbox
-            except Exception:
-                pass  # 深度路出错 → 降级到下方纯 NumPy 取证,不中断审计
+            except Exception as e:
+                # 深度路本次调用出错(如223行shape assert触发)→降级到下方纯
+                # NumPy取证,不中断审计。但绝不能让"权重已加载"继续冒充"本次
+                # 判定可信"——2026-07-10 Gate2审查发现：旧版用
+                # `self._model is not None` 直接判 block_level_hard,会让本该
+                # 走软flag的copy_move/splice几何检测器(全量holdout实测硬拒绝
+                # 误报27.3%)在catnet本次forward崩溃时被错误提升为硬拒绝,真实
+                # 图像被一票否决出局且无任何日志区分"catnet判clean"与"catnet
+                # 本次崩溃"。此处显式打印留痕,并用 catnet_ok_this_call(而非
+                # self._model是否非None)驱动下方 block_level_hard。
+                print(
+                    f"--> [Gatekeeper] CAT-Net 本次前向失败"
+                    f"({type(e).__name__}: {e})，降级为纯几何取证(不影响BAG判据)",
+                    flush=True,
+                )
 
         # 硬拒绝路:BAG 相位(有弃权红线保护)
         hit, mask, bbox = self.bag_phase_inconsistency(img_np)
         if hit:
             return True, mask, bbox
 
-        # 深度 CAT-Net 权重在时,块级几何判据可信 → 参与硬拒绝;
-        # 否则(dct-bag 降级)块级判据在超声上误报过高 → 降级为软 flag,不拒绝。
-        block_level_hard = self._model is not None
+        # 深度 CAT-Net 本次调用真正成功时,块级几何判据可信 → 参与硬拒绝;
+        # 否则(未加载 或 本次forward失败)→ 块级判据在超声上误报过高 → 降级为
+        # 软 flag,不拒绝。用 catnet_ok_this_call 而非 self._model is not None，
+        # 见上方注释。
+        block_level_hard = catnet_ok_this_call
 
         is_cm, cm_mask, cm_bbox = detect_copy_move(img_np)
         if is_cm:

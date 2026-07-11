@@ -39,6 +39,7 @@ This protocol defines the 3-layer gatekeeper pipeline for detecting fake, duplic
 - **Weights**: Trained during `train.py` startup, saved to `checkpoints/authenticity_model.pth`. 推理端因 ckpt 含 numpy `feat_mean/feat_std`,torch≥2.6 必须 `torch.load(..., weights_only=False)`;该路径只允许加载本项目自产可信权重。正式训练出固定权重后须同步 `AuthenticityModule.EXPECTED_CKPT_SHA256`,否则 `weights_only=False` 缺少完整性约束会重新暴露 pickle 任意代码执行风险。
 - **验证**: 训练结束在验证集报告三类准确率。
 - **Red-line**: authenticity MLP 权重变更须重新在物理体模数据集上全量训练；不可仅调参或微调已有权重。
+- **权重缺失 = 硬报错（2026-07-10 Gate2审查修复）**：`load_weights(path)` 此前对不存在的路径直接返回（无 else 分支），模型停留在随机初始化态、零日志零标志位，`predict()` 仍返回合法 0/1/2——真实性检测器悄悄变成随机分类器，一票否决门失效或随机误杀且无人察觉。现改为 `raise RuntimeError`，交给 `predict.py`/`video_predict.py` 的外层 `except Exception` 转 `ERROR` result.json（为此同步把 `predict.py` 的 gatekeeper 审计调用纳入了 try 包裹范围，此前只包了 build_model 往后）。**production 容器必须打包好 `authenticity_model.pth`**，缺失即视为部署事故，不再静默降级。
 
 > **历史说明**: 旧版用 `torch.randn` 随机噪声 + 随机标签做假训练(完全无用占位),已于本次重写为真实特征训练流程。
 
@@ -72,7 +73,7 @@ Two-stage duplicate detection:
 **⚠️ 硬拒绝路 vs 软 flag 路(2026-07-08 修正,红线守护)**:`detect()` 不再对全部检测器取无差别并集,而是按可信度分两路:
 - **硬拒绝路(`is_tampered=True` → REJECT)**: 深度 CAT-Net(若权重在) ∪ BAG 相位不一致。二者均有红线保护(CAT-Net 学习式;BAG 有「无 JPEG 栅格则弃权」门)。
 - **软 flag 路(记录 `last_soft_flags`,不拒绝)**: copy_move / splice 几何块级判据,**仅在 dct-bag 降级模式下**降级为软 flag。根因:经典块匹配在超声模态无法兼顾零误报与有效召回——全量 holdout(359张真实图)实测,若硬拒绝则 copy_move 误报 **27.3%**;5 组对拍实验(statistical thr 扫描非单调 / NCC 像素级 / NCC+位移投票)均证明误报与召回同涨同跌,压到零误报时召回仅 5–8%(形同虚设)。**CAT-Net 深度权重从未落地**(权重清单无 catnet_v2),降级路即生产路,故必须守红线。修复后硬拒绝误报 **0/359 = 0%**,软 flag 记录 31.8%(仅审计,不影响放行)。
-- **升级路径**: CAT-Net 深度权重(`catnet_v2.torchscript.pt`)落地后 `backend_name=="catnet"`,块级几何判据自动转回硬拒绝(`detect()` 内 `block_level_hard = self._model is not None` 门控)。
+- **升级路径**: CAT-Net 深度权重(`catnet_v2.torchscript.pt`)落地后 `backend_name=="catnet"`,块级几何判据自动转回硬拒绝——**2026-07-10 Gate2审查修复**：门控条件从 `block_level_hard = self._model is not None`（只反映"构造时权重加载成功"）改为 `catnet_ok_this_call`（反映"本次 `detect()` 调用里 CAT-Net 前向是否真成功"）。旧版的地雷：若权重已加载但本次 `_catnet_forward` 抛异常(如 shape assert 失败,原来被 `except Exception: pass` 悄悄吞掉),`block_level_hard` 仍算 True,会把本该软flag的 copy_move/splice(27.3%误报率)错误提升为硬拒绝、真实图像被一票否决出局且无日志。当前 catnet 权重未部署故此地雷不可达,一旦权重落地立即生效,故本次一并修复。同时给权重"损坏"（区别于"原本不存在"）的降级路径补了日志留痕。
 - **官方数据后待验证**: 2026-08-01 后可试 ROI 限定检测(只在结节区块匹配,背景自相似区不检)——子agent 评审认为这是 V2 最值得验证的方向。
 
 > **Gate2 跟进项(待真实数据验证)**:并集对误报率单调不减(P(任一命中)≥max各路),红线安全依赖每路各自保守。BAG 单路对干净单次 JPEG 由「全图弃权门 + 局部窗弃权 + `min_flag_blocks` 聚类」三重把守(全图同一栅格 → 局部相位恒等全图相位 → 零命中);但**重采样/缩放后的 JPEG** 会破坏 8×8 栅格对齐使局部相位散乱,属并集 FP 理论敞口(通常先被全图低 `grid_strength` 弃权门拦下)。**2026-08-01 官方真实 JPG 数据到位后须实测**:BAG 单路真图误报率 + copy-move/splice 两路几何检测器红线表现。

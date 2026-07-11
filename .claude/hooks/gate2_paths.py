@@ -23,6 +23,12 @@ HIGH_RISK_DIR_PREFIXES = (
     os.path.join("src", "models"),
     os.path.join("src", "training"),
     os.path.join("src", "inference"),  # QA_VP.md §1.7 推理侧红线：误报/维度契约/降级路径
+    os.path.join("src", "gatekeeper"),  # 一票否决安全链路：真实性/去重/篡改检测
+    os.path.join("src", "utils"),  # report_generator.py：TI-RADS评分/临床报告生成
+    # （2026-07-10 Gate2审查覆盖面扩容：gatekeeper/report_generator此前不在
+    # 高风险清单里，本轮就在这两处抓出真实bug——authenticity.py权重缺失静默
+    # 降级、tampering_catnet.py forward失败误判、report_generator.py NaN/越界
+    # idx静默算错——同类"看似能跑、实则跑歪"风险不该被排除在Gate2覆盖外。
 )
 
 # scripts/ 下按文件名模式命中（避免把 verify_model.py/deploy.py 等低风险脚本也算进来）

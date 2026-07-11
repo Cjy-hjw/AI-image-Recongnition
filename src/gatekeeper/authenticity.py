@@ -192,31 +192,45 @@ class AuthenticityModule:
         self.feat_std = None
 
     def load_weights(self, path):
-        if os.path.exists(path):
-            # 完整性校验:防御 pickle 任意代码执行攻击(weights_only=False 必须配套)
-            if self.EXPECTED_CKPT_SHA256 is not None:
-                with open(path, 'rb') as f:
-                    actual_sha = hashlib.sha256(f.read()).hexdigest()
-                if actual_sha != self.EXPECTED_CKPT_SHA256:
-                    raise RuntimeError(
-                        f"Checkpoint {path} integrity check failed.\n"
-                        f"Expected SHA256: {self.EXPECTED_CKPT_SHA256}\n"
-                        f"Actual SHA256:   {actual_sha}\n"
-                        "Possible causes: file corruption, malicious replacement, or "
-                        "EXPECTED_CKPT_SHA256 not updated after retraining."
-                    )
-            # weights_only=False:ckpt 含 numpy 标准化统计(feat_mean/feat_std),
-            # torch≥2.6 默认 weights_only=True 会拒绝反序列化 numpy 对象而报错。
-            # 权重由本项目 authenticity_trainer 自产(可信来源),显式关闭安全限制。
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                self.model.load_state_dict(ckpt["state_dict"])
-                fm, fs = ckpt.get("feat_mean"), ckpt.get("feat_std")
-                self.feat_mean = None if fm is None else np.asarray(fm, dtype=np.float32)
-                self.feat_std = None if fs is None else np.asarray(fs, dtype=np.float32)
-            else:
-                # 兼容旧的纯 state_dict 格式(无标准化参数)
-                self.model.load_state_dict(ckpt)
+        if not os.path.exists(path):
+            # 2026-07-10 Gate2审查发现：此前无 else 分支，权重文件不存在时方法
+            # 直接返回，模型停留在 __init__ 的随机初始化态，零日志零标志位。
+            # predict() 之后照常对随机 logits 做 softmax+argmax，返回合法的
+            # 0/1/2——与真实分类结果在接口上完全无法区分，真实性检测器悄悄
+            # 变成随机分类器，一票否决门失效或随机误杀真实图像，且无人能发现。
+            # 与本次训练管道"strict=False静默吞key→随机初始化"同源，触发点从
+            # "key不匹配"换成"文件不存在"。gatekeeper 是安全关键路径，硬报错
+            # 交给上层转 ERROR result.json，不允许静默退化为随机分类继续放行。
+            raise RuntimeError(
+                f"[FATAL] AuthenticityModule 权重文件不存在: {path}\n"
+                "真实性检测是 gatekeeper 一票否决链路的一环，缺权重不能静默退化为"
+                "随机初始化分类——继续跑会让虚假/合成图像有几率被误判为真实而放行，"
+                "也可能把真实图像随机误杀。"
+            )
+        # 完整性校验:防御 pickle 任意代码执行攻击(weights_only=False 必须配套)
+        if self.EXPECTED_CKPT_SHA256 is not None:
+            with open(path, 'rb') as f:
+                actual_sha = hashlib.sha256(f.read()).hexdigest()
+            if actual_sha != self.EXPECTED_CKPT_SHA256:
+                raise RuntimeError(
+                    f"Checkpoint {path} integrity check failed.\n"
+                    f"Expected SHA256: {self.EXPECTED_CKPT_SHA256}\n"
+                    f"Actual SHA256:   {actual_sha}\n"
+                    "Possible causes: file corruption, malicious replacement, or "
+                    "EXPECTED_CKPT_SHA256 not updated after retraining."
+                )
+        # weights_only=False:ckpt 含 numpy 标准化统计(feat_mean/feat_std),
+        # torch≥2.6 默认 weights_only=True 会拒绝反序列化 numpy 对象而报错。
+        # 权重由本项目 authenticity_trainer 自产(可信来源),显式关闭安全限制。
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            self.model.load_state_dict(ckpt["state_dict"])
+            fm, fs = ckpt.get("feat_mean"), ckpt.get("feat_std")
+            self.feat_mean = None if fm is None else np.asarray(fm, dtype=np.float32)
+            self.feat_std = None if fs is None else np.asarray(fs, dtype=np.float32)
+        else:
+            # 兼容旧的纯 state_dict 格式(无标准化参数)
+            self.model.load_state_dict(ckpt)
 
     def predict(self, img_np):
         features = extract_authenticity_features(img_np)

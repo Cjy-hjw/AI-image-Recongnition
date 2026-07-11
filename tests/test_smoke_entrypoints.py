@@ -26,6 +26,12 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 子进程必须能 import src.* —— 用仓库根做 cwd,并把根注入 PYTHONPATH
 _ENV = dict(os.environ, PYTHONPATH=REPO_ROOT)
 
+try:
+    from scripts.verify.gen_synthetic_dicom import build_dicom
+    _HAS_PYDICOM = True
+except ImportError:
+    _HAS_PYDICOM = False
+
 
 def _run_entry(script, args, timeout=300):
     """在仓库根以子进程跑入口脚本,返回 CompletedProcess。"""
@@ -380,3 +386,83 @@ class TestBuildModelErrorFallback:
             f"status 非法: {data.get('status')}\nSTDOUT:{r.stdout}"
         if data.get("status") == "ERROR":
             assert "reason" in data and data["reason"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DICOM 单帧/多帧 cine → video_predict.py --skip_gatekeeper 全产物
+# (2026-07-11 P1：docker-build-smoke 输入覆盖扩容第一步，本地先验证同一份
+#  scripts.verify.gen_synthetic_dicom.build_dicom 生成的 DICOM 能被真实链路
+#  完整跑通——与 test_entrypoint_dispatch.py::_write_dicom 那种只写魔数字节
+#  供 bash 路由测试的假文件不同，这里是真正能被 pydicom.dcmread() 解析、
+#  video_io._load_dicom_cine 能读出 pixel_array 的合法 DICOM)
+# entrypoint.sh 把 .dcm/.dicom 无条件路由到 video_predict.py（单帧也不例外，
+# _load_dicom_cine 会把 2D pixel_array 包装成 (1,H,W) 当单帧 cine 处理，见
+# 本轮 P1 计划里"已确认不是 bug 的发现"），故这里统一走 video_predict.py。
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.skipif(not _HAS_PYDICOM, reason="pydicom 未安装，跳过 DICOM 冒烟测试")
+class TestDicomInputPaths:
+    def test_single_frame_dicom_passes(self, tmp_path):
+        dcm = tmp_path / "single.dcm"
+        build_dicom(rows=32, cols=32, n_frames=1).save_as(str(dcm), enforce_file_format=True)
+        out = tmp_path / "vout_dcm1"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(dcm),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+            "--skip_gatekeeper",
+        ])
+        assert r.returncode == 0, \
+            f"单帧 DICOM 不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "单帧 DICOM 仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "PASSED", f"预期 status=PASSED，实际 {data}\nSTDOUT:{r.stdout}"
+        for name in ("result.json", "clinical_report.txt", "mask_predicted.png"):
+            assert (out / name).exists(), f"缺产物 {name}"
+
+    def test_multi_frame_dicom_cine_passes(self, tmp_path):
+        dcm = tmp_path / "cine.dcm"
+        build_dicom(rows=32, cols=32, n_frames=4).save_as(str(dcm), enforce_file_format=True)
+        out = tmp_path / "vout_dcm4"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(dcm),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+            "--skip_gatekeeper",
+        ])
+        assert r.returncode == 0, \
+            f"多帧 DICOM cine 不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "多帧 DICOM cine 仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "PASSED", f"预期 status=PASSED，实际 {data}\nSTDOUT:{r.stdout}"
+        for name in ("result.json", "clinical_report.txt", "mask_predicted.png"):
+            assert (out / name).exists(), f"缺产物 {name}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 非空损坏文件 → predict.py 必须 ERROR，不能裸崩溃
+# (2026-07-11 P1：与已有的空文件用例区分——空文件是 0 字节，cv2.imread 立即
+#  返回 None；这里是非空但内容不构成任何合法图像格式，验证 cv2.imread 在这种
+#  "看起来像文件、内容却是垃圾"输入下的失败路径同样被正确兜住)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestCorruptedNonEmptyFile:
+    def test_predict_corrupted_nonempty_file_writes_error_json(self, tmp_path):
+        corrupted = tmp_path / "corrupted.png"
+        # 非空、有 .png 扩展名，但内容是随机字节，不构成任何合法 PNG 结构
+        corrupted.write_bytes(os.urandom(2048))
+        out = tmp_path / "out_corrupted"
+        r = _run_entry("predict.py", [
+            "--input_image", str(corrupted),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"损坏文件不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "损坏文件仍必须落 result.json（不能零输出）"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"

@@ -32,6 +32,7 @@
 | `verify/gates/gate6_stage1_masking.py` | Stage 1 gradient masking (loss_mal=0.0, zero leakage) |
 | `verify/gates/gate7_optimizer_lr.py` | Optimizer LR alignment across 3 stages |
 | `verify/gates/gate8_adaptor_isolation.py` | TaskAlignmentAdaptor cls→seg 梯度隔离审计(2026-07-11 新增)——`loss_mal.backward()` 后断言 `seg_backbone` 梯度精确 `==0.0`(非 `<1e-7` 容差);内部主动复位 `requires_grad`(消除 gate3 Rule 3.3 的"假冻结"掩盖)+ 强制 `adaptor_stage{3,4}.gamma` 非零(消除零初始化门控让正确/错误 detach 都测出 0 的伪 Gate 陷阱)+ `gamma_prior=0.0`(消除物理先验合法耦合通路的干扰)。详见该文件源码注释与 `src/models/AGENTS.md` §1.1、`QA_VP.md` §1.1。回归测试:`tests/test_gate8_adaptor_isolation.py`(正面通过 + monkeypatch detach 负面检测)。 |
+| `verify/gen_synthetic_dicom.py` | **不属于 gate1→gate8 训练验证链路**,是 CI `docker-build-smoke` job(2026-07-11 P1 输入覆盖扩容) + `tests/test_smoke_entrypoints.py::TestDicomInputPaths` 共用的合成 DICOM fixture 生成器——用 `pydicom.dataset.FileDataset` 构造真正能被 `pydicom.dcmread()` 解析(区别于 `test_entrypoint_dispatch.py::_write_dicom` 那种只有魔数字节、只供 bash 分发路由测试用的假文件)、`video_io._load_dicom_cine` 能读出 `pixel_array` 的最小合法 DICOM,支持单帧(`--frames 1`)与多帧 cine(`--frames >1`)。CLI:`python scripts/verify/gen_synthetic_dicom.py --out PATH --frames N [--rows R --cols C]`。 |
 
 `verify_model.py` is a thin CLI (~11 lines) importing from `scripts/verify/runner.py`.
 

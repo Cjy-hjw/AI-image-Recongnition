@@ -57,6 +57,10 @@ python scripts/train_thyroidxl.py --data-root data/public_datasets/ThyroidXL --l
 # 合并 LoRA checkpoint 为部署用纯 Conv2d 权重（predict.py/evaluate.py 直接可加载）
 # v2 已通过验收（CPU/GPU一致性+LoRA-vs-合并一致性+真实predict.py链路AUC=0.8514），可信
 python scripts/merge_lora_checkpoint.py --in checkpoints/thyroidxl_best_v2.pth --out checkpoints/thyroidxl_merged_v2.pth --lora-r 8 --lora-alpha 16
+
+# 27021604(ThyUS2Path) LP-FT-LoRA 训练——MIL vs LoRA 对拍实验（已完成）
+# 结果 best patient-AUC=0.5531，与MIL基线0.5653、随机猜0.50同噪声区间：瓶颈是数据本身非MIL框架，详见 src/dataset/AGENTS.md
+python scripts/train_thyus2path_lora.py --data-root data/27021604_extract --lp-epochs 10 --ft-epochs 40 --batch-size 16
 ```
 
 ## Git 规范（AI 无法从 git log 推断格式约定）

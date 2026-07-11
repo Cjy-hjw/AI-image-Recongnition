@@ -74,21 +74,26 @@ def run_forward(model, img_tensor, precision: str, device: torch.device):
     # CPU does not support float16 autocast — fallback to float32
     is_fp16_on_cpu = device_type == "cpu" and precision == "fp16"
 
-    # 陷阱：torch.autocast 在 device_type="cpu" 时,进入 with 块(__enter__ →
-    # torch.set_autocast_cpu_dtype)才会真正校验 dtype,且**不看 enabled 参数**——
-    # 只要 dtype=torch.float16 就必然 TORCH_CHECK 失败("AutocastCPU only support
-    # Bfloat16"),不是在 torch.autocast(...) 构造这一步就崩。之前 enabled=False
-    # 但 dtype 仍传 float16,导致下面的 [WARNING] 打印了"已降级",但进 with 块时仍
-    # 必然崩溃,降级从未真正生效(Gate2 review 2026-07-11 修正措辞:崩溃点在
-    # __enter__ 不在构造函数)。
-    # 修复：is_fp16_on_cpu 时把 dtype 也一并避开 float16(enabled=False 时这个
-    # dtype 值不参与任何实际 cast,纯粹是为了避开触发 TORCH_CHECK 的组合)。
-    # 注：precision=="fp32" 分支下 enabled 恒为 False(CPU/GPU 皆然),此时
-    # dtype 取 torch.float16 只是占位值、不影响任何数值路径,并非刻意选择。
+    # 陷阱（2026-07-11 两轮教训，CI test job 实测抓到）：torch==2.1.0 的
+    # torch.autocast.__enter__ 在 device_type="cpu" 时**无条件**调用
+    # torch.set_autocast_cpu_dtype(dtype)——不看 enabled，只要 dtype!=
+    # torch.bfloat16 就必然 TORCH_CHECK 失败("AutocastCPU only support
+    # Bfloat16")。第一轮修复只堵了 precision=="fp16" 这一种取值（把 dtype
+    # 换成 bfloat16），却让 precision=="fp32" 的 else 分支从原来的 bfloat16
+    # 变成了 float16——以为 enabled=False 时 dtype 是 no-op（Gate2 review 也
+    # 这么判断），但 __enter__ 的校验发生在 enabled 判断之前，实测 CPU 上任何
+    # dtype=float16 都崩，与 enabled 值无关。正确做法：CPU 上 dtype 恒为
+    # bfloat16（不管 precision 是 fp32/fp16/bf16），靠 enabled 门控是否真正
+    # 生效；GPU 上维持原语义不变。
+    if device_type == "cpu":
+        ac_dtype = torch.bfloat16
+    else:
+        ac_dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+
     autocast_ctx = torch.autocast(
         device_type=device_type,
         enabled=(precision in ["fp16", "bf16"] and not is_fp16_on_cpu),
-        dtype=torch.bfloat16 if (precision == "bf16" or is_fp16_on_cpu) else torch.float16,
+        dtype=ac_dtype,
     )
     if is_fp16_on_cpu:
         print(

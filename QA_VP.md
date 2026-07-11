@@ -108,4 +108,4 @@ Before any code modification is merged, submitted, or deployed:
 3.  **Checklist Audit**: 逐条核对本协议 §1/§2 中**改动触及的**领域项(未触及的跳过)。审查流程与 skill 搭配见 `rules.md §2`。
 4.  **Zero Placeholder Rule**: Do not use placeholders or mocked outputs. All code must be fully operational.
 
-**CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 八门,2026-07-11 补 Gate 8 cls→seg 梯度隔离审计)+ 全套 pytest 回归。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。
+**CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 八门,2026-07-11 补 Gate 8 cls→seg 梯度隔离审计)+ 全套 pytest 回归;`docker-build-smoke` job(2026-07-11 新增,host runner 真实 `docker build` + 静态图/动态图容器冒烟,验证镜像本身而非模拟环境)。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。

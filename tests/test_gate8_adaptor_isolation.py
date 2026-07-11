@@ -74,6 +74,17 @@ def test_gate8_passes_with_correct_detach(capsys):
     assert model.adaptor_stage3.gamma.item() == pytest.approx(0.0)
     assert model.adaptor_stage4.gamma.item() == pytest.approx(0.0)
 
+    # requires_grad 必须精确恢复为进入 Gate8 前的状态(2026-07-11 Gate2 补审发现:
+    # 此前只测了 gamma 复原,没测 requires_grad 复原,而 dbecd67 把该行为从"离开时
+    # 全员 True"改成了"精确恢复调用前状态"——即便是 gate3 残留的污染态(此处即
+    # 上面 L64-65 显式设的 False)也如实还原,不静默清理成"看起来更干净"的 True。
+    # 断言恢复为 False,而不是恢复为 True,才是真正验证"精确复原"而非"顺便清干净"。
+    for p in model.seg_backbone.parameters():
+        assert p.requires_grad is False, (
+            "Gate8 结束后 seg_backbone.requires_grad 应精确恢复为调用前状态(False)，"
+            "而不是被静默清理成 True——否则会掩盖后续 Gate 对 requires_grad 状态的真实依赖"
+        )
+
 
 def test_gate8_catches_missing_detach(capsys):
     """负面测试：monkeypatch 掉 detach 模拟误删 bug，Gate 必须能检测到泄漏并返回 False。"""

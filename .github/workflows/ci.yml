@@ -4,8 +4,12 @@ name: CI
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
 
 # 同一分支新 push 取消旧的在跑任务,省额度。
 concurrency:

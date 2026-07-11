@@ -86,7 +86,10 @@ jobs:
           print('OK: 静态图路径冒烟测试通过')
           "
       - name: Generate synthetic cine video (ffmpeg lavfi testsrc,无需外部输入文件)
-        run: ffmpeg -f lavfi -i testsrc=duration=1:size=64x64:rate=5 -y /tmp/smoke_input.mp4
+        # ubuntu-latest runner 不保证预装 ffmpeg,显式装,勿依赖镜像隐式行为
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -f lavfi -i testsrc=duration=1:size=64x64:rate=5 -y /tmp/smoke_input.mp4
       - name: Smoke test — dynamic video path (video_predict.py via entrypoint 分发)
         # --skip_gatekeeper 跳过审计(video_predict.py 独有该flag,predict.py没有);
         # checkpoints/best_model.pth 缺失时 build_model 降级随机初始化(非硬报错,

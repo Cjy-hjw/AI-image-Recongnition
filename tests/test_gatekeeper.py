@@ -156,6 +156,49 @@ class TestDeduplication:
         assert feat.shape == (512,)
         assert abs(float(np.linalg.norm(feat)) - 1.0) < 1e-4
 
+    def test_resnet18_fallback_raises_instead_of_downloading_when_cache_missing(self, monkeypatch):
+        """2026-07-11 回归测试:SSCD 缺失降级到 resnet18 后,若本地缓存
+        (~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth)也不存在,
+        此前会静默走 `models.resnet18(pretrained=True)` 触发 torchvision
+        联网下载——离线交付容器(答疑Q26禁联网)下这条路径会挂死/超时。
+        现改为硬 raise,不得尝试任何联网操作。
+
+        用 monkeypatch 让 os.path.exists 对 resnet18 缓存路径选择性返回 False
+        (其余路径透传真实结果,避免误伤构造函数里其他文件存在性检查),
+        模拟"SSCD + resnet18 缓存双双缺失"的完全离线无权重场景。
+        """
+        from src.gatekeeper import deduplication as dedup_module
+
+        real_exists = os.path.exists
+        resnet_cache_path = os.path.expanduser(
+            "~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth"
+        )
+
+        def _fake_exists(path):
+            if os.path.normpath(path) == os.path.normpath(resnet_cache_path):
+                return False
+            return real_exists(path)
+
+        monkeypatch.setattr(dedup_module.os.path, "exists", _fake_exists)
+
+        # 同时确认不会触发联网:只拦截 pretrained=True 这一次调用(联网触发点),
+        # pretrained=False(构造函数里紧邻 else 分支之前那一次,纯建架构不加载
+        # 权重,合法无害)必须放行,否则会连带把测试自己弄坏。
+        real_resnet18 = dedup_module.models.resnet18
+
+        def _resnet18_guard(*args, **kwargs):
+            if kwargs.get("pretrained") is True:
+                raise AssertionError(
+                    "不应该调用 torchvision.models.resnet18(pretrained=True)——"
+                    "离线容器场景下这会尝试联网下载"
+                )
+            return real_resnet18(*args, **kwargs)
+
+        monkeypatch.setattr(dedup_module.models, "resnet18", _resnet18_guard)
+
+        with pytest.raises(RuntimeError, match="resnet18.*权重缺失|权重缺失.*resnet18"):
+            dedup_module.FeatureExtractor(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+
     def test_adaptive_cosine_threshold_per_backend(self):
         """cosine_threshold=None 时按激活后端自适应取推荐阈值(SSCD 0.86 / ResNet18 0.95)。
 

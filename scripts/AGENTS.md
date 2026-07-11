@@ -75,3 +75,26 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 | `merge_lora_checkpoint.py` | 把 `train_thyroidxl.py` 产出的 LoRA 结构 checkpoint 合并为纯 Conv2d 部署权重（`disable_lora`/`merge_weights` 数学合并，fp32、非 autocast） | `--in`(源LoRA checkpoint) `--out`(合并后裸 state_dict路径) `--lora-r`/`--lora-alpha`(须与训练时一致，否则 `strict=True` 加载直接报错) | 产出可被 `model_runner.build_model()` 直接 strict 加载（无需推理侧感知 LoRA）；**合并脚本本身无罪**——若合并前后模型输出差异巨大，先怀疑 backbone 数值病态（退化 BatchNorm），不要怀疑合并数学（已用单层测试 diff~1e-7 验证正确性） |
 | `train_thyus2path_lora.py` | 27021604(ThyUS2Path) LP-FT-LoRA 训练——**MIL vs LoRA 对拍实验**，同架构/同LP-FT-LoRA协议搬到该数据集，绕开 MIL bag 框架，验证 MIL 卡点是框架问题还是数据天花板 | `--data-root`(默认`data/27021604_extract`) `--lp-epochs`(10) `--ft-epochs`(40) `--batch-size`(16) `--val-frac`(0.2)；产出 `checkpoints/thyus2path_lora_best.pth` | 2026-07-10 实测：best patient-AUC=**0.5531**（FT-LoRA阶段train loss崩到0.02但val AUC全程0.45~0.55震荡，收官0.4998），与MIL的0.5653、随机猜0.50均在噪声范围内——**结论：瓶颈是数据本身（患者级标签广播到大量非靶区背景帧），非MIL框架问题**；不训分割头(该数据无mask标注)；只用27021604单一数据源 |
 
+---
+
+## 7. `entrypoint.sh` — 交付入口:扩展名分发 + 内容嗅探兜底(2026-07-11 加固)
+
+**背景**:官方"动态图"具体交付格式从未在答疑中明确过(见 `docs/比赛对齐与风险.md`「动态图交付格式未知风险」)。纯扩展名白名单(`mp4|avi|mov|mkv|dcm|dicom` → `video_predict.py`,其余 → `predict.py`)是工程假设,格式超出预期时会静默误判成静态图,导致该样本 100% 丢失预测。
+
+**分发逻辑(`entrypoint.sh` 第 5 节)**:
+1. **扩展名判断**(`ext_kind`,与此前行为一致,是路由默认值)。
+2. **内容 magic bytes 嗅探**(`sniff_kind`,交叉校验/兜底,仅当文件存在且可读时启用):
+   - **DICOM**:显式检查 offset 128 起紧跟的 4 字节 `"DICM"` 魔数(`dd if=... bs=1 skip=128 count=4`),不依赖 `file --mime-type`——不同环境/精简容器的 magic db 是否收录 DICOM 签名不保证,显式 offset 判定更可靠、更可移植。
+   - 其余用 `file --mime-type -b`(Linux/Git-Bash 均自带,无新依赖)取 `image/*`、`video/*` 前缀判定。
+   - 文件不存在/不可读/`file` 命令不可用 → `sniff_kind="skip"`,无嗅探依据,**退化为纯扩展名路由**(不引入新失败模式;是否存在由下游 `load_input_image`/`load_video_frames` 的加载失败分支负责报错,见 `src/inference/AGENTS.md` §1)。
+3. **裁决**(`sniff_kind` 有效时才生效):
+   - `sniff_kind` 与 `ext_kind` **一致** → 正常路由,无额外输出。
+   - **不一致** → **以内容嗅探为准重新路由**,打印 `[WARNING] Extension-based routing (...) mismatches content sniff (...) -- rerouting by content, not extension.`(不静默按可能错误的扩展名走)。
+   - **两者都判不出**(`sniff_kind="unknown"`:文件可读,但既非 DICOM 也非 `image/*`、`video/*`)→ **不猜测路由**,`echo ... CRITICAL ERROR ... >&2`、从透传参数里解析 `--output_dir`(`--output_dir value` 与 `--output_dir=value` 两种写法都认,未传则退化 `predict.py` 同款默认值 `data/output`)、落 `{"status": "ERROR", "reason": "..."}` 的 `result.json`(与 `src/inference/export.py::save_rejection_json` 同构 schema)、`exit 1`,**不 `exec` 任何 python 入口**——ERROR 是诚实的失败状态,比误判成静态图导致整段动态图样本丢失预测更安全。
+
+**实现层选择**:嗅探逻辑放在 `entrypoint.sh`(bash 层)而非 `src/inference/io.py`/`video_io.py`(Python 层)——因为分发决策(选 `predict.py` 还是 `video_predict.py`)本身就发生在 Python 进程启动之前,若把嗅探下沉到 Python 层,届时已经"选错入口"、为时已晚(比如误判成静态图启动了 `predict.py`,`predict.py` 内部再嗅探出其实是视频也无法回头去启动 `video_predict.py`)。因此嗅探必须在 dispatch 之前、bash 层完成。
+
+**测试**:`tests/test_entrypoint_dispatch.py::TestContentSniffFallback`(6 个用例):扩展名/内容不一致双向重路由(image↔video)、一致时不误报警告、DICOM 无白名单扩展名仍靠内容识别(offset-128 preamble 特殊性的回归验证)、完全无法识别内容硬失败(exit 1 + ERROR result.json + 不 exec 任何入口)、文件不存在时退化为纯扩展名路由(不因为读不到文件就误判"无法识别")。既有 `TestDispatch`/`TestProductionIntegrity`/`TestSrcTreeHashParity` 19 个用例全部沿用旧行为(用不存在的占位路径如 `/tmp/case.mp4`,天然命中"跳过嗅探"分支),未受影响。
+
+**已知边界(不在本次范围内)**:内容嗅探只能区分"这个文件是图片还是视频/DICOM",**不能**支持全新输入形态——若官方实际交付是"JPG 帧序列"(一组按帧编号的独立文件而非单文件),对单个 JPG 帧嗅探只会得到 `image/jpeg`,依然会被路由到 `predict.py` 做单帧预测,不会自动聚合成 cine 送 `video_predict.py`。这类形态若被 8-1 官方数据证实存在,需要在入参层面新增"目录路径"这一形态,现在不凭空实现(`rules.md`「先证后改」)。
+

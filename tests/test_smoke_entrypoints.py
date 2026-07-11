@@ -176,6 +176,100 @@ class TestLoadFailureErrorFallback:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ERROR 路径:--config 加载失败(路径不存在/YAML 格式错误/键缺失)→ 必须落
+# result.json,不能零输出(2026-07-11 修复：与上面输入加载失败同一类"try 外裸
+# 操作"问题,此前 open(args.config)/yaml.safe_load/config["environment"]["device"]
+# 都在 try 块外,见 model_runner.load_config docstring)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestConfigLoadFailureErrorFallback:
+    def test_predict_missing_config_writes_error_json(self, tmp_path):
+        img = tmp_path / "noise.png"
+        _write_noise_png(img)
+        missing_cfg = tmp_path / "does_not_exist.yaml"
+        out = tmp_path / "out"
+        r = _run_entry("predict.py", [
+            "--input_image", str(img),
+            "--config", str(missing_cfg),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"--config 路径不存在时不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "--config 缺失时仍必须落 result.json(不能零输出空目录)"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+    def test_predict_malformed_config_writes_error_json(self, tmp_path):
+        img = tmp_path / "noise.png"
+        _write_noise_png(img)
+        bad_cfg = tmp_path / "malformed.yaml"
+        bad_cfg.write_text('environment: "device: cuda:0\n', encoding="utf-8")
+        out = tmp_path / "out2"
+        r = _run_entry("predict.py", [
+            "--input_image", str(img),
+            "--config", str(bad_cfg),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"--config 格式错误时不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "--config 格式错误时仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+    def test_video_predict_missing_config_writes_error_json(self, tmp_path):
+        vid = tmp_path / "clip.mp4"
+        if not _write_noise_mp4(vid):
+            pytest.skip("mp4v codec 不可用,跳过本用例")
+        missing_cfg = tmp_path / "does_not_exist.yaml"
+        out = tmp_path / "vout"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(vid),
+            "--config", str(missing_cfg),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"--config 路径不存在时不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "--config 缺失时仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+    def test_video_predict_malformed_config_writes_error_json(self, tmp_path):
+        """与 test_predict_malformed_config_writes_error_json 对称补齐（2026-07-11
+        Gate2 review 发现缺口：此前 video_predict.py 侧只测了 config 缺失，没测格式
+        错误，虽然 load_config() 本身的 malformed 场景已被
+        test_model_runner.py::test_malformed_yaml_raises 单元覆盖，但子进程级冒烟
+        应锁死 video_predict.py 真实调用链路，而非只靠间接覆盖）。"""
+        vid = tmp_path / "clip.mp4"
+        if not _write_noise_mp4(vid):
+            pytest.skip("mp4v codec 不可用,跳过本用例")
+        bad_cfg = tmp_path / "malformed.yaml"
+        bad_cfg.write_text('environment: "device: cuda:0\n', encoding="utf-8")
+        out = tmp_path / "vout2"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(vid),
+            "--config", str(bad_cfg),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"--config 格式错误时不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "--config 格式错误时仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PASSED 路径:video_predict.py --skip_gatekeeper → 全产物
 # ═════════════════════════════════════════════════════════════════════════════
 

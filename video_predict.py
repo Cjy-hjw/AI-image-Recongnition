@@ -15,7 +15,6 @@ import os
 
 import cv2
 import torch
-import yaml
 
 from src.inference.video_io import load_video_frames
 from src.inference.video_aggregate import aggregate_frame_predictions
@@ -23,7 +22,7 @@ from src.inference.gatekeeper_runner import (
     run_gatekeeper_audit, build_seeded_deduplicator,
     build_auth_module, build_tamper_detector,
 )
-from src.inference.model_runner import build_model, preprocess_image, run_forward
+from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
 from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
@@ -54,11 +53,21 @@ def main():
                    help="跳过逐帧 gatekeeper 审计(仅调试/无训练权重时用)")
     args = p.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    device = torch.device(
-        config["environment"]["device"] if torch.cuda.is_available() else "cpu")
-    img_size = config["data"]["img_size"]
+
+    # 配置加载单独一层 try：与 predict.py 同一契约（见 model_runner.load_config
+    # docstring），路径不存在/YAML 格式错误/键缺失都必须兜成 ERROR result.json，
+    # 不能裸崩溃。os.makedirs 本身不纳入 try，理由同 predict.py。
+    try:
+        config = load_config(args.config)
+        device = torch.device(
+            config["environment"]["device"] if torch.cuda.is_available() else "cpu")
+        img_size = config["data"]["img_size"]
+    except Exception as e:
+        print(f"[FATAL] Config loading failed ({type(e).__name__}): {e}")
+        save_rejection_json(args.output_dir, {
+            "status": "ERROR", "reason": f"{type(e).__name__}: {e}",
+        })
+        return
 
     # 1. 抽帧 & 脱敏
     frames, frame_indices, is_dicom, error_msg = load_video_frames(

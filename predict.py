@@ -1,11 +1,10 @@
 import argparse
 import os
-import yaml
 import cv2
 import torch
 from src.inference.io import load_input_image
 from src.inference.gatekeeper_runner import run_gatekeeper_audit
-from src.inference.model_runner import build_model, preprocess_image, run_forward
+from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
 from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
@@ -25,10 +24,22 @@ def main():
                    help="生成 Grad-CAM 恶性热图(可解释性);需在 inference_mode 外重跑前向+反向,略增耗时")
     args = p.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    device = torch.device(
-        config["environment"]["device"] if torch.cuda.is_available() else "cpu")
+
+    # 配置加载单独一层 try：路径不存在/YAML 格式错误/键缺失都必须兜成 ERROR
+    # result.json，不能裸崩溃（2026-07-11 修复，见 model_runner.load_config
+    # 的 docstring）。os.makedirs 本身不纳入 try——它一旦失败，output_dir 都
+    # 不存在，没有地方能写 result.json，只能任其以非零 exit code 退出（这是
+    # 部署方控制的启动参数，不是输入数据能触达的攻击面，风险可接受）。
+    try:
+        config = load_config(args.config)
+        device = torch.device(
+            config["environment"]["device"] if torch.cuda.is_available() else "cpu")
+    except Exception as e:
+        print(f"[FATAL] Config loading failed ({type(e).__name__}): {e}")
+        save_rejection_json(args.output_dir, {
+            "status": "ERROR", "reason": f"{type(e).__name__}: {e}",
+        })
+        return
 
     # 1. Load & anonymize
     img_np, is_dicom, error_msg = load_input_image(args.input_image, args.output_dir)

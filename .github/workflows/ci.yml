@@ -47,3 +47,61 @@ jobs:
         run: python scripts/verify_model.py
       - name: Full pytest regression
         run: pytest -q
+
+  # 铁律 3(2026-07-11 新增):真实 `docker build` + 起容器冒烟测试。
+  # 背景:此前 test job 只是在同一基础镜像里手动 pip install「模拟」容器环境,
+  # 从未真正 `docker build` 过 Dockerfile 本身——2026-07-11 人工审计发现
+  # entrypoint.sh 依赖的 _src_tree_hash.sh 此前一直没被 COPY 进镜像,容器一
+  # 启动 entrypoint 就会 source 找不到文件直接崩溃,这个 bug 潜伏期间没有任何
+  # CI 检测到。本 job 跑在 host runner(非容器内 job,ubuntu-latest 自带 docker),
+  # 补上"镜像真的能 build 出来、entrypoint.sh 真的能在其中跑起来"这道验证。
+  # 无真实权重(checkpoints/ 未打进镜像,交付走官方平台人工上传通道,见
+  # docs/比赛对齐与风险.md),故只做机制级冒烟(容器能否构建/启动/分发/落盘),
+  # 不验证预测数值正确性(数值正确性由 test job 的 Gate1-8 + pytest 覆盖)。
+  docker-build-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t thyroid-infer:ci-test .
+      - name: Generate synthetic static image (well-known minimal valid 1x1 PNG)
+        run: echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" | base64 -d > /tmp/smoke_input.png
+      - name: Smoke test — static image path (predict.py via entrypoint 分发)
+        # 无 authenticity_model.pth,gatekeeper 审计第一步(Authenticity)必然
+        # 硬报错(2026-07-10 修复:权重缺失 raise 而非静默随机分类)——预期
+        # status=ERROR,这本身就是"容器构建+启动+分发+异常兜底"全链路走通的证明,
+        # 不是失败。只要 result.json 落盘且 status/reason 字段完整即视为通过。
+        run: |
+          mkdir -p /tmp/smoke_out_static
+          docker run --rm \
+            -v /tmp/smoke_input.png:/workspace/smoke_input.png:ro \
+            -v /tmp/smoke_out_static:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/smoke_input.png
+          echo "--- result.json ---"; cat /tmp/smoke_out_static/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_static/result.json'))
+          assert d.get('status') == 'ERROR', f'预期status=ERROR(容器内无真实权重),实际:{d}'
+          assert d.get('reason'), f'reason不应为空: {d}'
+          print('OK: 静态图路径冒烟测试通过')
+          "
+      - name: Generate synthetic cine video (ffmpeg lavfi testsrc,无需外部输入文件)
+        run: ffmpeg -f lavfi -i testsrc=duration=1:size=64x64:rate=5 -y /tmp/smoke_input.mp4
+      - name: Smoke test — dynamic video path (video_predict.py via entrypoint 分发)
+        # --skip_gatekeeper 跳过审计(video_predict.py 独有该flag,predict.py没有);
+        # checkpoints/best_model.pth 缺失时 build_model 降级随机初始化(非硬报错,
+        # 见 src/inference/AGENTS.md),故完整推理链路应能跑完产出 status=PASSED
+        # (预测数值本身无意义,只验证容器机制:分发+完整推理链路+落盘)。
+        run: |
+          mkdir -p /tmp/smoke_out_video
+          docker run --rm \
+            -v /tmp/smoke_input.mp4:/workspace/smoke_input.mp4:ro \
+            -v /tmp/smoke_out_video:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/smoke_input.mp4 --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_video/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_video/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(random-init模型仍应完整跑完),实际:{d}'
+          print('OK: 动态图路径冒烟测试通过')
+          "

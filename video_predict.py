@@ -11,7 +11,6 @@ Gatekeeper 说明:真实性/拼接/copy-move 为一票否决项,对**每个抽�
 """
 
 import argparse
-import json
 import os
 
 import cv2
@@ -66,6 +65,7 @@ def main():
         args.input_video, args.output_dir, args.max_frames)
     if frames is None:
         print(f"Error: {error_msg}")
+        save_rejection_json(args.output_dir, {"status": "ERROR", "reason": error_msg})
         return
     print(f"--> Decoded {len(frames)} sampled frames from {os.path.basename(args.input_video)}")
 
@@ -95,8 +95,7 @@ def main():
                     tamper_detector=tamper_detector)
                 if not passed:
                     rejection_json["rejected_frame_index"] = int(pos)
-                    with open(os.path.join(args.output_dir, "result.json"), "w") as f:
-                        json.dump(rejection_json, f, indent=2)
+                    save_rejection_json(args.output_dir, rejection_json)
                     print(f"--> [REJECTED] frame {pos} failed gatekeeper: {rejection_json.get('reason')}")
                     return
 

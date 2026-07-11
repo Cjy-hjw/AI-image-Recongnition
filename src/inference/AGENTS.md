@@ -26,7 +26,12 @@ This package provides reusable inference modules shared by `predict.py` (product
 - Supports DICOM (`.dcm`/`.dicom`) via `pydicom` and standard formats via `cv2.imread(..., IMREAD_GRAYSCALE)`.
 - **PHI Anonymization** (HIPAA Safe Harbor): 仅覆盖 DICOM 中**已存在**的 PHI 标签(完整清单见 `io.py` 的 `_PHI_FIELDS`),涵盖患者身份(Name/ID/BirthDate/Sex/Age/Address/Telephone/OtherIDs)、就诊(AccessionNumber/StudyID/各类 Date)、机构与设备(InstitutionName/Address/StationName/DeviceSerialNumber)、医师与操作者(Referring/Performing/Operators)。日期类置 `"00000101"`,其余置 `"ANONYMIZED"` 或空串。
 - Anonymized DICOM saved to `output_dir/anonymized_image.dcm`.
-- Returns `(None, False, error_msg)` on failure — caller must check and print error.
+- Returns `(None, False, error_msg)` on failure — caller must check `img_np is None`,
+  print the error **并调用 `export.save_rejection_json` 落 `status="ERROR"` 的
+  `result.json`**（2026-07-11 修复：此前只 print 不落盘，容器 exit code 仍为 0 但
+  `output_dir` 是空目录——比 gatekeeper 一票否决/ `except Exception` 兜底的 ERROR
+  状态还差，绕过了下游所有安全网）。`predict.py`/`video_predict.py` 的
+  `load_video_frames` 加载失败分支同样遵守此契约。
 
 ---
 
@@ -177,3 +182,17 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 新增的 NaN/越界idx校验抛 `ValueError`，CUDA OOM 等也需兜住——异常类型名随 `str(e)`
 一起落盘，不靠拆分 except 分支也能区分故障类别。`video_predict.py` 的 gatekeeper
 审计循环本就在 try 块内，此次只需扩 `predict.py`。
+
+### 已知缺口（2026-07-11 审计发现，未修，待后续 PR）：config 加载仍在 try 外
+
+`predict.py:27-31`/`video_predict.py:56-60` 的 `os.makedirs(args.output_dir)` →
+`open(args.config)` 读 YAML → `config["environment"]["device"]` 取值这三步，仍在
+`try` 块（分别始于 `predict.py:52`/`video_predict.py:78`）**之外**。`--config` 路径
+不存在（`FileNotFoundError`）、YAML 格式错误、或键缺失（`KeyError`）会导致进程裸
+崩溃、非零 exit code、零输出——与本节修复的"图像/视频加载失败"是**同一类** try 外
+裸操作问题，但代码位置不同，2026-07-11 这轮 P0 修复**未触及**。风险低于图像/视频
+加载失败（`--config`/`--weights`/`--output_dir` 是部署方控制的启动参数，不是输入
+数据能触达的攻击面；且非零 exit code 至少不会被外部编排层误判为"成功"，比"假成功
+空目录"危害小一档），但仍与"result.json 必须总产出、exit code 恒为0"的既定不变式
+冲突。**留作已知缺口不阻塞当前提交，后续如需彻底封闭该不变式，把这三步也纳入更外
+层 try 即可**。

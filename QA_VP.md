@@ -17,6 +17,10 @@ All deep learning implementations MUST be verified by quantifiable automated tes
         if p.grad is not None:
             assert p.grad.abs().sum() < 1e-7, f"Gradient leakage detected in parameter {name}: grad sum = {p.grad.abs().sum().item()}"
     ```
+*   **当前实现现状(2026-07-11,补 Gate 8 前的审计缺口)**:
+    - `gate2_vclub.py` 验证 vCLUB 互信息通路的隔离(`z_latent.detach()` 之后的局部图不得污染 encoder)。
+    - `TaskAlignmentAdaptor`(`multi_task_model.py:53-88`,跨任务对齐:分割特征 `.detach()` 后反哺分类分支)**曾长期只有实现、没有 Gate 量化验证这条 `.detach()` 契约**——`gate2_vclub` 的检查路径根本不经过 adaptor,结构上必然通过,形同虚设;`gate3_auc_margin` 的 Rule 3.3 会把 `seg_backbone.requires_grad` 显式设 False(用于其自身的 BN 冻结校验),这个状态残留在共享 `model` 实例上,若后续想用同一 model 反向传播测 detach 契约会被这个"假冻结"掩盖(不管 detach 是否还在,`requires_grad=False` 都会直接短路 autograd);`gate6_stage1_masking` 测的是 loss 整体乘 0(与 detach 无关),同样测不出 detach 是否失效。已补 `gate8_adaptor_isolation.py` 堵上此缺口,见 `src/models/AGENTS.md` §1.1 与 `scripts/AGENTS.md` §2 的详细记录。
+    - **该 Gate 的断言阈值不是照抄本节模板的 `< 1e-7`,而是精确 `!= 0.0`**:因为其测试构造(`gamma_prior=0.0` 消除物理先验合法耦合通路的干扰 + 手动把 `TaskAlignmentAdaptor.gamma` 从零初始化值拨到非零以真正激活注入通路)已使期望梯度在数学上精确为 0(而非"很小"),已用脚本双向对拍实测验证(正确 detach → `abs().sum()==0.0`;monkeypatch 拆掉 detach → `abs().sum()≈6094`,量级差异悬殊,无需容差空间)。完整推导与踩坑记录(尤其是 `gamma` 零初始化曾让"删掉 detach 也测不出来"的伪 Gate 陷阱)见 `gate8_adaptor_isolation.py` 源码内注释,不在此重复。
 
 ### 1.2 Optimizer Binding Checkpoints (Dual & Custom Parameters)
 *   **Safety Risk**: Custom loss formulations (e.g., AUC-Margin Lagrangian dual minimization, adaptive focal parameters) introduce auxiliary parameters (like `a`, `b`, `alpha` in `AUCMLossApprox`) that must be optimized alongside model weights. If these parameters are omitted from the optimizer, frozen during training stage transitions, or updated with incorrect scaling, optimization fails silently.
@@ -104,4 +108,4 @@ Before any code modification is merged, submitted, or deployed:
 3.  **Checklist Audit**: 逐条核对本协议 §1/§2 中**改动触及的**领域项(未触及的跳过)。审查流程与 skill 搭配见 `rules.md §2`。
 4.  **Zero Placeholder Rule**: Do not use placeholders or mocked outputs. All code must be fully operational.
 
-**CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 七门)+ 全套 pytest 回归。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。
+**CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 八门,2026-07-11 补 Gate 8 cls→seg 梯度隔离审计)+ 全套 pytest 回归。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。

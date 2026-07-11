@@ -34,6 +34,7 @@ def main():
     img_np, is_dicom, error_msg = load_input_image(args.input_image, args.output_dir)
     if img_np is None:
         print(f"Error: {error_msg}")
+        save_rejection_json(args.output_dir, {"status": "ERROR", "reason": error_msg})
         return
 
     # 2-5. Gatekeeper审计 + 模型推理 + 后处理 + 报告导出。整体包一层 except
@@ -86,7 +87,8 @@ def main():
                 report_txt += "\n\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(恶性激活热图)"
 
         out_json = {
-            "status": "PASSED", "malignancy_probability": preds["mal_prob"],
+            "status": "PASSED", "input_type": "static_image",
+            "malignancy_probability": preds["mal_prob"],
             "is_malignant": int(preds["mal_prob"] >= 0.5),
             "tirads_points": breakdown["total_points"],
             "tirads_level": breakdown["tr_level"], "risk_percentage": breakdown["risk"],

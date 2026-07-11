@@ -97,6 +97,65 @@ class TestPredictRejectPath:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ERROR 路径:输入文件加载失败(不存在/空文件)→ 必须落 result.json,不能零输出
+# （2026-07-11 修复的 P0 回归：此前 load_input_image/load_video_frames 加载失败时,
+#  两个入口脚本在 try 块外直接 return,只 print 不落盘——output_dir 是空目录,比
+#  gatekeeper REJECTED 还差,还绕开了 except Exception 那层安全网）
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestLoadFailureErrorFallback:
+    def test_predict_missing_image_writes_error_json(self, tmp_path):
+        missing = tmp_path / "does_not_exist.png"
+        out = tmp_path / "out"
+        r = _run_entry("predict.py", [
+            "--input_image", str(missing),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"输入文件不存在时不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "输入文件不存在时仍必须落 result.json(不能零输出空目录)"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+    def test_video_predict_missing_video_writes_error_json(self, tmp_path):
+        missing = tmp_path / "does_not_exist.mp4"
+        out = tmp_path / "vout"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(missing),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"输入视频不存在时不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "输入视频不存在时仍必须落 result.json(不能零输出空目录)"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+    def test_predict_empty_file_writes_error_json(self, tmp_path):
+        """空文件(0 字节,无扩展名)→ cv2.imread 必然解码失败,同样必须落 ERROR。"""
+        empty = tmp_path / "empty_no_ext"
+        empty.write_bytes(b"")
+        out = tmp_path / "out_empty"
+        r = _run_entry("predict.py", [
+            "--input_image", str(empty),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"空文件不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "空文件仍必须落 result.json(不能零输出空目录)"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PASSED 路径:video_predict.py --skip_gatekeeper → 全产物
 # ═════════════════════════════════════════════════════════════════════════════
 

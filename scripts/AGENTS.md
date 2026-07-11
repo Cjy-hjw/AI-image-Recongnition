@@ -17,13 +17,13 @@
 
 ---
 
-## 2. verify_model.py SEVEN-GATE TEST SUITE
+## 2. verify_model.py EIGHT-GATE TEST SUITE
 
 ### Package Structure (`scripts/verify/`)
 
 | File | Contents |
 |:---|:---|
-| `verify/runner.py` | `verify()` — orchestrates gate1→gate7, returns True/False |
+| `verify/runner.py` | `verify()` — orchestrates gate1→gate8, returns True/False |
 | `verify/gates/gate1_shapes.py` | Output tensor shape assertions |
 | `verify/gates/gate2_vclub.py` | vCLUB gradient isolation (encoder grad sum < 1e-7) |
 | `verify/gates/gate3_auc_margin.py` | AUC-Margin dual params + BatchNorm freeze check |
@@ -31,6 +31,7 @@
 | `verify/gates/gate5_data_leakage.py` | 图像级泄漏双检查:train↔val + holdout↔trainval(目录缺失优雅跳过) |
 | `verify/gates/gate6_stage1_masking.py` | Stage 1 gradient masking (loss_mal=0.0, zero leakage) |
 | `verify/gates/gate7_optimizer_lr.py` | Optimizer LR alignment across 3 stages |
+| `verify/gates/gate8_adaptor_isolation.py` | TaskAlignmentAdaptor cls→seg 梯度隔离审计(2026-07-11 新增)——`loss_mal.backward()` 后断言 `seg_backbone` 梯度精确 `==0.0`(非 `<1e-7` 容差);内部主动复位 `requires_grad`(消除 gate3 Rule 3.3 的"假冻结"掩盖)+ 强制 `adaptor_stage{3,4}.gamma` 非零(消除零初始化门控让正确/错误 detach 都测出 0 的伪 Gate 陷阱)+ `gamma_prior=0.0`(消除物理先验合法耦合通路的干扰)。详见该文件源码注释与 `src/models/AGENTS.md` §1.1、`QA_VP.md` §1.1。回归测试:`tests/test_gate8_adaptor_isolation.py`(正面通过 + monkeypatch detach 负面检测)。 |
 
 `verify_model.py` is a thin CLI (~11 lines) importing from `scripts/verify/runner.py`.
 

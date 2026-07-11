@@ -11,6 +11,7 @@ from scripts.verify.gates.gate4_famo import gate4_famo
 from scripts.verify.gates.gate5_data_leakage import gate5_data_leakage
 from scripts.verify.gates.gate6_stage1_masking import gate6_stage1_masking
 from scripts.verify.gates.gate7_optimizer_lr import gate7_optimizer_lr
+from scripts.verify.gates.gate8_adaptor_isolation import gate8_adaptor_isolation
 
 
 def verify():
@@ -76,6 +77,9 @@ def verify():
         return False
 
     if not gate7_optimizer_lr(backbone, config, device):
+        return False
+
+    if not gate8_adaptor_isolation(model, criterion, x, targets):
         return False
 
     return True

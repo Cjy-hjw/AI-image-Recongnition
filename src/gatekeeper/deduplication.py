@@ -90,7 +90,26 @@ class FeatureExtractor:
                 self.model.load_state_dict(
                     torch.load(local_weights, map_location='cpu', weights_only=True))
             else:
-                self.model = models.resnet18(pretrained=True)
+                # 2026-07-11 修复:此前 else 分支是 `models.resnet18(pretrained=True)`,
+                # 本地缓存缺失时会触发 torchvision 联网下载官方 ImageNet 权重——离线
+                # 交付容器场景(答疑Q26「不能联网」)下这条路径会直接挂死/超时,而不是
+                # 像预期那样"降级但至少能跑"。SSCD 主后端缺失已经是一次降级(→resnet18),
+                # 这里再对 resnet18 自身的权重缺失做二次静默降级(→联网下载)，会让整条
+                # 去重链路在完全没有任何权重的环境下看似"优雅降级"、实则卡死，且卡死点
+                # 发生在 gatekeeper 审计阶段、报错信息只有网络超时，排障成本极高。
+                # 按本项目"硬失败不静默降级"哲学(authenticity.py 同类修复先例)，改为
+                # 显式 raise——调用方(run_gatekeeper_audit → predict.py/video_predict.py
+                # 的 except Exception)会把它转成 status=ERROR 的 result.json，而不是让
+                # 进程在无网环境下无限期挂起。
+                raise RuntimeError(
+                    "[FATAL] Deduplicator resnet18 降级后端权重缺失: "
+                    f"{local_weights} 不存在,且离线容器不允许联网下载("
+                    "torchvision pretrained=True 会尝试联网,官方平台无网络访问)。"
+                    "去重是 gatekeeper 一票否决链路的一环,不能在权重链路完全断裂时"
+                    "继续尝试联网兜底——请确认打包流程已把 resnet18-f37072fd.pth "
+                    "放入 ~/.cache/torch/hub/checkpoints/,或修复 SSCD 主后端权重缺失"
+                    "(sscd_weights 缺失是本次降级到 resnet18 的根因)。"
+                )
             self.model.fc = torch.nn.Identity()
             self.model.to(device)
             self.model.eval()

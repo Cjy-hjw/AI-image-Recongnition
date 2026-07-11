@@ -41,6 +41,30 @@ def _make_python_shim(dir_path):
     return shim
 
 
+def _write_png(path):
+    """写一个带合法 PNG 魔数(\\x89PNG\\r\\n\\x1a\\n + IHDR chunk 头)的最小文件。"""
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR")
+
+
+def _write_mp4(path):
+    """写一个带合法 MP4 ftyp box 魔数(isom brand)的最小文件。"""
+    with open(path, "wb") as f:
+        f.write(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41")
+
+
+def _write_dicom(path):
+    """写一个带合法 DICOM 魔数的最小文件:128 字节任意 preamble + offset 128 处 'DICM'。"""
+    with open(path, "wb") as f:
+        f.write(b"\x00" * 128 + b"DICM" + b"\x02\x00\x00\x00garbage")
+
+
+def _write_unrecognized(path):
+    """写一段既非图片也非视频/DICOM 魔数的内容(纯文本填充,file(1) 会判为 text/plain)。"""
+    with open(path, "wb") as f:
+        f.write(b"this is filler content matching no known image/video/DICOM magic bytes at all")
+
+
 def _run_entrypoint(input_path, extra_args=None, env_extra=None, shim_dir=None):
     env = dict(os.environ)
     if shim_dir:
@@ -176,4 +200,103 @@ class TestSrcTreeHashParity:
         assert len(files) > 0, "src 树未找到 .py 文件"
         assert bash_sha == py_sha, \
             f"src 树指纹不一致!\n  bash:  {bash_sha}\n  python:{py_sha}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 内容嗅探兜底:扩展名与实际 magic bytes 不符时重新路由;完全无法识别时硬失败
+# (官方"动态图"交付格式未知风险的加固,见 scripts/entrypoint.sh 第5节注释)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestContentSniffFallback:
+    def test_ext_says_image_content_is_video_reroutes_to_video(self, tmp_path):
+        # 扩展名 .jpg(静态图桶)但内容其实是 MP4 ftyp box -> 必须以内容为准重路由到 video
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        case = tmp_path / "case.jpg"
+        _write_mp4(case)
+        r = _run_entrypoint(str(case), shim_dir=shim)
+        assert r.returncode == 0, f"STDERR:{r.stderr}"
+        assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout, \
+            f"内容嗅探为视频时应重路由到 video_predict.py\n{r.stdout}"
+        assert "WARNING" in r.stdout and "mismatch" in r.stdout.lower(), \
+            f"重路由必须打印不一致警告,不能静默\n{r.stdout}"
+
+    def test_ext_says_video_content_is_image_reroutes_to_predict(self, tmp_path):
+        # 扩展名 .mp4(动态桶)但内容其实是 PNG -> 必须以内容为准重路由到 predict
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        case = tmp_path / "case.mp4"
+        _write_png(case)
+        r = _run_entrypoint(str(case), shim_dir=shim)
+        assert r.returncode == 0, f"STDERR:{r.stderr}"
+        assert "SHIM_ARGS: predict.py --input_image" in r.stdout, \
+            f"内容嗅探为图片时应重路由到 predict.py\n{r.stdout}"
+        assert "WARNING" in r.stdout and "mismatch" in r.stdout.lower(), \
+            f"重路由必须打印不一致警告,不能静默\n{r.stdout}"
+
+    def test_matching_ext_and_content_no_spurious_warning(self, tmp_path):
+        # 扩展名与内容一致时不应误报 mismatch 警告(嗅探只做交叉校验,不该添噪声)
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        case = tmp_path / "case.png"
+        _write_png(case)
+        r = _run_entrypoint(str(case), shim_dir=shim)
+        assert r.returncode == 0, f"STDERR:{r.stderr}"
+        assert "SHIM_ARGS: predict.py --input_image" in r.stdout
+        # 只判定"扩展名/内容不一致重路由"这条特定警告未被误触发;不能用裸 "WARNING"
+        # 断言 —— 启动横幅本身就有与本功能无关的 "[WARNING] Trained weights not found"。
+        assert "mismatches content sniff" not in r.stdout, \
+            f"扩展名与内容一致不应误报 mismatch 重路由警告\n{r.stdout}"
+
+    def test_dicom_content_without_whitelisted_ext_routes_to_video(self, tmp_path):
+        # 扩展名 .raw(不在动态白名单内,按扩展名会被误判成静态图)但内容有合法 DICOM
+        # 魔数(offset 128 "DICM")-> 必须靠内容嗅探识别出 DICOM 并重路由到 video_predict.py。
+        # 这正是 DICOM 128 字节 preamble 特殊性(不能只靠扩展名/file(1) magic db 猜)的回归验证。
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        case = tmp_path / "case.raw"
+        _write_dicom(case)
+        r = _run_entrypoint(str(case), shim_dir=shim)
+        assert r.returncode == 0, f"STDERR:{r.stderr}"
+        assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout, \
+            f"DICOM 魔数应重路由到 video_predict.py,不受扩展名白名单限制\n{r.stdout}"
+        assert "WARNING" in r.stdout, f"扩展名与内容(DICOM)不一致应报警告\n{r.stdout}"
+
+    def test_unrecognized_content_hard_fails_with_error_json(self, tmp_path):
+        # 文件真实存在且可读,但内容既非 DICOM 也非 image/*、video/* -> 不能瞎猜路由,
+        # 必须 exit 1 + 不 exec 任何 python 入口 + 落 status=ERROR 的 result.json。
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        case = tmp_path / "case.jpg"
+        _write_unrecognized(case)
+        out_dir = tmp_path / "out"
+        r = _run_entrypoint(str(case), extra_args=["--output_dir", str(out_dir)],
+                            shim_dir=shim)
+        assert r.returncode == 1, f"无法识别格式应 exit 1\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        assert "SHIM_ARGS" not in r.stdout, "无法识别格式不该分发到任何 python 入口"
+        assert "CRITICAL ERROR" in r.stderr, f"未报无法识别格式错误\nSTDERR:{r.stderr}"
+
+        result_json = out_dir / "result.json"
+        assert result_json.exists(), f"无法识别格式必须落 ERROR result.json 到 --output_dir\n{r.stderr}"
+        import json
+        payload = json.loads(result_json.read_text(encoding="utf-8"))
+        assert payload["status"] == "ERROR", f"result.json status 应为 ERROR: {payload}"
+        assert "reason" in payload and payload["reason"], f"result.json 缺 reason: {payload}"
+
+    def test_nonexistent_file_skips_sniff_falls_back_to_extension(self, tmp_path):
+        # 文件不存在(评测/开发中常见占位场景,见既有 TestDispatch 用例)-> 无法嗅探,
+        # 必须退化为纯扩展名路由,不能因为读不到文件就误判成"无法识别"从而硬失败。
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        missing = tmp_path / "does_not_exist.mp4"
+        r = _run_entrypoint(str(missing), shim_dir=shim)
+        assert r.returncode == 0, f"文件不存在不该硬失败,应退化为扩展名路由\nSTDERR:{r.stderr}"
+        assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout
+        assert "mismatches content sniff" not in r.stdout, "无嗅探依据时不应误报 mismatch 重路由警告"
 

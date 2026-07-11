@@ -93,16 +93,22 @@ def test_build_model_falls_back_to_random_init_when_file_missing(tmp_path):
 
 
 class TestRunForwardCpuFp16Fallback:
-    """2026-07-11 血泪教训：CI docker-build-smoke 在纯 CPU 容器（torch==2.1.0，
-    Dockerfile 锁定版本）上跑 video_predict.py 时崩溃——run_forward() 打印了
+    """2026-07-11 血泪教训（两轮）：
+    第一轮——CI docker-build-smoke 在纯 CPU 容器（torch==2.1.0，Dockerfile 锁定
+    版本）上跑 video_predict.py 时崩溃——run_forward() 打印了
     "[WARNING] ...Falling back to float32..."，但紧接着仍必然 RuntimeError
-    (AutocastCPU only support Bfloat16)。根因：torch.autocast() 构造函数在
-    device_type="cpu" 时**不看 enabled 参数**，只要 dtype=torch.float16 就在
-    构造时校验失败——旧代码 enabled=False 但 dtype 仍传 float16，降级承诺
-    从未真正生效。修复：is_fp16_on_cpu 时 dtype 也一并避开 float16。
-    本测试锁死这个契约，防止回归回"打印了降级但没真降级"的状态。
+    (AutocastCPU only support Bfloat16)。根因：torch==2.1.0 的
+    torch.autocast.__enter__ 在 device_type="cpu" 时**不看 enabled 参数**，
+    只要 dtype!=torch.bfloat16 就必然 TORCH_CHECK 失败——旧代码 enabled=False
+    但 dtype 仍传 float16，降级承诺从未真正生效。
+    第二轮——第一轮修复只堵了 precision=="fp16"，却让 precision=="fp32" 的
+    dtype 从原本无害的 bfloat16 变成了 float16（误信"enabled=False 时 dtype
+    是 no-op"，Gate2 review 也这么判断，但 CI test job 的既有测试
+    test_run_forward_fp32_equals_bare_forward 直接实测抓到回归）。最终修复：
+    CPU 上 dtype 恒为 bfloat16，不管 precision 取值，靠 enabled 门控生效与否。
+    本测试类锁死"CPU 上任意 precision 都不崩溃"这个契约。
     注：torch>=2.5 已放宽此校验，本机（Demo_D env, torch 2.5.1）不会复现旧
-    bug 本身，但该测试在 CI 实际使用的 torch==2.1.0 容器上会真实生效；且无论
+    bug 本身，但这些测试在 CI 实际使用的 torch==2.1.0 容器上会真实生效；且无论
     版本，这里断言的"不崩溃 + 返回合法输出"契约本身必须恒成立。
     """
 
@@ -118,6 +124,19 @@ class TestRunForwardCpuFp16Fallback:
             torch.zeros(64, 64, dtype=torch.uint8).numpy(), img_size=64, device=device
         )
         outputs = run_forward(model, img_tensor, precision="fp16", device=device)
+        assert "malignancy" in outputs
+        assert torch.isfinite(outputs["malignancy"]).all()
+
+    def test_fp32_precision_on_cpu_does_not_raise(self):
+        """第二轮回归的直接锁死：precision="fp32" 曾在这次修复中被误改成
+        dtype=float16 而在 CPU 上崩溃（enabled=False 并不能豁免 CPU 的
+        dtype 校验）。"""
+        model = self._tiny_model()
+        device = torch.device("cpu")
+        img_tensor = preprocess_image(
+            torch.zeros(64, 64, dtype=torch.uint8).numpy(), img_size=64, device=device
+        )
+        outputs = run_forward(model, img_tensor, precision="fp32", device=device)
         assert "malignancy" in outputs
         assert torch.isfinite(outputs["malignancy"]).all()
 

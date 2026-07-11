@@ -35,6 +35,8 @@ jobs:
     container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
     steps:
       - uses: actions/checkout@v4
+      - name: Install system deps (file — entrypoint.sh 内容嗅探依赖,与 Dockerfile 保持一致)
+        run: apt-get update && apt-get install -y --no-install-recommends file && rm -rf /var/lib/apt/lists/*
       - name: Install runtime + test deps
         run: |
           # 镜像已自带 torch/torchvision 2.1.0,requirements 里的 torch>=2.1.0 已满足

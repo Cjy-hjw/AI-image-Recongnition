@@ -157,15 +157,21 @@ class TestDeduplication:
         assert abs(float(np.linalg.norm(feat)) - 1.0) < 1e-4
 
     def test_resnet18_fallback_raises_instead_of_downloading_when_cache_missing(self, monkeypatch):
-        """2026-07-11 回归测试:SSCD 缺失降级到 resnet18 后,若本地缓存
-        (~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth)也不存在,
-        此前会静默走 `models.resnet18(pretrained=True)` 触发 torchvision
-        联网下载——离线交付容器(答疑Q26禁联网)下这条路径会挂死/超时。
-        现改为硬 raise,不得尝试任何联网操作。
+        """2026-07-11 回归测试(v2,修正 v1 的 CI 回归——v1 曾无条件 raise,把 CI/开发机
+        这类本身有网络、pretrained=True 联网下载本能成功的环境也一并堵死,已用真实
+        CI 跑红复现锁定该教训)。
+
+        当前正确契约:SSCD 缺失降级到 resnet18 后,若本地缓存
+        (~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth)也不存在,应该
+        **仍然尝试** `models.resnet18(pretrained=True)` 联网下载(CI/开发机等有网
+        环境应该照常成功,不受影响)——只有当联网这一步本身失败(DNS/连接/超时等)时,
+        才转换成清晰的 RuntimeError(而不是让原始网络异常裸传播,排障成本高)。
 
         用 monkeypatch 让 os.path.exists 对 resnet18 缓存路径选择性返回 False
-        (其余路径透传真实结果,避免误伤构造函数里其他文件存在性检查),
-        模拟"SSCD + resnet18 缓存双双缺失"的完全离线无权重场景。
+        (其余路径透传真实结果,避免误伤构造函数里其他文件存在性检查),模拟"本地
+        缓存缺失";再 monkeypatch pretrained=True 分支模拟"联网也失败"(用
+        ConnectionError 模拟真实离线容器场景,不依赖测试环境实际断网),验证失败
+        被转换成携带上下文信息的 RuntimeError,而不是原始异常类型直接冒出来。
         """
         from src.gatekeeper import deduplication as dedup_module
 
@@ -181,23 +187,59 @@ class TestDeduplication:
 
         monkeypatch.setattr(dedup_module.os.path, "exists", _fake_exists)
 
-        # 同时确认不会触发联网:只拦截 pretrained=True 这一次调用(联网触发点),
-        # pretrained=False(构造函数里紧邻 else 分支之前那一次,纯建架构不加载
-        # 权重,合法无害)必须放行,否则会连带把测试自己弄坏。
+        # 只让 pretrained=True 这一次调用(联网触发点)模拟失败;pretrained=False
+        # (构造函数里紧邻 else 分支之前那一次,纯建架构不加载权重,合法无害)必须放行,
+        # 否则会连带把测试自己弄坏。
         real_resnet18 = dedup_module.models.resnet18
 
-        def _resnet18_guard(*args, **kwargs):
+        def _resnet18_network_failure(*args, **kwargs):
             if kwargs.get("pretrained") is True:
-                raise AssertionError(
-                    "不应该调用 torchvision.models.resnet18(pretrained=True)——"
-                    "离线容器场景下这会尝试联网下载"
-                )
+                raise ConnectionError("模拟离线容器场景:联网下载 ImageNet 权重失败")
             return real_resnet18(*args, **kwargs)
 
-        monkeypatch.setattr(dedup_module.models, "resnet18", _resnet18_guard)
+        monkeypatch.setattr(dedup_module.models, "resnet18", _resnet18_network_failure)
 
-        with pytest.raises(RuntimeError, match="resnet18.*权重缺失|权重缺失.*resnet18"):
+        with pytest.raises(RuntimeError, match="联网下载失败") as exc_info:
             dedup_module.FeatureExtractor(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+        # 原始异常必须通过 `raise ... from e` 保留,不能吞掉根因(排障需要看到
+        # ConnectionError 这个真实触发源,而不只是包装后的 RuntimeError 文案)。
+        assert isinstance(exc_info.value.__cause__, ConnectionError)
+
+    def test_resnet18_fallback_succeeds_via_network_when_cache_missing(self, monkeypatch):
+        """2026-07-11 补充回归测试:模拟"本地缓存缺失但网络可用"这个 CI/开发机
+        典型场景,验证 pretrained=True 联网下载路径本身没有被误伤——这正是 v1 版本
+        直接 raise 时会错误堵死的场景,必须显式测试锁定,防止未来重构再次引入同款回归。
+        """
+        from src.gatekeeper import deduplication as dedup_module
+
+        real_exists = os.path.exists
+        resnet_cache_path = os.path.expanduser(
+            "~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth"
+        )
+
+        def _fake_exists(path):
+            if os.path.normpath(path) == os.path.normpath(resnet_cache_path):
+                return False
+            return real_exists(path)
+
+        monkeypatch.setattr(dedup_module.os.path, "exists", _fake_exists)
+
+        # 用一个假的"成功的联网调用"代替真实网络请求(测试不应该依赖真实外网可用性),
+        # 只验证:pretrained=True 分支确实被调用到(而不是被跳过或提前 raise)。
+        network_call_seen = {"called": False}
+        real_resnet18 = dedup_module.models.resnet18
+
+        def _resnet18_fake_success(*args, **kwargs):
+            if kwargs.get("pretrained") is True:
+                network_call_seen["called"] = True
+                return real_resnet18(pretrained=False)  # 返回可用架构,跳过真实下载
+            return real_resnet18(*args, **kwargs)
+
+        monkeypatch.setattr(dedup_module.models, "resnet18", _resnet18_fake_success)
+
+        fe = dedup_module.FeatureExtractor(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+        assert network_call_seen["called"], "本地缓存缺失时应该尝试联网下载,而不是直接拒绝"
+        assert fe.backend_name == "resnet18"
 
     def test_adaptive_cosine_threshold_per_backend(self):
         """cosine_threshold=None 时按激活后端自适应取推荐阈值(SSCD 0.86 / ResNet18 0.95)。

@@ -97,6 +97,13 @@ Pipeline:
 - **`torch.inference_mode()`** — 所有推理前向统一使用 `torch.inference_mode()`，替代 no_grad。
 - **`torch.autocast`** with device-adaptive dtype:
   - CPU + fp16 → fallback to fp32 with `[WARNING]`.
+  - **2026-07-11 修复**：这条降级此前是"假的"——旧代码 `enabled=False` 但 `dtype`
+    仍传 `torch.float16`，`torch.autocast` 进 with 块(`__enter__` → C++端
+    `TORCH_CHECK`)时**不看 enabled**，只要 CPU+float16 组合就必崩(容器锁定的
+    `torch==2.1.0` 上真实触发，CI `docker-build-smoke` job 首次跑通 video 冒烟
+    时抓到)；本机 `torch==2.5.1` 已放宽校验不复现，属于版本差异陷阱。修复为
+    `is_fp16_on_cpu` 时 dtype 也一并避开 float16。见 `tests/test_model_runner.py`
+    的 `TestRunForwardCpuFp16Fallback`。
 - **Safety clamp**: `torch.clamp(outputs["malignancy"].float(), min=-15.0, max=15.0)` under fp16/bf16.
 
 ---

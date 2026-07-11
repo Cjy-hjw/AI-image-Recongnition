@@ -125,6 +125,6 @@
   - Phase 1（冻结 backbone）：best_patient_val_auc = **0.5653**（epoch 15 早停），当前最优，checkpoint: `checkpoints/malignancy_mil_best.pth`。
   - Phase 2（LLRD 解冻 backbone）：不稳定，AUC 在 0.46–0.56 震荡，未突破 Phase 1；根因：GAP 预池化 + 弱监督梯度稀疏，解冻后 backbone 灾难性遗忘。
   - 空间注意力版（SpatialAttentionModule 替代 GAP）：best_auc = **0.5000**（epoch 8 早停），双注意力模块冷启动失败——从零初始化产生噪声权重，弱监督信号无法同时收敛两模块。
-  - **结论**：等官方精确帧级标注数据（2026-08-01）到位后，空间注意力 + 解冻联合训练才真正有用；在此之前任何架构改造须先小实验验证。
+  - **结论（2026-07-10 已用对拍实验证实，不再是猜测）**：`scripts/train_thyus2path_lora.py`（复用 ThyroidXL 上验证过 patient-AUC=0.8514 的同架构 LP-FT-LoRA 管道，改喂 27021604 单帧数据+`patient_grouped_split`，绕开 MIL bag 框架）跑满 50 epoch，best patient-AUC=**0.5531**（FT-LoRA 阶段 train loss 从 0.50 崩到 0.02 严重过拟合，val AUC 全程在 0.45~0.55 震荡，收官 epoch50=0.4998），与 MIL 0.5653、随机猜 0.50 均在噪声范围内。**换了完全不同的训练范式结果仍卡住 → 瓶颈是 27021604 数据本身（患者级标签广播到大量非靶区背景帧），不是 MIL 弱监督框架的问题**。空间注意力/解冻联合训练等架构改造在这份数据上大概率仍无效，无需再投入；等官方精确帧级标注数据（2026-08-01）到位后才值得重新尝试架构层面优化。
 
 **注意**: 以上组件等ThyroidXL/ThyUS2Path数据到位后激活,当前为框架预备。

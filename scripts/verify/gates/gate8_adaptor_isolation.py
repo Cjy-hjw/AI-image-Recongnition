@@ -20,6 +20,11 @@ def gate8_adaptor_isolation(model, criterion, x, targets):
     """
     orig_gamma3 = None
     orig_gamma4 = None
+    # 2026-07-11 Gate2 review 非阻塞建议:之前只在 finally 里复原 gamma,没复原
+    # requires_grad——当时因为 Gate8 是流水线最后一个 Gate 所以无实际影响,但这是
+    # 对"Gate8 排最后"这个顺序假设的隐性依赖,未来插入 Gate9 若依赖干净的
+    # requires_grad 状态会踩坑。改为显式记录原值并在 finally 里逐参数复原。
+    orig_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
     try:
         # ── 前置状态复位:不依赖/不污染其他 Gate 的执行顺序 ──────────────────
         # 1) requires_grad 必须显式重置为 True,理由见上方 docstring 的 gate3 一条:
@@ -118,3 +123,7 @@ def gate8_adaptor_isolation(model, criterion, x, targets):
         if orig_gamma4 is not None:
             with torch.no_grad():
                 model.adaptor_stage4.gamma.copy_(orig_gamma4)
+        # 同理复原 requires_grad,不只复原 gamma(见上方 2026-07-11 注释)。
+        for name, p in model.named_parameters():
+            if name in orig_requires_grad:
+                p.requires_grad = orig_requires_grad[name]

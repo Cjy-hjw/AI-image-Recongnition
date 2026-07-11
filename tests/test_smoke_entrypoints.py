@@ -154,6 +154,26 @@ class TestLoadFailureErrorFallback:
         assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
         assert "reason" in data and data["reason"], "reason 不应为空"
 
+    def test_video_predict_empty_file_writes_error_json(self, tmp_path):
+        """空文件(0 字节,无扩展名)→ cv2.VideoCapture 打开必然失败,同样必须落 ERROR。
+        与 test_predict_empty_file_writes_error_json 对称补齐(2026-07-11 Gate2
+        review 非阻塞建议:此前只测了 video 侧 missing,没测 empty,覆盖度不对称)。"""
+        empty = tmp_path / "empty_no_ext"
+        empty.write_bytes(b"")
+        out = tmp_path / "vout_empty"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(empty),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"空文件不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "空文件仍必须落 result.json(不能零输出空目录)"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "ERROR", f"预期 status=ERROR，实际 {data}"
+        assert "reason" in data and data["reason"], "reason 不应为空"
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PASSED 路径:video_predict.py --skip_gatekeeper → 全产物

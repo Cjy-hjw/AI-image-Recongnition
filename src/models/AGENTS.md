@@ -57,9 +57,14 @@ To eliminate representation competition between high-frequency segmentation and 
 
 ### 1.1 Task-Alignment Adaptor (Soft Attention Gating)
 Because the classification branch loses spatial priors after decoupling, segmentation features must be injected back as soft attention.
-- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2).
+- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2), `multi_task_model.py:260,263`(`_forward_cls_backbone`)。
 - **Unidirectional Flow**: `f_seg` MUST be `.detach()`ed before passing to the Adaptor to prevent classification error gradients from corrupting the segmentation backbone's weights.
 - **Fusion Equation**: `f_cls_enhanced = f_cls + gamma * (f_cls * W_align)`, where `W_align` is generated via spatial interpolation, 1x1 channel projection, and 3x3 depthwise convolution + Sigmoid. `gamma` is a learnable scalar initialized to 0.
+- **Gate 8 验证(`scripts/verify/gates/gate8_adaptor_isolation.py`,2026-07-11 新增)**:上述"MUST `.detach()`"契约此前只有实现、没有 Gate 量化验证——`gate2_vclub` 走的是 vCLUB 局部图(不经过 adaptor)、`gate3_auc_margin`/`gate6_stage1_masking` 都测不到这条通路(具体原因见 `QA_VP.md` §1.1 与该 Gate 源码注释)。Gate 8 用 `loss_mal.backward()` + 断言 `seg_backbone` 梯度精确为 `0.0`(非 `<1e-7` 容差)量化验证该契约,并在 Gate 内部主动做了两处必要的前置状态复位(**这两处都是本 Gate 存在的核心原因,删了会退化成永远通过的伪 Gate**):
+    1. **requires_grad 复位**:`gate3_auc_margin` 的 Rule 3.3 会把 `seg_backbone.requires_grad` 显式设 False 留在共享 `model` 实例上,若不复位为 True,即使 `.detach()` 被误删,`seg_backbone` 也不会收到梯度(requires_grad=False 直接短路 autograd),会把"假冻结"误判成"detach 生效"。
+    2. **gamma 强制非零**:`gamma` 初始化为 `nn.Parameter(torch.zeros(1))`(零初始化残差门控)。全新构造的模型(`verify_model.py` 每次都新建 `pretrained=False` 的 model)gamma 恒为 0,此时注入项 `gamma*(f_cls*mask)` 数值上恒为 0,无论 `.detach()` 是否还在,雅可比都被 gamma=0 这个乘法因子清零——已用脚本对拍实测:gamma=0 时故意删掉 detach,`seg_backbone` 梯度依然精确为 0.0。因此 Gate 内部会先把 gamma 手动拨到 1.0(测完再原样恢复),让注入通路数值上真正激活,负面测试(误删 detach)才能被真正捕捉到(实测 `abs().sum()≈6094`)。
+    - 另需用 `gamma_prior=0.0` 消除 `cbm_head` 里 `e_prior`(物理先验,经 `soft_mask←seg_backbone` 非 detach 路径,是设计内的合法耦合)对 `loss_mal` 的贡献,否则会把这条无关合法通路误判为泄漏(实测 `gamma_prior=1.0` 默认值下 `seg_backbone` 梯度 `abs().sum()≈14.2`,与 detach 是否失效完全无关)。
+    - 回归测试:`tests/test_gate8_adaptor_isolation.py`(正面:真实代码通过;负面:monkeypatch `torch.Tensor.detach` 为恒等函数模拟误删,断言 Gate 能检测到并返回 False)。
 
 ---
 

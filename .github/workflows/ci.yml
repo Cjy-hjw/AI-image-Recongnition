@@ -26,7 +26,7 @@ jobs:
       - name: Check architecture contracts
         run: lint-imports
 
-  # 铁律 2:Gate 1(verify_model.py 七门)+ 全套 pytest 回归。
+  # 铁律 2:Gate 1(verify_model.py 八门)+ 全套 pytest 回归。
   # 直接跑在交付基镜像内 —— torch 2.1.0 / Python 3.10 / weights_only 默认 False,
   # 与离线推理容器完全一致。避免 GitHub runner 临时拼装的 torch 版本漂移
   # (如 torch≥2.6 翻转 weights_only 默认值)导致测出非交付环境的假故障。
@@ -41,7 +41,7 @@ jobs:
           # (无 --upgrade,pip 跳过不重装)。faiss-cpu 在 py3.10 有 wheel,正常安装。
           pip install -r requirements.txt
           pip install pytest
-      - name: Gate 1 - verify_model (7 gates)
+      - name: Gate 1 - verify_model (8 gates)
         run: python scripts/verify_model.py
       - name: Full pytest regression
         run: pytest -q

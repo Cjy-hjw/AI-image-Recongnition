@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import cv2
+import pytest
 import torch
 
 from src.training.authenticity_trainer import train_authenticity_classifier
@@ -80,3 +81,17 @@ def test_authenticity_module_loads_and_normalizes(tmp_path):
     assert pred in (0, 1, 2)
     assert np.asarray(prob).shape == (3,)
     assert abs(float(np.asarray(prob).sum()) - 1.0) < 1e-4, "softmax 概率应和为 1"
+
+
+def test_load_weights_raises_when_file_missing(tmp_path):
+    """回归 2026-07-10 Gate2审查发现的静默bug:load_weights 此前对不存在的路径
+    直接返回(无 else 分支),模型停留在随机初始化态,predict() 仍返回合法 0/1/2、
+    零日志零标志位——真实性检测器悄悄变成随机分类器,gatekeeper 一票否决门
+    失效或随机误杀且无人察觉。现在必须硬报错,不允许静默退化。"""
+    module = AuthenticityModule()
+    missing_path = str(tmp_path / "does_not_exist.pth")
+    with pytest.raises(RuntimeError, match="权重文件不存在"):
+        module.load_weights(missing_path)
+    # 硬报错前不能悄悄改动任何状态(仍是 __init__ 的干净初始状态)
+    assert module.feat_mean is None and module.feat_std is None
+

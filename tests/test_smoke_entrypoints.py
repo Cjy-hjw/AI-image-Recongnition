@@ -81,8 +81,19 @@ class TestPredictRejectPath:
         rj = out / "result.json"
         assert rj.exists(), "predict.py 未落 result.json"
         data = json.loads(rj.read_text(encoding="utf-8"))
-        assert data.get("status") in ("REJECTED", "PASSED"), \
-            f"status 非法: {data.get('status')}\nSTDOUT:{r.stdout}"
+        status = data.get("status")
+        if status == "ERROR":
+            # 2026-07-10 Gate2审查修复：authenticity.py 权重缺失现在硬报错（此前
+            # 静默退化为随机初始化分类,一票否决门形同虚设且无人察觉)。本地/CI
+            # 环境通常没有真实 checkpoints/authenticity_model.pth,这正是修复后
+            # 的预期新行为(不是回归)——只要 reason 明确指向"权重缺失"就放行,
+            # 若是其它原因的 ERROR 则说明有真实回归,仍然失败。
+            reason = data.get("reason", "")
+            assert "AuthenticityModule" in reason and "不存在" in reason, \
+                f"ERROR 但原因不是预期的权重缺失,可能是真实回归: {data}"
+        else:
+            assert status in ("REJECTED", "PASSED"), \
+                f"status 非法: {status}\nSTDOUT:{r.stdout}"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

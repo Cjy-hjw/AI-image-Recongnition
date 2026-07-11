@@ -165,3 +165,15 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 把这个异常兜成 `status="ERROR"` 的 `result.json`（复用 `export.save_rejection_json`），
 不能让异常裸传播——否则该次提交零输出（比赛评分管线大概率直接判零分，比"预测错误"
 更差）。`evaluate.py` 是开发者本地诊断脚本、非交付入口，不需要兜底，崩溃即可暴露问题。
+
+**2026-07-10 晚，Gate2审查后契约扩容**：兜底范围从"只包 `build_model()`"扩大到
+"整条 gatekeeper审计+推理+后处理+报告生成链路"，`except` 从 `RuntimeError` 放宽到
+`Exception`。原因：`src/gatekeeper/authenticity.py` 同轮修复后权重缺失也会
+`raise RuntimeError`（此前静默退化为随机分类，一票否决门形同虚设，见
+`src/gatekeeper/AGENTS.md`），若不把 gatekeeper 审计纳入 try 包裹，`predict.py`
+会在权重缺失时整进程崩溃、零输出——自相矛盾（越权威的失败越容易把容器打崩）。
+`except Exception`（而非只 `RuntimeError`）是因为 `torch.load` 遇损坏 checkpoint
+会抛 `pickle.UnpicklingError`（不是 `RuntimeError` 子类），`report_generator.py`
+新增的 NaN/越界idx校验抛 `ValueError`，CUDA OOM 等也需兜住——异常类型名随 `str(e)`
+一起落盘，不靠拆分 except 分支也能区分故障类别。`video_predict.py` 的 gatekeeper
+审计循环本就在 try 块内，此次只需扩 `predict.py`。

@@ -16,7 +16,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 7-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
 | **CI / 架构铁律** | `/.github/workflows/ci.yml` + `/.importlinter` | PR/push 到 main 自动跑两 job:① import-linter 4 契约(inference⊄training、models 无反向依赖、gatekeeper⊄上层、utils 叶子层)② Gate 1 七门 + 全套 pytest。任一红则挡合并。 |
-| **Tests** | `/tests/AGENTS.md` | 全套 **206 passed**:16 physical_prior + 15 cbm_head + 19 phase_refactor + 41 gatekeeper + 10 masked_loss + 21 video + 2 authenticity_trainer + 7 multisource + 3 smoke_entrypoints + 11 calibration + 19 entrypoint_dispatch + 20 pathology_dataset + 13 pathology_mil_dataset + **4 bn_freeze** + **5 model_runner**(2026-07-10 新增，BN冻结/checkpoint加载回归)。 |
+| **Tests** | `/tests/AGENTS.md` | 全套 **222 passed**:16 physical_prior + 15 cbm_head + 19 phase_refactor + 42 gatekeeper + 10 masked_loss + 21 video + 3 authenticity_trainer + 7 multisource + 4 smoke_entrypoints + 11 calibration + 19 entrypoint_dispatch + 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 5 model_runner + **13 report_generator**(2026-07-10 新增，TI-RADS越界idx/malignancy_prob NaN硬校验回归；此前该文件零测试覆盖)。 |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 
 ---

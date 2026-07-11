@@ -36,22 +36,26 @@ def main():
         print(f"Error: {error_msg}")
         return
 
-    # 2. Gatekeeper audit (predict only)
-    passed, rejection_json = run_gatekeeper_audit(
-        img_np, config, device, args.weights, args.output_dir)
-    if not passed:
-        save_rejection_json(args.output_dir, rejection_json)
-        return
-
-    # 3-5. 模型推理 + 后处理 + 报告导出。整体包一层 except Exception：离线推理
-    # 容器按提交产出 JSON 是硬契约，裸崩溃会让该次提交零输出（比预测错误更差，
-    # 大概率直接判零分）。只兜 build_model() 一处不够——torch.load 遇损坏
-    # checkpoint 会抛 pickle.UnpicklingError（不是 RuntimeError 子类，原 except
-    # RuntimeError 接不住）、CUDA OOM、decode_predictions/cv2/报告生成任一步
-    # 也都可能因边界数据崩溃。异常类型名随 str(e) 一起落盘，不靠拆分 except
-    # 分支也能区分"预期权重不匹配"和"其它意外故障"（2026-07-10 Gate2审查发现）。
+    # 2-5. Gatekeeper审计 + 模型推理 + 后处理 + 报告导出。整体包一层 except
+    # Exception：离线推理容器按提交产出 JSON 是硬契约，裸崩溃会让该次提交零
+    # 输出（比预测错误更差，大概率直接判零分）。gatekeeper 审计此前在 try 外
+    # 面——权重缺失等场景硬报错时会让 predict.py 整进程崩溃、零输出（本次
+    # Gate2审查同步给 authenticity.py 加了硬报错，若不把这段纳入 try 会自相
+    # 矛盾：越权威的失败越容易把容器打成裸崩溃）。只兜 build_model() 一处也
+    # 不够——torch.load 遇损坏 checkpoint 会抛 pickle.UnpicklingError（不是
+    # RuntimeError 子类，原 except RuntimeError 接不住）、CUDA OOM、
+    # decode_predictions/cv2/报告生成任一步也都可能因边界数据崩溃。异常类型名
+    # 随 str(e) 一起落盘，不靠拆分 except 分支也能区分"预期权重不匹配"和
+    # "其它意外故障"（2026-07-10 Gate2审查发现）。
     print(f"Running Multi-task Diagnosis under {args.precision.upper()} precision...")
     try:
+        # 2. Gatekeeper audit (predict only)
+        passed, rejection_json = run_gatekeeper_audit(
+            img_np, config, device, args.weights, args.output_dir)
+        if not passed:
+            save_rejection_json(args.output_dir, rejection_json)
+            return
+
         model = build_model(config, args.weights, device)
         img_tensor = preprocess_image(img_np, config["data"]["img_size"], device)
         outputs = run_forward(model, img_tensor, args.precision, device)

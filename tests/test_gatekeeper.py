@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2
 import numpy as np
 import pytest
+import torch
 
 from src.gatekeeper.synthesis import (
     make_phantom_like,
@@ -449,6 +450,40 @@ class TestCatNetDetector:
             if not is_tampered:
                 assert any(f == "splice" for f, _ in det.last_soft_flags), \
                     "几何缝命中应记录为软 flag"
+
+    def test_catnet_forward_failure_this_call_does_not_promote_geometric_to_hard(self):
+        """回归 2026-07-10 Gate2审查发现的地雷bug:旧版用
+        `block_level_hard = self._model is not None` 只反映"构造时权重加载
+        成功",不反映"本次 forward 是否真成功"。若 `_catnet_forward` 本次调用
+        抛异常(如 shape assert 失败),旧版仍会把 block_level_hard 算 True,
+        导致本该走软flag的copy_move/splice几何检测器(27.3%误报率)被错误提升
+        为硬拒绝,真实图像被一票否决出局且无日志。
+
+        修复后应改用 `catnet_ok_this_call`(本次调用是否真成功),权重"已加载
+        但本次forward失败"时几何命中必须仍走软flag路,不得硬拒绝。
+        """
+        base = _structured_ultrasound(seed=1)
+        donor = _structured_ultrasound(seed=99, vary_structure=True)
+        sp, _, _ = make_splice(base, donor, 2, patch_frac=0.30)
+        if not detect_splicing(sp)[0]:
+            pytest.skip("本次合成样本几何检测器未命中,无法验证软flag降级语义")
+
+        det = CatNetTamperingDetector()  # dct-bag 降级(无真实catnet权重)
+        # 模拟"权重已加载"但本次 forward 抛异常:注入一个会抛错的假模型。
+        det._model = object()  # 非 None,触发 `if self._model is not None` 分支
+        det._torch = torch
+
+        is_tampered, _, _ = det.detect(sp)
+        # 红线核心断言:即使 self._model 非 None(旧版据此判 block_level_hard=True),
+        # 本次 forward 失败后几何命中仍必须走软flag,不得被提升为硬拒绝。
+        if not is_tampered:
+            assert any(f == "splice" for f, _ in det.last_soft_flags), \
+                "catnet本次forward失败时,几何缝命中应仍记录为软flag(不得硬拒绝)"
+        else:
+            pytest.fail(
+                "catnet本次forward失败,但几何命中仍被硬拒绝——"
+                "block_level_hard 未正确回退到 catnet_ok_this_call"
+            )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -1,3 +1,4 @@
+import math
 
 # TI-RADS clinical attributes definitions & point configurations
 COMPOSITION_MAP = {
@@ -33,24 +34,42 @@ FOCI_MAP = {
     3: ("点状强回声 (Punctate echogenic foci / Microcalcification)", 3)
 }
 
+def _lookup(map_, idx, label):
+    """按 idx 查 TI-RADS 属性表，越界即硬报错（2026-07-10 Gate2审查发现）。
+
+    此前用 `map_.get(idx, ("未知", 0))` 静默把越界 idx 当 0 分处理——上游概念头
+    维度契约被破坏（如 index 从预期4类变5类）时不报错、不告警，只在报告正文里
+    悄悄出现"未知"二字。实测案例：margin_idx=5（非法，本应是2分档）被静默记0分，
+    总分从真值3(TR3,~4.8%风险,建议穿刺)算成1(TR2,~1.5%风险,无需处置)——静默跨越
+    了真实临床处置决策边界。越界必须视为上游contract violation硬拦截，不能带着
+    错误分数继续跑完整条报告生成链路。
+    """
+    if idx not in map_:
+        raise ValueError(
+            f"TI-RADS {label}_idx={idx!r} 超出映射表范围 {sorted(map_.keys())}——"
+            "上游概念头输出维度契约被破坏，拒绝静默按0分处理"
+        )
+    return map_[idx]
+
+
 def calculate_tirads_points(comp_idx, echo_idx, shape_idx, margin_idx, foci_probs, foci_threshold=0.5):
     """
     Computes total ACR TI-RADS points based on predicted indices.
     """
     points = 0
-    
-    comp_desc, comp_pts = COMPOSITION_MAP.get(comp_idx, ("未知", 0))
-    echo_desc, echo_pts = ECHOGENICITY_MAP.get(echo_idx, ("未知", 0))
-    shape_desc, shape_pts = SHAPE_MAP.get(shape_idx, ("未知", 0))
-    margin_desc, margin_pts = MARGIN_MAP.get(margin_idx, ("未知", 0))
-    
+
+    comp_desc, comp_pts = _lookup(COMPOSITION_MAP, comp_idx, "comp")
+    echo_desc, echo_pts = _lookup(ECHOGENICITY_MAP, echo_idx, "echo")
+    shape_desc, shape_pts = _lookup(SHAPE_MAP, shape_idx, "shape")
+    margin_desc, margin_pts = _lookup(MARGIN_MAP, margin_idx, "margin")
+
     points += (comp_pts + echo_pts + shape_pts + margin_pts)
-    
+
     foci_desc_list = []
     # Foci is multi-label, can select multiple positive classes
     for i, prob in enumerate(foci_probs):
         if prob >= foci_threshold:
-            desc, pts = FOCI_MAP.get(i)
+            desc, pts = _lookup(FOCI_MAP, i, "foci")
             points += pts
             foci_desc_list.append(f"{desc} (+{pts}分)")
             
@@ -96,6 +115,17 @@ def generate_report(image_id, patient_id, breakdown, malignancy_prob):
     """
     Generates a structured text explanation report.
     """
+    if malignancy_prob is None or not math.isfinite(malignancy_prob):
+        # 2026-07-10 Gate2审查发现：此前无校验，NaN 场景下 Python `nan >= 0.5`
+        # 恒为 False，会**无任何报错**地打印"良性倾向"——本该是"无效/不确定"的
+        # 结果被静默判成良性，是癌症筛查场景下的假阴性风险。None 场景直接
+        # `TypeError` 崩溃（虽是崩溃但同样不可接受，此处一并拦截给出明确原因）。
+        # 硬拦截交给上层 predict.py/video_predict.py 的 except Exception 转
+        # ERROR result.json，不允许带着无效概率继续生成一份"看起来正常"的报告。
+        raise ValueError(
+            f"generate_report 收到非法 malignancy_prob={malignancy_prob!r}——"
+            "上游推理必须产出有限概率值，拒绝据此生成确定性诊断结论"
+        )
     report = []
     report.append("="*60)
     report.append("  甲状腺结节超声智能辅助诊断及规范化审核报告")

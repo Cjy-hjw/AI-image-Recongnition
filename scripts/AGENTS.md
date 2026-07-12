@@ -116,3 +116,28 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 
 **测试**:`tests/test_entrypoint_dispatch.py::TestSubprocessCrashFallback`(4 个用例,用专用 shim `_make_crashing_shim`/`_make_success_shim` 驱动,不依赖真实 segfault):子进程崩溃且未产出 result.json → 父 shell 补写 ERROR JSON、退出码透传;子进程正常产出 result.json → 兜底逻辑不覆盖/不触碰;out_dir 预先存在陈旧 result.json + 本次崩溃 → 最终结果是本次的 ERROR 而非被误判为陈旧的成功、`.stale` 标记文件清理干净;去掉 `exec` 后分发路由本身不受影响(回归锁定)。既有 `TestDispatch`/`TestProductionIntegrity`/`TestContentSniffFallback` 全部改为显式传 `tmp_path` 隔离 `--output_dir`(改动后所有分发路径都会 mkdir/移动/清理 `$out_dir/result.json`,不再仅限未知格式分支,不隔离会污染/误删仓库真实的 `data/output/`)。
 
+### 7.1.1 Gate2 复审补丁(2026-07-12,实测复现的真实竞态 bug)
+
+**背景**:上面 §7.1 的初版改动落地时,C 级(entrypoint.sh)按计划走的是"主会话自审 + 专门崩溃测试代替审查",没有走 B 级那套完整 `/code-review` skill + sonnet reviewer 子agent 的 Gate2 流程——这是低估了"容器唯一入口"这个文件风险等级的判断失误。事后补做完整 Gate2(两个独立子agent 分别做逐行 diff 扫描 + 跨文件调用追踪/shell 语言陷阱扫描)后,抓到一个**在真实 bash 环境下实测复现**的竞态 bug,不是理论假设。
+
+**bug 本体**:`wait "$child_pid"` 在被 `trap` 捕获的信号(TERM/INT)打断时,bash 会在 trap handler 执行完毕后**立即返回**一个 `128+信号值` 的合成退出码——但子进程此时可能仍未真正退出(还在优雅关闭窗口内)。旧版代码只 `wait` 一次就把返回值当成子进程的真实退出码,若信号转发的目标进程需要哪怕零点几秒完成收尾写盘,旧版会:① 把合成的 `143` 误判成"子进程崩溃退出码";② 此时 `result.json` 还没被子进程写出(它还在忙),旧版的存在性检查判定为"未产出" → 补写一份**错误的 ERROR JSON**,而实际推理本可以在零点几秒后成功完成。子进程随即变成孤儿(重新挂靠 PID 1),原本正确的结果被静默丢弃。
+
+**A800(真实 Linux bash 4.3.48,与容器 Ubuntu 基础镜像同族)实测对照**(用一个"收到 TERM 后 `sleep 0.3` 优雅关闭、写 `status=PASSED` 后 `exit 7`"的 shim 驱动):
+| | 修复前(commit `6cb60a6`) | 修复后 |
+|:---|:---|:---|
+| entrypoint 最终 exit code | `143`(合成值,非子进程真实退出码) | `7`(子进程真实退出码) |
+| `result.json` 内容 | `{"status":"ERROR", "reason":"...without producing result.json..."}`(错误结论) | `{"status":"PASSED","source":"slow-shutdown-shim"}`(子进程真实产出) |
+| 子进程状态 | 变成孤儿(`PPID=1`),继续在后台跑完优雅关闭 | 正常被等到、无孤儿残留 |
+
+**修复(`scripts/entrypoint.sh` 第6节)**:
+1. **循环 wait**:`wait "$child_pid"` 返回后用 `kill -0 "$child_pid"` 探活,若子进程仍存活就重新 `wait`,直到它真正消失才采信 `exit_code`。
+2. **窄窗口信号补偿**:`trap forward_signal TERM INT` 注册时机早于 `child_pid=$!` 真正赋值,这段窄窗口内到达的信号此前会被 `forward_signal` 里的 `[ -n "$child_pid" ]` 判假静默丢弃。改用 `signal_received` 标记位记录,`child_pid` 一旦可用立即核实是否要补发。
+3. **收尾窗口延长保护**:`trap - TERM INT` 从"wait 后立即清除"挪到 `exit` 前最后一刻——期间(补写崩溃兜底 JSON、清理 `.stale`)若收到二次信号,trap 仍在场,bash 不会因未设 trap 的信号默认终止 shell 本身,避免兜底逻辑写到一半被打断。
+4. **陈旧文件 mv 校验**:`mv -f "$result_file" "$result_file.stale"` 静默失败(只读文件系统等)时补一条 `[WARNING]` 到 stderr,不再假装陈旧文件规避一定生效。
+5. **崩溃兜底 JSON 写入原子化**:`printf ... > "$result_file"` 改为先写 `.tmp` 再 `mv -f` 落位,避免这条兜底路径自己也留下半写文件。
+6. **`src/inference/export.py` 同步加固**(python 侧真正的数据源头):`save_prediction_artifacts`/`save_rejection_json` 的 `result.json` 写入改经 `_write_json_atomic`(temp 文件 + `os.replace`),防止 SIGTERM 恰好落在 `json.dump` 写盘期间导致磁盘上出现"存在但截断"的 `result.json`——这类文件比完全不存在更危险,存在性检查对它没有免疫力。
+
+**测试**:`tests/test_entrypoint_dispatch.py::TestSignalForwarding::test_signal_forwarded_and_wait_captures_real_exit_code` —— 用真实 `SIGTERM`(非 shim 自行退出的固定码)驱动上面同款"慢速优雅关闭" shim,断言 entrypoint 最终退出码是子进程的真实值(非合成 128+信号)、`result.json` 是子进程自己写出的那份而非兜底 ERROR。`os.name == "nt"` 时 skip(POSIX 信号语义在 Git Bash/Windows 进程模型下不保证一致,真实验证以 Linux CI 为准;本机验证额外走 A800 真实 Linux bash 环境人工复现,见上表)。
+
+**教训沉淀**:① entrypoint.sh 这类"改错即整个容器交付失败"的关键基础设施文件,即使不涉及 ML 数学管道,也不能用"有专门测试就等于走过 Gate2"来替代真正的 `/code-review` + reviewer 子agent 审查——本次两者本该同时具备,上一轮只做了前者;② shell 脚本的信号/进程语义类 bug,本地开发机复现不了不代表不存在,必须在与生产容器同族的真实 Linux bash 环境验证(本次用 A800 服务器,而非仅信任本地 Windows Git Bash 或纯理论推导)。
+

@@ -177,12 +177,26 @@ result_file="$out_dir/result.json"
 mkdir -p "$out_dir" 2>/dev/null
 if [ -f "$result_file" ]; then
     mv -f "$result_file" "$result_file.stale" 2>/dev/null
+    if [ -f "$result_file" ]; then
+        # mv 失败(只读文件系统/权限问题)会被 2>/dev/null 静默吞掉;显式核实一次,
+        # 失败时至少把风险打到 stderr——下面"result.json 是否存在"的判断此时
+        # 已经不可靠(陈旧文件仍占着位置),不诚实地假装陈旧文件规避生效了。
+        echo "--> [WARNING] failed to move stale result.json aside (readonly fs / permission issue?) -- crash-fallback staleness guard is degraded for this invocation" >&2
+    fi
 fi
 
 child_pid=""
+signal_missed=""
 forward_signal() {
+    # child_pid 已可用时直接转发,不重复标记;child_pid 还没赋值(窄窗口内)
+    # 时才记为"漏转发",交给下面 child_pid=$! 之后的补偿逻辑发**这一次**——
+    # 避免同一个信号被 trap 本身 + 补偿逻辑各发一次、变成转发两次(2026-07-12
+    # Gate2 复审 reviewer 子agent 发现的双发问题,当前子进程无自定义信号
+    # handler 故双发无害,但严谨起见仍去重)。
     if [ -n "$child_pid" ]; then
         kill -TERM "$child_pid" 2>/dev/null
+    else
+        signal_missed="1"
     fi
 }
 trap forward_signal TERM INT
@@ -198,16 +212,40 @@ case "$final_kind" in
         ;;
 esac
 child_pid=$!
-wait "$child_pid"
-exit_code=$?
-trap - TERM INT
+# 窄窗口补偿(2026-07-12 Gate2 复审发现):trap 在 child_pid 真正赋值前(上方
+# "trap forward_signal TERM INT" 那行)就已生效——若信号恰好落在 case 分支
+# 选择 ~ child_pid=$! 赋值之间到达,forward_signal 里 `[ -n "$child_pid" ]`
+# 判假,只记 signal_missed 不发送。这里补发**且只发这一次**:child_pid 一旦
+# 可用,若该窗口期间确实漏转发过就现在补发;若 forward_signal 已经直接发过
+# (child_pid 当时已可用),signal_missed 不会被置位,不会重复发送。
+if [ -n "$signal_missed" ]; then
+    kill -TERM "$child_pid" 2>/dev/null
+fi
+
+# wait 在被 trap 捕获的信号打断时会提前返回(bash 语义:trap handler 执行完
+# 后 wait 立即返回一个 128+信号 的合成退出码),而子进程此时可能仍未真正
+# 退出——已用真实 bash 环境实测复现(trap 转发 TERM 后 wait 立即返回,但
+# `ps -p "$child_pid"` 确认子进程仍存活)。用 kill -0 探活循环,只有子进程
+# 真正消失后才采信 exit_code,避免子进程"正准备写出合法 result.json"时被
+# 提前判定为已结束/崩溃。
+while :; do
+    wait "$child_pid"
+    exit_code=$?
+    kill -0 "$child_pid" 2>/dev/null || break
+done
+
+# 收尾窗口(补写崩溃兜底 JSON、清理 .stale)故意不提前清 trap:若二次信号在
+# 这段窗口到达,trap 仍能吸收它(bash 对已设 trap 的信号默认不会终止 shell),
+# 避免 shell 自身被第二次 TERM 打断、来不及写完兜底 JSON——解除转发放在最后
+# exit 前一刻。
 
 if [ ! -f "$result_file" ] && [ "$exit_code" -ne 0 ]; then
     mkdir -p "$out_dir" 2>/dev/null
     printf '{\n  "status": "ERROR",\n  "reason": "Inference subprocess exited with code %s without producing result.json (possible native crash/segfault or OOM-kill; NOT covered: whole-container/cgroup kill, see entrypoint.sh comments)"\n}\n' \
-        "$exit_code" > "$result_file"
+        "$exit_code" > "$result_file.tmp" && mv -f "$result_file.tmp" "$result_file"
     echo "--> [entrypoint] subprocess exit=$exit_code, no result.json produced -> wrote fallback ERROR json" >&2
 fi
 rm -f "$result_file.stale" 2>/dev/null
 
+trap - TERM INT
 exit "$exit_code"

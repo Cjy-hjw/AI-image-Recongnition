@@ -14,11 +14,15 @@
 
 标记文件写入方式(Gate2 审查完成后手动执行)：
     python .claude/hooks/mark_gate2_pass.py <file1> <file2> ...
+
+2026-07-12 新增：staged 里若含 gate2_paths.CRITICAL_INFRA_EXACT_FILES（容器
+唯一入口/构建定义这类改错即整体失败的文件），marker 的 review_mode 必须是
+"deep"，"self"（自审）不放行——见 gate2_paths.py 顶部该常量的教训记录。
 """
 import json, os, subprocess, sys, re, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gate2_paths import PASS_PATH, is_high_risk, read_pending, to_repo_relative, write_pending
+from gate2_paths import PASS_PATH, is_high_risk, read_pending, requires_deep_review, to_repo_relative, write_pending
 
 MARKER_TTL_SECONDS = 3600  # 1小时内的标记才有效，防止用旧标记混过新改动
 
@@ -81,6 +85,22 @@ if missing:
         "[GATE2-BLOCK] 以下高风险文件未被 Gate2 标记覆盖：\n  "
         + "\n  ".join(missing)
         + "\n请审查后执行: python .claude/hooks/mark_gate2_pass.py " + " ".join(missing),
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+# 关键基础设施文件（entrypoint.sh/Dockerfile/_src_tree_hash.sh）不接受 self
+# 审查——必须真走 `/code-review` skill + reviewer 子agent 后用 --review-mode
+# deep 标记。
+critical_staged = [f for f in high_risk_staged if requires_deep_review(f)]
+if critical_staged and marker.get("review_mode") != "deep":
+    print(
+        "[GATE2-BLOCK] 以下文件是容器唯一入口/构建定义类关键基础设施，不接受"
+        "\"self\"自审，必须真走 /code-review skill + reviewer 子agent 后标记"
+        " --review-mode deep：\n  "
+        + "\n  ".join(critical_staged)
+        + "\n审查通过后执行: python .claude/hooks/mark_gate2_pass.py --review-mode deep "
+        + " ".join(critical_staged),
         file=sys.stderr,
     )
     sys.exit(2)

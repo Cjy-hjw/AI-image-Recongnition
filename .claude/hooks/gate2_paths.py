@@ -61,6 +61,24 @@ HIGH_RISK_EXACT_FILES = (
     os.path.join("scripts", "_src_tree_hash.sh"),     # 防篡改指纹算法，须与 seal_container.py 字节级一致
 )
 
+# 2026-07-12 教训（用户发现）：entrypoint.sh 的崩溃兜底改动曾被划入"主会话
+# 自审即可"，跳过完整 `/code-review`+reviewer 子agent 流程；事后补审在真实
+# bash 环境实测复现一个信号转发竞态 bug（详见 scripts/AGENTS.md §7.1.1）。
+# 结论：容器唯一入口/构建定义这类改错即整体失败的文件，"自审"不够，必须
+# `mark_gate2_pass.py --review-mode deep` 显式声明才放行。requirements.txt
+# 版本锁定审查方式已是显式核对，暂不纳入。
+CRITICAL_INFRA_EXACT_FILES = (
+    os.path.join("scripts", "entrypoint.sh"),
+    "Dockerfile",
+    os.path.join("scripts", "_src_tree_hash.sh"),
+)
+
+
+def requires_deep_review(file_path: str) -> bool:
+    """判定文件是否要求 `mark_gate2_pass.py --review-mode deep`（"self" 不够）。"""
+    return os.path.normpath(file_path) in CRITICAL_INFRA_EXACT_FILES
+
+
 # pending/pass 标记文件路径 + 升级阈值：4 个 hook 共用同一份，禁止各自重复字面量
 PENDING_PATH = os.path.join(".claude", ".gate2_pending.json")
 PASS_PATH = os.path.join(".claude", ".gate2_pass.json")

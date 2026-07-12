@@ -520,6 +520,30 @@ class TestCatNetDetector:
         else:
             assert bbox is None
 
+    def test_catnet_own_hit_sets_hard_reject_source(self, monkeypatch):
+        """2026-07-12 code-review(Angle A)发现补齐:`last_hard_reject_source`
+        是本轮为修复 REJECTED reason 丢失命中源信息而新增的字段,需锁定其
+        本身的正确性,否则 gatekeeper_runner 拼接的 reason 文案会静默失真。"""
+        det = CatNetTamperingDetector()
+        det._model = object()
+        det._torch = torch
+        fixed_bbox = [1, 1, 20, 20]
+        monkeypatch.setattr(
+            det, "_catnet_forward",
+            lambda img: (True, np.zeros(img.shape[:2], dtype=np.uint8), fixed_bbox),
+        )
+        img = _structured_ultrasound(seed=1)
+        is_tam, _, _ = det.detect(img)
+        assert is_tam is True
+        assert det.last_hard_reject_source == "catnet"
+
+    def test_no_hard_reject_leaves_source_none(self):
+        det = CatNetTamperingDetector()  # dct-bag 降级,无篡改样本
+        img = _structured_ultrasound(seed=1)
+        is_tam, _, _ = det.detect(img)
+        assert is_tam is False
+        assert det.last_hard_reject_source is None
+
     def test_detect_geometric_is_soft_flag_in_degraded_mode(self):
         # 降级模式(无 CAT-Net 权重)下,几何检测器(copy_move/splice)在超声自相似纹理
         # 上误报过高(实测 copy_move 27.3%),违反「宁可漏检不可误杀」红线。
@@ -546,6 +570,12 @@ class TestCatNetDetector:
 
         修复后应改用 `catnet_ok_this_call`(本次调用是否真成功),权重"已加载
         但本次forward失败"时几何命中必须仍走软flag路,不得硬拒绝。
+
+        2026-07-12 更新:B2(统一软flag制度)后 copy_move/splice 已与 CatNet
+        状态完全解耦、恒为软flag——`block_level_hard`/`catnet_ok_this_call`
+        变量已从实现中删除。本测试断言("forward失败时几何命中应软flag")仍然
+        成立,但已退化为"永不硬拒绝"这一更强不变式的一个特例,不再是该机制的
+        专属回归测试(专属回归见下方 test_geometric_never_hard_rejects_even_when_catnet_ok)。
         """
         base = _structured_ultrasound(seed=1)
         donor = _structured_ultrasound(seed=99, vary_structure=True)
@@ -569,6 +599,111 @@ class TestCatNetDetector:
                 "catnet本次forward失败,但几何命中仍被硬拒绝——"
                 "block_level_hard 未正确回退到 catnet_ok_this_call"
             )
+
+    def test_geometric_never_hard_rejects_even_when_catnet_ok(self, monkeypatch):
+        """2026-07-12 统一软flag制度(B2):copy_move/splice 与 CatNet 状态解耦。
+
+        此前"CatNet 本次成功跑通(catnet_ok_this_call=True)"会把几何判据升级
+        为硬拒绝——但"CatNet 没崩溃"与"copy_move/splice 判据本身是否可信"是
+        两件独立的事。本测试锁死新不变式:即使 CatNet 本次前向成功(哪怕判定
+        为 clean),几何命中依然只能软flag,不得因 CatNet 状态被提升为硬拒绝。
+
+        2026-07-12 code-review(Angle A)发现:早期版本靠"合成样本恰好触发
+        detect_splicing"来驱动断言,不触发时 `pytest.skip`——这是本 diff 唯一
+        锁定 B2 核心不变式的回归测试,若该条件判断被意外反转(如
+        `if self.bag_hard_reject` 误写成 `if not ...`),测试可能静默 skip 而
+        非 fail,CI 照样绿灯。改用 monkeypatch 直接强制 `detect_splicing` 命中,
+        测试不再依赖合成图像的自然检测结果,变为确定性、不可跳过。
+        """
+        import src.gatekeeper.tampering_catnet as tc_module
+
+        img = _structured_ultrasound(seed=1)
+        fixed_bbox = [10, 10, 50, 50]
+        monkeypatch.setattr(
+            tc_module, "detect_splicing",
+            lambda img_np: (True, np.zeros(img_np.shape[:2], dtype=np.uint8), fixed_bbox),
+        )
+        monkeypatch.setattr(
+            tc_module, "detect_copy_move",
+            lambda img_np: (False, np.zeros(img_np.shape[:2], dtype=np.uint8), None),
+        )
+
+        det = CatNetTamperingDetector()  # dct-bag 降级(无真实catnet权重)
+        det._model = object()  # 非 None,触发 catnet 分支
+        det._torch = torch
+        # 桩替换 _catnet_forward:本次"成功"返回 clean(hit=False),模拟
+        # catnet_ok_this_call=True 但未命中的场景——旧实现下这会让
+        # block_level_hard=True,几何命中随即被提升为硬拒绝。
+        monkeypatch.setattr(
+            det, "_catnet_forward",
+            lambda img: (False, np.zeros(img.shape[:2], dtype=np.uint8), None),
+        )
+
+        is_tampered, _, _ = det.detect(img)
+        assert is_tampered is False, \
+            "CatNet 本次成功(判 clean)不应把几何判据(27.3%误报率)提升为硬拒绝"
+        assert any(f == "splice" for f, _ in det.last_soft_flags), \
+            "几何缝命中应仍记录为软flag,与 CatNet 状态无关"
+
+
+class TestBagHardRejectToggle:
+    """2026-07-12 统一软flag制度(B3):BAG 相位不一致默认软flag,
+    显式 `bag_hard_reject=True` 时才恢复硬拒绝。
+
+    默认 False 的理由:BAG 阈值(grid_strength_min/min_flag_blocks)仅经
+    8 个合成种子小样本验证(见上方 TestCatNetDetector 的干净图 FPR 测试),
+    远小于 copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门
+    是官方真实干净 holdout 上预注册、带置信区间的 FPR 验收达标。
+    """
+
+    @staticmethod
+    def _phase_shifted_sample():
+        """复用 test_detects_phase_shifted_paste 的构造:羽化拼接使局部块栅格
+        相位与全图错位,是 BAG 判据设计要捕获的正例。"""
+        host = _jpeg_roundtrip(_structured_ultrasound(seed=10), quality=85)
+        donor = _jpeg_roundtrip(_structured_ultrasound(seed=77, vary_structure=True),
+                                quality=85)
+        tampered = host.copy()
+        ph, pw = 96, 96
+        y0, x0 = 80, 80
+        patch = np.roll(donor[y0:y0 + ph, x0:x0 + pw], shift=(4, 4), axis=(0, 1))
+        tampered[y0:y0 + ph, x0:x0 + pw] = patch
+        tampered = cv2.GaussianBlur(tampered, (3, 3), 0)
+        return _jpeg_roundtrip(tampered, quality=85)
+
+    def test_bag_hit_is_soft_flag_by_default(self, monkeypatch):
+        """2026-07-12 code-review(Angle A):原版靠"合成拼接样本恰好触发
+        `bag_phase_inconsistency`"驱动断言,不触发时 `pytest.skip`——BAG 默认
+        softflag 这个不变式若被意外破坏(如 `bag_hard_reject` 默认值被误改为
+        True),测试可能静默 skip 而非 fail。改用 monkeypatch 强制命中,
+        测试变为确定性、不可跳过,只验证 detect() 内的路由逻辑,不依赖真实
+        BAG 检测器在某张合成图上是否命中(真实命中能力由本类其余测试覆盖)。
+        """
+        img = self._phase_shifted_sample()
+        det = CatNetTamperingDetector(grid_strength_min=0.5)  # 默认 bag_hard_reject=False
+        fixed_bbox = [5, 5, 40, 40]
+        monkeypatch.setattr(
+            det, "bag_phase_inconsistency",
+            lambda img_np: (True, np.zeros(img_np.shape[:2], dtype=np.uint8), fixed_bbox),
+        )
+        is_tampered, _, _ = det.detect(img)
+        assert is_tampered is False, "BAG 默认应软flag,不驱动硬拒绝"
+        assert any(f == "bag_phase" for f, _ in det.last_soft_flags), \
+            "BAG 命中应记录到 last_soft_flags"
+
+    def test_bag_hard_reject_true_restores_hard(self, monkeypatch):
+        """同上,改用 monkeypatch 强制 BAG 命中,不依赖合成样本自然触发。"""
+        img = self._phase_shifted_sample()
+        det = CatNetTamperingDetector(grid_strength_min=0.5, bag_hard_reject=True)
+        fixed_bbox = [5, 5, 40, 40]
+        monkeypatch.setattr(
+            det, "bag_phase_inconsistency",
+            lambda img_np: (True, np.zeros(img_np.shape[:2], dtype=np.uint8), fixed_bbox),
+        )
+        is_tampered, _mask, bbox = det.detect(img)
+        assert is_tampered is True, "bag_hard_reject=True 时 BAG 命中应恢复硬拒绝"
+        assert bbox is not None and len(bbox) == 4
+        assert det.last_hard_reject_source == "bag_phase"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

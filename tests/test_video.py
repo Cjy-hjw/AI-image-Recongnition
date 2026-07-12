@@ -260,3 +260,135 @@ class TestDeduplicatorInjection:
             img, config, "cpu", "checkpoints/best_model.pth", ".",
             deduplicator=dedup, auth_module=_StubAuthModule())
         assert created["n"] == 1, "注入 deduplicator 时不应重复构建"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Gatekeeper 统一软 flag 制度(2026-07-12):authenticity 不再一票否决
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestGatekeeperSoftFlagPolicy:
+    """authenticity 分类结果降级为软 flag(仅审计,不驱动 REJECTED)。
+
+    背景:authenticity_trainer 的 phantom/synthetic 训练标签 100% 来自
+    synthesis.py 程序化合成代理,真实域零 FPR 验证,argmax 无置信度门槛。
+    统一软flag制度要求:任何硬拒绝分支在真实 holdout FPR 验收达标前默认软化。
+    见 docs/P2红线修复实施计划.md B1、docs/P2启动定论_Opus复核.md。
+    """
+
+    @staticmethod
+    def _config(train_path="____nonexistent_train____"):
+        return {
+            "gatekeeper": {"phash_threshold": 1, "cosine_threshold": 0.995},
+            "data": {"train_path": train_path},
+        }
+
+    class _StubAuth:
+        """按构造参数返回固定 (is_phantom, probs)。"""
+        def __init__(self, is_phantom):
+            self._is_phantom = is_phantom
+
+        def predict(self, img_np):
+            probs = np.zeros(3, dtype=np.float32)
+            probs[self._is_phantom] = 0.9
+            return self._is_phantom, probs
+
+    class _StubDedup:
+        def is_duplicate(self, img_np):
+            return False, None
+
+    class _StubTamper:
+        def detect(self, img_np):
+            return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None
+
+    def _run(self, is_phantom, dedup=None, tamper=None):
+        import src.inference.gatekeeper_runner as gr
+        img = np.random.randint(0, 255, (64, 64), dtype=np.uint8)
+        return gr.run_gatekeeper_audit(
+            img, self._config(), "cpu", "checkpoints/best_model.pth", ".",
+            deduplicator=dedup or self._StubDedup(),
+            auth_module=self._StubAuth(is_phantom),
+            tamper_detector=tamper or self._StubTamper(),
+        )
+
+    def test_phantom_classification_does_not_reject(self):
+        passed, rejection = self._run(is_phantom=1)
+        assert passed is True and rejection is None, \
+            "authenticity 判 phantom(1) 不应再触发 REJECTED(已降级为软flag)"
+
+    def test_synthetic_classification_does_not_reject(self):
+        passed, rejection = self._run(is_phantom=2)
+        assert passed is True and rejection is None, \
+            "authenticity 判 synthetic(2) 不应再触发 REJECTED(已降级为软flag)"
+
+    def test_duplicate_still_hard_rejects(self):
+        class _DupHit:
+            def is_duplicate(self, img_np):
+                return True, "phash distance=0"
+        passed, rejection = self._run(is_phantom=0, dedup=_DupHit())
+        assert passed is False and rejection is not None
+        assert rejection["status"] == "REJECTED"
+        assert rejection["is_duplicate"] == 1
+        assert "Duplicate" in rejection["reason"]
+
+    def test_tamper_still_hard_rejects(self):
+        class _TamperHit:
+            def detect(self, img_np):
+                return True, np.zeros(img_np.shape[:2], dtype=np.uint8), [0, 0, 10, 10]
+        passed, rejection = self._run(is_phantom=0, tamper=_TamperHit())
+        assert passed is False and rejection is not None
+        assert rejection["status"] == "REJECTED"
+        assert rejection["is_tampered"] == 1
+
+    def test_tamper_reason_falls_back_to_generic_text_without_source_attr(self):
+        """2026-07-12 code-review(Angle A)发现:REJECTED reason 曾坍缩成笼统的
+        'hard-reject path',丢失具体命中源(CatNet vs BAG)。修复后
+        gatekeeper_runner 用 `getattr(tamper_detector, "last_hard_reject_source", None)`
+        取来源——本测试锁定向后兼容分支:stub/旧版 tamper_detector 没有该属性时,
+        不应报 AttributeError,应静默退化为通用文案。"""
+        class _TamperHitNoSourceAttr:
+            def detect(self, img_np):
+                return True, np.zeros(img_np.shape[:2], dtype=np.uint8), [0, 0, 10, 10]
+        passed, rejection = self._run(is_phantom=0, tamper=_TamperHitNoSourceAttr())
+        assert passed is False and rejection is not None
+        assert "Tampering detected (hard-reject path)" in rejection["reason"]
+
+    def test_tamper_reason_labels_catnet_source(self):
+        class _TamperHitCatNet:
+            last_hard_reject_source = "catnet"
+            def detect(self, img_np):
+                return True, np.zeros(img_np.shape[:2], dtype=np.uint8), [0, 0, 10, 10]
+        passed, rejection = self._run(is_phantom=0, tamper=_TamperHitCatNet())
+        assert passed is False and rejection is not None
+        assert "CAT-Net deep model" in rejection["reason"]
+
+    def test_tamper_reason_labels_bag_phase_source(self):
+        class _TamperHitBag:
+            last_hard_reject_source = "bag_phase"
+            def detect(self, img_np):
+                return True, np.zeros(img_np.shape[:2], dtype=np.uint8), [0, 0, 10, 10]
+        passed, rejection = self._run(is_phantom=0, tamper=_TamperHitBag())
+        assert passed is False and rejection is not None
+        assert "BAG phase inconsistency" in rejection["reason"]
+
+    def test_rejection_json_still_carries_phantom_audit_fields(self):
+        """软化后 is_phantom/is_gan 仍作为审计字段保留在 REJECTED 产物里
+        (由 duplicate 命中触发 REJECTED,同时 phantom=1,验证字段未被误删)。
+
+        2026-07-12 code-review(Angle B)发现:早期版本只验证字段保留、断言
+        phantom 完全不出现在人类可读的 reason 文本里——但这会让"是否恰好还有
+        另一路真实触发的软flag信号并发发生"这条审计信息从 reason 里彻底消失
+        (机器可读字段虽还在,人工审计/日志grep这类只看reason文本的场景看不到)。
+        改为断言 phantom 以明确标注为"soft-flag"(非拒绝驱动原因)的形式出现,
+        而不是完全不出现——reason 应能区分"是什么导致了REJECTED"(duplicate)
+        与"还观察到了什么但不是拒绝原因"(phantom soft-flag)。
+        """
+        class _DupHit:
+            def is_duplicate(self, img_np):
+                return True, "near-duplicate"
+        passed, rejection = self._run(is_phantom=1, dedup=_DupHit())
+        assert passed is False and rejection is not None
+        assert rejection["is_phantom"] == 1
+        assert "soft-flag: Physical Phantom" in rejection["reason"], \
+            "phantom 应以 soft-flag 标注形式出现在 reason 里(区别于拒绝驱动原因)"
+        assert rejection["reason"].startswith("Duplicate image:"), \
+            "REJECTED 的真正驱动原因(duplicate)应仍是 reason 的主要/首要表述"

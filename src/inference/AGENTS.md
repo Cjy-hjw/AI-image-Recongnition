@@ -49,13 +49,13 @@ This package provides reusable inference modules shared by `predict.py` (product
 - **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
 
 Pipeline:
-1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection
-2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set
-3. **Copy-Move** — `detect_copy_move()` dense block-matching
-4. **Splicing(硬粘贴)** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)
-5. **Splicing(羽化/泊松)** — `tampering_catnet.CatNetTamperingDetector` CAT-Net v2 DCT/BAG 取证(块伪影栅格相位错位),可插拔降级 dct-bag;`detect()` = 深度CAT-Net ∪ BAG ∪ 几何三路并集
+1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection。**2026-07-12 统一软flag制度**:分类结果**不再**驱动 REJECTED,仅作审计字段(`is_phantom`/`is_gan` 保留在 rejection JSON 里,但只在去重/篡改触发 REJECTED 时才会出现,自身不能单独致拒)。权重缺失/损坏仍在 `AuthenticityModule.load_weights` 硬报错,红线未变。详见 `src/gatekeeper/AGENTS.md` §1。
+2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set。硬拒绝,未软化。
+3. **Copy-Move** — `detect_copy_move()` dense block-matching。**恒为软flag**(`last_soft_flags`),与 CatNet 状态无关,详见下方第 5 点。
+4. **Splicing(硬粘贴)** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)。**恒为软flag**,同上。
+5. **Splicing(羽化/泊松)** — `tampering_catnet.CatNetTamperingDetector` CAT-Net v2 DCT/BAG 取证(块伪影栅格相位错位),可插拔降级 dct-bag。**2026-07-12 统一软flag制度后 `detect()` 判定逻辑改为**:CAT-Net **自身**前向命中(本次调用成功)硬拒绝 ∪ BAG 相位不一致(仅当 `bag_hard_reject=True` 显式开启;默认 `False` 仅软flag) ∪ 几何(copy_move/splice,**恒软flag,与 CatNet 状态解耦**,不再因"CatNet 这次没崩溃"被提升为硬拒绝)。硬拒绝命中源写入 `CatNetTamperingDetector.last_hard_reject_source`("catnet"|"bag_phase"|None),`gatekeeper_runner.py` 据此拼接精确的 REJECTED reason(而非笼统的"hard-reject path")。详见 `src/gatekeeper/AGENTS.md` §3。
 
-**Rejection JSON** (on failure):
+**Rejection JSON** (on failure)。`is_phantom`/`is_gan` 现为纯审计字段——出现非零值**不代表**该次判定单独触发了 REJECTED,只有 `is_duplicate`/`is_tampered` 驱动 `status="REJECTED"`(见上方第1点)；但若本次因去重/篡改被拒绝且 phantom/synthetic 同时命中,`reason` 文本会追加 `"(soft-flag: ...)"` 标注保留该并发信号(2026-07-12 code-review 补强,详见 `src/gatekeeper/AGENTS.md` §1):
 ```json
 {
   "status": "REJECTED",

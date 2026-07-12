@@ -36,6 +36,11 @@ gatekeeper:
   # sscd_weights:           # 可选,显式指定 SSCD TorchScript 路径;缺省自动探测 checkpoints/
   # catnet_weights:         # 可选,CAT-Net v2 TorchScript 路径;缺省探测 checkpoints/catnet_v2.torchscript.pt
                             #   缺失则降级 dct-bag(纯 NumPy 块伪影栅格取证),detect() 仍含几何检测器并集
+  # BAG 相位取证是否作硬拒绝。默认 false(仅软 flag)——BAG 阈值仅经 8 个合成种子
+  # 小样本验证,远小于 copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的
+  # 唯一闸门:官方真实干净 JPG holdout 上预注册、带置信区间的 FPR 验收达标
+  # (统一软flag制度,见 docs/P2红线修复实施计划.md B3)。
+  bag_hard_reject: false
   tamper_threshold: 0.5
 
 model:

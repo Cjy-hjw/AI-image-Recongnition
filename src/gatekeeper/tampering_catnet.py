@@ -14,7 +14,9 @@ CAT-Net v2(IJCV 2022, Apache-2.0)用 DCT 系数流追踪 JPEG 8x8 量化栅格�
   2) **深度 CAT-Net(可选,需下载 HRNet 权重)**:权重存在则加载 TorchScript,
      缺失则降级——只跑 BAG + 既有几何检测器,零破坏现有 gatekeeper 测试。
 
-最终 `CatNetTamperingDetector.detect` 的篡改判定 = 深度CAT-Net ∪ BAG相位 ∪ 几何缝。
+最终 `CatNetTamperingDetector.detect` 的篡改判定 = 深度CAT-Net(自身命中,硬拒绝) ∪
+BAG相位(默认软flag,`bag_hard_reject=True` 时硬拒绝) ∪ 几何缝(copy_move/splice,恒软flag,
+与 CatNet 状态解耦——见 detect() docstring "统一软flag制度")。
 """
 
 import os
@@ -139,14 +141,26 @@ class CatNetTamperingDetector:
     """
 
     def __init__(self, catnet_weights=None, grid_strength_min=0.8,
-                 win=64, stride=32, min_flag_blocks=3):
+                 win=64, stride=32, min_flag_blocks=3, bag_hard_reject=False):
         self.grid_strength_min = float(grid_strength_min)
         self.win = int(win)
         self.stride = int(stride)
         self.min_flag_blocks = int(min_flag_blocks)
+        # BAG 相位不一致是否作硬拒绝。默认 False(仅软 flag)——BAG 阈值仅经
+        # 8 个合成种子小样本验证(tests/test_gatekeeper.py::TestCatNetDetector),
+        # 远小于 copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门:
+        # 官方真实干净 JPG holdout 上预注册、带置信区间的 FPR 验收达标(统一软flag制度,
+        # 见 docs/P2红线修复实施计划.md B3)。
+        self.bag_hard_reject = bool(bag_hard_reject)
         self._model = None
         self.backend_name = "dct-bag"
         self.last_soft_flags = []  # 最近一次 detect 的软 flag 命中(降级模式块级疑似)
+        # 最近一次 detect 硬拒绝的来源标签("catnet"|"bag_phase"|None)。
+        # 2026-07-12 code-review(Angle A)发现:统一软flag制度后硬拒绝路只剩
+        # CatNet自身命中∪BAG(开关开启时),但 gatekeeper_runner 的 REJECTED
+        # reason 文案曾坍缩成笼统的"hard-reject path",审计时无法区分具体命中源。
+        # 补此字段供调用方(gatekeeper_runner)拼接更精确的 reason。
+        self.last_hard_reject_source = None
 
         weights = _find_catnet_weights(catnet_weights)
         if weights is not None:
@@ -245,15 +259,24 @@ class CatNetTamperingDetector:
         """篡改判定。返回签名向后兼容:(is_tampered, mask, bbox)。
 
         **硬拒绝路（is_tampered=True，触发 REJECT）**:
-            深度CAT-Net(若权重在) ∪ BAG相位不一致。
-            二者均有红线保护:CAT-Net 是学习式判据;BAG 有"无 JPEG 栅格则弃权"门。
+            深度CAT-Net(若权重在,自身前向命中) ∪ BAG相位不一致(仅当
+            `self.bag_hard_reject=True` 时;默认 False,见 §BAG 说明)。
 
-        **软 flag 路（记录但不拒绝，is_tampered 不受影响）**:
-            copy_move / splice 几何块级判据。经全量 holdout 实测(359张真实图):
-            copy_move 误报 27.3%、splice 亦在超声自相似纹理上不可靠——经典块匹配
-            在超声模态无法兼顾零误报与有效召回(详见 duipai 实验 + AGENTS.md §3)。
-            **红线「宁可漏检不可误杀」要求:降级模式下此二路不得硬拒绝真实图**,
-            故仅作软 flag 审计输出(stdout);待 CAT-Net 深度权重(catnet_v2)落地后升级为硬拒绝。
+        **软 flag 路（记录但不拒绝，is_tampered 不受影响，恒定，与 CatNet 状态无关）**:
+            copy_move / splice 几何块级判据,以及 `bag_hard_reject=False` 时的 BAG 命中。
+            经全量 holdout 实测(359张真实图):copy_move 误报 27.3%、splice 亦在
+            超声自相似纹理上不可靠——经典块匹配在超声模态无法兼顾零误报与有效召回
+            (详见 duipai 实验 + AGENTS.md §3)。**红线「宁可漏检不可误杀」要求:此二路
+            永不硬拒绝**,仅作软 flag 审计输出(stdout)。
+
+            **2026-07-12 与 CatNet 解耦(统一软flag制度)**:此前版本用
+            "CatNet 本次 forward 是否成功(`catnet_ok_this_call`)"作为几何判据能否
+            升级为硬拒绝的信任凭据——但"CatNet 这次没崩溃"和"copy_move/splice 判据
+            本身是否可信"是两件独立的事,前者成立不代表后者成立。现改为:copy_move/
+            splice **无条件**软 flag,CatNet 自身命中与否只影响 CatNet 自己的硬拒绝路,
+            不再驱动几何判据的硬拒绝权限。恢复几何判据硬拒绝的唯一闸门是它们各自的
+            真实域 holdout FPR 验收达标(非"CatNet 能跑")。
+
             `self.last_soft_flags` 暴露最近一次 detect 的软命中详情(供调用方按需读取
             接入报告;当前 gatekeeper_runner 仅取 is_tampered 放行,软 flag 走 stdout)。
 
@@ -261,55 +284,44 @@ class CatNetTamperingDetector:
             (is_tampered, mask uint8 (H,W), bbox [x1,y1,x2,y2] | None)
         """
         self.last_soft_flags = []  # 每次 detect 重置:软 flag 命中清单(可审计)
+        self.last_hard_reject_source = None  # 每次 detect 重置:本次硬拒绝来源标签
 
-        catnet_ok_this_call = False
         if self._model is not None:
             try:
                 hit, mask, bbox = self._catnet_forward(img_np)
-                catnet_ok_this_call = True
                 if hit:
-                    return True, mask, bbox
+                    self.last_hard_reject_source = "catnet"
+                    return True, mask, bbox  # CatNet 自身硬拒绝:保留(有自身学习式验证)
             except Exception as e:
-                # 深度路本次调用出错(如223行shape assert触发)→降级到下方纯
-                # NumPy取证,不中断审计。但绝不能让"权重已加载"继续冒充"本次
-                # 判定可信"——2026-07-10 Gate2审查发现：旧版用
-                # `self._model is not None` 直接判 block_level_hard,会让本该
-                # 走软flag的copy_move/splice几何检测器(全量holdout实测硬拒绝
-                # 误报27.3%)在catnet本次forward崩溃时被错误提升为硬拒绝,真实
-                # 图像被一票否决出局且无任何日志区分"catnet判clean"与"catnet
-                # 本次崩溃"。此处显式打印留痕,并用 catnet_ok_this_call(而非
-                # self._model是否非None)驱动下方 block_level_hard。
+                # 深度路本次调用出错(如 shape assert 触发)→降级到下方纯 NumPy
+                # 取证,不中断审计,不影响 BAG/几何判据(二者本就与 CatNet 状态无关)。
                 print(
                     f"--> [Gatekeeper] CAT-Net 本次前向失败"
-                    f"({type(e).__name__}: {e})，降级为纯几何取证(不影响BAG判据)",
+                    f"({type(e).__name__}: {e})，降级为纯几何/BAG取证",
                     flush=True,
                 )
 
-        # 硬拒绝路:BAG 相位(有弃权红线保护)
+        # BAG 相位:有「无 JPEG 栅格则弃权」红线保护;是否硬拒绝由 bag_hard_reject
+        # 显式开关控制(默认 False,见 __init__ 与 configs/thyroid_config.yaml 注释)。
         hit, mask, bbox = self.bag_phase_inconsistency(img_np)
         if hit:
-            return True, mask, bbox
+            if self.bag_hard_reject:
+                self.last_hard_reject_source = "bag_phase"
+                return True, mask, bbox
+            self.last_soft_flags.append(("bag_phase", bbox))
 
-        # 深度 CAT-Net 本次调用真正成功时,块级几何判据可信 → 参与硬拒绝;
-        # 否则(未加载 或 本次forward失败)→ 块级判据在超声上误报过高 → 降级为
-        # 软 flag,不拒绝。用 catnet_ok_this_call 而非 self._model is not None，
-        # 见上方注释。
-        block_level_hard = catnet_ok_this_call
-
-        is_cm, cm_mask, cm_bbox = detect_copy_move(img_np)
+        # copy_move/splice:与 CatNet 状态解耦,无条件软 flag(见上方 docstring)。
+        # mask 不再用于硬拒绝路的返回值,仅取 bbox 供软 flag 审计。
+        is_cm, _cm_mask, cm_bbox = detect_copy_move(img_np)
         if is_cm:
-            if block_level_hard:
-                return True, cm_mask, cm_bbox
             self.last_soft_flags.append(("copy_move", cm_bbox))
 
-        is_sp, sp_mask, sp_bbox = detect_splicing(img_np)
+        is_sp, _sp_mask, sp_bbox = detect_splicing(img_np)
         if is_sp:
-            if block_level_hard:
-                return True, sp_mask, sp_bbox
             self.last_soft_flags.append(("splice", sp_bbox))
 
         if self.last_soft_flags:
-            print(f"--> [Gatekeeper 软 flag] 降级模式块级篡改疑似(不拒绝,仅记录): "
+            print(f"--> [Gatekeeper 软 flag] 块级篡改疑似(不拒绝,仅记录): "
                   f"{[f for f, _ in self.last_soft_flags]}", flush=True)
 
         return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None

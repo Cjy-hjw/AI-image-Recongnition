@@ -560,7 +560,7 @@ class TestCatNetDetector:
                 assert any(f == "splice" for f, _ in det.last_soft_flags), \
                     "几何缝命中应记录为软 flag"
 
-    def test_catnet_forward_failure_this_call_does_not_promote_geometric_to_hard(self):
+    def test_catnet_forward_failure_this_call_does_not_promote_geometric_to_hard(self, monkeypatch):
         """回归 2026-07-10 Gate2审查发现的地雷bug:旧版用
         `block_level_hard = self._model is not None` 只反映"构造时权重加载
         成功",不反映"本次 forward 是否真成功"。若 `_catnet_forward` 本次调用
@@ -576,12 +576,21 @@ class TestCatNetDetector:
         变量已从实现中删除。本测试断言("forward失败时几何命中应软flag")仍然
         成立,但已退化为"永不硬拒绝"这一更强不变式的一个特例,不再是该机制的
         专属回归测试(专属回归见下方 test_geometric_never_hard_rejects_even_when_catnet_ok)。
+
+        2026-07-12 QA_VP §2.3 补课:早期版本靠"合成样本恰好触发
+        detect_splicing"驱动断言,不触发时 `pytest.skip`——检测器行为一旦被
+        意外破坏,测试可能静默 skip 而非 fail,CI 照样绿灯。改用 monkeypatch
+        强制 `detect_splicing` 命中,消除该脆弱性。
         """
+        import src.gatekeeper.tampering_catnet as tc_module
+
         base = _structured_ultrasound(seed=1)
         donor = _structured_ultrasound(seed=99, vary_structure=True)
         sp, _, _ = make_splice(base, donor, 2, patch_frac=0.30)
-        if not detect_splicing(sp)[0]:
-            pytest.skip("本次合成样本几何检测器未命中,无法验证软flag降级语义")
+        monkeypatch.setattr(
+            tc_module, "detect_splicing",
+            lambda img_np: (True, np.zeros(img_np.shape[:2], dtype=np.uint8), [10, 10, 50, 50]),
+        )
 
         det = CatNetTamperingDetector()  # dct-bag 降级(无真实catnet权重)
         # 模拟"权重已加载"但本次 forward 抛异常:注入一个会抛错的假模型。

@@ -77,6 +77,8 @@ All deep learning implementations MUST be verified by quantifiable automated tes
 *   **降级路径即生产路径**: 可插拔检测器（SSCD/CAT-Net）的深度权重若未落地交付，则降级路径就是实际生产路径，必须按降级路径实测红线，不得假设深度权重存在。判定以 `docs/预训练权重打包清单.md` + `.cache_weights/` 实际内容为准。
 *   **端到端验证**: 推理侧改动 MUST 实跑 `predict.py`（单图）完整链路，不能只跑单元测试（见 `memory/phase4-was-halfbaked.md`）。
 *   **容器封印时机**: `seal_container.py` 只在**交付最后一步**（最终权重就位后）跑，提前封印会埋雷。见 `memory/seal-container-timing.md`。
+*   **统一软 flag 制度**: gatekeeper 任一硬拒绝分支，在**官方真实干净 holdout 完成预注册、带置信区间的 FPR 验收**之前，默认只能软 flag（记录审计字段，不触发 REJECTED）。**降级（硬→软）是单调保守动作，不需要真实 FPR 证据即可执行**（收紧误报风险，不会引入新风险）；但**恢复硬拒绝必须先有真实域 FPR 证据**，不得凭"实现看起来对了"就把软 flag 升级回硬拒绝。2026-07 gatekeeper 统一软 flag 化改动（`8e608b7`/`c8871a6`/`6cb60a6`）即此原则的落地:CatNet 自身命中与 BAG 相位/copy_move/splice 几何判据解耦，硬拒绝来源需显式记录（`last_hard_reject_source`），BAG 是否硬拒绝由独立开关 `bag_hard_reject`（默认 `false`）控制。见 `docs/P2红线修复实施计划.md`。
+*   **子进程崩溃兜底（容器不可静默零输出）**: `entrypoint.sh` 若用 `exec python ...` 替换 bash 进程，一旦 Python 侧 segfault 或被 OOM-killer `SIGKILL`（不可被 trap 捕获，任何 try/except 都挡不住），没有存活进程能补写 `result.json`，容器表现为静默零输出而非可诊断的错误。**Rule**：去 `exec`、显式 `trap` 转发 `SIGTERM`/`SIGINT` 给子进程（否则容器优雅关闭时子进程变孤儿）、子进程异常退出且未产出 `result.json` 时必须补写结构化 ERROR JSON 兜底；兜底前须先移走上次调用可能残留的**陈旧** `result.json`（否则会被误判为"这次成功了"，比空目录更危险）。见 `docs/P2红线修复实施计划.md` C 级、`scripts/AGENTS.md` §7.1。
 
 ---
 
@@ -98,6 +100,10 @@ Audit all PyTorch/training code changes against this checklist:
     ```python
     assert pred.shape == target.shape, f"Shape mismatch: pred {pred.shape} vs target {target.shape} will trigger broadcast!"
     ```
+
+### 2.3 Test Robustness: Forced Triggering over Natural Triggering（测试反脆弱：强制触发优于自然触发）
+*   **Safety Risk**: 依赖合成样本"自然"触发检测器/分支的回归测试（例如指望某张构造图片恰好让 `detect_splicing`/`detect_copy_move` 判定为阳性）具有隐蔽脆弱性——若检测器行为被后续改动意外破坏（阈值漂移、判据被误删），测试可能**静默 `pytest.skip` 而非 `fail`**，CI 照样绿灯，红线破坏无人察觉。
+*   **Rule**: 凡测试意图是"验证某条件命中后的下游行为"，**优先用 `monkeypatch` 强制该条件命中**（如 `monkeypatch.setattr(detector, "detect_splicing", lambda *a, **k: True)`），而非依赖构造样本自然触发。自然触发允许作为补充（验证真实检测器确有此能力），但不能是唯一路径。2026-07 gatekeeper 软 flag 化改动中，`test_geometric_never_hard_rejects_even_when_catnet_ok` 等测试即从"构造图片指望触发"改为 monkeypatch 强制触发,见 `tests/test_gatekeeper.py`、`docs/P2红线修复实施计划.md`。
 
 ---
 

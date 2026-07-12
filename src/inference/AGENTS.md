@@ -161,6 +161,10 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 ### `save_rejection_json(output_dir, rejection_json)`
 - `result.json` with rejection details.
 
+### `_write_json_atomic(path, payload)`（2026-07-12,entrypoint.sh 崩溃兜底 Gate2 复审补强）
+- `save_prediction_artifacts`/`save_rejection_json` 写 `result.json` 均改经此函数:先写 `<path>.tmp.<pid>` 临时文件,`json.dump` 完成后 `os.replace` 原子重命名。
+- **动机**:`entrypoint.sh` 的子进程崩溃兜底逻辑只检查 `result.json` 是否**存在**,不校验内容是否完整。若 SIGTERM/OOM-kill 恰好在旧版直接 `open(...,"w") + json.dump` 写盘期间到达,磁盘上会留下半写/截断的 `result.json`——这类"存在但损坏"的文件比完全不存在更危险,会被误判为"本次已正常产出"。`os.replace` 在同目录内是原子操作(POSIX `rename(2)` / Windows `MoveFileEx`),不存在可被读到的中间态。
+
 ### `save_gradcam_overlay(model, img_tensor, img_np, output_path, branch="cls")`
 - 双主干显式分支:`branch="cls"`(默认)→ `cls_backbone`(EfficientNet-B2,解释恶性分类);`branch="seg"` → `seg_backbone`(ConvNeXt-Nano,解释分割)。经 `_resolve_gradcam_target_layer(model, branch)` 取 `blocks[-1][-1]` 或末个 Conv2d。
 - Generates heatmap overlay via `GradCAM` + `overlay_heatmap`.

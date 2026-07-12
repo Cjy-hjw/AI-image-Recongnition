@@ -17,11 +17,14 @@ entrypoint.sh 是容器唯一入口,负责:① 按输入扩展名分发到 predi
 
 bash 不可用(罕见,CI Linux 与本地 Git Bash 均有)时整文件 skip。
 """
+import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -79,6 +82,41 @@ def _make_success_shim(dir_path):
         '    printf \'{"status": "PASSED", "source": "success-shim"}\' > "$out/result.json"\n'
         'fi\n'
         'exit 0\n'
+    )
+    with open(shim, "w", encoding="utf-8", newline="\n") as f:
+        f.write(script)
+    os.chmod(shim, os.stat(shim).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    shutil.copy2(shim, os.path.join(dir_path, "python3"))
+    return shim
+
+
+def _make_slow_shutdown_shim(dir_path):
+    """造一个"收到 SIGTERM 后需要一点时间才能优雅退出"的假 python,模拟真实
+    predict.py/video_predict.py 收到容器编排器转发的关闭信号后仍需完成收尾
+    写盘的场景。用于验证 entrypoint.sh 的 wait 循环不会被 bash "wait 被 trap
+    打断提前返回"的语义坑(2026-07-12 Gate2 复审实测复现)误判成崩溃——必须
+    等子进程真正退出、拿到它优雅关闭后的真实退出码(7),而非信号打断 wait 时
+    的合成值。"""
+    shim = os.path.join(dir_path, "python")
+    script = (
+        '#!/bin/sh\n'
+        'echo "SHIM_ARGS: $@"\n'
+        'out=""\n'
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '    if [ "$prev" = "--output_dir" ]; then out="$a"; fi\n'
+        '    prev="$a"\n'
+        'done\n'
+        'graceful_shutdown() {\n'
+        '    sleep 0.3\n'
+        '    if [ -n "$out" ]; then\n'
+        '        mkdir -p "$out"\n'
+        '        printf \'{"status": "PASSED", "source": "slow-shutdown-shim"}\' > "$out/result.json"\n'
+        '    fi\n'
+        '    exit 7\n'
+        '}\n'
+        'trap graceful_shutdown TERM\n'
+        'sleep 5\n'
     )
     with open(shim, "w", encoding="utf-8", newline="\n") as f:
         f.write(script)
@@ -451,4 +489,63 @@ class TestSubprocessCrashFallback:
         r = _run_entrypoint("/tmp/case.mp4", shim_dir=shim, tmp_path=tmp_path)
         assert r.returncode == 0
         assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 真实信号转发(2026-07-12 Gate2 复审新增):TestSubprocessCrashFallback 只用
+# 固定退出码的 shim 驱动,从未真正向 entrypoint.sh 自身进程发送过 OS 信号——
+# 这条 gap 恰恰是"wait 被 trap 打断提前返回 128+信号、子进程实际仍存活"这一
+# 真实 bug 未被测试覆盖、只能靠人工 bash 环境复现才发现的原因。本类用真实
+# `SIGTERM` 补齐这段此前完全空白的验证。
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestSignalForwarding:
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX 信号语义在 Windows 原生进程模型下不可靠(bash 是 Git Bash 模拟),"
+               "真实验证以 Linux CI 为准",
+    )
+    def test_signal_forwarded_and_wait_captures_real_exit_code(self, tmp_path):
+        """向 entrypoint.sh 自身发送真实 SIGTERM,验证两件事:
+        ① trap 确实把信号转发给子进程(子进程收到后才开始优雅关闭,不是被
+           立即强杀,也不是完全没收到而空跑满 sleep 5 超时);
+        ② wait 循环等到子进程真正退出(exit 7)才采信 exit_code,不被"wait
+           被 trap 打断提前返回 128+信号"这一 bash 语义坑误判成崩溃——这正是
+           2026-07-12 Gate2 复审在真实 bash 环境下实测复现的 bug(修复前
+           `exit_code` 会被过早钉死在 143,而子进程当时仍在 `sleep 0.3` 优雅
+           关闭窗口内存活)。
+        """
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_slow_shutdown_shim(shim)
+        out_dir = tmp_path / "out"
+        env = dict(os.environ)
+        env["PATH"] = shim + os.pathsep + env["PATH"]
+        proc = subprocess.Popen(
+            [BASH, ENTRYPOINT, "/tmp/case.png", "--output_dir", str(out_dir)],
+            cwd=REPO_ROOT, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            time.sleep(0.5)  # 确保子进程已真正 spawn 并进入 `sleep 5` 阻塞
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        assert proc.returncode == 7, (
+            "entrypoint 应等到子进程优雅关闭后的真实退出码(7),而非 wait 被"
+            f"trap 打断时的合成值(如 143)\nSTDOUT:{stdout}\nSTDERR:{stderr}"
+        )
+        result_json = out_dir / "result.json"
+        assert result_json.exists(), (
+            "子进程收到转发的信号后应有机会完成优雅关闭并写出 result.json,"
+            f"而非被提前判定失败/未等到它写完\nSTDERR:{stderr}"
+        )
+        payload = json.loads(result_json.read_text(encoding="utf-8"))
+        assert payload.get("source") == "slow-shutdown-shim", (
+            f"result.json 应是子进程优雅关闭时写出的那份,不是兜底 ERROR JSON: {payload}"
+        )
 

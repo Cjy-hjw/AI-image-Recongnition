@@ -79,6 +79,17 @@ def build_dicom(
     if n_frames > 1:
         ds.NumberOfFrames = n_frames
 
+    # is_little_endian/is_implicit_VR 两个分支都显式设置（2026-07-11 Gate2 补审
+    # 建议）：pydicom>=3.0 的 filewriter._determine_encoding() 会优先按
+    # file_meta.TransferSyntaxUID 推导编码、不读这两个属性，两分支原本只有
+    # 未压缩分支设置、压缩分支省略也能在 pydicom 3.0.2 上正确工作——但这依赖
+    # pydicom 3.0+ 的内部优先级实现细节，`requirements.txt` 的 pydicom 下限
+    # 只锁 >=2.4.0（详见该文件注释：若解析到 2.4.x 版本，`_determine_encoding`
+    # 的优先级机制未经验证）。两分支都显式赋值，不依赖任何 pydicom 版本特定的
+    # 隐式推导行为，向后更稳妥。
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
+
     rng = np.random.default_rng(seed=0)
 
     if compressed:
@@ -91,14 +102,16 @@ def build_dicom(
             if not ok:
                 raise RuntimeError("cv2.imencode failed while building synthetic compressed DICOM")
             frame_bytes.append(jpg.tobytes())
+        # encapsulate() 按 DICOM Part5 Annex A.4 encapsulated pixel data 格式
+        # 封装：每帧 item 自动 pad 到偶数长度(0x00 补齐)，调用方无需手动处理。
+        # is_undefined_length=True 是 VR 自动定为 OB 的触发条件(pydicom
+        # filewriter._correct_ambiguous_vr_element)，encapsulated 数据必须如此。
         ds.PixelData = encapsulate(frame_bytes)
         ds["PixelData"].is_undefined_length = True
     else:
         pixel_shape = (n_frames, rows, cols) if n_frames > 1 else (rows, cols)
         pixels = rng.integers(0, 256, size=pixel_shape, dtype=np.uint8)
         ds.PixelData = pixels.tobytes()
-        ds.is_little_endian = True
-        ds.is_implicit_VR = False
 
     return ds
 

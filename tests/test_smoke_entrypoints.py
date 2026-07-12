@@ -447,15 +447,18 @@ class TestDicomInputPaths:
             assert (out / name).exists(), f"缺产物 {name}"
 
     @pytest.mark.skipif(not _HAS_PYLIBJPEG, reason="pylibjpeg 未安装，跳过压缩 DICOM 冒烟测试")
-    def test_compressed_dicom_passes(self, tmp_path):
+    @pytest.mark.parametrize("n_frames", [1, 4], ids=["single-frame", "multi-frame-cine"])
+    def test_compressed_dicom_passes(self, tmp_path, n_frames):
         """2026-07-11 Opus 战略审查发现的致命缺口补测：真实超声 DICOM 绝大多数是
         JPEG/JPEG2000/RLE 压缩，此前 fixture 只测过未压缩 ExplicitVRLittleEndian
         ——若压缩解码插件缺失，`ds.pixel_array` 会抛 NotImplementedError（被
         `_load_dicom_cine` 兜成 ERROR 不崩溃，但等于该动态图样本 100% 丢失预测）。
         `requirements.txt` 已补 pylibjpeg/pylibjpeg-libjpeg，这里验证 JPEG
-        baseline 压缩的 DICOM 经真实链路完整跑通产出 PASSED。"""
+        baseline 压缩的 DICOM 经真实链路完整跑通产出 PASSED。
+        参数化覆盖单帧 + 多帧 cine（2026-07-11 Gate2 review 非阻塞建议补齐：
+        此前只测过压缩+单帧组合，压缩+多帧 cine 这个组合未覆盖过）。"""
         dcm = tmp_path / "compressed.dcm"
-        build_dicom(rows=32, cols=32, n_frames=1, compressed=True).save_as(
+        build_dicom(rows=32, cols=32, n_frames=n_frames, compressed=True).save_as(
             str(dcm), enforce_file_format=True
         )
         out = tmp_path / "vout_dcm_compressed"

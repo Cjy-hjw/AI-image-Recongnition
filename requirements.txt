@@ -7,7 +7,12 @@ numpy>=1.24.0,<2          # 必须封顶 <2:torch 2.1.0 用 numpy 1.x C-ABI 编�
 safetensors>=0.4.0          # load_local_safetensors 加载离线骨干权重
 
 timm>=0.9.0                 # EfficientNet-B2 / ConvNeXt-Nano 骨干
-pydicom>=2.4.0              # DICOM/cine 解码 + PHI 脱敏
+# pydicom>=3.0.0(2026-07-11 Gate2 补审提高下限,原为>=2.4.0):
+# scripts/verify/gen_synthetic_dicom.py 的压缩 DICOM(encapsulated PixelData)
+# 编码依赖 pydicom>=3.0 的 filewriter._determine_encoding() 优先按
+# file_meta.TransferSyntaxUID 推导编码这一内部行为(实测源码确认，2.4.x 是否
+# 有等价保证未经验证)；本项目实测环境为 pydicom 3.0.2。
+pydicom>=3.0.0               # DICOM/cine 解码 + PHI 脱敏
 # 压缩 DICOM 解码插件(2026-07-11 补,Opus 战略审查发现的致命缺口):真实超声
 # DICOM 绝大多数是 JPEG/JPEG2000/RLE 压缩,此前只有 pydicom 裸装,ds.pixel_array
 # 遇压缩像素数据必抛 NotImplementedError(被 video_io._load_dicom_cine 的

@@ -95,7 +95,24 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 
 **实现层选择**:嗅探逻辑放在 `entrypoint.sh`(bash 层)而非 `src/inference/io.py`/`video_io.py`(Python 层)——因为分发决策(选 `predict.py` 还是 `video_predict.py`)本身就发生在 Python 进程启动之前,若把嗅探下沉到 Python 层,届时已经"选错入口"、为时已晚(比如误判成静态图启动了 `predict.py`,`predict.py` 内部再嗅探出其实是视频也无法回头去启动 `video_predict.py`)。因此嗅探必须在 dispatch 之前、bash 层完成。
 
-**测试**:`tests/test_entrypoint_dispatch.py::TestContentSniffFallback`(6 个用例):扩展名/内容不一致双向重路由(image↔video)、一致时不误报警告、DICOM 无白名单扩展名仍靠内容识别(offset-128 preamble 特殊性的回归验证)、完全无法识别内容硬失败(exit 1 + ERROR result.json + 不 exec 任何入口)、文件不存在时退化为纯扩展名路由(不因为读不到文件就误判"无法识别")。既有 `TestDispatch`/`TestProductionIntegrity`/`TestSrcTreeHashParity` 19 个用例全部沿用旧行为(用不存在的占位路径如 `/tmp/case.mp4`,天然命中"跳过嗅探"分支),未受影响。
+**测试**:`tests/test_entrypoint_dispatch.py::TestContentSniffFallback`(6 个用例):扩展名/内容不一致双向重路由(image↔video)、一致时不误报警告、DICOM 无白名单扩展名仍靠内容识别(offset-128 preamble 特殊性的回归验证)、完全无法识别内容硬失败(exit 1 + ERROR result.json + 不分发到任何入口)、文件不存在时退化为纯扩展名路由(不因为读不到文件就误判"无法识别")。既有 `TestDispatch`/`TestProductionIntegrity`/`TestSrcTreeHashParity` 19 个用例全部沿用旧行为(用不存在的占位路径如 `/tmp/case.mp4`,天然命中"跳过嗅探"分支),未受影响。
 
 **已知边界(不在本次范围内)**:内容嗅探只能区分"这个文件是图片还是视频/DICOM",**不能**支持全新输入形态——若官方实际交付是"JPG 帧序列"(一组按帧编号的独立文件而非单文件),对单个 JPG 帧嗅探只会得到 `image/jpeg`,依然会被路由到 `predict.py` 做单帧预测,不会自动聚合成 cine 送 `video_predict.py`。这类形态若被 8-1 官方数据证实存在,需要在入参层面新增"目录路径"这一形态,现在不凭空实现(`rules.md`「先证后改」)。
+
+---
+
+## 7.1 `entrypoint.sh` — 子进程崩溃兜底(2026-07-12,P2红线修复C级)
+
+**背景**:此前分发阶段(第 5 节路由裁决完成后)用 `exec python <script> ...`,把当前 bash 进程直接替换成 python 进程。若 python 侧发生**原生崩溃**(segfault)或被 **OOM-killer 发 SIGKILL**,替换掉的进程已不存在,**没有任何存活的进程能补写 `result.json`**——评测方拿到的是空目录/零输出,直接判零分(比任何数值误判都严重,`result.json` 缺失是比 `status=ERROR` 更差的失败模式)。
+
+**改法(`entrypoint.sh` 第 6 节)**:
+1. **去掉 `exec`**,改为 `python ... &` 后台启动子进程、记录 `child_pid`、`wait "$child_pid"` 父 shell 前台等待,取真实退出码。
+2. **信号转发**:不再 `exec` 替换进程后,bash 收到的 `SIGTERM`/`SIGINT`(容器编排器优雅关闭时常发)不会自动传给子进程——显式 `trap forward_signal TERM INT`,`forward_signal()` 里 `kill -TERM "$child_pid"` 转发,避免子进程变孤儿、容器优雅关闭超时后被强杀。
+3. **崩溃兜底**:`wait` 返回后,若 `$out_dir/result.json` **不存在**且 `exit_code` 非零,父 shell 补写一份最小 `{"status": "ERROR", "reason": "Inference subprocess exited with code N without producing result.json ..."}`,`reason` 里带上具体退出码辅助诊断。
+4. **陈旧文件规避**:分发前若 `$out_dir/result.json` 已存在(可能是上一次调用残留),先 `mv` 到 `.stale` 后缀移开——否则子进程本次崩溃但未产出新文件时,残留的旧 `result.json`(可能是上次的 `PASSED`)会被误判成"这次成功了",比空目录更危险(空目录至少诚实地是"没有结果")。流程结束(无论成功/兜底)统一清理 `.stale` 文件。
+5. **out_dir 解析前置**:`--output_dir` 解析逻辑从"仅未知格式分支使用"提升为脚本级、分发前统一解析,供未知格式 ERROR 分支与崩溃兜底分支共用同一份逻辑,避免重复解析 drift。
+
+**诚实边界(不得夸大)**:此修法能接住 **(a) python 自身 segfault** 与 **(b) python 子进程单独被 OOM-killer 选中 SIGKILL** 这两类主要情形(父 shell 在这两种情况下仍存活,能观察到子进程退出并兜底)。**接不住** **(c) 整个 cgroup/容器被外部一并杀掉**的情形——此时父 shell 自身也不存在了,任何用户态兜底都无能为力,需要容器编排层(如 k8s 存活探针 + 重启策略)兜底,不是本脚本能解决的问题,脚本注释与本文档均不得虚假宣称"已解决 OOM 问题"。
+
+**测试**:`tests/test_entrypoint_dispatch.py::TestSubprocessCrashFallback`(4 个用例,用专用 shim `_make_crashing_shim`/`_make_success_shim` 驱动,不依赖真实 segfault):子进程崩溃且未产出 result.json → 父 shell 补写 ERROR JSON、退出码透传;子进程正常产出 result.json → 兜底逻辑不覆盖/不触碰;out_dir 预先存在陈旧 result.json + 本次崩溃 → 最终结果是本次的 ERROR 而非被误判为陈旧的成功、`.stale` 标记文件清理干净;去掉 `exec` 后分发路由本身不受影响(回归锁定)。既有 `TestDispatch`/`TestProductionIntegrity`/`TestContentSniffFallback` 全部改为显式传 `tmp_path` 隔离 `--output_dir`(改动后所有分发路径都会 mkdir/移动/清理 `$out_dir/result.json`,不再仅限未知格式分支,不隔离会污染/误删仓库真实的 `data/output/`)。
 

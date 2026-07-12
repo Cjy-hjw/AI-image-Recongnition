@@ -110,6 +110,19 @@ case "$ext_lc" in
     *)                         ext_kind="static" ;;
 esac
 
+# out_dir 解析(等号/空格两种 --output_dir 写法都认,没传则落 predict.py 同款默认值)。
+# 提前到分发前解析,供下方"未知格式"ERROR分支与"子进程崩溃兜底"分支共用同一份逻辑,
+# 避免两处重复解析 drift。
+out_dir="data/output"
+prev_arg=""
+for arg in "$@"; do
+    case "$arg" in
+        --output_dir=*) out_dir="${arg#--output_dir=}" ;;
+    esac
+    if [ "$prev_arg" = "--output_dir" ]; then out_dir="$arg"; fi
+    prev_arg="$arg"
+done
+
 # sniff_kind: dynamic|static|unknown|skip("skip"= 文件不存在/不可读/file命令不可用,
 # 无嗅探依据,退化为纯扩展名路由,不当作"unknown"处理——两者语义不同,前者不该硬失败)
 sniff_kind="skip"
@@ -129,17 +142,6 @@ fi
 
 if [ "$sniff_kind" = "unknown" ]; then
     echo "CRITICAL ERROR: Cannot identify input format by content -- neither DICOM preamble nor image/video magic bytes matched (path=$INPUT_PATH, ext=.$ext_lc)." >&2
-    # 从透传参数里找 --output_dir(等号/空格两种写法都认),没传则落 predict.py 同款默认值,
-    # 保证 ERROR result.json 落在评测管线实际会去读的目录,而非静默丢弃。
-    out_dir="data/output"
-    prev_arg=""
-    for arg in "$@"; do
-        case "$arg" in
-            --output_dir=*) out_dir="${arg#--output_dir=}" ;;
-        esac
-        if [ "$prev_arg" = "--output_dir" ]; then out_dir="$arg"; fi
-        prev_arg="$arg"
-    done
     mkdir -p "$out_dir" 2>/dev/null
     printf '{\n  "status": "ERROR",\n  "reason": "Unrecognized input format: extension .%s and content magic bytes both failed to identify image/video/DICOM type"\n}\n' \
         "$ext_lc" > "$out_dir/result.json"
@@ -152,13 +154,60 @@ if [ "$sniff_kind" != "skip" ] && [ "$sniff_kind" != "$ext_kind" ]; then
     final_kind="$sniff_kind"
 fi
 
+# 6. 子进程崩溃兜底(2026-07-12,P2红线修复C级)。
+#    背景:此前用 `exec python ...` 直接把当前 bash 进程替换成 python 进程——
+#    若 python 侧发生原生崩溃(segfault)或被 OOM-killer 发 SIGKILL,没有任何存活的
+#    父进程能补写 result.json,评测方拿到的是空目录/零输出,直接判零分(比任何
+#    数值误判都严重)。改为前台子进程 + 父 shell 存活等待 + 崩溃兜底,但**诚实
+#    说明边界**:此修法能接住 (a) python 自身 segfault (b) python 子进程单独被
+#    OOM-killer 选中 SIGKILL 这两类主要情形;接不住 (c) 整个 cgroup/容器被外部
+#    杀掉(父 shell 与子进程一起消失,无法留下任何痕迹)——(c) 这种情况下父 shell
+#    自身也不存在了,任何用户态兜底都无能为力,需要容器编排层(如 k8s 存活探针
+#    + 重启策略)兜底,不是本脚本能解决的问题,不在此虚假宣称"已解决"。
+#
+#    陈旧文件规避:先把上一次调用可能残留的 result.json 移开,这样"本次是否
+#    产出新结果" = "文件是否重新出现"——否则子进程崩溃但 out_dir 里躺着上一次
+#    调用的旧 result.json,会被误判成"这次成功了",而实际评测的是陈旧/错误
+#    归属的结果,比空目录更危险(空目录至少诚实地是"没有结果")。
+#
+#    信号转发:不再 exec 替换进程,故 bash 收到的 SIGTERM/SIGINT(如容器编排器
+#    优雅关闭发出)不会自动传给子进程——显式 trap 转发,避免子进程变孤儿、
+#    容器优雅关闭超时后被强杀的情况。
+result_file="$out_dir/result.json"
+mkdir -p "$out_dir" 2>/dev/null
+if [ -f "$result_file" ]; then
+    mv -f "$result_file" "$result_file.stale" 2>/dev/null
+fi
+
+child_pid=""
+forward_signal() {
+    if [ -n "$child_pid" ]; then
+        kill -TERM "$child_pid" 2>/dev/null
+    fi
+}
+trap forward_signal TERM INT
+
 case "$final_kind" in
     dynamic)
         echo "--> Detected dynamic/cine input (.$ext_lc) -> video_predict.py"
-        exec python video_predict.py --input_video "$INPUT_PATH" "$@"
+        python video_predict.py --input_video "$INPUT_PATH" "$@" &
         ;;
     *)
         echo "--> Detected static image input (.$ext_lc) -> predict.py"
-        exec python predict.py --input_image "$INPUT_PATH" "$@"
+        python predict.py --input_image "$INPUT_PATH" "$@" &
         ;;
 esac
+child_pid=$!
+wait "$child_pid"
+exit_code=$?
+trap - TERM INT
+
+if [ ! -f "$result_file" ] && [ "$exit_code" -ne 0 ]; then
+    mkdir -p "$out_dir" 2>/dev/null
+    printf '{\n  "status": "ERROR",\n  "reason": "Inference subprocess exited with code %s without producing result.json (possible native crash/segfault or OOM-kill; NOT covered: whole-container/cgroup kill, see entrypoint.sh comments)"\n}\n' \
+        "$exit_code" > "$result_file"
+    echo "--> [entrypoint] subprocess exit=$exit_code, no result.json produced -> wrote fallback ERROR json" >&2
+fi
+rm -f "$result_file.stale" 2>/dev/null
+
+exit "$exit_code"

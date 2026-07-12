@@ -64,7 +64,7 @@ Two-stage duplicate detection:
 
 | Attack Type | Detection Method | 当前能力边界 |
 |:---|:---|:---|
-| **Copy-Move** | Dense block-matching to find duplicate pixel regions | **降级模式下软 flag,不硬拒绝**:全量 holdout 实测(359张真实图)硬拒绝会误报 **27.3%**——超声天然自相似(斑点/腺体纹理)使真实自相似块与复制块无法用统计/NCC/位移特征分开(5组对拍实验证实,详见下方软 flag 说明)。触碰「宁可漏检不可误杀」一票否决红线,故降级模式仅记录软 flag |
+| **Copy-Move** | Dense block-matching to find duplicate pixel regions | **降级模式下软 flag,不硬拒绝**:超声天然自相似(斑点/腺体纹理)使真实自相似块与复制块无法用统计/NCC/位移特征分开,触碰「宁可漏检不可误杀」一票否决红线。实测数据(359张真实图 holdout、27.3%误报率、5组对拍实验)见下方"硬拒绝路 vs 软 flag 路"完整说明 |
 | **Splicing(硬粘贴)** | 轴对齐长直缝几何判据:Sobel 强阶跃边 → HoughLinesP 找长直线(≥0.14·min(H,W))→ 按 ±10° 分水平/垂直缝 → **要求一条水平缝与一条垂直缝端点在 14px 内角点正交相交**(硬粘贴矩形特征) | 经两轮失败定案:像素/区域方差方案在含结节的干净图 20/20 误报(结节本身即方差异常区),触碰一票否决红线故弃用。现方案干净图 **0/80 零误报**、真实组织拼接召回 **~84%**,放弃纯噪声 donor 等极端对抗样本部分召回以换零误报 |
 | **Splicing(羽化/泊松融合)** | `tampering_catnet.py` — CAT-Net v2 风格 DCT/BAG 取证:`block_artifact_energy` 估计 8×8 块伪影栅格(BAG)主导相位,滑窗找局部相位错位区(来自另一 JPEG 的错位粘贴会破坏全图一致栅格,即使 RGB 边界被融合) | 几何缝检测器抓不到「无长直阶跃」的羽化拼接;BAG 取证补此盲区。**红线守护**:① 全图 `grid_strength<阈值`(无 JPEG 栅格)→ 弃权返回未篡改,不对未压缩真实图取证;② `grid_strength` 分母加绝对能量地板,防真实平滑背景+结节图因 median 塌缩被放大成误报;③ 局部相位换算回全图坐标系 `(p+y)%block`,消除窗口原点偏移(否则非 block 整倍 stride 会让干净 JPEG 全图误报)。`min_flag_blocks` 聚类门压随机误报 |
 

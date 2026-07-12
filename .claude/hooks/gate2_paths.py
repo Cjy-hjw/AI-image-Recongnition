@@ -4,7 +4,7 @@
 modularity_check.py 共同导入。
 
 单一事实源：避免"各 hook 各自维护一份路径判断/路径格式/pending读写逻辑，后续改动
-漏同步一处"的 drift。两次真实教训都由此而来：
+漏同步一处"的 drift。三次真实教训都由此而来：
 1. （2026-07-10 早）train_thyroidxl.py 在 scripts/、model_runner.py 在
    src/inference/，两者都不在旧版 HIGH_RISK_PREFIXES 里，提醒 hook 完全没触发。
 2. （2026-07-10 晚，Gate2 审查抓出）Edit/Write 工具传入的 `tool_input.file_path`
@@ -13,6 +13,17 @@ modularity_check.py 共同导入。
    后直接存盘，gate2_enforce.py 却拿仓库相对路径去比对——两者永不相等，导致
    "审查已通过但 commit 仍被 GATE2-BLOCK 永久拦截"。必须在写入 pending/pass 前
    统一转换成仓库相对路径，才能和 git diff 的输出正确比对。
+3. （2026-07-11，用户审查发现）`is_high_risk` 曾无条件 `if not file_path.endswith(".py"):
+   return False`——任何非 .py 文件永远判定为低风险，与"高风险"的真正含义（改错了
+   代价大、影响面广）脱节。当轮 `requirements.txt` 新增依赖版本锁定
+   （pylibjpeg 系列，须避开与 numpy<2 冲突的新版本）全程未经 Gate2 审查，
+   而这类改动一旦锁错版本会让**整个交付容器 build 失败**，风险不比"高风险
+   目录"里的代码改动小，只是恰好不落在旧判定的目录/扩展名范围内被放过。同理
+   `Dockerfile`（决定容器能否构建）、`scripts/entrypoint.sh`（容器唯一入口，
+   分发+防篡改逻辑）、`scripts/_src_tree_hash.sh`（防篡改指纹算法，须与
+   `seal_container.py` 的 Python 实现字节级一致）此前也全部因为非 .py
+   扩展名被系统性排除在 Gate2 覆盖之外。改为显式的高风险文件精确匹配清单
+   （见 HIGH_RISK_EXACT_FILES），不再用扩展名兜底排除。
 """
 import json
 import os
@@ -37,6 +48,17 @@ HIGH_RISK_SCRIPT_PATTERNS = (
     re.compile(r"^pretrain_.*\.py$"),
     re.compile(r"^merge_lora.*\.py$"),
     re.compile(r"^retrain_.*\.py$"),
+    re.compile(r"^seal_container\.py$"),  # 防篡改密封脚本，src树聚合哈希算法单一事实源
+)
+
+# 非 .py 但同样高风险的精确文件路径（2026-07-11 补，修复"仅 .py 才判高风险"的
+# 系统性盲区）——依赖/构建/容器入口/防篡改指纹，改错代价是整个交付容器不可用
+# 或防篡改契约破坏，不是"看着不像代码就低风险"。仓库相对路径精确匹配。
+HIGH_RISK_EXACT_FILES = (
+    "requirements.txt",                              # 依赖版本冲突可致容器 build 失败
+    "Dockerfile",                                     # 基础镜像/COPY/系统依赖，决定可构建性
+    os.path.join("scripts", "entrypoint.sh"),         # 容器唯一入口：分发路由 + 防篡改阻断
+    os.path.join("scripts", "_src_tree_hash.sh"),     # 防篡改指纹算法，须与 seal_container.py 字节级一致
 )
 
 # pending/pass 标记文件路径 + 升级阈值：4 个 hook 共用同一份，禁止各自重复字面量
@@ -58,10 +80,19 @@ def to_repo_relative(file_path: str) -> str:
 
 
 def is_high_risk(file_path: str) -> bool:
-    """判定单个文件路径是否属于 Gate2 高风险范围。"""
+    """判定单个文件路径是否属于 Gate2 高风险范围。
+
+    2026-07-11 修复：不再无条件排除非 .py 文件——HIGH_RISK_EXACT_FILES 里的
+    非 .py 文件（requirements.txt/Dockerfile/entrypoint.sh/_src_tree_hash.sh）
+    优先判定，判完才走 .py-only 的目录/脚本名模式判定。
+    """
+    norm = os.path.normpath(file_path)
+
+    if norm in HIGH_RISK_EXACT_FILES:
+        return True
+
     if not file_path.endswith(".py"):
         return False
-    norm = os.path.normpath(file_path)
 
     if any(norm.__contains__(p) for p in HIGH_RISK_DIR_PREFIXES):
         return True

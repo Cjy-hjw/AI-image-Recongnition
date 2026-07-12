@@ -124,11 +124,12 @@ jobs:
       - name: Install pydicom (host runner, only for synthetic DICOM fixture generation)
         # opencv-python-headless 供 --compressed 分支用 cv2.imencode 生成 JPEG 压缩帧
         run: pip install pydicom numpy opencv-python-headless
-      - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine + compressed)
+      - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine + compressed x2)
         run: |
           python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/single.dcm --frames 1 --rows 64 --cols 64
           python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/cine.dcm --frames 4 --rows 64 --cols 64
           python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/compressed.dcm --frames 1 --rows 64 --cols 64 --compressed
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/compressed_cine.dcm --frames 4 --rows 64 --cols 64 --compressed
       - name: Smoke test — DICOM single-frame (entrypoint 按内容嗅探路由到 video_predict.py)
         # entrypoint.sh 把 .dcm 无条件路由到 video_predict.py(单帧也不例外,
         # _load_dicom_cine 把 2D pixel_array 包装成 (1,H,W) 当单帧 cine 处理,
@@ -180,8 +181,27 @@ jobs:
           assert d.get('status') == 'PASSED', f'预期status=PASSED(压缩DICOM解码插件应正确解码,若为ERROR说明解压插件缺失或失效),实际:{d}'
           print('OK: 压缩DICOM冒烟测试通过')
           "
+      - name: Smoke test — compressed DICOM multi-frame cine (Gate2 review 非阻塞建议补齐:压缩+多帧组合此前未覆盖)
+        run: |
+          mkdir -p /tmp/smoke_out_dcm_compressed_cine
+          docker run --rm \
+            -v /tmp/compressed_cine.dcm:/workspace/compressed_cine.dcm:ro \
+            -v /tmp/smoke_out_dcm_compressed_cine:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/compressed_cine.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm_compressed_cine/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm_compressed_cine/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(压缩多帧cine应完整解码跑完),实际:{d}'
+          print('OK: 压缩DICOM多帧cine冒烟测试通过')
+          "
       - name: Generate synthetic JPG static image (官方确认静态图交付格式是 JPG,此前只测过 PNG)
-        run: python3 -c "
+        # 2026-07-12 修复：此前用 `run: python3 -c "..."` 单值写法(非 `run: |`
+        # 块标量)，YAML 按 plain scalar 规则把内嵌的多行字符串折叠成一行空格
+        # 分隔，Python 代码整个粘一起变成 IndentationError——与文件里其它
+        # python3 -c 步骤统一用 `run: |` 块标量的写法不一致，这里补齐。
+        run: |
+          python3 -c "
           import numpy as np, cv2
           arr = (np.random.rand(64, 64) * 255).astype('uint8')
           cv2.imwrite('/tmp/smoke_input.jpg', arr)

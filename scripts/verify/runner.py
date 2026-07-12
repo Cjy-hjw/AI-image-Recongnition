@@ -1,5 +1,8 @@
 import os
+import random
+
 import yaml
+import numpy as np
 import torch
 
 from src.models.multi_task_model import MultiTaskThyroidModel
@@ -16,6 +19,16 @@ from scripts.verify.gates.gate8_adaptor_isolation import gate8_adaptor_isolation
 
 def verify():
     print("=== MODEL SANITY & GRADIENT FLOW VERIFICATION ===")
+
+    # 固定随机种子:verify 用 dummy tensor(下方 randn/randint)做前反向数值门禁,
+    # 未播种会使每次 Gate1-8 输入不同 → Gate3(AUC-margin 对偶参数)偶发 flaky。
+    # 播种后 Gate 结果可复现,门禁本身才可信。cuda.manual_seed_all 无 CUDA 时为
+    # 安全 no-op(与训练脚本 set_seed 一致);不引入 cudnn.deterministic(超范围)。
+    _seed = 42
+    random.seed(_seed)
+    np.random.seed(_seed)
+    torch.manual_seed(_seed)
+    torch.cuda.manual_seed_all(_seed)
 
     # 1. Load config
     config_path = "configs/thyroid_config.yaml"

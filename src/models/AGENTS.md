@@ -7,11 +7,12 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | File / Package | Responsibility | Max Scope |
 |:---|:---|:---|
 | `physical_prior.py` | Differentiable physical feature extraction (AR, ER, Circularity) | ~160 lines |
-| `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~190 lines |
+| `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~209 lines |
 | `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor, decoder, stage freeze registry) | ~300 lines |
+| `mil_pooling.py` | 门控注意力多示例学习(Gated-Attention MIL)——患者级良恶性弱标签聚合:`SpatialAttentionModule`(保留 backbone `forward_features()` 空间判别性,不用 GAP 稀释微钙化等高频特征) + `GatedAttentionPooling`。仅供 `scripts/pretrain_malignancy_mil.py` 训练管线使用,不在 `MultiTaskThyroidModel` 主推理路径。见 `memory/patient-leakage-and-probe-trap.md` | ~255 lines |
 | `losses/` | Decomposed loss function subpackage | See below |
 | `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
-| `famo.py` | FAMO dynamic loss weight scheduler | ~50 lines |
+| `famo.py` | FAMO dynamic loss weight scheduler | ~85 lines |
 | `pretrained_loader.py` | `load_local_safetensors()` — offline backbone weight loader (ConvNeXt seg + EfficientNet cls) | ~36 lines |
 | `lora_utils.py` | `LoRAConv2d`(1x1 conv 低秩包装) + `apply_lora`/`get_lora_params`/`disable_lora` — LP-FT-LoRA 微调用 | ~140 lines |
 | `physical_prior.py` 的 `x_coords`/`y_coords` buffer | **2026-07-10 修复**：`torch.meshgrid` 返回的 0-stride 广播视图直接 `register_buffer` 会导致*任何* checkpoint 的 `load_state_dict()` 崩溃（PyTorch 检测目标 tensor 内存别名），已加 `.contiguous()` 修复。此 bug 与 LoRA 无关，早于且独立于下面的 LoRA 部署问题，是 `predict.py`/`evaluate.py` 此前从未能真正加载训练权重的根因之一，详见 `memory/`（如已生成）或 `src/inference/AGENTS.md` §3。 | — |
@@ -24,7 +25,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `losses/segmentation.py` | `DiceLoss` |
 | `losses/classification.py` | `AUCMLossApprox`, `SupervisedContrastiveLoss` |
 | `losses/concepts.py` | `symmetric_label_regression_loss`, `symmetric_label_regression_loss_bce` |
-| `losses/multitask.py` | `MultiTaskLoss` orchestrator (~144 lines) |
+| `losses/multitask.py` | `MultiTaskLoss` orchestrator (~183 lines) |
 
 ### losses/components/ Subpackage (MultiTaskLoss decomposition)
 

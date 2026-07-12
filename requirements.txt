@@ -8,6 +8,18 @@ safetensors>=0.4.0          # load_local_safetensors 加载离线骨干权重
 
 timm>=0.9.0                 # EfficientNet-B2 / ConvNeXt-Nano 骨干
 pydicom>=2.4.0              # DICOM/cine 解码 + PHI 脱敏
+# 压缩 DICOM 解码插件(2026-07-11 补,Opus 战略审查发现的致命缺口):真实超声
+# DICOM 绝大多数是 JPEG/JPEG2000/RLE 压缩,此前只有 pydicom 裸装,ds.pixel_array
+# 遇压缩像素数据必抛 NotImplementedError(被 video_io._load_dicom_cine 的
+# except Exception 兜成 status=ERROR 不崩溃,但等于该动态图样本 100% 丢失预测)。
+# RLE Lossless(1.2.840.10008.1.2.5)pydicom 自带 rle_handler 已支持,无需额外包;
+# JPEG/JPEG2000 需要下方两个插件。版本上限锁 <2.2.0/<2.3.0——从这两个版本起
+# 上游把 numpy 依赖改成 >=2.0,与本项目 numpy<2(torch 2.1.0 C-ABI 要求)冲突,
+# 锁定版本仍要求 numpy>=1.24,<2.0,且均有 manylinux2014_x86_64 cp310 wheel,
+# 与交付基镜像(pytorch/pytorch:2.1.0,Python 3.10)匹配。
+pylibjpeg>=2.1.0
+pylibjpeg-libjpeg>=2.0.0,<2.2.0    # JPEG baseline/extended/lossless
+pylibjpeg-openjpeg>=2.0.0,<2.3.0   # JPEG2000
 opencv-python-headless>=4.8.0
 pyyaml>=6.0
 scikit-learn>=1.2.0

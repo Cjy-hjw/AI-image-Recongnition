@@ -32,6 +32,12 @@ try:
 except ImportError:
     _HAS_PYDICOM = False
 
+try:
+    import pylibjpeg  # noqa: F401
+    _HAS_PYLIBJPEG = True
+except ImportError:
+    _HAS_PYLIBJPEG = False
+
 
 def _run_entry(script, args, timeout=300):
     """在仓库根以子进程跑入口脚本,返回 CompletedProcess。"""
@@ -439,6 +445,64 @@ class TestDicomInputPaths:
         assert data.get("status") == "PASSED", f"预期 status=PASSED，实际 {data}\nSTDOUT:{r.stdout}"
         for name in ("result.json", "clinical_report.txt", "mask_predicted.png"):
             assert (out / name).exists(), f"缺产物 {name}"
+
+    @pytest.mark.skipif(not _HAS_PYLIBJPEG, reason="pylibjpeg 未安装，跳过压缩 DICOM 冒烟测试")
+    def test_compressed_dicom_passes(self, tmp_path):
+        """2026-07-11 Opus 战略审查发现的致命缺口补测：真实超声 DICOM 绝大多数是
+        JPEG/JPEG2000/RLE 压缩，此前 fixture 只测过未压缩 ExplicitVRLittleEndian
+        ——若压缩解码插件缺失，`ds.pixel_array` 会抛 NotImplementedError（被
+        `_load_dicom_cine` 兜成 ERROR 不崩溃，但等于该动态图样本 100% 丢失预测）。
+        `requirements.txt` 已补 pylibjpeg/pylibjpeg-libjpeg，这里验证 JPEG
+        baseline 压缩的 DICOM 经真实链路完整跑通产出 PASSED。"""
+        dcm = tmp_path / "compressed.dcm"
+        build_dicom(rows=32, cols=32, n_frames=1, compressed=True).save_as(
+            str(dcm), enforce_file_format=True
+        )
+        out = tmp_path / "vout_dcm_compressed"
+        r = _run_entry("video_predict.py", [
+            "--input_video", str(dcm),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+            "--skip_gatekeeper",
+        ])
+        assert r.returncode == 0, \
+            f"压缩 DICOM 不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "压缩 DICOM 仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") == "PASSED", \
+            f"预期 status=PASSED(压缩解码插件应正确解码),实际 {data}\nSTDOUT:{r.stdout}"
+        for name in ("result.json", "clinical_report.txt", "mask_predicted.png"):
+            assert (out / name).exists(), f"缺产物 {name}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JPG 静态图 → predict.py 全产物(官方确认静态图交付格式就是 JPG,此前只测过 PNG)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestJpegInputPath:
+    def test_jpeg_static_image_reject_path_runs(self, tmp_path):
+        """2026-07-11 P1 收尾补测：docs/比赛对齐与风险.md 确认官方静态图交付格式
+        是 JPG，但此前所有冒烟/单测全部用 PNG 构造输入，JPG 路径从未被真实验证
+        过——cv2.imread 本身对两种格式一视同仁，但零成本的事该补，直接对齐交付
+        格式。"""
+        img = tmp_path / "noise.jpg"
+        arr = (np.random.rand(400, 500) * 255).astype(np.uint8)
+        import cv2
+        cv2.imwrite(str(img), arr)
+        out = tmp_path / "out_jpg"
+        r = _run_entry("predict.py", [
+            "--input_image", str(img),
+            "--output_dir", str(out),
+            "--precision", "fp32",
+        ])
+        assert r.returncode == 0, \
+            f"JPG 静态图不应崩溃\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        rj = out / "result.json"
+        assert rj.exists(), "JPG 静态图仍必须落 result.json"
+        data = json.loads(rj.read_text(encoding="utf-8"))
+        assert data.get("status") in ("REJECTED", "ERROR", "PASSED"), \
+            f"status 非法: {data.get('status')}\nSTDOUT:{r.stdout}"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

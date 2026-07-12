@@ -122,11 +122,13 @@ jobs:
       # host runner 生成真实可被 pydicom.dcmread() 解析的合成 DICOM，经真实容器
       # 验证不崩溃 —— 与上面 2 步一样，只验证容器机制，不验证预测数值。
       - name: Install pydicom (host runner, only for synthetic DICOM fixture generation)
-        run: pip install pydicom numpy
-      - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine)
+        # opencv-python-headless 供 --compressed 分支用 cv2.imencode 生成 JPEG 压缩帧
+        run: pip install pydicom numpy opencv-python-headless
+      - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine + compressed)
         run: |
           python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/single.dcm --frames 1 --rows 64 --cols 64
           python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/cine.dcm --frames 4 --rows 64 --cols 64
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/compressed.dcm --frames 1 --rows 64 --cols 64 --compressed
       - name: Smoke test — DICOM single-frame (entrypoint 按内容嗅探路由到 video_predict.py)
         # entrypoint.sh 把 .dcm 无条件路由到 video_predict.py(单帧也不例外,
         # _load_dicom_cine 把 2D pixel_array 包装成 (1,H,W) 当单帧 cine 处理,
@@ -157,6 +159,47 @@ jobs:
           d = json.load(open('/tmp/smoke_out_dcm4/result.json'))
           assert d.get('status') == 'PASSED', f'预期status=PASSED(多帧DICOM cine应完整跑完),实际:{d}'
           print('OK: DICOM 多帧cine冒烟测试通过')
+          "
+      - name: Smoke test — compressed DICOM (JPEG baseline,容器需 pylibjpeg 解码插件)
+        # 2026-07-11 Opus 战略审查发现的致命缺口:真实超声 DICOM 绝大多数是
+        # JPEG/JPEG2000/RLE 压缩,上面两步的 fixture 都是未压缩 ExplicitVRLittleEndian,
+        # 从未验证过压缩像素数据这条路径——若压缩解码插件缺失,ds.pixel_array 会抛
+        # NotImplementedError(被 _load_dicom_cine 兜成 ERROR 不崩溃,但等于该动态图
+        # 样本 100% 丢失预测)。requirements.txt 已补 pylibjpeg/pylibjpeg-libjpeg,
+        # 这里验证容器内真实解码成功、产出 PASSED(而非降级 ERROR)。
+        run: |
+          mkdir -p /tmp/smoke_out_dcm_compressed
+          docker run --rm \
+            -v /tmp/compressed.dcm:/workspace/compressed.dcm:ro \
+            -v /tmp/smoke_out_dcm_compressed:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/compressed.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm_compressed/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm_compressed/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(压缩DICOM解码插件应正确解码,若为ERROR说明解压插件缺失或失效),实际:{d}'
+          print('OK: 压缩DICOM冒烟测试通过')
+          "
+      - name: Generate synthetic JPG static image (官方确认静态图交付格式是 JPG,此前只测过 PNG)
+        run: python3 -c "
+          import numpy as np, cv2
+          arr = (np.random.rand(64, 64) * 255).astype('uint8')
+          cv2.imwrite('/tmp/smoke_input.jpg', arr)
+          "
+      - name: Smoke test — JPG static image path (predict.py via entrypoint 分发)
+        run: |
+          mkdir -p /tmp/smoke_out_jpg
+          docker run --rm \
+            -v /tmp/smoke_input.jpg:/workspace/smoke_input.jpg:ro \
+            -v /tmp/smoke_out_jpg:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/smoke_input.jpg
+          echo "--- result.json ---"; cat /tmp/smoke_out_jpg/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_jpg/result.json'))
+          assert d.get('status') == 'ERROR', f'预期status=ERROR(容器内无真实权重,同静态PNG用例),实际:{d}'
+          assert d.get('reason'), f'reason不应为空: {d}'
+          print('OK: JPG 静态图冒烟测试通过')
           "
       - name: Smoke test — corrupted non-empty file (predict.py 必须 ERROR 不崩溃)
         # 与上面标准 PNG 用例区分:这里带合法 PNG 魔数 + IHDR chunk 头(与

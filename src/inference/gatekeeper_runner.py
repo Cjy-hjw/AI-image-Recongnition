@@ -25,7 +25,11 @@ def build_seeded_deduplicator(config, device):
         sscd_weights=config["gatekeeper"].get("sscd_weights"),
     )
     if os.path.exists(config["data"]["train_path"]):
-        train_samples = os.listdir(config["data"]["train_path"])
+        # sorted():os.listdir 顺序取决于文件系统/inode,跨容器 rebuild、跨平台
+        # (Win 开发机 vs Linux 容器)会变——不排序则被选入去重种子库的前 200 张
+        # 可能不同,导致同一张边界重复图 is_duplicate 判定跨环境不一致(踩「宁可漏检
+        # 不可误杀」红线)。排序后种子集合确定,判定可复现。
+        train_samples = sorted(os.listdir(config["data"]["train_path"]))
         limit = min(len(train_samples), 200)
         for i in range(limit):
             p = os.path.join(

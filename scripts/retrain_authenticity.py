@@ -17,6 +17,7 @@ import os
 import sys
 import argparse
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,6 +36,14 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    # 全局播种:此前仅数据切分(patient_grouped_split)用 args.seed,模型初始化/
+    # DataLoader shuffle 不受控 → 重训权重不可复现。补齐四件套与其它训练脚本一致。
+    import random
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[auth-retrain] device={device} FEAT_DIM={FEAT_DIM} out={args.out}", flush=True)

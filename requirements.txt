@@ -22,10 +22,17 @@ pydicom>=3.0.0               # DICOM/cine 解码 + PHI 脱敏
 # 上游把 numpy 依赖改成 >=2.0,与本项目 numpy<2(torch 2.1.0 C-ABI 要求)冲突,
 # 锁定版本仍要求 numpy>=1.24,<2.0,且均有 manylinux2014_x86_64 cp310 wheel,
 # 与交付基镜像(pytorch/pytorch:2.1.0,Python 3.10)匹配。
-pylibjpeg>=2.1.0
+pylibjpeg>=2.1.0,<2.2.0            # 核心包:与两后端插件同源封顶。当前 2.1.0 的 numpy
+                                  # 依赖无版本约束(pip 解析仍受本文件 numpy<2 约束,安全),
+                                  # <2.2.0 挡未来版本可能把 numpy 依赖抬到 >=2.0 与本项目冲突。
 pylibjpeg-libjpeg>=2.0.0,<2.2.0    # JPEG baseline/extended/lossless
 pylibjpeg-openjpeg>=2.0.0,<2.3.0   # JPEG2000
 opencv-python-headless>=4.8.0
+# Pillow 由 torchvision/albumentations/scikit-image 间接依赖,此前从未显式锁定,
+# 版本完全由 pip 解析器决定。Pillow 10.x 移除 Image.ANTIALIAS 等 API 曾造成上游
+# 静默破坏;显式声明并封顶防漂移。基镜像(pytorch 2.1.0/py3.10)实测兼容 9.x-10.x,
+# <11 挡未来大版本 API 突变(若 CI 报解析冲突则放宽为仅下限 >=9.5.0,见 commit 说明)。
+Pillow>=9.5.0,<11
 pyyaml>=6.0
 scikit-learn>=1.2.0
 scikit-image>=0.20.0

@@ -136,6 +136,14 @@ def generate_report(image_id, patient_id, breakdown, malignancy_prob):
     report.append(f"预测结论: {'恶性可疑 (Suspicious for Malignancy)' if malignancy_prob >= 0.5 else '良性倾向 (Benign Nodule)'}")
     report.append("-"*60)
     report.append("  ACR TI-RADS 声学特征定量评估:")
+    # CBM 五概念头(成分/回声/形状/边缘/钙化)在当前基线 thyroidxl_merged_v2 中从未
+    # 收到语义监督——train_thyroidxl.py 只训 malignancy + 分割,概念头仅作为恶性预测
+    # 的隐藏中间表示被间接训练,其 argmax 索引与 TI-RADS 语义无监督对应关系(证据见
+    # docs/比赛对齐与风险.md「接线」条)。故下列五项为架构预演输出、语义未经验证,不可
+    # 作独立诊断依据;仅恶性概率与分割 mask 可信。8-01 官方概念标注重训建立语义监督后
+    # 删除本段与下面两行 append。
+    report.append("  [注] 声学五分项(成分/回声/形状/边缘/钙化)概念头未经语义监督,为架构")
+    report.append("       预演输出、语义未经验证,仅供参考;恶性概率与分割 mask 方为可信结论。")
     
     comp_desc, comp_pts = breakdown["composition"]
     report.append(f"  1. 成分: {comp_desc} (+{comp_pts}分)")

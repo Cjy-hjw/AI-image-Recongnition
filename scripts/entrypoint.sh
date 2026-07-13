@@ -41,9 +41,9 @@ for entry in predict.py video_predict.py; do
 done
 
 # 3. 检查模型权重文件
-if [ -f "checkpoints/best_model.pth" ]; then
-    ACTUAL_WEIGHTS_SHA=$(sha256sum checkpoints/best_model.pth | awk '{print $1}')
-    echo "--> checkpoints/best_model.pth SHA-256: $ACTUAL_WEIGHTS_SHA"
+if [ -f "checkpoints/thyroidxl_merged_v2.pth" ]; then
+    ACTUAL_WEIGHTS_SHA=$(sha256sum checkpoints/thyroidxl_merged_v2.pth | awk '{print $1}')
+    echo "--> checkpoints/thyroidxl_merged_v2.pth SHA-256: $ACTUAL_WEIGHTS_SHA"
 else
     echo "[WARNING] Trained weights not found. Skipping hash validation."
 fi
@@ -64,12 +64,12 @@ if [ "$PRODUCTION" = "1" ]; then
         echo "CRITICAL ERROR: src/ tree integrity hash mismatch! Core inference code has been tampered with." >&2
         exit 1
     fi
-    if [ ! -f "checkpoints/best_model.pth" ]; then
-        echo "CRITICAL ERROR: checkpoints/best_model.pth weight file is missing in production container!" >&2
+    if [ ! -f "checkpoints/thyroidxl_merged_v2.pth" ]; then
+        echo "CRITICAL ERROR: checkpoints/thyroidxl_merged_v2.pth weight file is missing in production container!" >&2
         exit 1
     fi
     if [ "$ACTUAL_WEIGHTS_SHA" != "$EXPECTED_WEIGHTS_SHA256" ]; then
-        echo "CRITICAL ERROR: checkpoints/best_model.pth weight signature mismatch! Parameters have been altered." >&2
+        echo "CRITICAL ERROR: checkpoints/thyroidxl_merged_v2.pth weight signature mismatch! Parameters have been altered." >&2
         exit 1
     fi
     echo "--> Offline production signature verification SUCCESS."

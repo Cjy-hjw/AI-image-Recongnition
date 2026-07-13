@@ -44,8 +44,9 @@ def build_model(config: dict, weights: str, device: torch.device):
         config=config,
     ).to(device)
     if os.path.exists(weights):
-        # weights_only=True:best_model.pth 按设计是纯 model state_dict(续训态另存
-        # training_state.pth),torch≥2.6 下安全加载并消除 FutureWarning。
+        # weights_only=True:部署默认权重 thyroidxl_merged_v2.pth(merge 产出的纯 Conv2d
+        # state_dict)与 train.py 的 best_model.pth 同规格,都是纯 model state_dict(续训态
+        # 另存 training_state.pth),torch≥2.6 下安全加载并消除 FutureWarning。
         raw = torch.load(weights, map_location=device, weights_only=True)
         # 兼容训练脚本另存的包装格式 {"epoch":, "stage":, "state_dict":, ...}
         # （如 train_thyroidxl.py）——不解包会把整个 dict 当 state_dict 喂进去，

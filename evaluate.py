@@ -17,7 +17,7 @@ from src.utils.report_generator import generate_report
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/thyroid_config.yaml")
-    parser.add_argument("--weights", type=str, default="checkpoints/best_model.pth")
+    parser.add_argument("--weights", type=str, default="checkpoints/thyroidxl_merged_v2.pth")
     parser.add_argument("--data_dir", type=str, default="data/holdout")
     parser.add_argument(
         "--precision",

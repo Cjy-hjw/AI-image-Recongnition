@@ -47,7 +47,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 21 PHI 字段脱敏（HIPAA Safe Harbor）。字段清单与规则见 `src/inference/AGENTS.md` §1 及 `QA_VP.md §1.6`。
 
 ### 2.3 Container Checksum Verification & Entrypoint Dispatch
-- `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/best_model.pth`, `predict.py`, `video_predict.py`, **and the entire `src/` tree** (核心推理逻辑,原仅校验入口脚本是防篡改盲区,现闭合)。`PRODUCTION=1` → hard exit on any hash mismatch.
+- `scripts/entrypoint.sh` executes SHA-256 verification on `checkpoints/thyroidxl_merged_v2.pth`, `predict.py`, `video_predict.py`, **and the entire `src/` tree** (核心推理逻辑,原仅校验入口脚本是防篡改盲区,现闭合)。`PRODUCTION=1` → hard exit on any hash mismatch.
 - **打包密封**:`scripts/seal_container.py` 交付前算 predict/video_predict/**src 全树**/best_model 的 SHA-256,正则注入 entrypoint.sh 的 `EXPECTED_*` 占位位。src 树聚合指纹算法(find *.py → POSIX 相对路径 → LC_ALL=C 字节序排序 → 逐文件 `sha  path\n` 拼接 → SHA-256)由 `scripts/_src_tree_hash.sh`(bash)与 `seal_container.py`(Python)**字节级配对**,单一事实源避免 drift,测试反向验证改坏函数必 FAIL。`.gitattributes` 锁 `.py` 为 LF 防 Win 构建/Linux 运行行尾哈希假阳性。
 - **防护边界**:此机制为「自包含篡改检测」非密码学防篡改——EXPECTED_* 写死在 entrypoint 自身且 src 树不含 entrypoint,能改 src 者可重算哈希绕过;真防篡改需信任锚外移(镜像签名 + cosign 外部验签)。详见 entrypoint.sh 顶部威胁模型注释。
 - **入口按输入扩展名自动分发**:`.mp4/.avi/.mov/.mkv/.dcm/.dicom` → `video_predict.py --input_video`(DICOM 单帧亦安全,内部 `_load_dicom_cine` 视作 1 帧);其余静态图 → `predict.py --input_image`。第一个位置参数为输入路径,其余 flag 透传。

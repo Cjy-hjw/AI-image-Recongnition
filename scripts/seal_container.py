@@ -8,7 +8,7 @@ EXPECTED_* 占位位;容器运行时(PRODUCTION=1)重算并比对,任一不符�
   - predict.py / video_predict.py  单图与动态图两个交付入口
   - src/ 全树(所有 *.py)            核心推理逻辑(原 entrypoint 只校验入口脚本,
                                      src/ 是防篡改盲区 — 本脚本闭合之)
-  - checkpoints/best_model.pth      模型权重(缺失则跳过,注入占位零值)
+  - checkpoints/thyroidxl_merged_v2.pth  模型权重(缺失则跳过,注入占位零值)
 
 src 树聚合哈希算法(entrypoint.sh 必须字节级复现):
   1. 找 src/ 下所有 *.py,路径取相对项目根的 POSIX 形式(正斜杠)
@@ -84,17 +84,17 @@ def main():
     video_sha = _sha256_file(os.path.join(_ROOT, "video_predict.py"))
     src_sha, src_files = src_tree_sha256(_ROOT)
 
-    weights_path = os.path.join(_ROOT, "checkpoints", "best_model.pth")
+    weights_path = os.path.join(_ROOT, "checkpoints", "thyroidxl_merged_v2.pth")
     if os.path.isfile(weights_path):
         weights_sha = _sha256_file(weights_path)
     else:
         weights_sha = _ZERO
-        print("[seal] 警告:checkpoints/best_model.pth 不存在,权重指纹注入零值占位")
+        print("[seal] 警告:checkpoints/thyroidxl_merged_v2.pth 不存在,权重指纹注入零值占位")
 
     print(f"[seal] predict.py        : {predict_sha}")
     print(f"[seal] video_predict.py  : {video_sha}")
     print(f"[seal] src/ 树({len(src_files)} 文件): {src_sha}")
-    print(f"[seal] best_model.pth     : {weights_sha}")
+    print(f"[seal] thyroidxl_merged_v2.pth : {weights_sha}")
 
     if args.dry_run:
         print("[seal] --dry-run:未写入 entrypoint.sh")

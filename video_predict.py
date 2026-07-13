@@ -41,7 +41,7 @@ def main():
     p.add_argument("--input_video", type=str, required=True,
                    help="Path to input ultrasound cine/video (MP4/AVI/MOV/MKV or multi-frame DCM)")
     p.add_argument("--config", type=str, default="configs/thyroid_config.yaml")
-    p.add_argument("--weights", type=str, default="checkpoints/best_model.pth")
+    p.add_argument("--weights", type=str, default="checkpoints/thyroidxl_merged_v2.pth")
     p.add_argument("--output_dir", type=str, default="data/output")
     p.add_argument("--precision", type=str, default="fp16",
                    choices=["fp32", "fp16", "bf16"], help="Inference precision")

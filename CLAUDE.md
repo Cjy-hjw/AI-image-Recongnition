@@ -40,8 +40,8 @@ python scripts/pretrain_malignancy_mil.py --epochs 30 --batch-size 4 --data-root
     --unfreeze-backbone --resume-from checkpoints/malignancy_mil_best.pth \
     --backbone-lr-scale 0.1 --llrd-eta 0.75 --out checkpoints/malignancy_mil_phase2_best.pth
 
-# 一键同步本地代码到A800服务器（跳过data/.git/__pycache__/.md，按文件大小增量上传）
-# 须先设环境变量：DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_PASSWORD
+# 一键同步本地代码到A800服务器（跳过data/.git/__pycache__/.md/账号密码，按文件大小增量上传）
+# 凭证：环境变量优先，未设则自动读账号密码/deploy.env（无需每次手动export）
 python scripts/deploy.py
 
 # 重训 AuthenticityClassifier（修复 gatekeeper 维度失配 / 特征维度变更后必跑）

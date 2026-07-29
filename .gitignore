@@ -29,3 +29,4 @@ desktop.ini
 
 # Gate2 审查标记(运行时状态,不入库)
 /.claude/.gate2_pass.json
+/.claude/.gate2_pending.json

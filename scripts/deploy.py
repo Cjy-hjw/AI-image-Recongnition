@@ -2,10 +2,29 @@ import os
 import sys
 import paramiko
 
-# === 服务器连接凭证:必须经环境变量注入,严禁写死入库 ===
-# 用法(本机临时设置,不进 git):
-#   DEPLOY_HOST=... DEPLOY_PORT=... DEPLOY_USER=... DEPLOY_PASSWORD=... python scripts/deploy.py
-# 任一缺失即 fail-fast,不留默认值(防止误连/凭证泄漏)。
+# === 服务器连接凭证:优先环境变量,其次 账号密码/deploy.env(该目录 .gitignore
+# 已排除、严禁入库,见目录内 ssh.md)。两者都缺失才 fail-fast——不再要求每次
+# 手动 export,但仍不写死进本文件本身。 ===
+_CRED_FILE = os.path.join(os.path.dirname(__file__), "..", "账号密码", "deploy.env")
+
+
+def _load_env_file_fallback(keys):
+    """把 _CRED_FILE 里 KEY=VALUE 行灌进 os.environ,仅填充当前未设置的 key。"""
+    if not os.path.isfile(_CRED_FILE):
+        return
+    with open(_CRED_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k in keys and not os.environ.get(k):
+                os.environ[k] = v.strip()
+
+
+_load_env_file_fallback({"DEPLOY_HOST", "DEPLOY_PORT", "DEPLOY_USER", "DEPLOY_PASSWORD"})
+
 host = os.environ.get("DEPLOY_HOST")
 port = os.environ.get("DEPLOY_PORT")
 user = os.environ.get("DEPLOY_USER")
@@ -36,6 +55,7 @@ ignore_dirs = {
     ".ruff_cache",
     "runs",
     "data",
+    "账号密码",  # 凭证目录,整目录级排除——不能只靠 .md 后缀过滤(deploy.env 就漏过一次)
 }
 ignore_files = {"deploy.py", "bash.cmd", "deploy_bundle.tar", "upload.py"}
 

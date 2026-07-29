@@ -5,7 +5,8 @@ import torch
 from src.inference.io import load_input_image
 from src.inference.gatekeeper_runner import run_gatekeeper_audit
 from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
-from src.inference.postprocess import decode_predictions, build_tirads_breakdown
+from src.inference.postprocess import (
+    decode_predictions, build_tirads_breakdown, build_probability_export)
 from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
 from src.utils.report_generator import generate_report
@@ -62,10 +63,14 @@ def main():
     print(f"Running Multi-task Diagnosis under {args.precision.upper()} precision...")
     try:
         # 2. Gatekeeper audit (predict only)
-        passed, rejection_json = run_gatekeeper_audit(
+        # 默认 soft 模式:审计命中只作 flag、诊断照常输出(赛道七豁免医保安全考核,
+        # gatekeeper 零计分,误拒一次即白丢该病例全部临床得分——见
+        # gatekeeper_runner.resolve_enforcement_mode)。仅当配置显式设为 hard 时
+        # passed 才可能为 False,此时保留原「拒绝即不出诊断」语义。
+        passed, audit = run_gatekeeper_audit(
             img_np, config, device, args.weights, args.output_dir)
         if not passed:
-            save_rejection_json(args.output_dir, rejection_json)
+            save_rejection_json(args.output_dir, audit)
             return
 
         model = build_model(config, args.weights, device)
@@ -104,6 +109,14 @@ def main():
             "tirads_points": breakdown["total_points"],
             "tirads_level": breakdown["tr_level"], "risk_percentage": breakdown["risk"],
             "foci_probabilities": preds["foci_prob"].tolist(), "gradcam_generated": gradcam_done,
+            # gatekeeper 审计结论随诊断一并输出(soft 模式下不再是"要么 REJECTED
+            # 要么什么都不说"),评测方与人工复核都能看到命中项。`skipped` 与动态图
+            # 侧对齐:静态图无"跳过审计"入口,恒 False,但保留该键让消费方两条链路
+            # 用同一份解析代码(Gate2 审查 P2-3)。
+            "gatekeeper": {"skipped": False, **audit},
+            # 官方硬约束:分类/分级/分型必须输出概率分布,否则计0分(赛前动员会 2026-07-28)。
+            # `foci_probabilities` 保留旧键不动(下游/测试依赖),与 concept_probabilities.foci 同值。
+            **build_probability_export(preds),
         }
         save_prediction_artifacts(args.output_dir, mask_resized, report_txt, out_json)
         print(f"--> Inference completed! Outputs saved to {args.output_dir}")

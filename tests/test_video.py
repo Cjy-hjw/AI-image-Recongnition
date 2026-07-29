@@ -276,9 +276,13 @@ class TestGatekeeperSoftFlagPolicy:
     """
 
     @staticmethod
-    def _config(train_path="____nonexistent_train____"):
+    def _config(train_path="____nonexistent_train____", enforcement_mode="hard"):
+        # 本类专测「去重/篡改仍能硬拒绝、且 reason 文案精确」这条语义,故显式设
+        # enforcement_mode=hard。**生产默认是 soft**(2026-07-28 赛道七豁免医保安全
+        # 考核后硬拒绝成纯负期望),soft 侧行为见 TestEnforcementModeSoftDefault。
         return {
-            "gatekeeper": {"phash_threshold": 1, "cosine_threshold": 0.995},
+            "gatekeeper": {"phash_threshold": 1, "cosine_threshold": 0.995,
+                           "enforcement_mode": enforcement_mode},
             "data": {"train_path": train_path},
         }
 
@@ -300,25 +304,31 @@ class TestGatekeeperSoftFlagPolicy:
         def detect(self, img_np):
             return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None
 
-    def _run(self, is_phantom, dedup=None, tamper=None):
+    def _run(self, is_phantom, dedup=None, tamper=None, enforcement_mode="hard"):
         import src.inference.gatekeeper_runner as gr
         img = np.random.randint(0, 255, (64, 64), dtype=np.uint8)
         return gr.run_gatekeeper_audit(
-            img, self._config(), "cpu", "checkpoints/best_model.pth", ".",
+            img, self._config(enforcement_mode=enforcement_mode),
+            "cpu", "checkpoints/best_model.pth", ".",
             deduplicator=dedup or self._StubDedup(),
             auth_module=self._StubAuth(is_phantom),
             tamper_detector=tamper or self._StubTamper(),
         )
 
     def test_phantom_classification_does_not_reject(self):
-        passed, rejection = self._run(is_phantom=1)
-        assert passed is True and rejection is None, \
-            "authenticity 判 phantom(1) 不应再触发 REJECTED(已降级为软flag)"
+        passed, audit = self._run(is_phantom=1)
+        assert passed is True, \
+            "authenticity 判 phantom(1) 不应触发 REJECTED(已降级为软flag)"
+        # 即便 enforcement_mode=hard,phantom 也不得进入硬拒绝依据
+        assert audit["would_reject_in_hard_mode"] is False
+        assert audit["is_phantom"] == 1 and audit["flagged"] is True
 
     def test_synthetic_classification_does_not_reject(self):
-        passed, rejection = self._run(is_phantom=2)
-        assert passed is True and rejection is None, \
-            "authenticity 判 synthetic(2) 不应再触发 REJECTED(已降级为软flag)"
+        passed, audit = self._run(is_phantom=2)
+        assert passed is True, \
+            "authenticity 判 synthetic(2) 不应触发 REJECTED(已降级为软flag)"
+        assert audit["would_reject_in_hard_mode"] is False
+        assert audit["is_gan"] == 1 and audit["flagged"] is True
 
     def test_duplicate_still_hard_rejects(self):
         class _DupHit:
@@ -350,7 +360,7 @@ class TestGatekeeperSoftFlagPolicy:
                 return True, np.zeros(img_np.shape[:2], dtype=np.uint8), [0, 0, 10, 10]
         passed, rejection = self._run(is_phantom=0, tamper=_TamperHitNoSourceAttr())
         assert passed is False and rejection is not None
-        assert "Tampering detected (hard-reject path)" in rejection["reason"]
+        assert "Tampering detected (source unspecified)" in rejection["reason"]
 
     def test_tamper_reason_labels_catnet_source(self):
         class _TamperHitCatNet:
@@ -392,3 +402,111 @@ class TestGatekeeperSoftFlagPolicy:
             "phantom 应以 soft-flag 标注形式出现在 reason 里(区别于拒绝驱动原因)"
         assert rejection["reason"].startswith("Duplicate image:"), \
             "REJECTED 的真正驱动原因(duplicate)应仍是 reason 的主要/首要表述"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# enforcement_mode:默认 soft — 审计命中不再中断诊断(2026-07-28 豁免后修正)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestEnforcementModeSoftDefault:
+    """赛道七豁免全部医保安全考核后,硬拒绝成纯负期望:gatekeeper 零计分,
+    而 REJECTED 会让该病例**不输出任何诊断**,白丢唯一的分数来源(官方明确
+    "真实病例被误判为伪造,诊断结果仍参与目标三四五计分",前提是先输出诊断)。
+    故默认 `enforcement_mode: soft`——命中只记 flag,诊断照出。
+    """
+
+    @staticmethod
+    def _run(config_gk, dedup=None, tamper=None, is_phantom=0):
+        import src.inference.gatekeeper_runner as gr
+
+        class _StubAuth:
+            def predict(self, img_np):
+                probs = np.zeros(3, dtype=np.float32)
+                probs[is_phantom] = 0.9
+                return is_phantom, probs
+
+        class _StubDedup:
+            def is_duplicate(self, img_np):
+                return False, None
+
+        class _StubTamper:
+            def detect(self, img_np):
+                return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None
+
+        img = np.random.randint(0, 255, (64, 64), dtype=np.uint8)
+        config = {"gatekeeper": config_gk, "data": {"train_path": "____nonexistent____"}}
+        return gr.run_gatekeeper_audit(
+            img, config, "cpu", "checkpoints/best_model.pth", ".",
+            deduplicator=dedup or _StubDedup(),
+            auth_module=_StubAuth(),
+            tamper_detector=tamper or _StubTamper())
+
+    class _DupHit:
+        def is_duplicate(self, img_np):
+            return True, "phash distance=0"
+
+    class _TamperHit:
+        def detect(self, img_np):
+            return True, np.zeros(img_np.shape[:2], dtype=np.uint8), [0, 0, 10, 10]
+
+    def test_duplicate_does_not_reject_by_default(self):
+        """配置未写 enforcement_mode → 默认 soft → 命中去重仍 passed=True。"""
+        passed, audit = self._run({}, dedup=self._DupHit())
+        assert passed is True, "默认 soft 模式下命中去重不得中断诊断"
+        assert audit["enforcement_mode"] == "soft"
+        assert audit["is_duplicate"] == 1
+        assert audit["flagged"] is True
+        assert audit["would_reject_in_hard_mode"] is True, \
+            "审计事实必须保留:soft 只是不执行拒绝,不是假装没命中"
+        assert "status" not in audit, "soft 模式产物不得带 REJECTED 状态"
+
+    def test_tamper_does_not_reject_by_default(self):
+        passed, audit = self._run({}, tamper=self._TamperHit())
+        assert passed is True and audit["is_tampered"] == 1
+        assert audit["would_reject_in_hard_mode"] is True
+
+    def test_hard_mode_still_rejects(self):
+        """hard 模式仍保留一票否决能力(未来规则变化/回归可测)。"""
+        passed, rejection = self._run(
+            {"enforcement_mode": "hard"}, dedup=self._DupHit())
+        assert passed is False and rejection["status"] == "REJECTED"
+
+    def test_clean_image_audit_is_not_flagged(self):
+        passed, audit = self._run({})
+        assert passed is True
+        assert audit["flagged"] is False and audit["would_reject_in_hard_mode"] is False
+        assert audit["reason"] == ""
+
+    def test_invalid_mode_degrades_to_soft(self):
+        """拼写错误不得静默启用硬拒绝——失败方向必须偏向"多输出一份诊断"。"""
+        passed, audit = self._run(
+            {"enforcement_mode": "HARD_typo"}, dedup=self._DupHit())
+        assert passed is True and audit["enforcement_mode"] == "soft"
+
+    def test_hard_mode_is_case_insensitive(self):
+        passed, rejection = self._run(
+            {"enforcement_mode": " Hard "}, dedup=self._DupHit())
+        assert passed is False and rejection["status"] == "REJECTED"
+
+    def test_shipped_config_defaults_to_soft(self):
+        """交付配置 configs/thyroid_config.yaml 必须是 soft(防止改回 hard 后忘了)。"""
+        import yaml
+        from pathlib import Path
+        from src.inference.gatekeeper_runner import resolve_enforcement_mode
+        # 用 __file__ 定位仓库根,不依赖 cwd(Gate2 审查 P2-4)
+        cfg_path = Path(__file__).resolve().parents[1] / "configs" / "thyroid_config.yaml"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        assert resolve_enforcement_mode(cfg) == "soft"
+
+    def test_malformed_gatekeeper_section_degrades_to_soft(self):
+        """`gatekeeper` 段写歪(YAML 少一层缩进 → 标量/列表)不得抛异常。
+
+        抛异常会被入口 except 兜成 ERROR result.json = 整例零诊断,恰是软化要避免
+        的后果(Gate2 审查 P2-1)。
+        """
+        from src.inference.gatekeeper_runner import resolve_enforcement_mode
+        for bad in ("hard", ["hard"], 3, True, None):
+            assert resolve_enforcement_mode({"gatekeeper": bad}) == "soft", \
+                f"gatekeeper={bad!r} 应降级 soft 而非抛异常/误判 hard"
+        assert resolve_enforcement_mode({}) == "soft"

@@ -22,6 +22,15 @@ calibration:
   param_file: "checkpoints/calibration.json"
 
 gatekeeper:
+  # 审计命中后的处置模式(主开关):
+  #   soft(默认,交付值) — 命中只作 flag 写进 result.json,诊断照常输出;
+  #   hard              — 去重/篡改命中即 REJECTED,不输出任何诊断字段。
+  # 默认 soft 的依据:2026-07-28 官方赛前动员会明确赛道七豁免全部医保安全考核,
+  # 总分 = 临床诊断得分 Sclin × 100,gatekeeper 零计分贡献;且"真实病例被误判为
+  # 伪造,诊断结果仍参与目标三四五计分"(前提是必须先输出诊断)。故硬拒绝已成
+  # 纯负期望——拒对零收益,误拒一次白丢该病例全部临床得分。hard 仅供回归测试与
+  # 未来规则变化时启用(非法值一律降级 soft,见 gatekeeper_runner.resolve_enforcement_mode)。
+  enforcement_mode: soft
   fpr_threshold: 0.01
   precision_threshold: 0.98
   phash_threshold: 1        # Hamming distance limit

@@ -68,6 +68,32 @@ def build_tamper_detector(config):
     )
 
 
+def resolve_enforcement_mode(config) -> str:
+    """读取 `gatekeeper.enforcement_mode`,归一化为 'soft' / 'hard'(缺省 'soft')。
+
+    2026-07-28 官方赛前动员会:赛道七豁免全部医保安全考核,总分 = 临床诊断得分
+    Sclin × 100,gatekeeper **零计分贡献**;且官方明确"真实病例被误判为伪造,诊断
+    结果仍参与目标三四五计分"——前提是必须先输出诊断。故硬拒绝在本赛道已成
+    **纯负期望**:拒对了零收益,误拒一次即白丢该病例全部临床得分(唯一分数来源)。
+    默认 soft:审计照跑、结果照记,但不再中断诊断输出。
+
+    非法值(拼写错误等)一律降级 soft 并打警告——失败方向必须偏向"多输出一份诊断"
+    而非"多拒一张真实图"(统一软flag制度,见 src/gatekeeper/AGENTS.md §1)。同理,
+    `gatekeeper` 段本身写歪(YAML 少一层缩进写成 `gatekeeper: hard`、写成 None/列表)
+    也只降级 soft,**不抛异常**——抛异常会被入口的 except 兜成 ERROR result.json,
+    等于整例零诊断,恰好是本函数要避免的后果(Gate2 审查 P2-1)。
+    """
+    gk = config.get("gatekeeper")
+    if not isinstance(gk, dict):
+        gk = {}
+    raw = gk.get("enforcement_mode", "soft")
+    mode = str(raw).strip().lower()
+    if mode not in ("soft", "hard"):
+        print(f"--> [WARNING] 未知 gatekeeper.enforcement_mode={raw!r},降级为 'soft'")
+        return "soft"
+    return mode
+
+
 def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
                          deduplicator=None, auth_module=None,
                          tamper_detector=None):
@@ -80,9 +106,22 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
         三者均为 None 时内部即时构建——单图路径行为不变，向后兼容。
 
     Returns:
-        (passed: bool, rejection_json: dict|None)
+        (passed: bool, audit: dict)
+
+        `audit` **恒为 dict**(旧契约在通过时返回 None,已改)——审计结论必须能落进
+        result.json,否则 phantom/synthetic 软 flag 只打印在 stdout、评测方拿不到。
+        字段:
+          flagged                 任一审计项命中(含仅软 flag 的 phantom/synthetic)
+          would_reject_in_hard_mode  去重/篡改命中 → hard 模式下会 REJECTED
+          enforcement_mode        本次生效的模式
+          reason                  人类可读命中说明(无命中为 "")
+          is_phantom/is_gan/is_duplicate/is_tampered  逐项审计位
+
+        仅当 `enforcement_mode == "hard"` 且 would_reject 为真时返回
+        `(False, {..., "status": "REJECTED"})`,可直接交 `save_rejection_json`。
     """
     print("Running Gatekeeper Audit...")
+    mode = resolve_enforcement_mode(config)
     if auth_module is None:
         auth_module = build_auth_module(weights_path)
     # 权重缺失/损坏仍在 AuthenticityModule.load_weights 内硬报错(未改动,红线保留)。
@@ -111,49 +150,59 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
     elif is_phantom == 2:
         print("--> [Gatekeeper 软 flag] authenticity: GAN/Synthetic 疑似(不拒绝,仅记录)", flush=True)
 
-    audit_failed = is_duplicate or is_tampered
+    # 去重/篡改命中 = "hard 模式下会拒绝"。soft 模式下只作 flag,不中断诊断。
+    would_reject = bool(is_duplicate or is_tampered)
 
-    if audit_failed:
-        rejections = []
-        if is_duplicate:
-            rejections.append(f"Duplicate image: {dup_reason}")
-        if is_tampered:
-            # 2026-07-12 code-review(Angle A)发现:此前坍缩成笼统的
-            # "hard-reject path"丢失了具体命中源(CatNet深度模型 vs BAG,
-            # 二者可信度/验证量级截然不同)。改用 CatNetTamperingDetector 新增的
-            # last_hard_reject_source 拼更精确的文案;tamper_detector 为向后兼容
-            # 保留的旧对象(无该属性)时退化为原通用文案。
-            source = getattr(tamper_detector, "last_hard_reject_source", None)
-            if source == "catnet":
-                rejections.append("Tampering detected (CAT-Net deep model hard-reject)")
-            elif source == "bag_phase":
-                rejections.append("Tampering detected (BAG phase inconsistency hard-reject)")
-            else:
-                rejections.append("Tampering detected (hard-reject path)")
-        # phantom/synthetic 已降级为软flag、不独立驱动 REJECTED,但若本次审计因
-        # 去重/篡改被拒绝,仍把 phantom/synthetic 的软flag信息附加进 reason——
-        # 否则(2026-07-12 code-review Angle B 发现)is_phantom/is_gan 字段虽仍
-        # 保留在 JSON 里,但人类可读的 reason 文本会静默丢失这条并发信号。
-        if is_phantom == 1:
-            rejections.append("(soft-flag: Physical Phantom suspected)")
-        elif is_phantom == 2:
-            rejections.append("(soft-flag: GAN/Synthetic suspected)")
+    rejections = []
+    if is_duplicate:
+        rejections.append(f"Duplicate image: {dup_reason}")
+    if is_tampered:
+        # 2026-07-12 code-review(Angle A)发现:此前坍缩成笼统的
+        # "hard-reject path"丢失了具体命中源(CatNet深度模型 vs BAG,
+        # 二者可信度/验证量级截然不同)。改用 CatNetTamperingDetector 新增的
+        # last_hard_reject_source 拼更精确的文案;tamper_detector 为向后兼容
+        # 保留的旧对象(无该属性)时退化为原通用文案。
+        source = getattr(tamper_detector, "last_hard_reject_source", None)
+        if source == "catnet":
+            rejections.append("Tampering detected (CAT-Net deep model)")
+        elif source == "bag_phase":
+            rejections.append("Tampering detected (BAG phase inconsistency)")
+        else:
+            rejections.append("Tampering detected (source unspecified)")
+    # phantom/synthetic 已降级为软flag、不独立驱动 REJECTED,但仍把软flag信息并入
+    # reason——否则(2026-07-12 code-review Angle B 发现)is_phantom/is_gan 字段虽仍
+    # 保留在 JSON 里,但人类可读的 reason 文本会静默丢失这条并发信号。
+    if is_phantom == 1:
+        rejections.append("(soft-flag: Physical Phantom suspected)")
+    elif is_phantom == 2:
+        rejections.append("(soft-flag: GAN/Synthetic suspected)")
 
-        reason_str = ", ".join(rejections)
-        print(f"--> [REJECTED] Gatekeeper audit failed: {reason_str}")
+    audit = {
+        "flagged": bool(rejections),
+        "would_reject_in_hard_mode": would_reject,
+        "enforcement_mode": mode,
+        "reason": ", ".join(rejections),
+        # is_phantom/is_gan 为审计字段(信息记录,不驱动 REJECT)
+        "is_phantom": int(is_phantom == 1),
+        "is_gan": int(is_phantom == 2),
+        "is_duplicate": int(is_duplicate),
+        "is_tampered": int(is_tampered),
+    }
 
-        rejection_json = {
-            "status": "REJECTED",
-            "reason": reason_str,
-            # is_phantom/is_gan 保留为审计字段(信息记录,不再驱动 REJECT)
-            "is_phantom": int(is_phantom == 1),
-            "is_gan": int(is_phantom == 2),
-            "is_duplicate": int(is_duplicate),
-            "is_tampered": int(is_tampered),
-        }
-        return False, rejection_json
+    if would_reject and mode == "hard":
+        print(f"--> [REJECTED] Gatekeeper audit failed: {audit['reason']}")
+        return False, {**audit, "status": "REJECTED"}
+
+    if would_reject:
+        # soft 模式:命中照记、诊断照出。丢一次诊断 = 丢该病例全部临床得分,
+        # 而审计本身在赛道七不产生任何得分(见 resolve_enforcement_mode)。
+        print(f"--> [Gatekeeper 软 flag] {audit['reason']}(不拒绝,继续诊断)", flush=True)
+        return True, audit
+
+    if audit["flagged"]:
+        return True, audit
 
     print(
         "--> [PASSED] Gatekeeper audit successfully verified image authenticity and normalization."
     )
-    return True, None
+    return True, audit

@@ -5,9 +5,11 @@
 
 与 `predict.py`(单图)互不影响——单图路径完全不变。
 
-Gatekeeper 说明:真实性/拼接/copy-move 为一票否决项,对**每个抽样帧**审计,任一
-帧失败即整段拒绝。**不做 cine 帧间去重**——同一 cine 相邻帧天然近重复,去重仅针对
-跨提交的重复影像(`Deduplicator` 只比对训练集种子,不把本段帧加入索引,故无误判)。
+Gatekeeper 说明:真实性/拼接/copy-move 对**每个抽样帧**审计。默认 `soft` 模式下命中
+只记 flag(汇总进 `result.json` 的 `gatekeeper` 字段),**不中断整段诊断**;仅
+`gatekeeper.enforcement_mode: hard` 时才恢复「任一帧失败即整段拒绝」。**不做 cine
+帧间去重**——同一 cine 相邻帧天然近重复,去重仅针对跨提交的重复影像(`Deduplicator`
+只比对训练集种子,不把本段帧加入索引,故无误判)。
 """
 
 import argparse
@@ -20,10 +22,11 @@ from src.inference.video_io import load_video_frames
 from src.inference.video_aggregate import aggregate_frame_predictions
 from src.inference.gatekeeper_runner import (
     run_gatekeeper_audit, build_seeded_deduplicator,
-    build_auth_module, build_tamper_detector,
+    build_auth_module, build_tamper_detector, resolve_enforcement_mode,
 )
 from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
-from src.inference.postprocess import decode_predictions, build_tirads_breakdown
+from src.inference.postprocess import (
+    decode_predictions, build_tirads_breakdown, build_probability_export)
 from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
 from src.utils.report_generator import generate_report
@@ -90,23 +93,45 @@ def main():
         cal_path = config.get("calibration", {}).get("param_file", "checkpoints/calibration.json")
         calibrator = TemperatureScaler.from_file(cal_path)
 
-        # 2. 逐帧 gatekeeper(一票否决,任一帧失败整段拒绝)
+        # 2. 逐帧 gatekeeper。默认 soft 模式:命中只记 flag,**不中断整段**——
+        # 旧逻辑任一帧命中即 return,一次误判就白丢整段视频的全部临床得分,
+        # 而赛道七 gatekeeper 零计分(见 gatekeeper_runner.resolve_enforcement_mode)。
+        # 逐帧审计放大了这个风险(32 帧任一误报即整段归零),故这里是软化的重点。
+        gatekeeper_audit = {"skipped": True}
         if not args.skip_gatekeeper:
             # 三个重型对象只构建一次,跨帧复用(避免每帧重复加载权重/播种训练集)
             deduplicator = build_seeded_deduplicator(config, device)
             auth_module = build_auth_module(args.weights)
             tamper_detector = build_tamper_detector(config)
+            frame_audits = []
             for pos, frame_np in zip(frame_indices, frames):
-                passed, rejection_json = run_gatekeeper_audit(
+                passed, audit = run_gatekeeper_audit(
                     frame_np, config, device, args.weights, args.output_dir,
                     deduplicator=deduplicator,
                     auth_module=auth_module,
                     tamper_detector=tamper_detector)
                 if not passed:
-                    rejection_json["rejected_frame_index"] = int(pos)
-                    save_rejection_json(args.output_dir, rejection_json)
-                    print(f"--> [REJECTED] frame {pos} failed gatekeeper: {rejection_json.get('reason')}")
+                    # 仅 hard 模式可达:保留原「一票否决整段」语义。
+                    audit["rejected_frame_index"] = int(pos)
+                    save_rejection_json(args.output_dir, audit)
+                    print(f"--> [REJECTED] frame {pos} failed gatekeeper: {audit.get('reason')}")
                     return
+                if audit["flagged"]:
+                    frame_audits.append({"frame_index": int(pos), **audit})
+            gatekeeper_audit = {
+                "skipped": False,
+                "enforcement_mode": resolve_enforcement_mode(config),
+                "n_frames_audited": len(frames),
+                "n_frames_flagged": len(frame_audits),
+                "flagged_frame_indices": [a["frame_index"] for a in frame_audits],
+                "any_flagged": bool(frame_audits),
+                "any_would_reject_in_hard_mode": any(
+                    a["would_reject_in_hard_mode"] for a in frame_audits),
+                "flagged_frames": frame_audits,
+            }
+            if frame_audits:
+                print(f"--> [Gatekeeper 软 flag] {len(frame_audits)}/{len(frames)} 帧命中审计,"
+                      f"整段继续诊断(帧号 {gatekeeper_audit['flagged_frame_indices']})", flush=True)
 
         # 3. 逐帧诊断
         print(f"Running per-frame multi-task diagnosis under {args.precision.upper()}...")
@@ -154,6 +179,14 @@ def main():
             if gradcam_done:
                 report_txt += "\n  Grad-CAM 可视化解释: 见 gradcam_cls.png(关键帧恶性激活热图)"
 
+        # 关键帧本身是否被审计 flag——mask/报告/Grad-CAM 全出自这一帧,人工复核与
+        # 评测方应一眼看见"这份报告出自一张被 flag 的帧",而不是自己拿
+        # keyframe_frame_index 去和 flagged_frame_indices 做集合运算(Gate2 审查 P2-2)。
+        # 二者同一坐标系:都来自 frame_indices 的原始帧号。
+        if not gatekeeper_audit.get("skipped"):
+            gatekeeper_audit["keyframe_flagged"] = (
+                agg["keyframe_frame_index"] in gatekeeper_audit["flagged_frame_indices"])
+
         out_json = {
             "status": "PASSED",
             "input_type": "video_cine",
@@ -166,8 +199,16 @@ def main():
             "tirads_level": breakdown["tr_level"], "risk_percentage": breakdown["risk"],
             "foci_probabilities": kf_preds["foci_prob"].tolist(),
             "gradcam_generated": gradcam_done,
+            "gatekeeper": gatekeeper_audit,
             "per_frame_malignancy": [
-                {"frame_index": f["frame_index"], "mal_prob": f["mal_prob"]} for f in per_frame],
+                {"frame_index": f["frame_index"], "mal_prob": f["mal_prob"],
+                 "malignancy_probabilities": f["preds"]["mal_probs"].tolist()}
+                for f in per_frame],
+            # 概率分布取自**关键帧**(最恶性帧),与 tirads_*/foci_probabilities 同源;
+            # 视频级 malignancy_probability 是跨帧 max 聚合,与关键帧的
+            # malignancy_probabilities[1] 一致(max 帧即关键帧)。schema 与静态图共用
+            # build_probability_export,两条链路严格一致。
+            **build_probability_export(kf_preds),
         }
         save_prediction_artifacts(args.output_dir, mask_resized, report_txt, out_json)
         print(f"--> Video inference completed! Outputs saved to {args.output_dir}")

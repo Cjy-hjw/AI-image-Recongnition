@@ -37,9 +37,17 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 ## 2. `gatekeeper_runner.py` — 4-Layer Audit
 
-### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None, auth_module=None, tamper_detector=None)` → `(passed, rejection_json)`
+### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None, auth_module=None, tamper_detector=None)` → `(passed: bool, audit: dict)`
 
 **Scope**: Production inference only. evaluate.py 仅导入 model_runner/postprocess/export 三模块；gatekeeper_runner 由 predict.py(单图) 和 video_predict.py(动态图) 使用。
+
+**`audit` 恒为 dict**(2026-07-29 契约变更;旧版通过时返回 `None`)——审计结论必须能落进 `result.json`,否则 phantom/synthetic 软 flag 只打印在 stdout、评测方拿不到。任何调用点都不得再假设"通过 ⇒ 第二个返回值是 None"。
+
+### `resolve_enforcement_mode(config)` → `"soft" | "hard"`(2026-07-29 新增)
+读 `config["gatekeeper"]["enforcement_mode"]`,归一化(strip+lower),缺省/非法值一律降级 `"soft"` 并打 `[WARNING]`。
+**为什么默认 soft**:官方赛前动员会(2026-07-28)明确赛道七**豁免全部医保安全考核**,总分 = 临床诊断得分 Sclin × 100,gatekeeper **零计分贡献**;且"真实病例被误判为伪造,诊断结果仍参与目标三四五计分"——前提是必须先输出诊断。故硬拒绝已成**纯负期望**:拒对了零收益,误拒一次即白丢该病例全部临床得分。**失败方向必须偏向"多输出一份诊断"而非"多拒一张真实图"**,所以拼写错误(如 `"Hard_typo"`)降级 soft 而不是报错或按 hard 处理。
+- `soft`(默认、交付固定值):去重/篡改命中只落 flag,`passed` 恒为 `True`,诊断照常输出;
+- `hard`:恢复"命中即 REJECTED、不输出任何诊断"的旧语义,仅供回归测试与未来规则变化时启用。
 
 - 三个可选预建对象(视频逐帧复用,避免每帧重复加载权重/播种训练集):
   - `deduplicator`: 用 `build_seeded_deduplicator(config, device)` 预建；
@@ -49,23 +57,32 @@ This package provides reusable inference modules shared by `predict.py` (product
 - **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
 
 Pipeline:
-1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection。**2026-07-12 统一软flag制度**:分类结果**不再**驱动 REJECTED,仅作审计字段(`is_phantom`/`is_gan` 保留在 rejection JSON 里,但只在去重/篡改触发 REJECTED 时才会出现,自身不能单独致拒)。权重缺失/损坏仍在 `AuthenticityModule.load_weights` 硬报错,红线未变。详见 `src/gatekeeper/AGENTS.md` §1。
-2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set。硬拒绝,未软化。
+1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection。**2026-07-12 统一软flag制度**:分类结果**不再**驱动 REJECTED,仅作审计字段(`is_phantom`/`is_gan`)。权重缺失/损坏仍在 `AuthenticityModule.load_weights` 硬报错,红线未变——**审计命中软化 ≠ 故障软化**,文件损坏/权重缺失/解码失败一律仍走 ERROR。详见 `src/gatekeeper/AGENTS.md` §1。
+2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set。命中 ⇒ `would_reject_in_hard_mode=True`;**是否真拒绝取决于 `enforcement_mode`**(默认 soft 不拒绝,仅审计)。
 3. **Copy-Move** — `detect_copy_move()` dense block-matching。**恒为软flag**(`last_soft_flags`),与 CatNet 状态无关,详见下方第 5 点。
 4. **Splicing(硬粘贴)** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)。**恒为软flag**,同上。
-5. **Splicing(羽化/泊松)** — `tampering_catnet.CatNetTamperingDetector` CAT-Net v2 DCT/BAG 取证(块伪影栅格相位错位),可插拔降级 dct-bag。**2026-07-12 统一软flag制度后 `detect()` 判定逻辑改为**:CAT-Net **自身**前向命中(本次调用成功)硬拒绝 ∪ BAG 相位不一致(仅当 `bag_hard_reject=True` 显式开启;默认 `False` 仅软flag) ∪ 几何(copy_move/splice,**恒软flag,与 CatNet 状态解耦**,不再因"CatNet 这次没崩溃"被提升为硬拒绝)。硬拒绝命中源写入 `CatNetTamperingDetector.last_hard_reject_source`("catnet"|"bag_phase"|None),`gatekeeper_runner.py` 据此拼接精确的 REJECTED reason(而非笼统的"hard-reject path")。详见 `src/gatekeeper/AGENTS.md` §3。
+5. **Splicing(羽化/泊松)** — `tampering_catnet.CatNetTamperingDetector` CAT-Net v2 DCT/BAG 取证(块伪影栅格相位错位),可插拔降级 dct-bag。**2026-07-12 统一软flag制度后 `detect()` 判定逻辑为**:CAT-Net **自身**前向命中(本次调用成功)"硬"路 ∪ BAG 相位不一致(仅当 `bag_hard_reject=True` 显式开启;默认 `False` 仅软flag) ∪ 几何(copy_move/splice,**恒软flag,与 CatNet 状态解耦**,不再因"CatNet 这次没崩溃"被提升)。命中源写入 `CatNetTamperingDetector.last_hard_reject_source`("catnet"|"bag_phase"|None),`gatekeeper_runner.py` 据此拼精确 reason(`"Tampering detected (CAT-Net deep model)"` / `"(BAG phase inconsistency)"` / `"(source unspecified)"`)。**注意**:这里的"硬"只表示"该路命中会置 `is_tampered=True`",最终是否 REJECTED 仍被 `enforcement_mode` 顶层封顶。详见 `src/gatekeeper/AGENTS.md` §3。
 
-**Rejection JSON** (on failure)。`is_phantom`/`is_gan` 现为纯审计字段——出现非零值**不代表**该次判定单独触发了 REJECTED,只有 `is_duplicate`/`is_tampered` 驱动 `status="REJECTED"`(见上方第1点)；但若本次因去重/篡改被拒绝且 phantom/synthetic 同时命中,`reason` 文本会追加 `"(soft-flag: ...)"` 标注保留该并发信号(2026-07-12 code-review 补强,详见 `src/gatekeeper/AGENTS.md` §1):
+**Audit dict**(恒返回)。`is_phantom`/`is_gan` 为纯审计字段——非零值**不代表**单独触发拒绝,只有 `is_duplicate`/`is_tampered` 会置 `would_reject_in_hard_mode`;phantom/synthetic 与去重/篡改并发命中时,`reason` 追加 `"(soft-flag: ...)"` 标注保留该并发信号(2026-07-12 code-review 补强,详见 `src/gatekeeper/AGENTS.md` §1):
 ```json
 {
-  "status": "REJECTED",
-  "reason": "...",
-  "is_phantom": 0|1,
-  "is_gan": 0|1,
-  "is_duplicate": 0|1,
-  "is_tampered": 0|1
+  "flagged": true,                     // 任一审计项命中(含仅软flag的 phantom/synthetic)
+  "would_reject_in_hard_mode": true,   // 去重/篡改命中 → hard 模式下会 REJECTED
+  "enforcement_mode": "soft",
+  "reason": "Duplicate image: ..., (soft-flag: Physical Phantom suspected)",
+  "is_phantom": 0,
+  "is_gan": 0,
+  "is_duplicate": 1,
+  "is_tampered": 0
 }
 ```
+仅当 `enforcement_mode == "hard"` **且** `would_reject_in_hard_mode` 为真时返回 `(False, {...上述字段, "status": "REJECTED"})`,可直接交 `save_rejection_json`。soft 模式产物**不含** `status` 键(靠这点区分,回归测试有断言)。
+
+**两个入口如何消费**(`result.json` 的 `gatekeeper` 字段。两条链路 schema **不同**——静态图是单图 audit,动态图是逐帧聚合;共有键 `skipped`/`enforcement_mode`,消费方须先看 `input_type` 再取各自专属键):
+- `predict.py` — `{"skipped": false, ...audit}`(静态图无跳过审计的入口,`skipped` 恒 false,保留该键是为让消费方两条链路共用同一份解析代码);
+- `video_predict.py` — `{skipped, enforcement_mode, n_frames_audited, n_frames_flagged, flagged_frame_indices, any_flagged, any_would_reject_in_hard_mode, keyframe_flagged, flagged_frames}`。**soft 下单帧命中不再让整段视频零诊断**(旧逻辑 `return`,32 帧任一误报即整段归零,是本次软化的最大受益点);`--skip_gatekeeper` 时该字段为 `{"skipped": true}`(无其它键)。
+  - **被 flag 的帧仍参与 max 聚合**——这是有意为之:soft 的语义就是"命中只记 flag、诊断照出",把 flagged 帧排除出聚合等于变相执行拒绝,又回到本次要修的坑(且 `detect_copy_move` 在真实图有 27.3% 误报,排除大概率丢的是真帧)。
+  - `keyframe_flagged` 显式标注**关键帧本身是否被 flag**——mask/报告/Grad-CAM 全出自关键帧,人工复核应一眼看见"这份报告出自一张被 flag 的帧",不必自己拿 `keyframe_frame_index` 与 `flagged_frame_indices` 做集合运算(二者同一坐标系,都是 `frame_indices` 的原始帧号)。
 
 ---
 
@@ -123,8 +140,23 @@ Pipeline:
 ## 4. `postprocess.py` — Prediction Decoding
 
 ### `decode_predictions(outputs, calibrator=None)` → `dict`
-Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `foci_prob`, `mal_prob`.
+Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `comp_prob`, `echo_prob`, `shape_prob`, `margin_prob`, `foci_prob`, `mal_prob`, `mal_probs`。
 - `calibrator`: 可选 `TemperatureScaler`。各分类头在 softmax/sigmoid **之前**先 `apply(task, logits)` 温度缩放;`None` 或全 T=1.0 时输出逐位等同无校准。各头统一 `.float()` 后再缩放(fp16 温度除法精度对齐),T>0 单调不改 argmax。mask 分割不走校准。
+- **`*_prob` = 完整概率分布**(2026-07-29 新增)。四个 softmax 头和为 1;`foci_prob` 是**多标签 sigmoid**,各元素独立、不求和。`mal_probs` = `[p_benign, p_malignant]`,`mal_prob` 恒等于 `mal_probs[1]`(同源,不允许两条计算路径)。
+- `*_idx` 取自概率向量的 argmax(softmax 严格单调,与对 logits 取 argmax 等价),保证索引与分布**自洽**——否则报告文字会和概率各说各话。
+- **为什么必须有**:官方硬约束(赛前动员会 2026-07-28)"所有分类/分级/分型任务必须输出功率分布或置信度,**否则计0分**"。此前只取 argmax,概率在 decode 层就永久丢失(`cbm_head.py` 内部其实已算出,属导出遗漏而非能力缺失)。
+
+### `build_probability_export(preds)` → `dict`（2026-07-29 新增）
+把 `decode_predictions` 的概率字段整成 JSON 可序列化结构,是 `predict.py`/`video_predict.py` **共用的 schema 唯一真源**(新增维度只改这一处;`tests/test_probability_output.py::TestEntryPointsShareOneSchema` 用 AST 断言两个入口都调用它,禁止任一侧手写概率字段导致 schema 分叉)。
+```json
+{
+  "concept_probabilities": {"composition": [...], "echogenicity": [...], "shape": [...], "margin": [...], "foci": [...]},
+  "concept_predicted_index": {"composition": 3, "echogenicity": 2, "shape": 0, "margin": 1},
+  "malignancy_probabilities": [0.13, 0.87]
+}
+```
+类别顺序即索引顺序,与 `src/utils/report_generator.py` 的 `COMPOSITION_MAP`/`ECHOGENICITY_MAP`/`SHAPE_MAP`/`MARGIN_MAP`/`FOCI_MAP` 键严格对应,且与 `configs/thyroid_config.yaml` 的 `num_classes_*` 一致(两条契约都有回归测试)。numpy float32 必须 `.tolist()`,否则 `json.dumps` 直接抛异常。
+> ⚠️ CBM 五概念头**未经语义监督**(`train_thyroidxl.py` 只训 malignancy + 分割),概率数值可用但语义映射未经验证——报告侧已加免责标注,8-01 官方概念标注重训后删除。
 
 ### `build_tirads_breakdown(comp_idx, echo_idx, shape_idx, margin_idx, foci_prob)` → `dict`
 Delegates to `src/utils/report_generator.calculate_tirads_points()`.

@@ -72,12 +72,15 @@ All deep learning implementations MUST be verified by quantifiable automated tes
 
 项目重心已从「训练」扩展到「离线推理容器交付」，以下推理侧红线与训练红线同等强制：
 
-*   **Gatekeeper 误报一票否决**: gatekeeper 任一检测器**误杀真实图 = 一票否决**（拒掉合法输入直接沉赛道）。**任何 gatekeeper 检测器改动后，MUST 用全量 holdout 真实图实测硬拒绝误报率，零误报是红线**。误报与召回不可兼得时遵守「宁可漏检不可误杀」，将不可靠检测器降为软 flag 而非硬拒绝。血泪教训：`detect_copy_move` 曾在 359 张真实图误报 27.3%，AGENTS.md 却写「零误报」——**别信文档声称，用数字实测**。见 `memory/gatekeeper-copymove-softflag.md`。
+*   **Gatekeeper 误报**: gatekeeper 任一检测器**误杀真实图**代价极高。**任何 gatekeeper 检测器改动后，MUST 用全量 holdout 真实图实测硬拒绝误报率，零误报是红线**。误报与召回不可兼得时遵守「宁可漏检不可误杀」，将不可靠检测器降为软 flag 而非硬拒绝。血泪教训：`detect_copy_move` 曾在 359 张真实图误报 27.3%，AGENTS.md 却写「零误报」——**别信文档声称，用数字实测**。见 `memory/gatekeeper-copymove-softflag.md`。
+    - **2026-07-29 代价重估(旧表述"一票否决直接沉赛道"已过时,但红线未松)**:赛道七已豁免全部医保安全考核(官方赛前动员会 2026-07-28,总分=临床诊断得分×100,无 Sins),且 `gatekeeper.enforcement_mode` 默认 `soft` ——误报**默认不再拒绝**任何输入,最坏后果由"整队沉赛道"降为"审计噪声误导人工复核 + 报告可信度受损"。但检测器本身的零误报要求**不变**:① hard 模式仍在代码里可达;② 未来若规则变化或其它赛道复用,软化只是执行层封顶、不是检测器可以变脏的许可;③ 误报污染 `result.json` 的 `gatekeeper` 字段,直接影响专家评审对可靠性的判断。
 *   **权重维度契约**: checkpoint 维度必须与当前模型定义一致。**特征/结构维度变更后，MUST 立即重训并重新导出权重**，否则推理容器 `size mismatch` 崩溃。改维度须同步所有引用点（特征提取器 / 分类器 `input_dim` / 训练器 `FEAT_DIM` / test 断言）。见 `memory/authenticity-weight-mismatch.md`。
 *   **降级路径即生产路径**: 可插拔检测器（SSCD/CAT-Net）的深度权重若未落地交付，则降级路径就是实际生产路径，必须按降级路径实测红线，不得假设深度权重存在。判定以 `docs/预训练权重打包清单.md` + `.cache_weights/` 实际内容为准。
 *   **端到端验证**: 推理侧改动 MUST 实跑 `predict.py`（单图）完整链路，不能只跑单元测试（见 `memory/phase4-was-halfbaked.md`）。
 *   **容器封印时机**: `seal_container.py` 只在**交付最后一步**（最终权重就位后）跑，提前封印会埋雷。见 `memory/seal-container-timing.md`。
 *   **统一软 flag 制度**: gatekeeper 任一硬拒绝分支，在**官方真实干净 holdout 完成预注册、带置信区间的 FPR 验收**之前，默认只能软 flag（记录审计字段，不触发 REJECTED）。**降级（硬→软）是单调保守动作，不需要真实 FPR 证据即可执行**（收紧误报风险，不会引入新风险）；但**恢复硬拒绝必须先有真实域 FPR 证据**，不得凭"实现看起来对了"就把软 flag 升级回硬拒绝。2026-07 gatekeeper 统一软 flag 化改动（`8e608b7`/`c8871a6`/`6cb60a6`）即此原则的落地:CatNet 自身命中与 BAG 相位/copy_move/splice 几何判据解耦，硬拒绝来源需显式记录（`last_hard_reject_source`），BAG 是否硬拒绝由独立开关 `bag_hard_reject`（默认 `false`）控制。见 `docs/P2红线修复实施计划.md`。
+    - **2026-07-29 顶层开关**:在检测器级软/硬分级之上，新增 `gatekeeper.enforcement_mode: soft|hard`（`gatekeeper_runner.resolve_enforcement_mode`，默认与交付固定 `soft`）做统一封顶——本条所述**仍保留硬拒绝资格的分支**（CatNet 自身命中、去重）在 soft 下也只落 `would_reject_in_hard_mode` 审计 flag、不触发 REJECTED。**这不是给检测器松绑**：恢复某检测器硬拒绝资格仍需真实域 FPR 证据（闸门不变），enforcement_mode 只决定"已获资格的分支这次要不要真执行"。非法值一律降级 `soft`（失败方向偏向多输出一份诊断）。改 gatekeeper 判定逻辑时**两层都要核**：检测器级资格 + 执行层模式。
+*   **推理侧不得因审计而零输出(§1.7 关联)**: 审计命中（is_duplicate/is_tampered/is_phantom）与**故障**（文件损坏、权重缺失、解码失败）必须严格区分——前者在 soft 下只 flag、诊断照出；后者仍走 ERROR 硬报错路径（如 `AuthenticityModule.load_weights` 权重缺失硬报错，红线未动）。改 gatekeeper 时若把故障也软化成 flag，会让容器带着随机初始化的权重"正常"输出一份看似合法的诊断，比崩溃更危险。回归测试：`tests/test_gatekeeper_soft_enforcement.py`。
 *   **子进程崩溃兜底（容器不可静默零输出）**: `entrypoint.sh` 若用 `exec python ...` 替换 bash 进程，一旦 Python 侧 segfault 或被 OOM-killer `SIGKILL`（不可被 trap 捕获，任何 try/except 都挡不住），没有存活进程能补写 `result.json`，容器表现为静默零输出而非可诊断的错误。**Rule**：去 `exec`、显式 `trap` 转发 `SIGTERM`/`SIGINT` 给子进程（否则容器优雅关闭时子进程变孤儿）、子进程异常退出且未产出 `result.json` 时必须补写结构化 ERROR JSON 兜底；兜底前须先移走上次调用可能残留的**陈旧** `result.json`（否则会被误判为"这次成功了"，比空目录更危险）。见 `docs/P2红线修复实施计划.md` C 级、`scripts/AGENTS.md` §7.1。
 
 ---

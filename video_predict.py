@@ -26,7 +26,8 @@ from src.inference.gatekeeper_runner import (
 )
 from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
 from src.inference.postprocess import (
-    decode_predictions, build_tirads_breakdown, build_probability_export)
+    decode_predictions, build_tirads_breakdown, build_probability_export,
+    NonFiniteProbabilityError)
 from src.inference.calibration import TemperatureScaler
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
 from src.utils.report_generator import generate_report
@@ -127,35 +128,122 @@ def main():
                 "any_flagged": bool(frame_audits),
                 "any_would_reject_in_hard_mode": any(
                     a["would_reject_in_hard_mode"] for a in frame_audits),
+                # 与 predict.py(单图)的键名对齐:单图 audit 用 flagged /
+                # would_reject_in_hard_mode,视频聚合层原先只有 any_* 前缀,消费方
+                # (评测脚本/人工复核)无法对两条链路写通用读取代码。any_* 保留不删
+                # (向后兼容已写好的读取方),新增无前缀别名作为**两入口共有键**。
+                "flagged": bool(frame_audits),
+                "would_reject_in_hard_mode": any(
+                    a["would_reject_in_hard_mode"] for a in frame_audits),
                 "flagged_frames": frame_audits,
             }
             if frame_audits:
                 print(f"--> [Gatekeeper 软 flag] {len(frame_audits)}/{len(frames)} 帧命中审计,"
                       f"整段继续诊断(帧号 {gatekeeper_audit['flagged_frame_indices']})", flush=True)
 
-        # 3. 逐帧诊断
+        # 3. 逐帧诊断。两类「这一帧坏」只废这一帧,不拖垮整段——语义与本轮
+        # gatekeeper 软化一致:丢一帧损失有限,丢整段 = 该病例全部临床得分归零。
+        # 捕两类,且**只**捕这两类(2026-07-30 /code-review Angle C 收紧):
+        #   NonFiniteProbabilityError — 概率/mask NaN/Inf(`_assert_finite` 拦);
+        #   AssertionError — 帧形状/维度非法(preprocess_image 的 ndim 校验),DICOM
+        #     多帧序列偶发混入彩色/畸形帧,属"这一帧数据坏"不是系统故障。
+        # RuntimeError(CUDA OOM/权重维度不符)、cv2.error(底层解码错)、
+        # KeyboardInterrupt 等**真故障必须冒泡**到外层落 status=ERROR,不能被逐帧
+        # 兜底吞掉伪装成"少几帧"的 PASSED(评测方拿到看似正常实则没正常跑的诊断)。
+        # img_tensor/frame_np **直接存进 per_frame 元素**,不再另开平行 dict:
+        # `agg["keyframe_index"]` 是 per_frame 的下标,而旧版 key_tensors 以**全帧**
+        # 下标为键,一旦这里 continue 跳帧,两个下标空间就错位——且 key_tensors 元素
+        # 更多、`key_tensors[kf_pos]` 恒取得到值、**不抛 KeyError**,于是 mask/Grad-CAM
+        # 静默出自错帧,而 JSON 里的 keyframe_frame_index 仍是对的(自相矛盾且无报错,
+        # 已用 tests/test_gatekeeper_soft_enforcement.py::TestBadFrameIsolation 实测复现:
+        # 第 0 帧坏 + 第 2 帧最恶性时,mask/Grad-CAM 实际出自帧 1 而非帧 2)。
+        # 存进同一个元素后,下标空间只剩一个,该错位从结构上不可能发生。
+        #
+        # 显存优化(2026-07-30 /code-review Angle A+E):`frame_np` 存全帧,但
+        # `img_tensor`(GPU 张量)**只保留当前最恶性那一帧**——32 帧(或 --max_frames<=0
+        # 不限帧的 DICOM cine)全量常驻会在官方平台 32G 显存硬上界(rules.md §2 Q33)
+        # 上叠加模型+Grad-CAM 分配而 OOM,本地 A800 80G 测不出来。gradcam 只需要
+        # 关键帧张量,边扫边留 argmax 帧即可(单帧张量常驻,非 32 帧)。
         print(f"Running per-frame multi-task diagnosis under {args.precision.upper()}...")
         per_frame = []
-        key_tensors = {}  # pos → img_tensor(供关键帧 Grad-CAM 复用,避免重算)
-        for list_pos, (orig_idx, frame_np) in enumerate(zip(frame_indices, frames)):
-            preds, img_tensor = diagnose_frame(
-                model, frame_np, args.precision, device, img_size, calibrator=calibrator)
-            per_frame.append({
+        failed_frames = []
+        kf_tensor = None          # 仅当前最恶性帧的张量(Grad-CAM 复用)
+        kf_img_tensor_pos = -1    # 它在 per_frame 里的下标
+        for orig_idx, frame_np in zip(frame_indices, frames):
+            try:
+                preds, img_tensor = diagnose_frame(
+                    model, frame_np, args.precision, device, img_size, calibrator=calibrator)
+            except (NonFiniteProbabilityError, AssertionError) as e:
+                failed_frames.append({"frame_index": int(orig_idx), "reason": str(e)})
+                print(f"--> [WARNING] frame {orig_idx} 异常已跳过({type(e).__name__}: {e})"
+                      f";整段继续", flush=True)
+                continue
+            cur = {
                 "frame_index": int(orig_idx),
                 "mal_prob": float(preds["mal_prob"]),
                 "preds": preds,
+                "frame_np": frame_np,
+            }
+            # 与 aggregate_frame_predictions 的 max 判据严格同序:Python
+            # `max(range(n), key=...)` 在相等时取**首个**最大,故这里用严格 `>`
+            # (只在**真正更恶性**时才刷新保留帧),平分时也保留首帧,两条判据
+            # 选出的关键帧下标恒一致。其余帧的张量随循环变量释放,显存常驻
+            # 从 32 帧降到 1 帧。
+            if kf_tensor is None or cur["mal_prob"] > per_frame[kf_img_tensor_pos]["mal_prob"]:
+                kf_tensor = img_tensor
+                kf_img_tensor_pos = len(per_frame)
+            per_frame.append(cur)
+
+        # 全帧失败 → 无任何可用诊断,如实落 ERROR。用显式 if 而非 assert:
+        # assert 在 `python -O` 下会被整条剥离(本项目未开 -O,但交付容器不该依赖这个
+        # 前提),且 aggregate_frame_predictions([]) 本身安全返回 keyframe_index=-1、
+        # 不抛,靠 assert 拦等于把契约压在一条可被优化掉的语句上。
+        if not per_frame:
+            reason = f"All {len(frames)} sampled frames failed numeric validation"
+            print(f"[FATAL] {reason}")
+            save_rejection_json(args.output_dir, {
+                "status": "ERROR", "reason": reason,
+                "n_frames_sampled": len(frames),
+                # 与 PASSED 路径同一组键(2026-07-30 /code-review Angle A):下游按
+                # "两路径共有的 schema 超集"统一解析时,ERROR 样本不能缺键致 KeyError。
+                "n_frames_diagnosed": 0,
+                "n_frames_failed": len(failed_frames),
+                "failed_frame_indices": [f["frame_index"] for f in failed_frames],
+                "failed_frames": failed_frames,
             })
-            key_tensors[list_pos] = (img_tensor, frame_np)
+            return
 
         # 4. 聚合 + 关键帧
         agg = aggregate_frame_predictions(
             [{"frame_index": f["frame_index"], "mal_prob": f["mal_prob"]} for f in per_frame])
-        kf_pos = agg["keyframe_index"]
-        assert kf_pos >= 0, f"keyframe_index={kf_pos}: per_frame is unexpectedly empty"
-        kf = per_frame[kf_pos]
+        # 双重守卫:即便上面的 `if not per_frame` 未来被误改(只 print 不 return),
+        # 这里也绝不能用 keyframe_index=-1 去索引——Python 负索引 `per_frame[-1]`
+        # **不抛异常而静默取最后一帧**,于是 mask/Grad-CAM 出自末帧而 JSON 写
+        # keyframe_frame_index=-1,与本轮修掉的 key_tensors 错位同性质(负索引静默错位)。
+        # 用显式 if 而非 assert(同上分帧失败守卫,assert 在 -O 下会被剥离)。
+        if agg["keyframe_index"] < 0:
+            save_rejection_json(args.output_dir, {
+                "status": "ERROR",
+                "reason": f"no valid keyframe (keyframe_index={agg['keyframe_index']})",
+                "n_frames_sampled": len(frames),
+                "n_frames_diagnosed": agg["n_frames"],
+                "n_frames_failed": len(failed_frames),
+                "failed_frame_indices": [f["frame_index"] for f in failed_frames],
+                "failed_frames": failed_frames,
+            })
+            return
+        kf = per_frame[agg["keyframe_index"]]
         kf_preds = kf["preds"]
-        kf_tensor, kf_frame_np = key_tensors[kf_pos]
-
+        kf_frame_np = kf["frame_np"]
+        # kf_tensor 在逐帧循环里按"最恶性帧"保留(与 aggregate 同序),此处直接复用;
+        # 一致性锁:保留帧的下标必须等于聚合器选出的关键帧下标,不等说明两条
+        # max 判据分叉(近乎不可能,但一旦发生 Grad-CAM 会用到错帧张量)。不一致时
+        # 不静默换张量——打 warning 并重算该关键帧张量,Grad-CAM 用错帧比没有更糟。
+        if kf_img_tensor_pos != agg["keyframe_index"]:
+            print(f"--> [WARNING] 关键帧张量下标({kf_img_tensor_pos})与聚合关键帧"
+                  f"({agg['keyframe_index']})不一致,Grad-CAM 改用重算张量", flush=True)
+            _, kf_tensor = diagnose_frame(
+                model, kf_frame_np, args.precision, device, img_size, calibrator=calibrator)
         # 5. 关键帧 mask / TI-RADS / 报告
         mask_resized = cv2.resize(
             kf_preds["mask_binary"], (kf_frame_np.shape[1], kf_frame_np.shape[0]),
@@ -168,9 +256,13 @@ def main():
             patient_id="ANONYMOUS_PACS_PATIENT" if is_dicom else "ANONYMOUS",
             breakdown=breakdown, malignancy_prob=kf_preds["mal_prob"])
         report_txt += (
-            f"\n\n  [动态图聚合] 抽样 {agg['n_frames']} 帧;恶性概率 "
-            f"max={agg['mal_prob_max']:.3f} / mean={agg['mal_prob_mean']:.3f};"
+            f"\n\n  [动态图聚合] 抽样 {len(frames)} 帧、成功诊断 {agg['n_frames']} 帧;"
+            f"恶性概率 max={agg['mal_prob_max']:.3f} / mean={agg['mal_prob_mean']:.3f};"
             f"关键帧=原始帧 {agg['keyframe_frame_index']}。最终判定按最恶性帧。")
+        if failed_frames:
+            report_txt += (
+                f"\n  [注意] {len(failed_frames)} 帧因数值异常被跳过"
+                f"(帧号 {[f['frame_index'] for f in failed_frames]}),聚合仅基于其余帧。")
 
         # 5b. 关键帧 Grad-CAM(可选,inference_mode 外复用关键帧张量)
         gradcam_done = 0
@@ -190,7 +282,14 @@ def main():
         out_json = {
             "status": "PASSED",
             "input_type": "video_cine",
-            "n_frames_sampled": agg["n_frames"],
+            # n_frames_sampled 取**抽样帧数**(len(frames)),不是 agg["n_frames"]——
+            # 后者只统计诊断成功的帧,数值异常跳帧后二者不再相等。分开两个键如实反映
+            # "抽了多少 / 成功诊断多少 / 失败多少",不静默少算(无失败时三者退化为原行为)。
+            "n_frames_sampled": len(frames),
+            "n_frames_diagnosed": agg["n_frames"],
+            "n_frames_failed": len(failed_frames),
+            "failed_frame_indices": [f["frame_index"] for f in failed_frames],
+            "failed_frames": failed_frames,
             "malignancy_probability": agg["mal_prob_max"],
             "malignancy_probability_mean": agg["mal_prob_mean"],
             "is_malignant": agg["final_is_malignant"],

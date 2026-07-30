@@ -26,6 +26,44 @@ from gate2_paths import PASS_PATH, is_high_risk, read_pending, requires_deep_rev
 
 MARKER_TTL_SECONDS = 3600  # 1小时内的标记才有效，防止用旧标记混过新改动
 
+# PreToolUse 在 Bash 命令**执行前**触发,此时同一条命令里的 `git add` 尚未运行。
+# 2026-07-29 实测漏洞:同一份改动,`git add -A && git commit ...`(最常见写法)
+# 因检查时暂存区为空而 **exit 0 放行**,而先 add 再单独 commit 则 exit 2 阻断——
+# 整个 Gate2 闸门被一行式 commit 完全绕开(本会话 1bafb84 正是这样漏过去的,
+# 当时 .gate2_pass.json 已过期 396 小时仍成功提交)。
+# 对策:命令里出现 `git add` 或 `git commit -a/--all` 时,改用**工作区全量改动**
+# 作保守超集判定——宁可多拦(提示补标记),不可漏放。
+_ADD_RE = re.compile(r"\bgit\s+add\b")
+# 只匹配短选项簇里的 a(-a / -am / -a -m)与 --all;`--amend` 不含裸 `-a` 簇,
+# 且第二个字符是 `-`(不在 [a-zA-Z] 内),故不会误命中。
+_COMMIT_ALL_RE = re.compile(
+    r"\bgit\s+commit\b[^&|;\n]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=\s|$))"
+)
+
+
+def _files_for_review(cmd):
+    """返回本次 commit 实际会包含的文件集合（含尚未 add、但命令会 add 的）。"""
+    def _run(args):
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            return [f.strip() for f in r.stdout.splitlines() if f.strip()]
+        except Exception:
+            return None
+
+    staged = _run(["git", "diff", "--cached", "--name-only"])
+    if staged is None:
+        return None  # git 本身失败，不是本 hook 的职责，交由调用方放行
+
+    if not (_ADD_RE.search(cmd) or _COMMIT_ALL_RE.search(cmd)):
+        return staged
+
+    # 保守超集：已暂存 ∪ 工作区已改动(tracked) ∪ 未跟踪(会被 `git add -A` 纳入)
+    extra = (_run(["git", "diff", "--name-only", "HEAD"]) or []) + (
+        _run(["git", "ls-files", "--others", "--exclude-standard"]) or []
+    )
+    return sorted(set(staged) | set(extra))
+
+
 try:
     data = json.load(sys.stdin)
 except (json.JSONDecodeError, EOFError):
@@ -35,13 +73,8 @@ cmd = data.get("tool_input", {}).get("command", "")
 if not cmd or not re.search(r"\bgit\s+commit\b", cmd):
     sys.exit(0)
 
-try:
-    result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only"],
-        capture_output=True, text=True, timeout=10,
-    )
-    staged = [f.strip() for f in result.stdout.splitlines() if f.strip()]
-except Exception:
+staged = _files_for_review(cmd)
+if staged is None:
     sys.exit(0)  # git 命令本身失败，不是本 hook 的职责，放行
 
 high_risk_staged = [f for f in staged if is_high_risk(f)]

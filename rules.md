@@ -21,6 +21,9 @@ Before deploying or starting full training, you **MUST** execute the double-gate
 *   **Zero-Hallucination Diagnostic Loop (自诊断闭环)**:
     * If `verify_model.py` fails any Gate (Exit Code != 0), the AI agent **MUST** print a structured diagnostic report (containing the failed Gate, numerical discrepancy evidence, and recovery guidance), execute patches locally in a sandbox, and verify correctness before requesting a git diff review.
 * **Rule**: Gate 1（`python scripts/verify_model.py` 全通过）**且** Gate 2（reviewer 子agent 审核通过）后，才启动正式训练。
+* **Rule (Gate2 触发时机 · 推理侧/交付侧代码)**: 上一条的触发点写的是「启动正式训练」，但**推理容器代码（`predict.py`/`video_predict.py`/`src/inference/**`/`src/gatekeeper/**`/`entrypoint.sh`）永远不会触发训练**——若照字面理解，这类改动等于没有 Gate2 触发点。**对推理侧/交付侧改动，Gate2 的触发点是「commit 之前」**，不是训练前、也不是 push 后补做。
+  - **反例（2026-07-29 本会话真实违规）**：改完概率输出 + gatekeeper 软化后，只跑了 §2 搭配规范的**第二步**（`QA_VP.md` 领域清单 + reviewer 子agent），**跳过第一步 `/code-review` skill** 就 commit + push 了；事后补跑 skill，10 角度高召回审查查出 6 条问题，其中一条是修 Gate2 nits 时**自己引入的回归**（`_assert_finite` 在逐帧循环里无隔离，单帧 NaN 拖垮整段视频），性质与该轮刚修完的"一帧拖垮整段"完全相同。教训有二：① **两步缺一都漏**（规则原文已写明，是执行纪律问题不是规则缺陷）；② **修复本身也要过 Gate2**——按审查意见改完的代码不是"顺手一改"，它和原始改动同等风险，本次正是"补丁引入新回归"。
+  - **顺序不可颠倒**：先 `/code-review` skill（通用 8 角度）→ 再 `QA_VP.md` 领域清单。颠倒或只做一步都视为未完成 Gate2。
 * **Rule (CI 只验证已 push 的 commit)**: 声称「CI 通过」前,必须跑 `gh run list --branch <branch> --limit 1`(走代理)核对其 `headSha` **正是本轮 commit** 且 `conclusion=success`——`pull_request` 事件的 run message 取自 PR 而非最新 commit,只能凭 SHA 判定。本地未 push 的改动 CI 从未覆盖,不得用本地 pytest 全绿或历史 commit 绿灯冒充;对不上则如实说明「本地绿、CI 未覆盖本轮」。
 * **OOM Preventative Rule → `src/models/AGENTS.md` §4**: See model architecture constraints for spatial attention resolution limits. **官方平台算力硬上界(答疑第4期 Q33):单卡 32G 显存、16 核 CPU、96G 内存、419 TFLOPS(FP16 稀疏)**——batch/分辨率/AMP 规划不得超此显存;本地 A800(80G)上不 OOM 不代表平台 32G 不 OOM,交付前须按 32G 复核。
 

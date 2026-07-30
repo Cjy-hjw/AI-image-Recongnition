@@ -405,6 +405,162 @@ class TestGatekeeperSoftFlagPolicy:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 篡改软 flag 接入 audit(2026-07-29):copy_move/splice/BAG 信号不再只走 stdout
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestSoftFlagsLandInAudit:
+    """`CatNetTamperingDetector.last_soft_flags` 必须落进 audit 的 `soft_flags` 键。
+
+    背景(2026-07-29 /code-review):此前生产代码零读取 `last_soft_flags`,
+    于是仅被 copy_move/splice/BAG(三者均为软判据,恒不进 is_tampered)命中的图,
+    `audit["flagged"]` 为 False、result.json 完全沉默——而 copy_move 在 359 张
+    真实图上误报 27.3%,信号量不小却全丢。同时锁死红线:软 flag 只计入
+    `flagged`,**绝不**进 `would_reject_in_hard_mode`(升级为拒绝依据会误杀真实影像)。
+    """
+
+    @staticmethod
+    def _config(enforcement_mode="soft"):
+        return {
+            "gatekeeper": {"phash_threshold": 1, "cosine_threshold": 0.995,
+                           "enforcement_mode": enforcement_mode},
+            "data": {"train_path": "____nonexistent_train____"},
+        }
+
+    class _StubAuth:
+        def predict(self, img_np):
+            return 0, np.ones(3, dtype=np.float32) / 3
+
+    class _StubDedup:
+        def is_duplicate(self, img_np):
+            return False, None
+
+    class _StubTamperWithSoftFlags:
+        """detect 返回 is_tampered=False,但 last_soft_flags 有命中(软判据)。"""
+        last_hard_reject_source = None
+
+        def __init__(self, flags):
+            self.last_soft_flags = flags
+
+        def detect(self, img_np):
+            return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None
+
+    def _run(self, flags, mode="soft"):
+        import src.inference.gatekeeper_runner as gr
+        img = np.random.randint(0, 255, (64, 64), dtype=np.uint8)
+        return gr.run_gatekeeper_audit(
+            img, self._config(mode), "cpu", "checkpoints/best_model.pth", ".",
+            deduplicator=self._StubDedup(),
+            auth_module=self._StubAuth(),
+            tamper_detector=self._StubTamperWithSoftFlags(flags),
+        )
+
+    def test_soft_flags_in_audit_and_flagged_but_not_hard_reject(self):
+        passed, audit = self._run(
+            [("copy_move", [5, 5, 40, 40]), ("splice", [0, 0, 10, 10])])
+        assert passed is True, "仅软 flag 命中不得拒绝"
+        assert audit["flagged"] is True, \
+            "仅软 flag 命中时 flagged 必须为 True——此前为 False,信号全丢"
+        assert audit["would_reject_in_hard_mode"] is False, \
+            "红线:软 flag 恒不得计入硬拒绝依据(copy_move 真实图误报 27.3%)"
+        assert audit["soft_flags"] == [
+            {"type": "copy_move", "bbox": [5, 5, 40, 40]},
+            {"type": "splice", "bbox": [0, 0, 10, 10]},
+        ]
+        assert "soft-flag: copy_move" in audit["reason"], \
+            "软 flag 必须以标注形式进 reason,供只看文本的日志grep/人工审计"
+
+    def test_soft_flags_do_not_reject_even_in_hard_mode(self):
+        """hard 模式下软 flag 仍不得驱动 REJECTED(与 phantom/synthetic 同一政策)。"""
+        passed, audit = self._run([("bag_phase", None)], mode="hard")
+        assert passed is True and audit["would_reject_in_hard_mode"] is False
+        assert audit["soft_flags"] == [{"type": "bag_phase", "bbox": None}]
+
+    def test_no_flags_yields_empty_list_and_unflagged(self):
+        passed, audit = self._run([])
+        assert passed is True and audit["flagged"] is False
+        assert audit["soft_flags"] == []
+
+    def test_collect_soft_flags_backward_compatible_without_attr(self):
+        """旧 detector 无 last_soft_flags 属性 → getattr 兜 [],不得 AttributeError。"""
+        import src.inference.gatekeeper_runner as gr
+
+        class _LegacyTamper:
+            def detect(self, img_np):
+                return False, np.zeros(img_np.shape[:2], dtype=np.uint8), None
+
+        img = np.random.randint(0, 255, (64, 64), dtype=np.uint8)
+        passed, audit = gr.run_gatekeeper_audit(
+            img, self._config(), "cpu", "checkpoints/best_model.pth", ".",
+            deduplicator=self._StubDedup(), auth_module=self._StubAuth(),
+            tamper_detector=_LegacyTamper())
+        assert passed is True and audit["soft_flags"] == []
+
+    def test_collect_soft_flags_normalizes_unexpected_shapes(self):
+        """last_soft_flags 若混入畸形元素(非二元组),不得让整条 audit 崩掉。"""
+        import src.inference.gatekeeper_runner as gr
+        assert gr.collect_soft_flags(None) == []
+        assert gr.collect_soft_flags(object()) == []  # 无该属性外的"假值"兜底
+        out = gr.collect_soft_flags(type("T", (), {
+            "last_soft_flags": [("copy_move", [1, 2, 3, 4]), "weird-string"]})())
+        assert out[0] == {"type": "copy_move", "bbox": [1, 2, 3, 4]}
+        assert out[1]["type"] == "weird-string" and out[1]["bbox"] is None
+
+    def test_cosine_threshold_malformed_config_uses_delivery_default(self):
+        """畸形配置下 cosine_threshold 应落到**交付值**而非更宽松的库默认。
+
+        若缺省传 None,Deduplicator 会取类内推荐值 resnet18=0.95,比交付的 0.995
+        宽松——等于畸形配置静默放松去重判据(误报变多,踩宁可漏检不可误杀红线)。
+        """
+        import src.inference.gatekeeper_runner as gr
+        d = gr.build_seeded_deduplicator({}, device="cpu")  # 整段缺失
+        assert abs(d.cosine_threshold - 0.995) < 1e-9, \
+            f"resnet18 后端的畸形配置默认须为交付值 0.995,实为 {d.cosine_threshold}"
+
+    def test_value_level_malformed_thresholds_degrade_not_crash(self):
+        """值级畸形(段是 dict 但单个阈值写歪)须降级交付默认,不得穿透成整例 ERROR。
+
+        2026-07-30 /code-review Angle C:`gatekeeper_cfg()` 只兜「段是不是 dict」,
+        兜不住段内**值**写歪。运维手改 yaml 把 `cosine_threshold: "high"`(字符串)、
+        `phash_threshold: "x"` 写进交付配置,`float("high")`/`int("x")` 会穿透到
+        Deduplicator/int() 抛 ValueError,被入口兜成整例 ERROR = 零诊断——正是软化
+        要避免的后果。值非法时降级交付默认,而不是抛异常。
+        """
+        import src.inference.gatekeeper_runner as gr
+        for bad_cos in ("high", ["x"], object()):
+            cfg = {"gatekeeper": {"cosine_threshold": bad_cos}}
+            d = gr.build_seeded_deduplicator(cfg, device="cpu")  # 不抛即达标
+            assert abs(d.cosine_threshold - 0.995) < 1e-9, \
+                f"cosine_threshold={bad_cos!r} 应降级交付默认 0.995"
+        for bad_ph in ("x", None, [1]):
+            cfg = {"gatekeeper": {"phash_threshold": bad_ph}}
+            d = gr.build_seeded_deduplicator(cfg, device="cpu")  # 不抛即达标
+            assert d.phash_threshold == 1, \
+                f"phash_threshold={bad_ph!r} 应降级交付默认 1"
+        # 合法标量字符串("0.9")可被 float() 解析,属合法值,不得误降级
+        cfg = {"gatekeeper": {"cosine_threshold": "0.9"}}
+        d = gr.build_seeded_deduplicator(cfg, device="cpu")
+        assert abs(d.cosine_threshold - 0.9) < 1e-9, \
+            "可解析的标量字符串是合法值,不得误当畸形降级"
+
+    def test_collect_soft_flags_drops_flag_with_malformed_bbox_elements(self):
+        """bbox 元素畸形(含 None/str/NaN)的整条 flag 须丢弃,不得让整例审计崩。
+
+        2026-07-30 /code-review Angle A:外层 try 只兜「非二元组」,二元组里 bbox
+        为 [None, 10, 20, 30] 时 `int(None)` 抛 TypeError 会逃逸出函数,被入口兜成
+        整例 ERROR——软 flag 是纯审计字段,它的畸形绝不能让整例零诊断。
+        """
+        import src.inference.gatekeeper_runner as gr
+        tamper = type("T", (), {"last_soft_flags": [
+            ("copy_move", [None, 10, 20, 30]),      # bbox 元素含 None → 丢整条
+            ("splice", ["a", "b", "c", "d"]),        # bbox 元素是 str → 丢整条
+            ("bag_phase", [1, 2, 3, 4]),             # 正常 → 保留
+        ]})()
+        out = gr.collect_soft_flags(tamper)
+        assert out == [{"type": "bag_phase", "bbox": [1, 2, 3, 4]}], \
+            "bbox 元素畸形的整条 flag 应被丢弃,只保留正常的;不得抛异常"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # enforcement_mode:默认 soft — 审计命中不再中断诊断(2026-07-28 豁免后修正)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -510,3 +666,31 @@ class TestEnforcementModeSoftDefault:
             assert resolve_enforcement_mode({"gatekeeper": bad}) == "soft", \
                 f"gatekeeper={bad!r} 应降级 soft 而非抛异常/误判 hard"
         assert resolve_enforcement_mode({}) == "soft"
+
+    @pytest.mark.parametrize("bad_cfg", [
+        {},                                    # 整段缺失
+        {"gatekeeper": None},                  # gatekeeper:
+        {"gatekeeper": "hard"},                # gatekeeper: hard(少一层缩进)
+        {"gatekeeper": ["hard"]},              # 写成列表
+    ], ids=["missing", "none", "scalar", "list"])
+    def test_malformed_config_does_not_break_builders(self, bad_cfg):
+        """降级必须贯穿**整条**读取路径,不能只在解析模式那一处兜底。
+
+        2026-07-29 `/code-review` 实测复现的真实缺口:`resolve_enforcement_mode`
+        当时已 isinstance 兜底、正确返回 soft,但紧接着的
+        `build_seeded_deduplicator`(KeyError/TypeError)与 `build_tamper_detector`
+        (AttributeError)仍直接 `config["gatekeeper"][...]` —— 三种畸形写法都在
+        "模式已降级为 soft"**之后**崩,入口兜成 status=ERROR,整例零诊断。
+        现统一走 `gatekeeper_cfg()`。
+        """
+        import src.inference.gatekeeper_runner as gr
+        gr.build_seeded_deduplicator(bad_cfg, device="cpu")   # 不抛即达标
+        gr.build_tamper_detector(bad_cfg)
+        assert gr.gatekeeper_cfg(bad_cfg) == {}
+
+    def test_gatekeeper_cfg_passes_through_valid_dict(self):
+        """兜底不得吞掉合法配置——阈值必须照常透传。"""
+        import src.inference.gatekeeper_runner as gr
+        cfg = {"gatekeeper": {"phash_threshold": 7, "bag_hard_reject": True}}
+        assert gr.gatekeeper_cfg(cfg)["phash_threshold"] == 7
+        assert gr.build_tamper_detector(cfg).bag_hard_reject is True

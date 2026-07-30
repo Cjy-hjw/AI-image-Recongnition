@@ -8,6 +8,22 @@ from src.gatekeeper.deduplication import Deduplicator
 from src.gatekeeper.tampering_catnet import CatNetTamperingDetector
 
 
+def gatekeeper_cfg(config) -> dict:
+    """取 `config["gatekeeper"]`,非 dict(缺键 / None / 标量 / 列表)一律返回 {}。
+
+    唯一入口——本模块**所有**读 gatekeeper 段的地方都必须走这里。
+    2026-07-29 /code-review 实测复现:此前只有 `resolve_enforcement_mode` 自己做了
+    isinstance 兜底,`build_seeded_deduplicator`/`build_tamper_detector` 仍直接
+    `config["gatekeeper"]["..."]`,于是 `gatekeeper: hard`(YAML 少一层缩进)、
+    `gatekeeper: null`、整段缺失三种写法都会在模式已降级为 soft **之后**抛
+    KeyError/TypeError,被入口 except 兜成 `status="ERROR"` —— **整例零诊断**,
+    恰好是 enforcement_mode 软化要避免的后果。降级必须贯穿整条读取路径,
+    只在解析模式那一处兜底等于没兜。
+    """
+    gk = config.get("gatekeeper")
+    return gk if isinstance(gk, dict) else {}
+
+
 def build_seeded_deduplicator(config, device):
     """构建并用训练集种子初始化 Deduplicator。
 
@@ -15,26 +31,56 @@ def build_seeded_deduplicator(config, device):
     `run_gatekeeper_audit` 会对每帧重复读取并 ResNet 编码最多 200 张训练图,
     O(帧数×200) 的冗余严重拖慢延迟(赛道有推理时延自动评分)。
     """
-    # cosine_threshold 缺省传 None(而非 0.95)——否则 0.95 兜底会顶替 None 锁死
-    # 按后端自适应/映射逻辑(reviewer 必修1)。config 可给标量(两后端同值)或
-    # 映射 {sscd:0.86, resnet18:0.995};缺该键则交由 Deduplicator 取后端推荐值。
+    # 两个阈值的缺省值都显式对齐 **configs/thyroid_config.yaml 的交付值**——畸形
+    # 配置下宁可按交付行为继续跑,也不要因 KeyError 让整例零诊断(见 gatekeeper_cfg)。
+    #   phash_threshold 缺省 1     = 交付值。
+    #   cosine_threshold 缺省全映射 = 交付值 {sscd:0.86, resnet18:0.995},**而非 None**。
+    #     传 None 会让 Deduplicator 取类内推荐值,resnet18 后端是 0.95 —— 比交付值
+    #     宽松,等于畸形配置下静默把去重判据从 0.995 放松到 0.95(误报变多,踩
+    #     「宁可漏检不可误杀真实影像」红线)。原则:降级要降到**交付行为**,不是
+    #     降到库默认行为。config 可给标量(两后端同值)或映射,Deduplicator 内部按
+    #     backend_name 取值、缺键回退后端推荐值,故这里给全映射即可。
+    gk = gatekeeper_cfg(config)
+    train_path = (config.get("data") or {}).get("train_path")
+
+    # 值级畸形兜底(2026-07-30 /code-review Angle C):`gatekeeper_cfg()` 只兜了
+    # 「gatekeeper 段是不是 dict」,兜不住段内**单个值**写歪——运维手改 yaml 把
+    # `cosine_threshold: "high"`(字符串)、`phash_threshold: "x"` 这类非数值写进
+    # 交付配置时,`float("high")` 会穿透到 Deduplicator/int() 里抛 ValueError,被
+    # 入口兜成整例 ERROR = 零诊断,正是软化要避免的后果。阈值是「宁可跑严一点也
+    # 不能零输出」的审计参数,值非法时**降级到交付默认**而不是抛异常。
+    raw_cos = gk.get("cosine_threshold", {"sscd": 0.86, "resnet18": 0.995})
+    if isinstance(raw_cos, dict):
+        cos_thr = raw_cos
+    else:
+        try:
+            cos_thr = float(raw_cos)
+        except (TypeError, ValueError):
+            print(f"--> [WARNING] cosine_threshold={raw_cos!r} 非法,降级交付默认映射",
+                  flush=True)
+            cos_thr = {"sscd": 0.86, "resnet18": 0.995}
+    raw_ph = gk.get("phash_threshold", 1)
+    try:
+        phash_thr = int(raw_ph)
+    except (TypeError, ValueError):
+        print(f"--> [WARNING] phash_threshold={raw_ph!r} 非法,降级交付默认 1", flush=True)
+        phash_thr = 1
+
     deduplicator = Deduplicator(
         device=device,
-        phash_threshold=config["gatekeeper"]["phash_threshold"],
-        cosine_threshold=config["gatekeeper"].get("cosine_threshold"),
-        sscd_weights=config["gatekeeper"].get("sscd_weights"),
+        phash_threshold=phash_thr,
+        cosine_threshold=cos_thr,
+        sscd_weights=gk.get("sscd_weights"),
     )
-    if os.path.exists(config["data"]["train_path"]):
+    if train_path and os.path.exists(train_path):
         # sorted():os.listdir 顺序取决于文件系统/inode,跨容器 rebuild、跨平台
         # (Win 开发机 vs Linux 容器)会变——不排序则被选入去重种子库的前 200 张
         # 可能不同,导致同一张边界重复图 is_duplicate 判定跨环境不一致(踩「宁可漏检
         # 不可误杀」红线)。排序后种子集合确定,判定可复现。
-        train_samples = sorted(os.listdir(config["data"]["train_path"]))
+        train_samples = sorted(os.listdir(train_path))
         limit = min(len(train_samples), 200)
         for i in range(limit):
-            p = os.path.join(
-                config["data"]["train_path"], train_samples[i], "image.png"
-            )
+            p = os.path.join(train_path, train_samples[i], "image.png")
             if os.path.exists(p):
                 train_img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
                 if train_img is not None:
@@ -62,9 +108,10 @@ def build_tamper_detector(config):
     单图 predict.py 无需调用——run_gatekeeper_audit 内部按需懒建；
     视频 video_predict.py 在帧循环前调用此函数，传入 tamper_detector 参数。
     """
+    gk = gatekeeper_cfg(config)
     return CatNetTamperingDetector(
-        catnet_weights=config["gatekeeper"].get("catnet_weights"),
-        bag_hard_reject=config["gatekeeper"].get("bag_hard_reject", False),
+        catnet_weights=gk.get("catnet_weights"),
+        bag_hard_reject=gk.get("bag_hard_reject", False),
     )
 
 
@@ -78,20 +125,57 @@ def resolve_enforcement_mode(config) -> str:
     默认 soft:审计照跑、结果照记,但不再中断诊断输出。
 
     非法值(拼写错误等)一律降级 soft 并打警告——失败方向必须偏向"多输出一份诊断"
-    而非"多拒一张真实图"(统一软flag制度,见 src/gatekeeper/AGENTS.md §1)。同理,
-    `gatekeeper` 段本身写歪(YAML 少一层缩进写成 `gatekeeper: hard`、写成 None/列表)
-    也只降级 soft,**不抛异常**——抛异常会被入口的 except 兜成 ERROR result.json,
-    等于整例零诊断,恰好是本函数要避免的后果(Gate2 审查 P2-1)。
+    而非"多拒一张真实图"(统一软flag制度,见 src/gatekeeper/AGENTS.md §1)。整段写歪
+    (YAML 少一层缩进写成 `gatekeeper: hard`、写成 None/列表)由 `gatekeeper_cfg()`
+    统一兜成 {},本模块所有读该段的地方共用同一降级语义。
     """
-    gk = config.get("gatekeeper")
-    if not isinstance(gk, dict):
-        gk = {}
-    raw = gk.get("enforcement_mode", "soft")
+    raw = gatekeeper_cfg(config).get("enforcement_mode", "soft")
     mode = str(raw).strip().lower()
     if mode not in ("soft", "hard"):
         print(f"--> [WARNING] 未知 gatekeeper.enforcement_mode={raw!r},降级为 'soft'")
         return "soft"
     return mode
+
+
+def collect_soft_flags(tamper_detector) -> list:
+    """把 `CatNetTamperingDetector.last_soft_flags` 归一化成可 JSON 序列化的 list。
+
+    2026-07-29 /code-review 发现:`last_soft_flags` 在生产代码里**零读取点**——
+    `run_gatekeeper_audit` 只解包 `is_tampered`,于是仅被 copy_move/splice/BAG 命中
+    (三者均为软判据,恒不进 is_tampered)的图,`audit["flagged"]` 为 **False**、
+    result.json 完全沉默,软 flag 只出现在 stdout。而 copy_move 在 359 张真实图上
+    误报 27.3%,信号量不小却全丢,与本模块 docstring 自陈的「审计结论必须能落进
+    result.json」直接矛盾(那次修复只覆盖了 phantom/synthetic)。
+
+    `last_soft_flags` 每次 `detect()` 开头重置(tampering_catnet.py:286),故视频
+    逐帧复用同一 detector **无跨帧污染**。旧 detector 对象无该属性 → getattr 兜 []。
+
+    **防御式归一化(2026-07-30 /code-review Angle A 补强)**:软 flag 是纯审计字段,
+    它的畸形**绝不能让整例审计崩溃**(崩了会被入口兜成 ERROR = 零诊断,比丢一条
+    审计记录严重得多)。故对三层畸形都兜底:
+      ① 非二元组元素        → {"type": str(item), "bbox": None};
+      ② bbox 不是可迭代序列  → bbox=None;
+      ③ bbox 元素无法转 int  → 整条 flag 丢弃(bbox 已不可信,留着只会误导复核)。
+    长度≠4 的 bbox 目前三个检测器都不会产出(None 或 4-list),暂原样透传——
+    归一化的目标是"不崩 + 可序列化",不是替上游校验几何语义。
+    """
+    flags = getattr(tamper_detector, "last_soft_flags", None) or []
+    out = []
+    for item in flags:
+        try:
+            kind, bbox = item
+        except (TypeError, ValueError):
+            out.append({"type": str(item), "bbox": None})
+            continue
+        if bbox is None:
+            out.append({"type": str(kind), "bbox": None})
+            continue
+        try:
+            norm_bbox = [int(v) for v in bbox]
+        except (TypeError, ValueError):
+            continue  # bbox 元素畸形(含 None/str/NaN):丢整条,不炸整例
+        out.append({"type": str(kind), "bbox": norm_bbox})
+    return out
 
 
 def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
@@ -111,11 +195,15 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
         `audit` **恒为 dict**(旧契约在通过时返回 None,已改)——审计结论必须能落进
         result.json,否则 phantom/synthetic 软 flag 只打印在 stdout、评测方拿不到。
         字段:
-          flagged                 任一审计项命中(含仅软 flag 的 phantom/synthetic)
-          would_reject_in_hard_mode  去重/篡改命中 → hard 模式下会 REJECTED
+          flagged                 任一审计项命中(含仅软 flag 的 phantom/synthetic/
+                                  copy_move/splice/BAG-相位)
+          would_reject_in_hard_mode  **仅**去重/篡改硬判据命中 → hard 模式下会 REJECTED。
+                                  软 flag 恒不计入(见 soft_flags)
           enforcement_mode        本次生效的模式
           reason                  人类可读命中说明(无命中为 "")
           is_phantom/is_gan/is_duplicate/is_tampered  逐项审计位
+          soft_flags              [{"type": "copy_move"|"splice"|"bag_phase",
+                                    "bbox": [x1,y1,x2,y2]|None}, ...]
 
         仅当 `enforcement_mode == "hard"` 且 would_reject 为真时返回
         `(False, {..., "status": "REJECTED"})`,可直接交 `save_rejection_json`。
@@ -136,6 +224,9 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
     if tamper_detector is None:
         tamper_detector = build_tamper_detector(config)
     is_tampered, _tam_mask, _tam_bbox = tamper_detector.detect(img_np)
+    # 软 flag(copy_move/splice/BAG-相位)恒不进 is_tampered,必须单独取出落进 audit,
+    # 否则只出现在 stdout、评测方与人工复核都拿不到(见 collect_soft_flags)。
+    soft_flags = collect_soft_flags(tamper_detector)
 
     # authenticity 软 flag(2026-07-12,统一软flag制度):authenticity_trainer 的
     # phantom/synthetic 训练标签 100% 来自 synthesis.py 程序化合成代理,从未见过
@@ -176,6 +267,9 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
         rejections.append("(soft-flag: Physical Phantom suspected)")
     elif is_phantom == 2:
         rejections.append("(soft-flag: GAN/Synthetic suspected)")
+    # 篡改软 flag 同理并入 reason(与 phantom 同一处理),人类可读文本不能漏这条信号。
+    for f in soft_flags:
+        rejections.append(f"(soft-flag: {f['type']} suspected)")
 
     audit = {
         "flagged": bool(rejections),
@@ -187,6 +281,11 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
         "is_gan": int(is_phantom == 2),
         "is_duplicate": int(is_duplicate),
         "is_tampered": int(is_tampered),
+        # copy_move/splice/BAG-相位软命中详情。**只计入 flagged,绝不进
+        # would_reject_in_hard_mode**——三者恒为软判据(copy_move 在 359 张真实图上
+        # 误报 27.3%),升级为拒绝依据会直接踩「宁可漏检不可误杀真实影像」红线。
+        # 恢复其硬拒绝权限的唯一闸门是各自真实域 holdout FPR 验收达标。
+        "soft_flags": soft_flags,
     }
 
     if would_reject and mode == "hard":

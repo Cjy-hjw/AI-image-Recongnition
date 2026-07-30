@@ -30,6 +30,12 @@ gatekeeper:
   # 伪造,诊断结果仍参与目标三四五计分"(前提是必须先输出诊断)。故硬拒绝已成
   # 纯负期望——拒对零收益,误拒一次白丢该病例全部临床得分。hard 仅供回归测试与
   # 未来规则变化时启用(非法值一律降级 soft,见 gatekeeper_runner.resolve_enforcement_mode)。
+  #
+  # ⚠️ 本项与下方 `bag_hard_reject` 是**两把独立的锁**,只切一把不会生效:
+  #   enforcement_mode 决定"硬判据命中后是否 REJECTED";
+  #   bag_hard_reject  决定"BAG 相位命中算不算硬判据"(false 时只进 soft_flags)。
+  # 故 `enforcement_mode: hard` + `bag_hard_reject: false` 下,BAG 命中**仍不拒绝**——
+  # 想让 BAG 真正参与拒绝,两处都要切。切换时务必同时确认另一处。
   enforcement_mode: soft
   fpr_threshold: 0.01
   precision_threshold: 0.98
@@ -45,10 +51,17 @@ gatekeeper:
   # sscd_weights:           # 可选,显式指定 SSCD TorchScript 路径;缺省自动探测 checkpoints/
   # catnet_weights:         # 可选,CAT-Net v2 TorchScript 路径;缺省探测 checkpoints/catnet_v2.torchscript.pt
                             #   缺失则降级 dct-bag(纯 NumPy 块伪影栅格取证),detect() 仍含几何检测器并集
-  # BAG 相位取证是否作硬拒绝。默认 false(仅软 flag)——BAG 阈值仅经 8 个合成种子
-  # 小样本验证,远小于 copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的
-  # 唯一闸门:官方真实干净 JPG holdout 上预注册、带置信区间的 FPR 验收达标
+  # BAG 相位取证是否作硬拒绝。默认 false(仅软 flag,进 result.json 的
+  # gatekeeper.soft_flags)——BAG 阈值仅经 8 个合成种子小样本验证,远小于
+  # copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门:官方真实干净
+  # JPG holdout 上预注册、带置信区间的 FPR 验收达标
   # (统一软flag制度,见 docs/P2红线修复实施计划.md B3)。
+  #
+  # ⚠️ 与上方 `enforcement_mode` 是**两把独立的锁**:本项只决定"BAG 命中算不算
+  # 硬判据",即使置 true,也还要 `enforcement_mode: hard` 才会真的 REJECTED。
+  # 反之 `enforcement_mode: hard` 单独切换不会让 BAG 参与拒绝。切一处前先看另一处。
+  # 注:copy_move/splice 无对应开关——二者**恒为软判据**(真实图误报 27.3%),
+  # 无论两把锁怎么切都只进 soft_flags,不驱动 would_reject_in_hard_mode。
   bag_hard_reject: false
   tamper_threshold: 0.5
 

@@ -12,7 +12,11 @@ def _load_env_file_fallback(keys):
     """把 _CRED_FILE 里 KEY=VALUE 行灌进 os.environ,仅填充当前未设置的 key。"""
     if not os.path.isfile(_CRED_FILE):
         return
-    with open(_CRED_FILE, "r", encoding="utf-8") as f:
+    # utf-8-sig:凭证文件常由 Windows 编辑器(记事本 / PowerShell Set-Content)生成,
+    # 带 UTF-8 BOM 时纯 "utf-8" 读法会把首行 key 读成 "﻿DEPLOY_HOST",与 keys
+    # 集合比对失败 → 该 key **静默**不加载,最终报"缺少 DEPLOY_HOST"而文件里明明
+    # 写着,极难排查。utf-8-sig 在无 BOM 时行为与 utf-8 完全一致,无副作用。
+    with open(_CRED_FILE, "r", encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:

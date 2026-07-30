@@ -9,13 +9,13 @@ This package provides reusable inference modules shared by `predict.py` (product
 | File | Responsibility |
 |:---|:---|
 | `io.py` | Image loading (DICOM + PNG/JPG) and PHI anonymization;通道/位深归一化工具 `_to_gray`/`_rescale_to_uint8` 下沉于此(静/动两路径共用,video_io re-import)。`_to_gray` 覆盖全部通道形态((H,W)/(H,W,1)/(H,W,3)/RGBA/channel-first/多光谱 均收敛 2D,杜绝 3D 漏过致下游 `preprocess_image` 5 维崩溃),并以 `channel_order` 区分 RGB(DICOM 像素)与 BGR(OpenCV 视频帧)避免多普勒伪彩加权错位。单图 DICOM 经 `_to_gray` 收敛灰度 |
-| `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline (predict.py 单图 + video_predict.py 动态图) |
+| `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline (predict.py 单图 + video_predict.py 动态图)。**2026-07-29 新增 `collect_soft_flags()`**:把 `CatNetTamperingDetector.last_soft_flags` 归一化成可 JSON 序列化结构落进 audit——此前生产代码零读取该属性,仅 copy_move/splice/BAG 命中的图 `flagged` 为 False、result.json 完全沉默,而 copy_move 在 359 张真实图上误报 27.3%,信号全丢 |
 | `model_runner.py` | Model build, image preprocessing, forward pass |
 | `postprocess.py` | Prediction decoding and TI-RADS breakdown(可选接 `calibration.TemperatureScaler` 做温度缩放) |
 | `calibration.py` | Post-hoc 置信度校准(温度缩放):`TemperatureScaler`(每任务标量 T,缺参数即 T=1.0 降级)+ 离线拟合 `fit_temperature`/`fit_ordinal_temperature` + 诊断 `compute_ece`/`reliability_diagram`。真实数据 2026-08-01 初赛才到,现仅骨架 |
 | `export.py` | Artifact saving (mask, report, JSON, Grad-CAM overlay) |
 | `video_io.py` | 动态图/视频(cine)抽帧:MP4/AVI/MOV/MKV via OpenCV + 多帧 DICOM cine via pydicom;复用 `io._PHI_FIELDS` 脱敏,经 `_to_gray` 统一灰度兜底(含彩色/多普勒 cine);OpenCV 视频帧传 `channel_order="bgr"`、DICOM cine 用默认 `"rgb"`。供 `video_predict.py`(根目录) |
-| `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先) |
+| `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先;**空输入安全返回 `keyframe_index=-1` 不抛**,由 `video_predict.py` 的显式守卫拦全帧失败,见下方「坏帧隔离」) |
 
 ---
 
@@ -66,23 +66,40 @@ Pipeline:
 **Audit dict**(恒返回)。`is_phantom`/`is_gan` 为纯审计字段——非零值**不代表**单独触发拒绝,只有 `is_duplicate`/`is_tampered` 会置 `would_reject_in_hard_mode`;phantom/synthetic 与去重/篡改并发命中时,`reason` 追加 `"(soft-flag: ...)"` 标注保留该并发信号(2026-07-12 code-review 补强,详见 `src/gatekeeper/AGENTS.md` §1):
 ```json
 {
-  "flagged": true,                     // 任一审计项命中(含仅软flag的 phantom/synthetic)
-  "would_reject_in_hard_mode": true,   // 去重/篡改命中 → hard 模式下会 REJECTED
+  "flagged": true,                     // 任一审计项命中(含仅软flag的 phantom/synthetic/copy_move/splice/BAG)
+  "would_reject_in_hard_mode": true,   // **仅**去重/篡改硬判据命中 → hard 模式下会 REJECTED;软flag 恒不计入
   "enforcement_mode": "soft",
-  "reason": "Duplicate image: ..., (soft-flag: Physical Phantom suspected)",
+  "reason": "Duplicate image: ..., (soft-flag: Physical Phantom suspected), (soft-flag: copy_move suspected)",
   "is_phantom": 0,
   "is_gan": 0,
   "is_duplicate": 1,
-  "is_tampered": 0
+  "is_tampered": 0,
+  "soft_flags": [{"type": "copy_move", "bbox": [x1, y1, x2, y2]}]
 }
 ```
+**`soft_flags`(2026-07-29 新增)**:`[{"type": "copy_move"|"splice"|"bag_phase", "bbox": [x1,y1,x2,y2]|None}, ...]`,由 `collect_soft_flags(tamper_detector)` 归一化产出(旧 detector 无该属性 → getattr 兜 `[]`,不 AttributeError;`last_soft_flags` 每次 `detect()` 开头重置,故视频逐帧复用同一 detector 无跨帧污染)。**红线:软 flag 只计入 `flagged`,绝不进 `would_reject_in_hard_mode`**——copy_move/splice 恒为软判据(真实图误报 27.3%),BAG 仅在 `bag_hard_reject=true` 时才升级硬判据。
 仅当 `enforcement_mode == "hard"` **且** `would_reject_in_hard_mode` 为真时返回 `(False, {...上述字段, "status": "REJECTED"})`,可直接交 `save_rejection_json`。soft 模式产物**不含** `status` 键(靠这点区分,回归测试有断言)。
 
-**两个入口如何消费**(`result.json` 的 `gatekeeper` 字段。两条链路 schema **不同**——静态图是单图 audit,动态图是逐帧聚合;共有键 `skipped`/`enforcement_mode`,消费方须先看 `input_type` 再取各自专属键):
+**两个入口如何消费**(`result.json` 的 `gatekeeper` 字段。两条链路 schema **不同**——静态图是单图 audit,动态图是逐帧聚合。**唯一全路径都在的键是 `skipped`**;`enforcement_mode` 只在真正跑过审计时才有(`--skip_gatekeeper` 路径只产出 `{"skipped": true}`,别的键一个都没有)。消费方须先判 `skipped`,再看 `input_type` 取各自专属键):
 - `predict.py` — `{"skipped": false, ...audit}`(静态图无跳过审计的入口,`skipped` 恒 false,保留该键是为让消费方两条链路共用同一份解析代码);
-- `video_predict.py` — `{skipped, enforcement_mode, n_frames_audited, n_frames_flagged, flagged_frame_indices, any_flagged, any_would_reject_in_hard_mode, keyframe_flagged, flagged_frames}`。**soft 下单帧命中不再让整段视频零诊断**(旧逻辑 `return`,32 帧任一误报即整段归零,是本次软化的最大受益点);`--skip_gatekeeper` 时该字段为 `{"skipped": true}`(无其它键)。
+- `video_predict.py` — `{skipped, enforcement_mode, n_frames_audited, n_frames_flagged, flagged_frame_indices, any_flagged, any_would_reject_in_hard_mode, flagged, would_reject_in_hard_mode, keyframe_flagged, flagged_frames}`。**soft 下单帧命中不再让整段视频零诊断**(旧逻辑 `return`,32 帧任一误报即整段归零,是本次软化的最大受益点);`--skip_gatekeeper` 时该字段为 `{"skipped": true}`(无其它键)。
+  - **`flagged`/`would_reject_in_hard_mode` 无前缀别名(2026-07-29 新增)**:与 `predict.py` 单图 audit 的键名对齐——此前视频侧只有 `any_*` 前缀,消费方(评测脚本/人工复核)无法对两条链路写通用读取代码。`any_*` 保留不删(向后兼容已写好的读取方),新增无前缀别名作为**两入口共有键**。
   - **被 flag 的帧仍参与 max 聚合**——这是有意为之:soft 的语义就是"命中只记 flag、诊断照出",把 flagged 帧排除出聚合等于变相执行拒绝,又回到本次要修的坑(且 `detect_copy_move` 在真实图有 27.3% 误报,排除大概率丢的是真帧)。
   - `keyframe_flagged` 显式标注**关键帧本身是否被 flag**——mask/报告/Grad-CAM 全出自关键帧,人工复核应一眼看见"这份报告出自一张被 flag 的帧",不必自己拿 `keyframe_frame_index` 与 `flagged_frame_indices` 做集合运算(二者同一坐标系,都是 `frame_indices` 的原始帧号)。
+
+#### 坏帧隔离(2026-07-29,修复一轮自引入回归)
+
+Phase 1 给 `decode_predictions` 全部分类头加了 NaN/Inf 硬校验(`_assert_finite` 抛 `ValueError`),但 `video_predict.py` 逐帧循环当时**无 try/except**——异常直接冒泡到最外层 `except Exception`,**整段 32 帧全废、status=ERROR**。性质与 Phase 2 花大力气修的「一帧 gatekeeper 命中拖垮整段」完全相同,只是触发源从"审计拒绝"换成"数值校验"。修复语义与 gatekeeper 软化一致:**丢一帧损失有限,丢整段 = 该病例全部临床得分归零**。
+
+`video_predict.py` 逐帧循环现在的契约(2026-07-30 二轮收紧):
+- **只捕 `(NonFiniteProbabilityError, AssertionError)` 两类**,记入 `failed_frames` 后 `continue`。前者是 `_assert_finite` 抛的**专属子类**(2026-07-30 新增,`ValueError` 子类),后者是 `preprocess_image` 的帧形状/维度校验(`assert img_np.ndim == 2`)。**初版用宽口 `except ValueError`,会把 cv2/numpy 在畸形帧上抛的同类型异常误当"可丢帧"吞掉**——故障被伪装成"少几帧"的 PASSED(/code-review Angle C 实测 `cv2.error` 非 ValueError 子类、但 numpy 会抛 ValueError,故必须用专属类型精确区分)。`RuntimeError`(CUDA OOM/权重维度不符)、`cv2.error`、`KeyboardInterrupt` 等真故障必须冒泡成 ERROR。
+- **mask 也罩 `_assert_finite`**(2026-07-30):分类头有硬拦、mask 若漏拦,NaN logits 经 sigmoid 得 NaN,`(NaN>0.5)` 恒 False → **静默产出全零分割图**而 status=PASSED、报告正常,评测只看 JSON 察觉不到分割已废。
+- **`frame_np` 存 per_frame 元素,`img_tensor` 改为只留当前最恶性帧**(2026-07-30 显存优化):32 帧(或不限帧 DICOM cine)的 GPU 张量全量常驻会在官方平台 32G 显存硬上界(rules.md §2 Q33)上叠加模型+Grad-CAM 而 OOM,本地 A800 80G 测不出。逐帧用严格 `>` 刷新 `kf_tensor`(与 `aggregate_frame_predictions` 的 `max(range(n),key=...)` 取首个最大严格同序),显存常驻从 32 帧降到 1 帧;关键帧处有 `kf_img_tensor_pos != agg["keyframe_index"]` 一致性锁(不等则 warning + 重算)。**错位陷阱(2026-07-29 实测复现)**:旧版 `key_tensors` 平行 dict 以全帧下标为键、`keyframe_index` 是 per_frame 下标,跳帧后两空间错位且 `key_tensors[kf_pos]` 恒取得到值、不抛 KeyError,mask/Grad-CAM 静默出自错帧;`frame_np` 存进 per_frame 元素后下标空间只剩一个。
+- **全帧失败**用显式 `if not per_frame:` 守卫落 ERROR + `failed_frames` 明细,**不靠 `assert`**(assert 在 `python -O` 下会被整条剥离)。另有 `if agg["keyframe_index"] < 0:` **双重守卫**(2026-07-30):即便全帧失败守卫未来被误改成只 print 不 return,`per_frame[-1]` 负索引**不抛异常**而静默取末帧,mask/Grad-CAM 出自末帧而 JSON 写 -1,与 key_tensors 错位同性质。
+- **丢帧如实记录,不静默少算**:`result.json` 顶层 `n_frames_sampled` 改取**抽样帧数** `len(frames)`(此前取 `agg["n_frames"]` 即成功帧数),并新增 `n_frames_diagnosed`/`n_frames_failed`/`failed_frame_indices`/`failed_frames`(含每帧 `reason`)。**ERROR 路径键集与 PASSED 对齐**(2026-07-30):全帧失败/无关键帧的 ERROR JSON 也带 `n_frames_diagnosed`/`failed_frame_indices`,下游按"两路径共有 schema 超集"统一解析时不会 KeyError。无失败时 `sampled == diagnosed`、`failed_*` 为空,退化为原行为。
+- **静态图 `predict.py` 不软化**:单图 NaN = 该图没有任何有效诊断,编一份出来是假的;`report_generator.generate_report` 对 NaN `malignancy_prob` 本就是硬报错(2026-07-10 决定,`nan >= 0.5` 恒 False 会静默输出"良性倾向",癌症筛查假阴性),且 ERROR 的 result.json 本身是合法 JSON,比 NaN 污染的"PASSED"更可解析。
+
+回归测试:`tests/test_gatekeeper_soft_enforcement.py::TestBadFrameIsolation`(坏帧隔离 / 关键帧错位指纹 / 全帧失败非 AssertionError / 无失败退化 / RuntimeError 仍冒泡 / 帧形状非法 AssertionError 丢帧 / keyframe_index=-1 显式 ERROR 不负索引静默取末帧)+ `tests/test_probability_output.py::TestNonFiniteProbabilityIsRejected`(专属子类锁定 + mask NaN 也拦)。
 
 ---
 

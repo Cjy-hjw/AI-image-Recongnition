@@ -123,6 +123,95 @@ class TestDecodeEmitsDistributions:
         assert np.isclose(half["mal_probs"].sum(), 1.0, atol=1e-5)
 
 
+class TestNonFiniteProbabilityIsRejected:
+    """概率含 NaN/Inf 必须硬报错,不得导出"看起来正常"的无效分布。
+
+    2026-07-29 `/code-review` 实测复现的两个后果:
+    ① `torch.argmax` 对全 NaN 向量**静默返回 0** —— logits=[0.2, nan, 1.5, -0.3]
+       真实最大值在 idx=2,却报 idx=0,报告打印错误的 TI-RADS 分项;
+    ② `json.dumps` 写出字面量 `NaN`,**非标准 JSON**,严格解析器(Go/Rust/Jackson
+       默认)拒绝整个 result.json —— 该样本零输出,比预测错更严重。
+    与 `report_generator.generate_report` 对 malignancy_prob 的既定处置同范式,
+    但覆盖面扩到全部分类头(generate_report 只校验恶性标量)。
+    """
+
+    @pytest.mark.parametrize("head,bad_logits", [
+        ("composition", [[0.2, float("nan"), 1.5, -0.3]]),
+        ("echogenicity", [[float("inf"), 0.1, 0.2, 0.3]]),
+        ("shape", [[float("nan"), 0.5]]),
+        ("margin", [[0.1, 0.2, float("nan"), 0.4]]),
+        ("foci", [[float("nan"), 0.0, 0.0, 0.0]]),
+        ("malignancy", [[float("inf"), 0.3]]),
+    ])
+    def test_non_finite_logits_raise(self, head, bad_logits):
+        outputs = _fake_outputs()
+        outputs[head] = torch.tensor(bad_logits)
+        with pytest.raises(ValueError, match="NaN/Inf"):
+            decode_predictions(outputs)
+
+    @pytest.mark.parametrize("head", ["composition", "margin", "foci", "malignancy"])
+    def test_negative_infinity_logit_is_legal(self, head):
+        """`-inf` **不该**被拦:softmax/sigmoid 后是有限值(exp(-inf)=0)。
+
+        数学含义就是"该类概率为 0",分布仍和为 1、仍可 JSON 序列化。拦它会把合法
+        的极端置信输出误杀成 ERROR、白丢该样本诊断——本轮写这条断言时第一版测试
+        就误把 `-inf` 当非法,被这条反向用例纠正。校验的是**输出**是否有限,
+        不是输入 logits 是否有限,二者不等价。
+        """
+        outputs = _fake_outputs()
+        n = outputs[head].shape[1]
+        logits = [0.1] * n
+        logits[0] = float("-inf")
+        outputs[head] = torch.tensor([logits])
+        preds = decode_predictions(outputs)  # 不抛即达标
+        key = {"composition": "comp_prob", "margin": "margin_prob",
+               "foci": "foci_prob", "malignancy": "mal_probs"}[head]
+        assert np.all(np.isfinite(preds[key]))
+        assert preds[key][0] == pytest.approx(0.0), "-inf 对应类的概率应为 0"
+
+    def test_argmax_would_have_silently_returned_zero(self):
+        """锁定"为什么必须拦"——证明不拦时 argmax 真的给出错误索引。"""
+        nan_prob = torch.softmax(torch.tensor([[0.2, float("nan"), 1.5, -0.3]]), dim=1)[0]
+        assert int(torch.argmax(nan_prob).item()) == 0, \
+            "前提变了:若 argmax 不再对 NaN 返回 0,本拦截的理由需重新评估"
+        assert 2 == int(torch.argmax(torch.tensor([0.2, -1e9, 1.5, -0.3])).item()), \
+            "真实最大 logit 在 idx=2,与 NaN 下的 0 不符——这就是静默错判"
+
+    def test_error_message_names_the_offending_head(self):
+        outputs = _fake_outputs()
+        outputs["margin"] = torch.tensor([[float("nan"), 0.1, 0.2, 0.3]])
+        with pytest.raises(ValueError, match="margin"):
+            decode_predictions(outputs)
+
+    def test_raises_dedicated_subclass_for_frame_isolation(self):
+        """必须抛 `NonFiniteProbabilityError`(`ValueError` 子类),不能只是基类 ValueError。
+
+        视频逐帧循环靠这个**专属类型**区分「概率无效可丢帧」与「其它 ValueError
+        (cv2/形状故障)须冒泡」——若退化成基类,cv2.error 之外的普通 ValueError
+        会被误当可丢帧吞掉,故障被伪装成"少几帧"的 PASSED。
+        """
+        from src.inference.postprocess import NonFiniteProbabilityError
+        outputs = _fake_outputs()
+        outputs["malignancy"] = torch.tensor([[float("nan"), 0.3]])
+        with pytest.raises(NonFiniteProbabilityError):
+            decode_predictions(outputs)
+        # 同时仍是 ValueError(向后兼容旧 `pytest.raises(ValueError)` 契约)
+        assert issubclass(NonFiniteProbabilityError, ValueError)
+
+    def test_mask_nan_is_also_rejected(self):
+        """mask 的 NaN 不得静默产出全零分割图(2026-07-30 /code-review Angle C)。
+
+        此前只拦六个分类头,mask 路径裸奔:NaN logits 经 sigmoid 得 NaN,
+        `(NaN > 0.5)` 恒 False → **全零 mask**,而 status=PASSED、报告正常——
+        评测/人工只看 JSON 察觉不到分割已废,比报错更隐蔽。
+        """
+        from src.inference.postprocess import NonFiniteProbabilityError
+        outputs = _fake_outputs()
+        outputs["mask"] = torch.full((1, 1, 8, 8), float("nan"))
+        with pytest.raises(NonFiniteProbabilityError, match="mask"):
+            decode_predictions(outputs)
+
+
 class TestProbabilityExportContract:
     """build_probability_export = 两个推理入口共用的导出层,schema 唯一真源。"""
 

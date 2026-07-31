@@ -61,8 +61,13 @@ def test_authenticity_trainer_end_to_end(tmp_path):
     assert np.asarray(ckpt["feat_std"]).shape == (13,)
 
 
-def test_authenticity_module_loads_and_normalizes(tmp_path):
+def test_authenticity_module_loads_and_normalizes(tmp_path, monkeypatch):
     """推理端 AuthenticityModule 加载训练产物后,feat_mean/feat_std 被填充且 predict 可跑。"""
+    # 2026-07-30 交付封印:EXPECTED_CKPT_SHA256 已设为当前生产权重的实际哈希。
+    # 本测试训练一个**全新的**随机权重,哈希必然不匹配——须临时把校验关掉
+    # (monkeypatch 置 None),否则测的不是"加载+归一化"而是"哈希校验拦截"。
+    # 哈希校验本身的正确性由 test_sha256_mismatch_raises / test_sha256_match_passes 覆盖。
+    monkeypatch.setattr(AuthenticityModule, "EXPECTED_CKPT_SHA256", None)
     train_ds = _FakeDataset(12, seed_base=0)
     val_ds = _FakeDataset(6, seed_base=10000)
     save_path = str(tmp_path / "authenticity_model.pth")
@@ -94,4 +99,46 @@ def test_load_weights_raises_when_file_missing(tmp_path):
         module.load_weights(missing_path)
     # 硬报错前不能悄悄改动任何状态(仍是 __init__ 的干净初始状态)
     assert module.feat_mean is None and module.feat_std is None
+
+
+class TestExpectedCkptSha256:
+    """EXPECTED_CKPT_SHA256 完整性校验(2026-07-30 交付封印启用)的双向回归。
+
+    配套 `weights_only=False`(ckpt 含 numpy 标准化统计)防 pickle 任意代码执行。
+    校验启用后:哈希匹配 → 正常加载;不匹配(文件被篡改/损坏/重训后忘更新常量)
+    → 硬 RuntimeError,不允许带不可信权重继续跑。
+    """
+
+    def _make_ckpt(self, tmp_path, seed=0):
+        """训练并保存一个临时 checkpoint,返回路径。"""
+        train_ds = _FakeDataset(8, seed_base=seed)
+        val_ds = _FakeDataset(4, seed_base=seed + 5000)
+        save_path = str(tmp_path / "authenticity_model.pth")
+        train_authenticity_classifier(train_ds, val_ds, torch.device("cpu"), save_path)
+        return save_path
+
+    def test_sha256_match_passes(self, tmp_path, monkeypatch):
+        import hashlib
+        save_path = self._make_ckpt(tmp_path)
+        with open(save_path, "rb") as f:
+            actual = hashlib.sha256(f.read()).hexdigest()
+        monkeypatch.setattr(AuthenticityModule, "EXPECTED_CKPT_SHA256", actual)
+        module = AuthenticityModule()
+        module.load_weights(save_path)  # 不抛即达标
+        assert module.feat_mean is not None
+
+    def test_sha256_mismatch_raises(self, tmp_path, monkeypatch):
+        save_path = self._make_ckpt(tmp_path)
+        monkeypatch.setattr(
+            AuthenticityModule, "EXPECTED_CKPT_SHA256", "0" * 64)  # 必不匹配
+        module = AuthenticityModule()
+        with pytest.raises(RuntimeError, match="integrity check failed"):
+            module.load_weights(save_path)
+
+    def test_sha256_none_skips_check(self, tmp_path, monkeypatch):
+        """开发态(EXPECTED_CKPT_SHA256=None)跳过校验,向后兼容。"""
+        save_path = self._make_ckpt(tmp_path)
+        monkeypatch.setattr(AuthenticityModule, "EXPECTED_CKPT_SHA256", None)
+        module = AuthenticityModule()
+        module.load_weights(save_path)  # 不抛即达标
 

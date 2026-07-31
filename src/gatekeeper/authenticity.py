@@ -182,7 +182,11 @@ class AuthenticityClassifier(nn.Module):
 class AuthenticityModule:
     """High-level class wrapping feature extraction and prediction."""
     # SHA256 of trusted authenticity_model.pth (更新训练后需同步此哈希)
-    EXPECTED_CKPT_SHA256 = None  # 首次训练后设置;None 时跳过校验(开发态)
+    # 2026-07-30 交付封印:从 None 改为当前 A800 上 authenticity_model.pth 的实际哈希。
+    # ⚠️ 双刃剑:此后任何重训(scripts/retrain_authenticity.py)都必须同步更新此常量,
+    # 否则硬报错("not updated after retraining")。时机同 seal_container.py——
+    # 只在最终权重就位后改,改完不再动 authenticity 权重。
+    EXPECTED_CKPT_SHA256 = "25f3afee1e0db18e112a577765429d96f3c051c0199251788d9b4734e4e68c5e"
 
     def __init__(self):
         self.model = AuthenticityClassifier()

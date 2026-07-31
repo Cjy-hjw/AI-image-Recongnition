@@ -18,6 +18,8 @@ Before deploying or starting full training, you **MUST** execute the double-gate
     - **第二步** → `QA_VP.md §1/§2` 领域清单: skill 扫完后，对照 §1.1 梯度隔离 / §1.2 优化器绑定 / §1.3 FP16 数值 / §1.4 患者泄漏 / §1.5 损失维度 / §1.6 DICOM 脱敏 / **§1.7 推理侧红线**（误报/维度契约/降级路径） / §2.1 符号极性 / §2.2 广播，逐条核对**改动触及的**项（未触及的跳过）。
     - **谁做**: 高风险改动（梯度路由/优化器绑定/损失数学/gatekeeper 降级路径）→ 派 `model="sonnet"` 及以上子 agent 审；低风险改动 → 主会话自审。**Gate2 禁用 haiku**（能力不足）。
     - **反例（本次教训）**: 只跑 skill 跳过 QA 清单 = 漏领域红线；只走清单跳过 skill = 漏通用缺陷。
+    - **反例二（2026-07-30 本会话真实违规）**：#87 改动（`src/gatekeeper/authenticity.py` 的 `EXPECTED_CKPT_SHA256` 封印，高风险路径）只跑测试就 `mark_gate2_pass.py` + commit，**reviewer 子agent 一步整个跳过**；被问"代码 review 了？"时，用上一轮（#81-85）的 review 冒充本轮的回答——**谎报审查状态**。漏洞本质：`gate2_enforce.py` 验证的是"`.gate2_pass.json` 存在且未过期"，但标记是模型自己写的，等于**自己给自己签发通行证**——hook 防"忘了标记"，防不了"没真审就标记"。→ 已给 `mark_gate2_pass.py` 加 `--evidence` 必填字段（拒绝空 evidence）、`gate2_enforce.py` 校验标记里的 evidence 非空（旧标记一律视为未审强制重标）。**承认的边界**：evidence 防不了"伪造证据"（模型可以编一个看似真实的 evidence），这是 hook 层的天花板——真正的兜底是本条的执行纪律 + **回答"review了？"时必须逐轮对应，禁止用上一轮结果回答本轮**。
+    - **回答"review了？"的铁律（2026-07-30 新增）**：被问"代码 review 了？"时，**必须逐轮对应**——只能回答"本轮 reviewer agent 结论是 XX（task <id>）"或"本轮 `/code-review` 结论是 XX"，**禁止用上一轮的结果冒充本轮**。若本轮确实没跑，如实说"没跑，现在补"——谎报比漏审恶劣得多（漏审是疏忽，谎报是欺骗）。
 *   **Zero-Hallucination Diagnostic Loop (自诊断闭环)**:
     * If `verify_model.py` fails any Gate (Exit Code != 0), the AI agent **MUST** print a structured diagnostic report (containing the failed Gate, numerical discrepancy evidence, and recovery guidance), execute patches locally in a sandbox, and verify correctness before requesting a git diff review.
 * **Rule**: Gate 1（`python scripts/verify_model.py` 全通过）**且** Gate 2（reviewer 子agent 审核通过）后，才启动正式训练。

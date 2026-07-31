@@ -109,6 +109,23 @@ if age > MARKER_TTL_SECONDS:
     )
     sys.exit(2)
 
+# 2026-07-30 新增:标记必须带非空 evidence——2026-07-30 本会话真实违规:#87
+# 改动(src/gatekeeper/authenticity.py,高风险路径)只跑测试就 mark_gate2_pass +
+# commit,reviewer 子agent 一步整个跳过;且回答"review了?"时用上一轮的 review
+# 冒充本轮。hook 只查"标记存在",查不了"真审没审"——evidence 字段把审查证据
+# 落到磁盘,空标记无处可藏、事后可追溯当时声称的审查是什么。旧标记(无该字段)
+# 一律视为未审,强制重审重标。
+evidence = str(marker.get("evidence", "")).strip()
+if not evidence:
+    print(
+        "[GATE2-BLOCK] Gate2 标记缺少审查证据(evidence 为空)。\n"
+        "2026-07-30 起标记必须附带审查来源与结论,例如:\n"
+        '  python .claude/hooks/mark_gate2_pass.py --evidence "reviewer agent 结论:..." <files>\n'
+        "若确实只是主会话自审,写:--evidence \"主会话自审:<审查了什么、结论>\"",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 # staged 已是仓库相对路径（git diff 输出），marked_files 统一转相对路径再比对——
 # 二者格式不一致正是本次 Gate2 审查揪出的核心 bug（详见 gate2_paths.py 顶部注释）。
 marked_files = {to_repo_relative(f) for f in marker.get("files", [])}

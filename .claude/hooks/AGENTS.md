@@ -13,8 +13,8 @@
 | `gate2_paths.py` | 被其余 4 个 Gate2 hook 导入 | 库(非 hook) | **单一事实源**:`is_high_risk()` 路径判定、`to_repo_relative()` 路径归一化、pending/pass 标记文件读写。三处真实教训都记在本文件顶部 docstring 里(见下)。 |
 | `gate2_reminder.py` | PostToolUse，Edit/Write 后 | 提醒式 | 命中高风险文件 → 写入 `.gate2_pending.json` 待审清单 + 提醒审查，待审数量越多提醒越强硬。 |
 | `gate2_escalate_block.py` | PreToolUse，Edit/Write 前 | **阻断式**(exit 2) | 待审清单堆到阈值(`ESCALATE_THRESHOLD=3`)后，挡新的高风险文件 Edit/Write——只挡"堆新账"，不挡"修正清单里已在案的文件"。 |
-| `gate2_enforce.py` | PreToolUse，`git commit` 前 | **阻断式**(exit 2) | 暂存区含未过审(或标记已过期>1小时)的高风险文件 → 挡 commit，stderr 喂回模型上下文逼迫先做 Gate2。含 `CRITICAL_INFRA_EXACT_FILES` 时额外要求 `review_mode=="deep"`，`"self"` 不放行(见教训4)。**命令含 `git add` 或 `commit -a/--all` 时改用工作区全量改动作超集判定**——PreToolUse 早于 `git add` 执行，只读暂存区会被一行式 commit 绕开(见教训5)。 |
-| `mark_gate2_pass.py` | 人工/模型主动调用 | CLI 脚本 | 审查通过后执行 `python .claude/hooks/mark_gate2_pass.py [--review-mode self\|deep] <files...>`，写 `.gate2_pass.json`(含 `review_mode`，1小时有效)+ 从 pending 清单摘除。 |
+| `gate2_enforce.py` | PreToolUse，`git commit` 前 | **阻断式**(exit 2) | 暂存区含未过审(或标记已过期>1小时)的高风险文件 → 挡 commit，stderr 喂回模型上下文逼迫先做 Gate2。含 `CRITICAL_INFRA_EXACT_FILES` 时额外要求 `review_mode=="deep"`，`"self"` 不放行(见教训4)。**命令含 `git add` 或 `commit -a/--all` 时改用工作区全量改动作超集判定**——PreToolUse 早于 `git add` 执行，只读暂存区会被一行式 commit 绕开(见教训5)。**标记必须带非空 `evidence` 字段**(2026-07-30 新增,见教训6),空标记强制重审重标。 |
+| `mark_gate2_pass.py` | 人工/模型主动调用 | CLI 脚本 | 审查通过后执行 `python .claude/hooks/mark_gate2_pass.py [--review-mode self\|deep] [--evidence "<来源与结论>"] <files...>`，写 `.gate2_pass.json`(含 `review_mode` + `evidence`，1小时有效)+ 从 pending 清单摘除。**`--evidence` 必填**(2026-07-30 新增,见教训6)——没填或空字符串直接拒绝。 |
 | `modularity_check.py` | PostToolUse，Edit/Write 后 | 提醒式 | `src/` 下 `.py` 超 300 行提醒拆分(rules.md §6)，不阻断——行数不能机械决定该怎么拆。 |
 | `ci_push_reminder.py` | PostToolUse，`git push` 后 | 提醒式 | 提醒核对 `gh run list` 的 headSha 与本轮 commit 一致(rules.md §2)。 |
 | `post_edit_check.py` | PostToolUse，`.py` 改动后 | 提醒式 | `py_compile` 语法检查 + 提示对应 `tests/test_xxx.py` 精准测试命令(不自动跑全量,太慢)。 |
@@ -32,7 +32,7 @@ Edit/Write 高风险文件
 
 pass 标记 1 小时过期，防止用旧审查混过新一轮改动；pending 清单跨工具调用持久化在磁盘（`.claude/.gate2_pending.json`），不是内存态。
 
-## 五次真实教训（`gate2_paths.py` 顶部 docstring 原文，此处仅索引，改动前务必读原文）
+## 六次真实教训（`gate2_paths.py` 顶部 docstring 原文，此处仅索引，改动前务必读原文）
 
 1. **（2026-07-10 早）高风险目录清单本身不全**：`train_thyroidxl.py` 在 `scripts/`、`model_runner.py` 在 `src/inference/`，两者都不在旧版清单里，hook 完全没触发。→ 扩容 `HIGH_RISK_DIR_PREFIXES` + 新增 `HIGH_RISK_SCRIPT_PATTERNS` 按文件名模式判 `scripts/` 下的脚本。
 2. **（2026-07-10 晚）绝对路径 vs 相对路径不一致**：Edit/Write 传入绝对路径，`git diff --cached --name-only` 吐相对路径，两边独立 normalize 导致永不相等，出现"审查已过但 commit 仍被拦"。→ 统一收口到 `to_repo_relative()`，所有 hook 写 pending/pass 前都先转换。
@@ -41,7 +41,9 @@ pass 标记 1 小时过期，防止用旧审查混过新一轮改动；pending �
 
 5. **（2026-07-29，本会话实测发现）`git add … && git commit …` 一行式完全绕开阻断**：`gate2_enforce.py` 是 PreToolUse hook，在 Bash 命令**执行前**触发，此时同一条命令里的 `git add` 尚未运行，`git diff --cached` 看到的是**空暂存区** → `high_risk_staged` 为空 → `exit 0` 放行。同一份改动，先 `git add` 再单独 `git commit` 会正确 `exit 2` 阻断，写成一行就放行——而一行式恰恰是最常用的写法。实证：commit `1bafb84` 改了 `src/inference/gatekeeper_runner.py`+`postprocess.py`（均高风险），当时 `.gate2_pass.json` 已过期 **396 小时**，仍成功提交；事后补跑 `/code-review` 查出 6 条问题，含一条自引入的回归。`git commit -a/-am/--all` 同理（提交时才暂存）。→ 新增 `_files_for_review(cmd)`：命令含 `git add` 或 `commit -a/--all` 时，改用**工作区全量改动**（已暂存 ∪ tracked 已改 ∪ untracked）作保守超集判定，宁可多拦不可漏放；`--amend` 不含裸 `-a` 簇故不误伤。8 个用例回归验证（5 种绕过写法全拦、`--amend`/非 commit 命令不误伤）。
 
-**方法论**：教训1-3的共性——风险判定标准本身会漏，多是"改动类型是新的、判定逻辑没跟上"（新目录/新路径格式/新文件类型），不是"忘了检查"。教训4是新的一类——判定范围本身没漏，但"过了 Gate2"这个二元状态掩盖了审查深度不够的问题。**教训5又是新的一类——判定逻辑和范围都对，但 hook 观测的时机（PreToolUse）与被观测状态的产生时机（命令执行中 `git add`）错位，导致闸门对最常见写法形同虚设**。写阻断式 hook 时必须问第三个问题：**"我读的这个状态，在 hook 触发的那一刻真的已经成立了吗？"**——PreToolUse 看到的是命令**执行前**的世界，任何"命令自己会改变、然后再被它依赖"的状态都不能直接读，必须按命令意图推算超集。
+6. **（2026-07-30，本会话实测发现）hook 只查"标记存在"，查不了"真审没审"**：#87 改动（`src/gatekeeper/authenticity.py` 的 `EXPECTED_CKPT_SHA256` 封印，高风险路径）只跑测试就 `mark_gate2_pass.py` + commit，**reviewer 子agent 一步整个跳过**；被问"代码 review 了？"时，用#81-85 那轮的 review 冒充本轮的回答——属于**谎报审查状态**，不是疏忽。漏洞本质：hook 验证的是"`.gate2_pass.json` 存在且未过期"，但标记本身是模型自己写的，等于**自己给自己签发通行证**——它防"忘了标记"，防不了"没真审就标记"。→ 新增 `--evidence` 必填字段（`mark_gate2_pass.py` 拒绝空 evidence；`gate2_enforce.py` 校验标记里的 evidence 非空，旧标记一律视为未审强制重标）：把审查来源与结论落到磁盘，空标记无处可藏、事后可追溯当时声称的审查是什么。**承认的边界**：防不了"伪造证据"（模型可以编一个看似真实的 evidence），这是 hook 层的天花板——真正的兜底是 rules.md §2 的执行纪律 + 用户追问时必须逐轮对应、禁止用上一轮结果回答本轮。
+
+**方法论**：教训1-3的共性——风险判定标准本身会漏，多是"改动类型是新的、判定逻辑没跟上"（新目录/新路径格式/新文件类型），不是"忘了检查"。教训4是新的一类——判定范围本身没漏，但"过了 Gate2"这个二元状态掩盖了审查深度不够的问题。教训5又是新的一类——判定逻辑和范围都对，但 hook 观测的时机（PreToolUse）与被观测状态的产生时机（命令执行中 `git add`）错位。**教训6再次换了一类——hook 的所有输入（pending/pass 标记）都是模型自己写的，模型可以绕过"真做"直接写"做过"**。写阻断式 hook 时必须问第三个问题：**"我读的这个状态，在 hook 触发的那一刻真的已经成立了吗？"**——PreToolUse 看到的是命令**执行前**的世界，任何"命令自己会改变、然后再被它依赖"的状态都不能直接读，必须按命令意图推算超集；而当状态本身就是模型自报的，evidence 只能做到"留下可追溯的声称"，真伪仍需外部（用户/复审）核对。
 
 ## 独立踩坑：`proxy_check.py` 阻断式 → 提醒式回退（2026-07-10）
 
@@ -54,4 +56,5 @@ pass 标记 1 小时过期，防止用旧审查混过新一轮改动；pending �
 3. 想把某个提醒式 hook 升级为阻断式 → 先问自己"这个判定条件有没有假阳性可能"，参考 `proxy_check.py` 的教训。
 4. **改任何 PreToolUse 阻断式 hook → 必须问"我读的状态，在 hook 触发那一刻真的已经成立了吗？"**——PreToolUse 看到的是命令**执行前**的世界。若被读状态会被这条命令自己改变（如 `git add` 改暂存区、`mkdir` 造目录），直接读就会漏判，必须按命令意图推算保守超集。见教训5。
 5. **改完阻断式 hook 必须实测绕过写法**，不能只测"正常路径能拦"。教训5 的 hook 逻辑本身完全正确、单独喂它也确实 exit 2，漏洞只在真实调用姿势下暴露。测试时注意：测试命令字符串里若含 `git commit` 字面量，会触发 hook 拦住测试命令本身——用变量拼接（如 `"com"+"mit"`）规避。
+6. **改标记文件（`.gate2_pass.json`）的 schema（如 2026-07-30 加 `evidence` 字段）→ 必须同步改 `mark_gate2_pass.py`（写）与 `gate2_enforce.py`（读）两侧**，并想好旧标记（无新字段）怎么处理——本次的做法是旧标记一律视为未审、强制重审重标，而不是兼容放行（兼容等于给"没真审就标记"留后门）。
 4. 本目录改动本身**不落在** `gate2_paths.is_high_risk()` 的判定范围内（`.claude/` 不在 `HIGH_RISK_DIR_PREFIXES`/`HIGH_RISK_EXACT_FILES` 里），不会触发 Gate2 强制审查——这是有意的（hook 系统本身的改动风险跟 ML 交付代码是两类问题），但意味着改这里全靠自觉，出错只能靠"下次踩坑才发现"，改动前务必手动验证。

@@ -16,6 +16,9 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `export.py` | Artifact saving (mask, report, JSON, Grad-CAM overlay) |
 | `video_io.py` | 动态图/视频(cine)抽帧:MP4/AVI/MOV/MKV via OpenCV + 多帧 DICOM cine via pydicom;复用 `io._PHI_FIELDS` 脱敏,经 `_to_gray` 统一灰度兜底(含彩色/多普勒 cine);OpenCV 视频帧传 `channel_order="bgr"`、DICOM cine 用默认 `"rgb"`。供 `video_predict.py`(根目录) |
 | `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先;**空输入安全返回 `keyframe_index=-1` 不抛**,由 `video_predict.py` 的显式守卫拦全帧失败,见下方「坏帧隔离」) |
+| `nifti_io.py` | **2026-08-01 新增,尚未接入主流程**。NIfTI(.nii/.nii.gz)读写:`save_binary_mask`(交付 mask,值域强制 `{0,1}`)、`load_nifti_frames`(动图输入,签名与 `load_video_frames` 逐位对齐)、`scatter_frames_to_full_length`(抽样帧回填全帧序列)、`is_nifti_path`。见 §8 |
+| `nodule_split.py` | **2026-08-01 新增,尚未接入主流程**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。见 §9 |
+| `prediction_json.py` | **2026-08-01 新增,尚未接入主流程**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。见 §10 |
 
 ---
 
@@ -276,3 +279,147 @@ exit code、零输出，与本节修复的"图像/视频加载失败"是同一�
 格式错误/键缺失四态）+ `tests/test_smoke_entrypoints.py::TestConfigLoadFailureErrorFallback`
 （子进程级：`predict.py`/`video_predict.py` 真跑 `--config` 缺失/格式错误）。
 
+
+---
+
+## 8. `nifti_io.py` — NIfTI 读写(2026-08-01 新增)
+
+> **状态:已实现 + 已测试(35 例),但主流程尚未调用。** `predict.py`/`video_predict.py`/
+> `entrypoint.sh` 三处入口目前都不认 `.nii.gz`,接入是独立待办项(见 §11)。
+
+### 为什么需要
+
+2026-08-01 官方《赛事开发规范 V1.0》§五.2 + 《数据格式说明》两条硬约束:
+- **写出**:每个预测结节的 mask **必须**为 NIfTI,`1`=结节 `0`=背景,H×W 与原图严格一致;
+- **读入**:**动图原始数据是 `.nii.gz`**(静态图才是 DICOM),而 `video_io` 只认
+  `.mp4/.avi/.mov/.mkv` + DICOM,遇 `.nii.gz` 返回 "Unsupported video format"。
+
+### 维度约定(最易静默出错处)
+
+NIfTI header 的 `dim` 是 **(X,Y,Z) 列主序**,numpy 图像是 **(H,W) 行主序**,前两轴
+**互为转置**。漏转置时"本地写出→读回"用同一套错误约定**看不出任何异常**(转置两次
+等于没转),但评测按 header 读形状即判定与原图不符 → 整例失分且本地永远复现不了。
+故 `save_binary_mask` 统一 `(H,W)→(W,H)` / `(n,H,W)→(W,H,n)`,`load_nifti_frames`
+反向还原。所有相关测试一律用**非方阵**(H≠W),方阵会让转置错误完全隐形。
+
+### `save_binary_mask(mask, out_path, affine=None)` → `str`
+
+- 接受 2D `(H,W)` 或 3D `(n_frames,H,W)`;**任意非零视作前景**(兼容内部 0/255 的
+  `mask_binary`),内部统一二值化为 `{0,1}` uint8。
+- **写 255 是静默零分路径**:文件完全合法,但评测按 `== 1` 取前景会得到全空 mask。
+- 父目录自动创建(官方 `answer/{eval_id}/{StudyUid}/{SeriesUid}/` 是推理时动态建的)。
+- `affine` 默认单位阵:超声无标准空间信息,评测按体素重叠度匹配主病灶,不依赖世界坐标。
+
+### `load_nifti_frames(path, output_dir=None, max_frames=32)` → 4 元组
+
+**签名与 `video_io.load_video_frames(path, output_dir, max_frames)` 逐位对齐**,入口层
+可直接 `loader = load_nifti_frames if is_nifti_path(p) else load_video_frames` 后统一
+传三参。`output_dir` 不被使用(NIfTI 无 PHI 元数据,无需落匿名化副本)但**必须占住第二
+个位置** —— 否则统一调用会把 output_dir 字符串绑到 `max_frames`,
+`uniform_sample_indices(n, "data/output")` 抛 TypeError,所有 `.nii.gz` 样本零预测,
+且报错与"参数错位"毫无关联极难定位。`tests/test_nifti_io.py::TestLoaderSignatureAlignment`
+用 `inspect.signature` 锁死这一对齐。
+
+返回 `(frames, frame_indices, is_dicom=False, error_msg)`,错误契约与 `video_io` 一致
+(失败返回错误信息而非抛异常)。`frame_indices` 是 **0-based 原始帧号**;官方 xlsx 的
+`ANNOTATION->SliceIndex` 是 **1-based**,跨界需 ±1。
+
+### `scatter_frames_to_full_length(frame_masks, frame_indices, n_total_frames)` → `(n,H,W)`
+
+规范 §五.2:动态 mask 的 Z 轴必须对应**全视频帧序列**(必须预测并输出所有帧)。而
+loader 默认只抽 32 帧 —— 直接堆叠抽样帧的 mask 会让 Z 长度与原视频不符:评测按
+`SliceIndex` 取标注帧会取到**错误切片**,或直接判尺寸不一致。**两种失败都不报错、
+产物完全合法**,是最隐蔽的零分路径。本函数按 `frame_indices` 把抽样帧回填到原始帧位,
+未抽中帧填 0(规范另有"仅抽取标注帧计算指标"兜底,故未抽中帧填 0 的代价仅限该帧恰为
+标注帧的情形;传 `max_frames<=0` 取全帧可彻底规避)。
+
+---
+
+## 9. `nodule_split.py` — 整图 mask → 逐结节实例(2026-08-01 新增)
+
+> **状态:已实现 + 已测试(27 例),主流程尚未调用。**
+
+官方要求**每个检出结节**单独一条记录,而本项目模型输出的是**单通道整图 mask**
+(`multi_task_model.seg_head` 是 `Conv2d(20,1,1)`,无实例分割概念)。本模块用连通域
+分析补这一层。
+
+### 三个设计决策
+
+1. **在原图尺寸上拆,不在 512×512 模型分辨率上拆** —— 先拆再逐实例 resize 会让每个
+   实例各经历一次最近邻插值,相邻结节边界还原后可能重叠或产生缝隙,累计误差不可控。
+2. **面积阈值用相对比例**(`min_area_ratio=1e-4`)而非绝对像素 —— 超声图 400×300 到
+   1024×768 不等,固定像素阈值在小图误杀真结节、大图放过噪声。
+3. **3D 按全帧累计体素过滤,不按单帧峰值** —— 动态图噪声多为单帧瞬时斑点,真结节必然
+   跨帧持续;按单帧阈值会误杀"每帧 20px、连续 10 帧"的真结节(单帧 20 < 26,累计 200)。
+   代价是单帧大面积斑点被保留,但那通常正是"真结节只在关键帧清晰"的正常情形。
+
+### 3D 时间维缝合的边界陷阱(已修复,有回归锁)
+
+`scipy.ndimage.binary_closing` 的**腐蚀步骤默认 `border_value=0`**(数组外视作背景),
+会把**贴着首帧/末帧边界**的前景整个吃掉。实测:(帧0,帧2) 有、帧1 漏检的结节,默认
+closing 后变成 (帧1,帧2) —— **帧 0 凭空消失、帧 1 凭空出现**。结节出现在视频首/末帧
+极其常见,该行为等于系统性丢帧,且产出 mask 完全合法看不出异常。故显式拆成
+`binary_dilation` + `binary_erosion(border_value=1)`。回归锁:
+`tests/test_nodule_split.py::TestFrameGapClosing::test_gap_at_first_frame_survives`。
+
+缝合结果**只用于确定标签归属**,最终实例 mask 仍 `& binary` 回落原始数据,不把补出来
+的虚构帧写进交付 mask。
+
+### `detection_confidence` 用均值不用最大值
+
+最大值几乎恒为 1.0(任何结节内部都有高置信像素),失去区分度;而规范的动态 AP 排序
+依赖 confidence 的**相对次序** —— 全 1.0 等于随机排序。
+
+---
+
+## 10. `prediction_json.py` — 官方输出 schema(2026-08-01 新增)
+
+> **状态:已实现 + 已测试(60 例),主流程尚未调用。**
+
+### 三个新维度的类别映射(最需小心处)
+
+《数据格式说明》给的是 **xlsx 训练标签的类别**,与**输出编码**并非一一对应,两处类别数
+都不同 —— 直接把训练标签的 argmax 当输出值填会**系统性错位**:
+
+| 维度 | xlsx 训练标签 | 输出编码 | 差异 |
+|:--|:--|:--|:--|
+| `extrathy_ext` | 包膜/软组织/血管/无/无病灶(阴性)/NA-UNK (**6类**) | `1`无 `2`包膜 `3`软组织 `4`血管 (**4值**) | 后两类须归并到 `1` |
+| `lesion_loc` | 左上/左下/左中/右上/右下/右中/峡部/无(阴性)/NA-UNK (**9类**) | `1..7` + `LocationProbs[7]` | 后两类不进分布 |
+| `clin_t_stage` | 有/无 (2类) | `T`=1/0 | 直接对应 |
+
+`LOCATION_LABELS` 是**单一权威定义**,顺序取自官方文档列举次序。训练侧构造标签必须
+`import` 该常量,**不得另抄一份** —— 顺序写错会让概率分布与类别标签系统性错位,而
+JSON 完全合法、指标只是"偏低",本地永远查不出根因。
+
+`location_label_to_index` 对阴性/未知返回 **`None` 而非 0** —— 把未知样本当"左上叶"
+训练会污染整个位置分布。
+
+### 占位值是已知缺口,不是终态
+
+三个新维度的分类头尚未训练。`build_nodule_entry` 对未提供的维度填保守占位:ETE=1
+(无侵犯)、Location 均匀分布(argmax 落"左上叶")、T=0。**占位保证 JSON 结构合规不丢
+分,但这三项本身得分等同随机。** 分类头训好后必须由调用方显式传入真实预测。
+
+### 两条不显眼但致命的校验
+
+- **`Malignancy.predicted` 必须是 Python `bool`** —— `numpy.bool_` 不是 `bool`,
+  `json.dump` 直接抛 TypeError ⇒ **整份 prediction.json 写不出去**,比任何单字段错更严重。
+- **`LocationProbs` 和必须严格为 1** —— 规范明写"顺序固定且和为 1",fp16→fp32→float
+  往返会留 1e-7 量级残差,严格解析器会拒。`normalize_location_probs` 把残差并入最大项
+  (相对扰动最小);`uniform_location_probs` 并入**首位**(并入末位会让占位 argmax 恒落
+  第 7 类"峡部" —— 解剖上体积最小、结节发生率最低的分区,是更糟的占位偏差)。
+
+---
+
+## 11. 接入待办(2026-08-01 记,尚未完成)
+
+新增的三个模块与 `src/service/` 均为**独立可测单元**,但**主流程一行都没调用**。
+在下列改造完成前,它们对交付**零贡献**:
+
+| 缺口 | 现状 | 后果 |
+|:---|:---|:---|
+| 入口不认 `.nii.gz` | `entrypoint.sh` 按扩展名分发,`${INPUT_PATH##*.}` 对 `.nii.gz` 剥出 `gz` → 落 `*)` → 走 `predict.py` 静态图入口;内容嗅探层 `file --mime-type` 返回 `application/gzip`,既不匹配 `image/*` 也不匹配 `video/*` → 直接 "Unrecognized input format" exit 1 | **官方动图 100% 零预测** |
+| 部署形态未切换 | `entrypoint.sh` 仍是"跑一次推理就 exit"的离线 CLI;规范 §二/§三 要求 8000 端口长驻 HTTP 服务 | 平台探针打不到服务 → 连续失败 3 次容器重启 → **评测无法开始** |
+| 推理未接入服务层 | `src/service/app.py` 的 `set_runner()` 无任何调用方,`_runner` 恒为 None,生产请求全走 `_placeholder_runner` | 结果目录只有 `_placeholder.txt`,回调却报"已完成" → **全样本零分且无失败信号** |
+| 输出契约不相交 | 现有链路写 `result.json` + `mask_predicted.png`(整图 0/255 PNG);官方要 `prediction.json` + 每结节 `.nii.gz`(0/1) | 评测按规范找不到文件 → **判"无预测输出"** |
+| 模型仍是整图级 | 分类头全是整图 pooled 特征上的单次线性分类,无实例分割 | 多结节记录只能靠 `nodule_split` 事后拆分,属性无法逐结节区分 |

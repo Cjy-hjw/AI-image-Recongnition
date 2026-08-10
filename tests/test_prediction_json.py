@@ -35,7 +35,7 @@ from src.inference.prediction_json import (
 )
 
 
-def _entry(nid="N1", mask="n1.nii.gz", **kw):
+def _entry(nid="N1", mask="SERIES_UID/n1.nii.gz", **kw):
     kw.setdefault("detection_confidence", 0.9)
     kw.setdefault("malignancy_confidence", 0.7)
     kw.setdefault("tirads_class", 4)
@@ -50,7 +50,7 @@ class TestSchemaShape:
         validate_prediction_json(p)  # 不抛即通过
         assert p["StudyUID"] == "STU001"
         assert p["ProcessingTime_ms"] == 1234
-        assert p["Prediction"]["MaskFiles"] == ["n1.nii.gz"]
+        assert p["Prediction"]["MaskFiles"] == ["SERIES_UID/n1.nii.gz"]
 
     def test_negative_case_is_empty_array_not_error(self):
         """规范:阴性病例 Nodules 为空数组。空是合法输出,不是错误。"""
@@ -65,8 +65,69 @@ class TestSchemaShape:
 
     def test_maskfiles_mirrors_nodule_maskfile(self):
         p = build_prediction_json(
-            "S", [_entry("N1", "a.nii.gz"), _entry("N2", "b.nii.gz")], 1)
-        assert p["Prediction"]["MaskFiles"] == ["a.nii.gz", "b.nii.gz"]
+            "S",
+            [_entry("N1", "SERIES_A/a.nii.gz"), _entry("N2", "SERIES_B/b.nii.gz")],
+            1)
+        assert p["Prediction"]["MaskFiles"] == [
+            "SERIES_A/a.nii.gz", "SERIES_B/b.nii.gz"]
+
+    def test_studyuid_field_carries_patient_id(self):
+        """V2.1:StudyUID 字段值填 PatientId(非真正 StudyUid)。
+        构造时传 PatientId,断言输出 StudyUID 等于它 —— 这是目录一级命名与
+        prediction.json 字段对齐的唯一契约。"""
+        patient_id = "PAT_2026_0007"
+        p = build_prediction_json(patient_id, [_entry()], 1)
+        assert p["StudyUID"] == patient_id
+
+
+class TestRelativeMaskPath:
+    """V2.1:MaskFile 须是相对病例一级目录的路径,禁绝对路径/`..`越界。"""
+
+    def test_legal_relative_path_accepted(self):
+        """`SERIES/nodule_001.nii.gz` 形态合法,build 与 validate 两侧都不抛。"""
+        e = _entry(mask="SERIES_UID/nodule_001.nii.gz")
+        validate_prediction_json(build_prediction_json("P", [e], 1))  # 不抛即通过
+
+    def test_plain_filename_still_accepted(self):
+        """V2.0 纯文件名形态仍兼容(不强制相对路径,只禁违规形态)。"""
+        e = _entry(mask="nodule_001.nii.gz")
+        validate_prediction_json(build_prediction_json("P", [e], 1))
+
+    @pytest.mark.parametrize("bad", [
+        "/x/y.nii.gz",        # POSIX 绝对路径
+        "C:/x/y.nii.gz",      # Windows 盘符绝对路径
+        "C:\\x\\y.nii.gz",    # Windows 反斜杠绝对路径
+    ])
+    def test_absolute_path_rejected_at_build(self, bad):
+        with pytest.raises(PredictionSchemaError, match="绝对路径"):
+            _entry(mask=bad)
+
+    @pytest.mark.parametrize("bad", [
+        "../escape.nii.gz",          # 末段 `..` 越界
+        "SERIES/../escape.nii.gz",   # 中段 `..` 越界
+        "../SERIES/n1.nii.gz",       # 首段 `..` 越界
+        "SERIES/..\\escape.nii.gz",  # 混合分隔符的 `..`
+    ])
+    def test_parent_dir_traversal_rejected_at_build(self, bad):
+        with pytest.raises(PredictionSchemaError, match=r"\.\."):
+            _entry(mask=bad)
+
+    def test_absolute_path_rejected_at_validate(self):
+        """validate 闸门须拦住手工拼装的违规 payload(不只依赖 build 侧)。"""
+        e = _entry()
+        p = build_prediction_json("P", [e], 1)
+        p["Prediction"]["MaskFiles"] = ["/abs/path.nii.gz"]
+        p["Prediction"]["Nodules"][0]["MaskFile"] = "/abs/path.nii.gz"
+        with pytest.raises(PredictionSchemaError, match="绝对路径"):
+            validate_prediction_json(p)
+
+    def test_parent_traversal_rejected_at_validate(self):
+        e = _entry()
+        p = build_prediction_json("P", [e], 1)
+        p["Prediction"]["MaskFiles"] = ["../esc.nii.gz"]
+        p["Prediction"]["Nodules"][0]["MaskFile"] = "../esc.nii.gz"
+        with pytest.raises(PredictionSchemaError, match=r"\.\."):
+            validate_prediction_json(p)
 
 
 class TestLocationOrdering:

@@ -33,7 +33,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 - **`src/gatekeeper/`** — 真实性 / 去重 / 篡改四层门控：见 `src/gatekeeper/AGENTS.md`
 - **`scripts/`** — 8-Gate verify_model.py + 数据格式化 + 预训练管道：见 `scripts/AGENTS.md`
 - **`src/service/`** — V2.1 常驻 HTTP 推理服务(app/tasks/config/case_discovery/runner):见 `src/service/AGENTS.md`
-- **`tests/`** — 356 passed, 1 skipped（含 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 15 model_runner + 2 gate8_adaptor_isolation + 49 gatekeeper + 50 video + 30 entrypoint_dispatch + 23 probability_output + 14 gatekeeper_soft_enforcement + 6 authenticity_trainer + 8 official_loader）；**Phase 5(2026-08-10)另加 V2.1 交付四模块**:test_nifti_io(35) + test_nodule_split(31) + test_prediction_json(72) + test_v21_output(11) + test_service_runner(10) + test_case_discovery(39) + test_service_api(20),本地收集共 **580 collected**：见 `tests/AGENTS.md`
+- **`tests/`** — 356 passed, 1 skipped（含 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 15 model_runner + 2 gate8_adaptor_isolation + 49 gatekeeper + 50 video + 30 entrypoint_dispatch + 23 probability_output + 14 gatekeeper_soft_enforcement + 6 authenticity_trainer + 8 official_loader）；**Phase 5(2026-08-10)另加 V2.1 交付四模块**:test_nifti_io(24) + test_nodule_split(28) + test_prediction_json(19) + test_v21_output(11) + test_service_runner(11) + test_case_discovery(39) + test_service_api(20),本地收集共 **463 collected**（grep `def test_` 实测口径;含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip）：见 `tests/AGENTS.md`
 
 所有拆分模块通过 `__init__.py` re-export shim 保持旧导入路径兼容。
 

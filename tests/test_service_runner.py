@@ -138,7 +138,7 @@ def mock_heavy(monkeypatch):
                              processing_ms, interpretation=None):
         box["written"].append({
             "case_dir": case_dir, "patient_id": patient_id, "subdir_uid": subdir_uid,
-            "kind": kind, "processing_ms": processing_ms})
+            "kind": kind, "processing_ms": processing_ms, "case_result": case_result})
 
     monkeypatch.setattr(model_runner_mod, "build_model", _fake_build_model)
     monkeypatch.setattr(model_runner_mod, "load_config", _fake_load_config)
@@ -192,6 +192,7 @@ class TestPerCaseDispatch:
         out = tmp_path / "out"
         runner_mod.build_service_runner()(str(tmp_path), str(out))
         ms = mock_heavy["written"][0]["processing_ms"]
+        assert isinstance(ms, int) and ms >= 0
         assert isinstance(ms, int) and ms >= 0
 
     def test_gatekeeper_not_skipped_per_case(self, mock_heavy, tmp_path):
@@ -295,6 +296,32 @@ class TestPerCaseFailureIsolation:
 
         # P_OK 例正常产出(被 REJECTED 例不影响,失败隔离红线)
         assert "P_OK" in pids_written
+
+    def test_dynamic_auth_skipped_propagated_to_audit(
+            self, mock_heavy, tmp_path, monkeypatch):
+        """Gate2 P2 回归:动态链路聚合 gatekeeper_audit 的 auth_skipped 须**取自逐帧
+        audit**(任一幕 True 即 True),覆盖'权重存在但 predict 在帧上崩溃'这种跳过——
+        不能用 `state['auth'] is None` 判据(那只覆盖权重缺失,漏了 predict 崩溃,
+        会让聚合层误报 auth_skipped=False 而实际已跳过,误导运维/评测)。"""
+        _save_nifti(str(tmp_path / "P_DYN" / "P_DYN" / "P_DYN.nii.gz"))
+        out = tmp_path / "out"
+
+        import src.inference.gatekeeper_runner as gatekeeper_mod
+        # 逐帧 audit 返回 auth_skipped=True(= predict 崩溃被 catch 的效果),passed=True(soft)。
+        # 注意 build_auth_module 被 mock_heavy 设为返回真实 object(非 None),即 state["auth"]
+        # 非 None——此时若聚合层仍用 `state["auth"] is None` 会得 False,本测试正是要抓这个。
+        def _audit_auth_skipped(*a, **k):
+            return True, {"flagged": False, "would_reject_in_hard_mode": False,
+                          "enforcement_mode": "soft", "reason": "", "soft_flags": [],
+                          "auth_skipped": True}
+        monkeypatch.setattr(gatekeeper_mod, "run_gatekeeper_audit", _audit_auth_skipped)
+
+        runner_mod.build_service_runner()(str(tmp_path), str(out))
+
+        dyn = [w for w in mock_heavy["written"] if w["patient_id"] == "P_DYN"][0]
+        ga = dyn["case_result"]["gatekeeper_audit"]
+        assert ga["auth_skipped"] is True, (
+            "动态聚合层须透传逐帧 auth_skipped(predict 崩溃场景),不能用 state['auth'] is None")
 
     def test_loader_failure_isolated(self, mock_heavy, tmp_path, monkeypatch):
         """输入加载失败(如损坏 NIfTI)也只隔离该例,不拖垮整批。"""

@@ -8,7 +8,9 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 |:---|:---|:---|
 | `physical_prior.py` | Differentiable physical feature extraction (AR, ER, Circularity) | ~160 lines |
 | `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~209 lines |
-| `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor, decoder, stage freeze registry) | ~300 lines |
+| `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor 装配, decoder, stage freeze registry)。ConvBlock/TaskAlignmentAdaptor 已外移至 `blocks.py`（re-export 保后兼容） | ~260 lines |
+| `blocks.py` | 可复用 nn 块：`ConvBlock`（U-Net double-conv 解码块）+ `TaskAlignmentAdaptor`（分割→分类单向软注意力，`.detach()` 契约 + gamma 零初始化见 §1.1 / Gate 8） | ~67 lines |
+| `heads/` | 官方新增三维度增量诊断头子包（Plan v2 阶段2 填充：位置/侵犯/临床T，见 `docs/训练实现计划.md`）。当前为骨架，`heads/__init__.py` 记接入接口现状 + re-export 新头类 | scaffold |
 | `mil_pooling.py` | 门控注意力多示例学习(Gated-Attention MIL)——患者级良恶性弱标签聚合:`SpatialAttentionModule`(保留 backbone `forward_features()` 空间判别性,不用 GAP 稀释微钙化等高频特征) + `GatedAttentionPooling`。仅供 `scripts/pretrain_malignancy_mil.py` 训练管线使用,不在 `MultiTaskThyroidModel` 主推理路径。见 `memory/patient-leakage-and-probe-trap.md` | ~255 lines |
 | `losses/` | Decomposed loss function subpackage | See below |
 | `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
@@ -58,7 +60,7 @@ To eliminate representation competition between high-frequency segmentation and 
 
 ### 1.1 Task-Alignment Adaptor (Soft Attention Gating)
 Because the classification branch loses spatial priors after decoupling, segmentation features must be injected back as soft attention.
-- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2), `multi_task_model.py:260,263`(`_forward_cls_backbone`)。
+- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2), adaptor 调用在 `multi_task_model.py:204,207`(`_forward_cls_backbone`);类定义在 `blocks.py`。
 - **Unidirectional Flow**: `f_seg` MUST be `.detach()`ed before passing to the Adaptor to prevent classification error gradients from corrupting the segmentation backbone's weights.
 - **Fusion Equation**: `f_cls_enhanced = f_cls + gamma * (f_cls * W_align)`, where `W_align` is generated via spatial interpolation, 1x1 channel projection, and 3x3 depthwise convolution + Sigmoid. `gamma` is a learnable scalar initialized to 0.
 - **Gate 8 验证(`scripts/verify/gates/gate8_adaptor_isolation.py`,2026-07-11 新增)**:上述"MUST `.detach()`"契约此前只有实现、没有 Gate 量化验证——`gate2_vclub` 走的是 vCLUB 局部图(不经过 adaptor)、`gate3_auc_margin`/`gate6_stage1_masking` 都测不到这条通路(具体原因见 `QA_VP.md` §1.1 与该 Gate 源码注释)。Gate 8 用 `loss_mal.backward()` + 断言 `seg_backbone` 梯度精确为 `0.0`(非 `<1e-7` 容差)量化验证该契约,并在 Gate 内部主动做了两处必要的前置状态复位(**这两处都是本 Gate 存在的核心原因,删了会退化成永远通过的伪 Gate**):
@@ -75,10 +77,16 @@ To ensure that the decoupling penalty $I(z; C)$ successfully regularizes the enc
 
 - **Forward Path Contract** (`cbm_head` returns a keyed `CBMHeadOutput` dataclass, not a positional tuple):
   ```python
-  z_latent_detached = outputs["z_latent"].detach()
-  concept_vector_decouple = model.cbm_head(z_latent_detached).concept_vector.detach()
+  # 复用 model() 前向已产出的 concept_vector（勿二次跑 cbm_head）:
+  #   arg1 = outputs["z_latent"]（保梯度，退耦约束导流回 backbone）
+  #   arg2 = outputs["concept_vector"].detach()（掐断梯度，防标签泄漏）
+  concept_vector_decouple = outputs["concept_vector"].detach()
   vclub_mi_bound = model.vclub(outputs["z_latent"], concept_vector_decouple)
   ```
+  ⚠️ **禁二次 `model.cbm_head(z_latent.detach())`**(审查 S2,2026-08-10):cbm_head
+  前向在 `self.training` 下每次都推进 EMA 熵门 `ema_entropy_tau`,二次前向使其每 step
+  被推进两次(`alpha_gate` 收敛快 2×)且浪费算力。concept_vector 在 e_prior 融合前算出、
+  与 z_latent 是否 detach 无关,复用值逐位等价,再 `.detach()` 即所需退耦向量。
 
 ---
 

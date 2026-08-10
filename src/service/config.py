@@ -23,10 +23,20 @@ LOGS_ROOT = os.environ.get("AICOMP_LOGS_ROOT", os.path.join(WORKSPACE_ROOT, "log
 SERVICE_PORT = int(os.environ.get("AICOMP_PORT", "8000"))
 SERVICE_HOST = os.environ.get("AICOMP_HOST", "0.0.0.0")
 
-# 训推平台回调基址。规范只写 "{训推平台服务地址}/api/competition/inference/callback/",
-# 未给出具体主机 —— 必须由平台通过环境变量注入。**留空则回调被跳过**(仅记日志),
-# 这样本地/离线自测不会因为连不上平台而让整条推理链路失败。
-CALLBACK_BASE_URL = os.environ.get("AICOMP_CALLBACK_BASE_URL", "").rstrip("/")
+# 训推平台回调基址。
+#
+# 规范散文段落只写 "{训推平台服务地址}/api/competition/inference/callback/"(无主机),
+# 但**同一份文档的官方推理服务代码示例给出了实际地址**(赛道七 V1.0 与 V2.0 均有,
+# 该章节两版逐字相同):
+#     CALLBACK_URL = "http://10.1.13.241:80/api/competition/inference/callback/"
+# 该 IP 与容器 SSH 主机(`ssh root@10.1.13.241 -p 10638`)一致,即平台内网网关。
+#
+# 仍保留环境变量覆盖:① 平台若按队伍分配不同网关,注入即可改;② 本地自测设为空串
+# 跳过回调。**默认值不设空串**——留空会让"忘了配环境变量"这种失误静默退化成
+# "不回调",而平台等不到回调就一直挂到评测超时,比连不上报错更难排查。
+_DEFAULT_CALLBACK_BASE = "http://10.1.13.241:80"
+CALLBACK_BASE_URL = os.environ.get(
+    "AICOMP_CALLBACK_BASE_URL", _DEFAULT_CALLBACK_BASE).rstrip("/")
 CALLBACK_PATH = "/api/competition/inference/callback/"
 
 # 回调重试:平台侧网络抖动不该让一次完整推理的结果丢失。总耗时上界约
@@ -49,14 +59,36 @@ def answer_dir(evaluation_id) -> str:
     return os.path.join(ANSWER_ROOT, str(evaluation_id))
 
 
-def relative_pred_path(evaluation_id) -> str:
-    """回调 body 里 `predPath` 的值。
+def pred_path(evaluation_id) -> str:
+    """回调 body 里 `predPath` 的值 —— **绝对路径**。
 
-    规范示例写的是 `"predPath": "canswer/454899866564564"` —— 前缀 `canswer` 与
-    §二.2 定义的目录 `/2026aicompetition/workspace/answer/{evaluation_id}` 对不上,
-    高度疑似官方笔误(多打一个 c)。此处按**目录定义**取 `answer/{evaluation_id}`,
-    因为平台最终要按这个路径去找文件,拼错则找不到结果。若实测平台按字面 `canswer`
-    解析,设环境变量 `AICOMP_PRED_PATH_PREFIX=canswer` 即可切换,无需改代码。
+    ## 为什么是绝对路径(2026-08-09 修正,此前实现是错的)
+
+    赛道七规范的 body 示例写 `"predPath": "canswer/454899866564564"`,前缀 `canswer`
+    与 §二.2 定义的目录 `/2026aicompetition/workspace/answer/{evaluation_id}` 对不上,
+    我方当时判为笔误(多打一个 c)、按目录定义取**相对**路径 `answer/{id}`。
+
+    **同一份文档的官方推理服务代码示例才是权威写法**(V1.0/V2.0 均有,逐字相同):
+
+        payload = {
+            "request_id": request_id,
+            "evaluationId": evaluation_id,
+            "predPath": f"/2026aicompetition/workspace/answer/{evaluation_id}",
+        }
+
+    —— 是**完整绝对路径**,既不是 `canswer/...` 也不是相对的 `answer/...`。散文段落
+    "predPath输出路径格式为 /2026aicompetition/workspace/answer/{evaluation_id}/{结果集}"
+    与代码示例一致,三者中只有 body 示例的 `canswer/...` 是孤例,可判定为笔误。
+
+    平台拿这个值去定位结果目录,路径形态不对就是**找不到结果 ⇒ 该次评测零分**,
+    且回调本身返回 200、我方日志一切正常,是典型的静默失败。
+
+    随 `ANSWER_ROOT` 走(而非硬编码字符串),使 `AICOMP_ANSWER_ROOT` 覆盖时
+    predPath 自动跟随,不会出现"结果写在 A、却告诉平台去 B 找"的错位。
     """
-    prefix = os.environ.get("AICOMP_PRED_PATH_PREFIX", "answer")
-    return f"{prefix}/{evaluation_id}"
+    return answer_dir(evaluation_id).replace(os.sep, "/")
+
+
+# 向后兼容别名。旧名 `relative_pred_path` 的语义(相对路径)已被证伪,保留仅为
+# 不破坏既有调用点;新代码一律用 `pred_path`。
+relative_pred_path = pred_path

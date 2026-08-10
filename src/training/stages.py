@@ -31,10 +31,16 @@ def configure_stage_parameters(
     配置三阶段渐进式训练策略的参数。
 
     Stage 1 (Epoch 1-40): 分割 + 概念联合训练
-    - 仅激活分割解码器和概念分类头 (proj_plus, proj_minus, s_layer)
-    - 冻结: classifier_direct, latent_mlp, AUCM 对偶变量
+    - **双主干 + 分割解码器 + 概念分类头 (proj_plus, proj_minus, s_layer) 均可训**
+      —— 在 seg + 概念目标上学表征(非纯头 warmup)
+    - 冻结: classifier_direct, latent_mlp (恶性直连头，因 mal loss 在 Stage 1 关闭
+      `enable_mal_loss=(stage>1)`)、AUCM 对偶变量
     - Warmup (Epoch 1-5) + Cosine Annealing (Epoch 6-40)
     - FAMO 仅调度活跃任务
+    - ⚠️ 审查 S6:`is_param_trainable(stage=1)` 只冻上面两个 CBM 子模块,主干可训,
+      与本清单一致;勿据"仅激活分割头"误读为冻主干。**use_lora 模型例外**:
+      `set_training_stage` 会把非冻子模块 `requires_grad=True`,重解冻 `__init__` 为
+      LoRA 冻的基座骨干——use_lora 走独立训练脚本(train_thyroidxl 等),勿套此三阶段循环。
 
     Stage 2 (Epoch 41-100): 全模型解冻
     - 所有参数解冻，5 通道 FAMO 细粒度调度

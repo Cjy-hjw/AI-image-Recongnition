@@ -9,7 +9,7 @@
 | `src/gatekeeper/` | Image authenticity verification (inference-time) | `authenticity.py`, `deduplication.py`, `tampering.py` |
 | `src/utils/` | Visualization, report generation, Grad-CAM | `report_generator.py`, `grad_cam.py` |
 | `src/training/` | Training loop, stage management | `trainer.py`, `stages.py`, `loop/`, `authenticity_trainer.py` |
-| `src/models/` | Neural network architectures & losses | `multi_task_model.py`, `pretrained_loader.py`, `physical_prior.py`, `cbm_head.py`, `losses/` | See `src/models/AGENTS.md` |
+| `src/models/` | Neural network architectures & losses | `multi_task_model.py`, `blocks.py`, `heads/`, `pretrained_loader.py`, `physical_prior.py`, `cbm_head.py`, `losses/` | See `src/models/AGENTS.md` |
 
 **Rule**: New functionality MUST go into the appropriate package. Do NOT create monolithic files spanning multiple domains. Target: no file > 300 lines, no function > 3 domains.
 

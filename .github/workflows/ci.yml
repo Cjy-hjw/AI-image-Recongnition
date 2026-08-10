@@ -46,7 +46,14 @@ jobs:
           # 镜像已自带 torch/torchvision 2.1.0,requirements 里的 torch>=2.1.0 已满足
           # (无 --upgrade,pip 跳过不重装)。faiss-cpu 在 py3.10 有 wheel,正常安装。
           pip install -r requirements.txt
-          pip install pytest
+          # pandas/openpyxl 仅 official_loader(训练侧数据加载器,src/dataset)单测需要:
+          # **不进 requirements.txt**——离线推理容器从不 import 该模块(它只被训练脚本用),
+          # 加进容器只会白白变肥,同 paramiko 的处置逻辑(见 requirements.txt 尾注)。
+          # 缺它们时 tests/test_official_loader.py 顶部的 importorskip 会静默 skip 掉 8 个
+          # 用例,CI 从未真验过本会话新增的 official_loader;在此补上让它们真跑。
+          # pandas 封顶 <2.3:2.2.x 有 cp310 manylinux wheel 且兼容 numpy 1.x(requirements
+          # 已锁 numpy<2,torch 2.1.0 C-ABI 要求);不封顶恐被未来 pandas 拖 numpy>=2 上来冲突。
+          pip install pytest "pandas>=2.0,<2.3" "openpyxl>=3.1"
       - name: Gate 1 - verify_model (8 gates)
         run: python scripts/verify_model.py
       - name: Full pytest regression

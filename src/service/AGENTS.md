@@ -9,17 +9,19 @@ V2.1《赛事开发规范》§二/§三 的 HTTP 交互层。与旧的离线 CLI
 
 | 项 | 现状 |
 |:--|:--|
-| 路由 + 线程池 + 回调闭环 | **已实现 + 已测试**(`tests/test_service_api.py` 27 例) |
-| 真实 runner 接线 | **待接线**(S6 阶段,`build_service_runner` 尚不存在);当前 `_runner=None`,生产请求全走 `_placeholder_runner` → 结果目录只有 `_placeholder.txt`,回调却报"已完成" → **全样本零分且无失败信号**。上线前必须由生产代码调 `set_runner()` 注入真实实现。 |
-| 部署形态 | `entrypoint.sh` 仍是"跑一次推理就 exit"的离线 CLI,未切长驻服务(与 `src/inference/AGENTS.md §11` 同一待办) |
+| 路由 + 线程池 + 回调闭环 | **已实现 + 已测试**(`tests/test_service_api.py` 20 例) |
+| 真实 runner 接线 | **已接线**(Phase 5 A2 落地):`build_service_runner` 已实现(`runner.py`),`app.py:main()` 启动时 `set_runner(build_service_runner(...))` 注入真实推理 runner。`_placeholder_runner` 仅存占位语义(`_runner or _placeholder_runner` 兜底),不再被生产路径使用。见 §3.4 |
+| 部署形态 | Dockerfile `ENTRYPOINT` 已切 `python -m src.service.app`(uvicorn 常驻 8000);`entrypoint.sh` 降级为本地/CI 单文件调试旁路(见 `src/inference/AGENTS.md §11`) |
 
 ## 1. 文件职责
 
 | File | Responsibility |
 |:---|:---|
-| `app.py` | FastAPI 路由(`/call` `/health` `/task/{request_id}`)+ runner 注入(`set_runner`/`_placeholder_runner`/全局 `_runner`)+ `_extract_fields` 入参容错 + `main()` uvicorn 前台启动 |
+| `app.py` | FastAPI 路由(`/call` `/health` `/task/{request_id}`)+ runner 注入(`set_runner`/`_placeholder_runner`/全局 `_runner`)+ `_extract_fields` 入参容错 + `main()` uvicorn 前台启动(启动时 `set_runner(build_service_runner(...))` 注入真实 runner) |
 | `config.py` | 端口/路径/回调常量(均可环境变量覆盖):`SERVICE_PORT=8000`、`INFERENCE_WORKERS=1`、`WORKSPACE_ROOT`/`ANSWER_ROOT`/`LOGS_ROOT`、`callback_url()`/`answer_dir()`/`pred_path()`、`CALLBACK_MAX_RETRIES=3`/`CALLBACK_TIMEOUT_S=10` |
 | `tasks.py` | 单例 `ThreadPoolExecutor(max_workers=1)` + `submit_inference` + `post_callback`(指数退避重试)+ `_write_task_error`(原子写)+ `_tasks` 状态表 + `task_summary`/`get_task_status`/`shutdown` |
+| `case_discovery.py` | **A2 新增** `discover_cases(dataset_path)` 纯函数:递归遍历目录,静/动分派(`.dcm`→static,`.nii.gz`/`.nii`→dynamic)+ 取 PatientId/subdir_uid(静态读 DICOM 头,动态按组委会口径取直接父目录名)。只做发现不接推理,无重依赖 |
+| `runner.py` | **A2 新增** 真实推理 runner:模型只 build 一次跨病例复用 + 单病例失败隔离 + V2.1 落盘。见 §4.1 |
 
 ## 2. 官方硬约束 ↔ 实现
 
@@ -51,14 +53,14 @@ V2.1《赛事开发规范》§二/§三 的 HTTP 交互层。与旧的离线 CLI
 的检查(模型加载、磁盘 stat、权重校验)都交由 worker 线程判断,失败写 `_error.json`
 并照常回调。
 
-### 3.4 runner 参数注入(placeholder 待接线)
+### 3.4 runner 参数注入(已接线)
 `runner = callable(dataset_path, output_dir) -> None`,以参数注入而非直接 import。
 理由:① 测试可替换成假 runner,不必加载模型;② 推理主流程(多结节改造)与服务层
-解耦,两边可独立演进。**当前 `_runner=None`**,`call()` 走 `_runner or _placeholder_runner`
-回落到 `_placeholder_runner` —— 它**不产出任何预测**,只在结果目录留一份 `_placeholder.txt`
-说明。存在意义:让 `/call → 线程池 → 目录创建 → 回调` 链路能端到端自测,不必等模型侧
-多结节改造完成。**上线前必须由 `set_runner()` 覆盖**,否则该次评测全部输出为空,等同零分。
-真实 runner 接线(`build_service_runner`)是 S6 阶段待办,尚不存在。
+解耦,两边可独立演进。**`app.py:main()` 启动时 `set_runner(build_service_runner(...))`
+注入真实 runner**(模型权重/config/precision 由环境变量 `AICOMP_WEIGHTS`/`AICOMP_CONFIG`/
+`AICOMP_PRECISION` 注入,缺省回落 CLI 同款路径)。`_runner or _placeholder_runner` 回落到
+`_placeholder_runner` 的占位语义**仅当 `set_runner` 未被调用时**才触发(Dockerfile ENTRYPOINT
+已切 `python -m src.service.app`,生产路径必走 `main()` 注入,占位不再被生产使用)。
 
 ### 3.5 无论成败都回调
 worker 线程 `finally` 块无条件调 `post_callback`。平台靠回调判定该任务已终结;
@@ -80,8 +82,39 @@ runner(dataset_path: str, output_dir: str) -> None
   = `{ANSWER_ROOT}/{evaluation_id}`(该子目录"必须由参赛者代码在推理时动态创建",
   规范 §二.2 原文;`app._run` 已 `os.makedirs(out_dir, exist_ok=True)` 预建)。
 - V2.1 逐病例产物:`{output_dir}/{PatientId}/prediction.json` + 逐结节 `.nii.gz`
-  mask(0/1,H×W 与原图严格一致)。**注意**:真实 runner 的逐病例落盘逻辑尚未实现,
-  当前 `_placeholder_runner` 只写 `_placeholder.txt`。
+  mask(0/1,H×W 与原图严格一致)。**真实 runner 已实现**(见 §4.1),不再是占位。
+
+### 4.1 `runner.py` — 真实推理 runner(Phase 5 A2 落地)
+
+`build_service_runner(config_path=None, weights=None, precision=None, max_frames=None)`
+→ `runner(dataset_path, output_dir) -> None`,签名与 `tasks.submit_inference` 调用点逐字对齐。
+
+**三条红线(对应 QA_VP §1.7 / rules.md §5)**:
+1. **模型只 build 一次、跨病例复用**:`build_model`/`load_config`/`TemperatureScaler`/
+   gatekeeper 三件重型对象(dedup/auth/tamper)在闭包 `_ensure_built` 里建一次,绝不每病例
+   重载(批量每病例重读权重 + 重播种 200 张图会把延迟打爆,赛道有推理时延评分)。模块级
+   `_RUNNER_CACHE`(key=路径精度参数)+ 锁让「同参数重复调 build_service_runner」(多次 `/call`
+   或测试)也只建一次。**惰性构建**:真正 build 推迟到 runner 首次被调用,避免 `main()` 启动期
+   因模型未就位崩掉 8000 探针(平台连续 3 次探活失败重启容器)。
+2. **单病例失败隔离**:`_process_case` 每病例独立 `try/except Exception`,一例崩溃(权重不匹配/
+   CUDA OOM/NIfTI 损坏/数值 NaN)只落该例的 `prediction.json` ERROR 占位 + 记日志,**绝不 raise
+   拖垮整批**(平台只有一次评测机会,一例崩掉整批 = 全部零输出)。
+3. **匿名化/gatekeeper 不因批量而跳过**:每病例照跑 `load_input_image` 的 DICOM PHI 匿名化与
+   逐帧 gatekeeper 审计,与 CLI 同语义。gatekeeper 默认 soft(赛道七豁免),`passed` 恒 True;
+   仅显式 `enforcement_mode: hard` 且命中硬判据才走拒绝分支(`_rejection_result`,落 REJECTED
+   占位不产诊断)。
+
+**失败/拒绝占位**:`_write_case_error` 复用 write_case_v21 的原子写(V2.1 目录里不出现 V2.0 的
+`result.json`),占位 nodule 只保 JSON 结构合规(数值保守占位 + `Interpretation.Conclusion` 写明
+ERROR/REJECTED 原因)。**该函数自身绝不抛**(写盘失败只记日志),否则隔离语义自相矛盾。
+
+**`subdir_uid`/`orig_hw` 透传**:`case_discovery` 定的 `subdir_uid` 是 V2.1 动态输出子目录名
+(= AccessionNumber,组委会口径与 PatientId 同源);`_run_static_case` 透传 `orig_hw=img_np.shape[:2]`
+(缺它 write_case_v21 无法把 mask resize 回原图)。
+
+**@云TODO(云端首跑校正)**:权重/config 路径来自环境变量(缺省回落 CLI 同款路径),容器内挂载点
+不同须云端首跑核对;gatekeeper 批量耗时未实测;动态 AccessionNumber 来源已定(组委会口径),但
+推理输入目录层级仍待云端首跑核对。
 
 ## 5. 入参容错(`_extract_fields`)
 
@@ -121,14 +154,13 @@ runner(dataset_path: str, output_dir: str) -> None
 (而非硬编码字符串),`AICOMP_ANSWER_ROOT` 覆盖时 predPath 自动跟随。
 `relative_pred_path` 是向后兼容别名,语义已证伪,保留仅为不破坏旧调用点。
 
-## 7. 测试覆盖(`tests/test_service_api.py`,27 例)
+## 7. 测试覆盖
 
-| 测试类 | 覆盖点 |
-|:--|:--|
-| `TestHealthNeverBlocks` | 推理阻塞时 /health 仍响应;/health 暴露任务计数 |
-| `TestCallEndpoint` | 立即返 200;创建 evaluation 目录并跑 runner;dataset_path 透传 |
-| `TestPayloadTolerance` | 平顶层 payload / camelCase / 缺 request_id 自动生成 / 缺 evaluation_id 拒绝 / 非法 JSON 给 400 不给 500 |
-| `TestFailureIsolation` | runner 抛异常写 `_error.json`;单任务失败不拖垮服务 |
-| `TestCallback` | 基址未配跳过回调;body 含三必需字段;**失败也触发回调** |
-| `TestConfigPaths` | answer_dir 布局;predPath 是绝对路径;端口 8000;worker=1 |
-| `TestPlaceholderRunner` | placeholder 明确标注输出为空 |
+| 测试文件 | 覆盖点 | 例数 |
+|:--|:--|:--|
+| `tests/test_service_api.py` | 服务层 HTTP 路由/回调/容错(见 src/service/AGENTS.md 正文) | 20 |
+| `tests/test_service_runner.py` | runner 批量编排:逐病例调 write_case_v21、单病例失败隔离落 ERROR 占位、模型只 build 一次(跨病例 + 跨多次 build_service_runner 缓存)、空/无效数据集不崩 | 10 |
+| `tests/test_case_discovery.py` | `discover_cases` 静/动分派、静态 DICOM 头读取、动态按组委会口径取直接父目录名、路径推断、空目录不崩、确定性顺序 | 39 |
+
+`TestPlaceholderRunner` 用例(占位 runner 明确标注输出为空)仍在 `test_service_api.py` 中,
+验证 `_runner` 未注入时占位语义存在(向后兼容,不参与生产路径)。

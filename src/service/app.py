@@ -163,6 +163,14 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    # 注入真实推理 runner(替换骨架模式 `_placeholder_runner`)。V2.1 生产入口必须
+    # 产出逐病例 prediction.json,占位模式会让整次评测零分。模型构建是**惰性**的
+    # (首次 /call 的 runner 真正跑时才 build_model),故此处 build_service_runner
+    # 不会拖慢 8000 端口探针的就绪时间 —— 平台启动探针对启动期崩溃零容忍。
+    from src.service.runner import build_service_runner
+    set_runner(build_service_runner())
+
     logger.info(
         "启动推理服务 %s:%s | answer_root=%s | callback=%s",
         config.SERVICE_HOST, config.SERVICE_PORT, config.ANSWER_ROOT,

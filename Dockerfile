@@ -43,4 +43,18 @@ RUN mkdir -p /workspace/checkpoints /workspace/data/output
 RUN chmod +x /workspace/scripts/entrypoint.sh
 
 # 默认设置 entrypoint 启动容器时执行哈希验证与推理
-ENTRYPOINT ["/workspace/scripts/entrypoint.sh"]
+#
+# 2026-08-10 V2.1 容器入口切换(阶段 A2):ENTRYPOINT 由离线单文件 CLI
+# (entrypoint.sh)改为 **常驻 HTTP 推理服务** `python -m src.service.app`
+# (uvicorn 监听 8000,/call 收批量目录任务,/health 供平台探针)。
+#
+# 背景:官方赛事开发规范 V2.1 把交付形态整体改写——不再是「跑一次推理就 exit」,
+# 而是「常驻 HTTP 服务 + 批量目录推理 + 逐病例 V2.1 prediction.json 输出」。
+# entrypoint.sh 的 30 个 dispatch 测试 / 封印(seal_container) / 信号转发 / 崩溃兜底
+# 仍是已验证资产,**保留作本地/CI 单文件调试旁路**(开发模式下直接运行),但不再是
+# 容器生产入口 —— 平台探针打的是 8000,不是 entrypoint 的退出码。
+#
+# `src.service.app:main()` 启动时 `set_runner(build_service_runner(...))` 注入真实
+# 推理 runner(见 src/service/runner.py);模型权重/config/precision 由环境变量
+# `AICOMP_WEIGHTS`/`AICOMP_CONFIG`/`AICOMP_PRECISION` 注入,缺省回落 CLI 同款路径。
+ENTRYPOINT ["python", "-m", "src.service.app"]

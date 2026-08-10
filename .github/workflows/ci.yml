@@ -59,17 +59,65 @@ jobs:
       - name: Full pytest regression
         run: pytest -q
 
-  # 铁律 3(2026-07-11 新增):真实 `docker build` + 起容器冒烟测试。
-  # 背景:此前 test job 只是在同一基础镜像里手动 pip install「模拟」容器环境,
-  # 从未真正 `docker build` 过 Dockerfile 本身——2026-07-11 人工审计发现
-  # entrypoint.sh 依赖的 _src_tree_hash.sh 此前一直没被 COPY 进镜像,容器一
-  # 启动 entrypoint 就会 source 找不到文件直接崩溃,这个 bug 潜伏期间没有任何
-  # CI 检测到。本 job 跑在 host runner(非容器内 job,ubuntu-latest 自带 docker),
-  # 补上"镜像真的能 build 出来、entrypoint.sh 真的能在其中跑起来"这道验证。
+  # 铁律 3(2026-08-10 V2.1 改写):真实 `docker build` + 常驻 HTTP 服务冒烟。
+  # 背景:V2.1 容器入口从离线 CLI(entrypoint.sh)切为常驻 HTTP 推理服务
+  # `python -m src.service.app`(uvicorn 监听 8000,/call 收批量目录任务,
+  # /health 供平台探针;见 Dockerfile ENTRYPOINT)。平台探针打 `GET /health`
+  # (30s×3 失败=容器重启),本 job 验证「镜像能 build 出来 + 服务能起 +
+  # /health 返回 200」。跑在 host runner(非容器内 job,ubuntu-latest 自带 docker)。
+  #
   # 无真实权重(checkpoints/ 未打进镜像,交付走官方平台人工上传通道,见
-  # docs/比赛对齐与风险.md),故只做机制级冒烟(容器能否构建/启动/分发/落盘),
-  # 不验证预测数值正确性(数值正确性由 test job 的 Gate1-8 + pytest 覆盖)。
+  # docs/比赛对齐与风险.md),但服务启动是**惰性**的 —— app.py::main() 调
+  # set_runner(build_service_runner(...)) 只解析路径(见 runner.py
+  # _resolve_runtime_params,不校验文件存在),模型真正构建推迟到首次 /call 的
+  # runner 调用(_ensure_built),故权重缺失时 /health 仍返回 200,**无需挂载
+  # dummy 权重**。预测数值正确性由 test job 的 Gate1-8 + pytest 覆盖。
   docker-build-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t thyroid-infer:ci-test .
+      - name: Start service container (detached, host 8000 → container 8000)
+        run: |
+          docker run -d --name thyroid-smoke -p 8000:8000 thyroid-infer:ci-test
+          # 马上起探针可能会撞上后台容器尚未 bind 端口,下面轮询已覆盖
+      - name: Poll /health until 200 (timeout 60s)
+        # 平台探针 30s×3 失败即重启容器,故 /health 必须在秒级就绪且极轻。
+        # 这里轮询最多 60s,一旦 200 立即通过;超时则 dump 容器日志定位。
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/health_body.json -w '%{http_code}' http://localhost:8000/health || true)
+            if [ "$code" = "200" ]; then
+              echo "OK: /health 返回 200 (第 ${i}s)"
+              cat /tmp/health_body.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FAIL: /health 60s 内未返回 200,最后一次 body:"
+          cat /tmp/health_body.json 2>/dev/null || true
+          echo "--- 容器日志 tail ---"
+          docker logs thyroid-smoke 2>&1 | tail -n 50
+          exit 1
+      - name: Assert /health body
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/health_body.json'))
+          assert d.get('status') == 'ok', f'预期 /health status=ok,实际:{d}'
+          print('OK: /health body 校验通过:', d)
+          "
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f thyroid-smoke || true
+
+  # 铁律 3b(entrypoint.sh 分发冒烟,保留为调试旁路):entrypoint.sh 已从生产入口
+  # 降级为本地/CI 单文件调试旁路(见 Dockerfile 注释),其 30 个 dispatch 测试 /
+  # 封印 / 信号转发 / 崩溃兜底仍是已验证资产、有独立价值,故保留整组单文件分发
+  # + 落盘冒烟(容器能按扩展名分发到 predict.py/video_predict.py、异常兜底不崩)。
+  # 本 job 与 docker-build-smoke 各自独立 build 镜像(避免 job 间共享 runner 状态)。
+  entrypoint-dispatch-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

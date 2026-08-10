@@ -170,8 +170,12 @@ def submit_inference(request_id, evaluation_id, dataset_path, runner):
             _set_status(request_id, STATUS_DONE)
         except Exception as e:  # noqa: BLE001 — worker 线程的异常无人接管,必须自兜
             logger.exception("[task] 推理失败 request_id=%s", request_id)
-            _set_status(request_id, STATUS_FAILED, error=f"{type(e).__name__}: {e}")
+            # 先写 _error.json 落盘、再翻 FAILED:保证"观察到 FAILED"即蕴含"文件已存在",
+            # 消除消费方(平台/人工/测试 _wait_status)在两行之间读到"FAILED 但结果目录空"
+            # 的竞态(与"还没跑"无法区分)。写盘失败被 _write_task_error 内部吞掉,不阻断状态
+            # 翻转;终态集合(FAILED + 文件)与交换前一致,纯顺序调整无逻辑变更。
             _write_task_error(evaluation_id, request_id, f"{type(e).__name__}: {e}")
+            _set_status(request_id, STATUS_FAILED, error=f"{type(e).__name__}: {e}")
         finally:
             # **无论成败都回调**:平台靠回调判定该任务已终结。失败时不回调会让平台
             # 一直等到评测超时,比回调一个"结果目录里只有 _error.json"更糟。

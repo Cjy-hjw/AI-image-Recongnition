@@ -25,7 +25,10 @@ def svc(tmp_path, monkeypatch):
     建了线程池和任务表 —— 不 reload 会让用例间互相看到对方的任务与结果目录。
     """
     monkeypatch.setenv("AICOMP_ANSWER_ROOT", str(tmp_path / "answer"))
-    monkeypatch.delenv("AICOMP_CALLBACK_BASE_URL", raising=False)
+    # callback 默认基址已改为平台内网 IP(config.py);测试环境连不上会触发 3 次重试
+    # 退避、阻塞单 worker,拖垮后续任务(test_service_survives_failed_task 曾因此超时)。
+    # 显式设空串禁用回调——测试不该依赖真实网络;需要测回调的用例自行 setenv 覆盖。
+    monkeypatch.setenv("AICOMP_CALLBACK_BASE_URL", "")
 
     from src.service import app as app_mod
     from src.service import config as config_mod
@@ -241,7 +244,7 @@ class TestCallback:
         assert captured["body"] == {
             "request_id": "req-9",
             "evaluationId": 4321,
-            "predPath": "answer/4321",
+            "predPath": config_mod.pred_path(4321),
         }
 
     def test_callback_fires_even_on_failure(self, svc, monkeypatch):
@@ -270,13 +273,15 @@ class TestConfigPaths:
         _, config_mod, _ = svc
         assert config_mod.answer_dir(123).endswith(os.path.join("answer", "123"))
 
-    def test_pred_path_prefix_overridable(self, svc, monkeypatch):
-        """规范示例写 `canswer/...` 与目录定义 `answer/...` 矛盾(疑似官方笔误)。
-        默认按目录定义取 answer,留环境变量以便实测后切换而无需改代码。"""
+    def test_pred_path_is_absolute_answer_dir(self, svc):
+        """predPath 改为**绝对路径**(按官方推理服务代码示例 `/2026aicompetition/
+        workspace/answer/{id}`);相对路径平台定位不到结果→零分。`AICOMP_PRED_PATH_PREFIX`
+        旧开关已随之移除。`relative_pred_path` 保留为 `pred_path` 的向后兼容别名。"""
         _, config_mod, _ = svc
-        assert config_mod.relative_pred_path(9) == "answer/9"
-        monkeypatch.setenv("AICOMP_PRED_PATH_PREFIX", "canswer")
-        assert config_mod.relative_pred_path(9) == "canswer/9"
+        expect = config_mod.answer_dir(9).replace(os.sep, "/")
+        assert config_mod.pred_path(9) == expect
+        assert config_mod.pred_path(9).endswith("answer/9")
+        assert config_mod.relative_pred_path is config_mod.pred_path
 
     def test_port_is_8000(self, svc):
         """规范 §三:健康检查接口必须在 8000 端口。"""

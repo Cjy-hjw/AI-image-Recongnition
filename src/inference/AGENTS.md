@@ -18,8 +18,9 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先;**空输入安全返回 `keyframe_index=-1` 不抛**,由 `video_predict.py` 的显式守卫拦全帧失败,见下方「坏帧隔离」) |
 | `nifti_io.py` | **2026-08-01 新增,尚未接入主流程**。NIfTI(.nii/.nii.gz)读写:`save_binary_mask`(交付 mask,值域强制 `{0,1}`)、`load_nifti_frames`(动图输入,签名与 `load_video_frames` 逐位对齐)、`scatter_frames_to_full_length`(抽样帧回填全帧序列)、`is_nifti_path`。见 §8 |
 | `nodule_split.py` | **2026-08-01 新增,尚未接入主流程**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。见 §9 |
-| `prediction_json.py` | **2026-08-01 新增,尚未接入主流程**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。见 §10 |
+| `prediction_json.py` | **2026-08-01 新增,已接入(A3)**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。V2.1 起 `StudyUID` 填 PatientId、`MaskFile` 为相对病例一级目录路径。见 §10 |
 | `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6 |
+| `v21_output.py` | **A3 新增**。**唯一 V2.1 写盘入口** `write_case_v21`:把 `case_pipeline` 结果落成官方 V2.1 逐结节交付形态(软/二值 mask resize 回原图 → `split_nodules` 逐实例 → 每结节 `.nii.gz` + `prediction.json` 原子写)。静/动两链路,动态逐结节 3D mask 跨帧关联(最简实现,@云TODO)。见 §12 |
 
 ---
 
@@ -340,8 +341,9 @@ exit code、零输出，与本节修复的"图像/视频加载失败"是同一�
 
 ## 8. `nifti_io.py` — NIfTI 读写(2026-08-01 新增)
 
-> **状态:已实现 + 已测试(35 例),但主流程尚未调用。** `predict.py`/`video_predict.py`/
-> `entrypoint.sh` 三处入口目前都不认 `.nii.gz`,接入是独立待办项(见 §11)。
+> **状态:已实现 + 已测试(35 例)+ 已接入。** A1 起 `entrypoint.sh` 按 `.nii.gz`
+> 分发,`src/service/case_discovery.py`/`runner.py` 经本模块读写动态图输入与逐结节
+> mask 落盘(V2.1 交付链路)。
 
 ### 为什么需要
 
@@ -396,7 +398,8 @@ loader 默认只抽 32 帧 —— 直接堆叠抽样帧的 mask 会让 Z 长度�
 
 ## 9. `nodule_split.py` — 整图 mask → 逐结节实例(2026-08-01 新增)
 
-> **状态:已实现 + 已测试(27 例),主流程尚未调用。**
+> **状态:已实现 + 已测试(27 例)+ 已接入。** `v21_output.write_case_v21` 在 V2.1
+> 交付链路中调用 `split_nodules` 把整图 mask 拆成逐结节实例。
 
 官方要求**每个检出结节**单独一条记录,而本项目模型输出的是**单通道整图 mask**
 (`multi_task_model.seg_head` 是 `Conv2d(20,1,1)`,无实例分割概念)。本模块用连通域
@@ -433,7 +436,8 @@ closing 后变成 (帧1,帧2) —— **帧 0 凭空消失、帧 1 凭空出现**
 
 ## 10. `prediction_json.py` — 官方输出 schema(2026-08-01 新增)
 
-> **状态:已实现 + 已测试(60 例),主流程尚未调用。**
+> **状态:已实现 + 已测试(72 例)+ 已接入。** A3 起 `v21_output.write_case_v21` 经
+> `build_prediction_json`/`validate_prediction_json` 组装并校验 V2.1 输出。
 
 ### 三个新维度的类别映射(最需小心处)
 
@@ -470,15 +474,45 @@ JSON 完全合法、指标只是"偏低",本地永远查不出根因。
 
 ---
 
-## 11. 接入待办(2026-08-01 记,尚未完成)
+## 11. Phase 5 接入待办(2026-08-01 记,2026-08-10 A1-A3 已闭合)
 
-新增的三个模块与 `src/service/` 均为**独立可测单元**,但**主流程一行都没调用**。
-在下列改造完成前,它们对交付**零贡献**:
+> **已闭合**:下列缺口在 Phase 5 / 本轮 commit 已全部落地(详见 §12 与各模块状态)。
+> 保留本表作为接入历史与「还剩什么」的说明。
 
-| 缺口 | 现状 | 后果 |
+| 缺口 | 现状 | 处置 |
 |:---|:---|:---|
-| 入口不认 `.nii.gz` | `entrypoint.sh` 按扩展名分发,`${INPUT_PATH##*.}` 对 `.nii.gz` 剥出 `gz` → 落 `*)` → 走 `predict.py` 静态图入口;内容嗅探层 `file --mime-type` 返回 `application/gzip`,既不匹配 `image/*` 也不匹配 `video/*` → 直接 "Unrecognized input format" exit 1 | **官方动图 100% 零预测** |
-| 部署形态未切换 | `entrypoint.sh` 仍是"跑一次推理就 exit"的离线 CLI;规范 §二/§三 要求 8000 端口长驻 HTTP 服务 | 平台探针打不到服务 → 连续失败 3 次容器重启 → **评测无法开始** |
-| 推理未接入服务层 | `src/service/app.py` 的 `set_runner()` 无任何调用方,`_runner` 恒为 None,生产请求全走 `_placeholder_runner` | 结果目录只有 `_placeholder.txt`,回调却报"已完成" → **全样本零分且无失败信号** |
-| 输出契约不相交 | 现有链路写 `result.json` + `mask_predicted.png`(整图 0/255 PNG);官方要 `prediction.json` + 每结节 `.nii.gz`(0/1) | 评测按规范找不到文件 → **判"无预测输出"** |
-| 模型仍是整图级 | 分类头全是整图 pooled 特征上的单次线性分类,无实例分割 | 多结节记录只能靠 `nodule_split` 事后拆分,属性无法逐结节区分 |
+| 入口不认 `.nii.gz` | `entrypoint.sh` 按扩展名分发,`${INPUT_PATH##*.}` 对 `.nii.gz` 剥出 `gz` → 落 `*)` | **A1 已闭合**:`.nii.gz`/`.nii` 全名匹配单独判定归 dynamic,魔数嗅探显式跳过 NIfTI |
+| 部署形态未切换 | `entrypoint.sh` 仍是"跑一次推理就 exit"的离线 CLI | **A2 已闭合**:Dockerfile `ENTRYPOINT` 切 `python -m src.service.app`(uvicorn 8000),entrypoint.sh 降级为调试旁路 |
+| 推理未接入服务层 | `src/service/app.py` 的 `set_runner()` 无调用方,`_runner` 恒为 None | **A2 已闭合**:`build_service_runner` 落地,`main()` 注入真实 runner(见 `src/service/AGENTS.md`) |
+| 输出契约不相交 | V2.0 `result.json` + `mask_predicted.png`;官方要 `prediction.json` + 每结节 `.nii.gz` | **A3 已闭合**:`v21_output.write_case_v21` 唯一写盘入口,`prediction_json` 校验 |
+| 模型仍是整图级 | 分类头无实例分割 | **@云TODO 存续**:分类头仍整图级,多结节属性靠 `nodule_split` 事后拆分,逐结节属性无法区分(v21_output 已接 `nodule_split`) |
+
+## 12. `v21_output.py` — V2.1 单病例输出写盘入口(A3 新增)
+
+**唯一 V2.1 写盘入口**(`write_case_v21`),把 `case_pipeline` 的推理结果转成官方
+《赛事开发规范 V2.1》§五的逐结节交付形态:
+
+- **mask 尺寸硬约束**:软 `pred_mask` 与二值 `mask_binary` 都 resize 回**原图 H×W**(软用
+  `INTER_LINEAR` 保概率平滑,二值用 `INTER_NEAREST` 保 `{0,1}` 语义);调用方(runner)透传
+  `orig_hw`,缺 `orig_hw` 直接 `V21OutputError`——绝不拿 resize 后的模型输入张量冒充原图。
+- **逐结节**:`nodule_split.split_nodules` 连通域拆分(2D 静态 / 3D 动态跨帧),每结节
+  一个 `.nii.gz`(`nodule_NNN.nii.gz`,值域 `{0,1}`),`detection_confidence` 取区域内概率均值。
+- 每结节 `build_nodule_entry`(良恶性/TI-RADS 真实预测;ETE=1/Location 均匀/T=0 占位)→
+  `build_prediction_json` → `validate_prediction_json` → **原子写**(`.tmp` + `os.replace`)。
+- **阴性病例合法**(`split_nodules` 0 结节):`Nodules`/`MaskFiles` 空数组,仍写结构合规
+  `prediction.json`。
+- **两个本地测不出的坑(写死在本模块)**:① NIfTI 列主序转置由 `save_binary_mask` 内部做,
+  本模块只传行主序数组,不重复转置;② `MaskFile` 必须是相对病例一级目录的**正斜杠**路径
+  (`{subdir_uid}/nodule_NNN.nii.gz`,禁绝对路径/`..`,`_validate_relative_mask_path` 双侧拦截),
+  Windows 上 `os.path.join` 产 `\\`,官方 Linux 评测按 `/` 解析会定位失败。
+- **动态 3D 跨帧关联(@云TODO 最简实现)**:抽样帧逐帧 resize → `scatter_frames_to_full_length`
+  回填全帧 `(n_total, H, W)` 3D mask → 3D 连通域 = 跨帧同一结节自然连成一个实例;分割中间帧
+  漏检会拆成两个实例,空间相邻结节可能被闭运算粘连——真正的 tracking 待官方数据校正。
+- **`_build_entries_and_save_masks(...)` 只返回 `entries`**(2026-08-10 nit:原返回
+  `(entries, rel_paths)`,`rel_paths` 无其它用途,两处调用点原都写 `entries, _ =` 丢弃,已简化)。
+
+### 失败语义
+
+`V21OutputError`(独立于 `PredictionSchemaError`):case_result 缺关键键 / 维度不符 / 依赖缺失
+(cv2)等运行期故障,由 runner 的病例级隔离捕获转 ERROR 占位,不拖垮整批。`rejected` 标记的
+case_result 不应走本函数(由 runner 的 ERROR/REJECTED 兜底)。

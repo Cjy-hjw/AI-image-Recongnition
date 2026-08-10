@@ -28,11 +28,12 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 
 - **`src/models/`** — 双主干模型 + CBM 头 + 物理先验 + 损失：见 `src/models/AGENTS.md`
 - **`src/training/`** — 三阶段渐进训练 + GradScaler 协议 + vCLUB 隔离：见 `src/training/AGENTS.md`
-- **`src/inference/`** — 推理管线（io / model_runner / postprocess / calibration / export / video）：见 `src/inference/AGENTS.md`
+- **`src/inference/`** — 推理管线(io / model_runner / postprocess / calibration / export / video / case_pipeline / v21_output / prediction_json / nifti_io / nodule_split):见 `src/inference/AGENTS.md`
 - **`src/dataset/`** — 数据加载 + 增强 + PathologyDataset 病理预训练：见 `src/dataset/AGENTS.md`
 - **`src/gatekeeper/`** — 真实性 / 去重 / 篡改四层门控：见 `src/gatekeeper/AGENTS.md`
 - **`scripts/`** — 8-Gate verify_model.py + 数据格式化 + 预训练管道：见 `scripts/AGENTS.md`
-- **`tests/`** — 356 passed, 1 skipped（含 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 15 model_runner + 2 gate8_adaptor_isolation + 49 gatekeeper + 50 video + 30 entrypoint_dispatch + 23 probability_output + 14 gatekeeper_soft_enforcement + 6 authenticity_trainer + 8 official_loader）：见 `tests/AGENTS.md`
+- **`src/service/`** — V2.1 常驻 HTTP 推理服务(app/tasks/config/case_discovery/runner):见 `src/service/AGENTS.md`
+- **`tests/`** — 356 passed, 1 skipped（含 20 pathology_dataset + 13 pathology_mil_dataset + 4 bn_freeze + 15 model_runner + 2 gate8_adaptor_isolation + 49 gatekeeper + 50 video + 30 entrypoint_dispatch + 23 probability_output + 14 gatekeeper_soft_enforcement + 6 authenticity_trainer + 8 official_loader）；**Phase 5(2026-08-10)另加 V2.1 交付四模块**:test_nifti_io(35) + test_nodule_split(31) + test_prediction_json(72) + test_v21_output(11) + test_service_runner(10) + test_case_discovery(39) + test_service_api(20),本地收集共 **580 collected**：见 `tests/AGENTS.md`
 
 所有拆分模块通过 `__init__.py` re-export shim 保持旧导入路径兼容。
 

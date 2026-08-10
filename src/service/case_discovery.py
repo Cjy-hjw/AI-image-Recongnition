@@ -30,13 +30,11 @@ A3/A2 后续做)。故本模块**不依赖 torch / 模型**,可独立单测,且 
   字段缺失)→ 降级走路径推断,见 `_fallback_patient_id_from_path` 的 @云TODO。
 
 - **动态 `.nii.gz`/`.nii`**:NIfTI 无 DICOM 头,PatientId/AccessionNumber **只能
-  从路径推断**。训练数据定稿 §1.11 提示动图形如 `{PatientId}/{PatientId}/{PatientId}.nii.gz`
-  (一患者一动态序列,定稿 §4.2 项1 实测确认)—— 据此**参数化**取某级父目录名作
-  PatientId。但**确切目录层级本地拿不到官方真实数据无法锁死**(定稿 §4.2 是云端
-  agent 在训练集 `annotation/` 下实测,推理输入侧目录结构是 `verification/original/`
-  下的 3 层嵌套哈希,定稿 §4.2 项2 仅写「靠扩展名区分静动」、未给确切层级),故此处
-  用**可配置的「向上第 N 级父目录」参数**,默认按训练数据口径取 2 级父目录,并显式
-  标 @云TODO:云端首跑校正。
+  从路径推断**。**组委会 2026-08-10 答复(已明确)**:动态图 **PatientId =
+  AccessionNumber = 直接父目录名**,即输入按 `{...}/{PatientId}/{xxx}.nii.gz`
+  组织,文件上一层目录名同时是 PatientId 与 AccessionNumber(动态一患者一序列)。
+  据此取 `_DYNAMIC_PATIENT_DEPTH=1`(直接父目录);训练集 `{pid}/{pid}/{pid}.nii.gz`
+  的深度 2 口径仅训练集适用,与推理输入不同,若云端首跑不符只改该常量。
 
   `subdir_uid`(V2.1 动态输出子目录名 = AccessionNumber,定稿 §1.2)来源官方**未明确**
   (定稿 §1.2 注 + §4.1 项1:动态 `.nii.gz` 无 DICOM 头,推理时 AccessionNumber 从何
@@ -196,23 +194,21 @@ def _build_static_case(path):
 def _build_dynamic_case(path):
     """动态 `.nii.gz`/`.nii` 病例:无 DICOM 头,PatientId/AccessionNumber 只能从路径推断。
 
-    训练数据定稿 §1.11:动图目录 `{PatientId}/{PatientId}/{PatientId}.nii.gz` →
-    取**向上第 2 级父目录名**作 PatientId(文件本身 1 级 + 中间一层 PatientId 目录 1 级)。
+    **官方口径(2026-08-10 组委会答复,已明确,原 @待官方 关闭)**:动态图
+    **PatientId = AccessionNumber = 直接父目录名**(`_DYNAMIC_PATIENT_DEPTH=1`)。
+    即动图输入按 `{...}/{PatientId}/{xxx}.nii.gz` 组织,文件上一层目录名就是
+    PatientId 与 AccessionNumber(动态一患者一序列,二者同源)。
 
-    但**推理输入侧目录结构本地拿不到官方真实数据无法锁死**(定稿 §4.2 项2 仅写
-    「靠扩展名区分静动」、未给确切层级),故层级用参数 `_DYNAMIC_PATIENT_DEPTH`
-    (默认 2),云端首跑发现对不上时改这一个常量即可,不用动逻辑。
+    训练数据定稿 §1.11 的 `{PatientId}/{PatientId}/{PatientId}.nii.gz`(深度 2)是
+    **训练集**组织方式;推理输入侧组委会口径是直接父目录(深度 1),故取
+    `_DYNAMIC_PATIENT_DEPTH=1`。若云端首跑发现推理输入目录层级与组委会答复不符,
+    只改 `_DYNAMIC_PATIENT_DEPTH` 这一个常量即可,不用动逻辑。
 
-    `subdir_uid`(V2.1 动态输出子目录名 = AccessionNumber,定稿 §1.2)来源官方
-    **未明确**(定稿 §1.2 注 + §4.1:动态 .nii.gz 无 DICOM 头,AccessionNumber 从何
-    获取待官方)→ @待官方,先用 PatientId 占位(动态一患者一序列,定稿 §4.2 项1,
-    PatientId 在动态语境下与 AccessionNumber 的输出子目录定位语义等价),云端拿
-    到真值后在此替换。
+    `subdir_uid`(V2.1 动态输出子目录名 = AccessionNumber)按组委会口径 =
+    PatientId(同一直接父目录名),二者同源不产生子目录冲突。
     """
     patient_id = _infer_ancestor_name(path, _DYNAMIC_PATIENT_DEPTH)
-    # @待官方:AccessionNumber 来源未明确(见模块 docstring)。动态一患者一序列
-    # (定稿 §4.2 项1)下,用 PatientId 作 subdir_uid 占位不会产生子目录冲突。
-    # 官方真值到位后替换此处。
+    # 官方口径:AccessionNumber = PatientId = 直接父目录名(见 docstring)。
     subdir_uid = patient_id if patient_id else _fallback_subdir_uid_from_path(path)
 
     return {
@@ -253,13 +249,13 @@ def _fallback_subdir_uid_from_path(path):
     return _infer_ancestor_name(path, 1)
 
 
-# ── 推断层级常量(云端首跑后在此校正) ──────────────────────────────────────
-# 训练集口径(定稿 §1.11):静态 {pid}/{series}/*.dcm → pid 在第 2 级父;
-# 动态 {pid}/{pid}/{pid}.nii.gz → pid 在第 2 级父。
-# 推理侧口径(定稿 §4.2 项2):verification/original/{哈希}/{DICOM UID}/{文件} →
-# 层级不同,@云TODO 云端首跑后改这两个常量。
+# ── 推断层级常量 ──────────────────────────────────────────────────────────
+# 静态:训练集口径 {pid}/{series}/*.dcm → pid 在第 2 级父(DICOM 头缺失时兜底)。
+# 动态:**组委会 2026-08-10 答复:PatientId = AccessionNumber = 直接父目录名** →
+#   _DYNAMIC_PATIENT_DEPTH=1(原训练集口径 {pid}/{pid}/{pid}.nii.gz 是深度 2,仅训练集)。
+# 云端首跑若发现推理输入层级与组委会答复不符,只改对应常量即可。
 _STATIC_PATIENT_DEPTH = 2
-_DYNAMIC_PATIENT_DEPTH = 2
+_DYNAMIC_PATIENT_DEPTH = 1
 
 
 def _infer_ancestor_name(path, depth):

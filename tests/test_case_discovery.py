@@ -246,15 +246,26 @@ class TestBuildStaticCase:
 class TestBuildDynamicCase:
     """动态 .nii.gz case:无 DICOM 头,全部从路径推断。"""
 
-    def test_dynamic_layout_patient_at_depth_2(self, tmp_path):
-        # 定稿 §1.11 动态口径:{pid}/{pid}/{pid}.nii.gz
+    def test_dynamic_layout_patient_at_direct_parent(self, tmp_path):
+        # 组委会 2026-08-10 口径:PatientId=AccessionNumber=直接父目录名(depth=1)。
+        # 训练集 {pid}/{pid}/{pid}.nii.gz 在 depth=1 下也命中同一值(上一层=P3)。
         nii = tmp_path / "P3" / "P3" / "P3.nii.gz"
         _save_nifti(str(nii))
         case = _build_dynamic_case(str(nii))
         assert case["kind"] == "dynamic"
         assert case["patient_id"] == "P3"
-        # subdir_uid = AccessionNumber(@待官方)→ 暂用 PatientId 占位
+        # subdir_uid = AccessionNumber = PatientId(组委会口径,直接父目录名)
         assert case["subdir_uid"] == "P3"
+
+    def test_dynamic_layout_official_single_layer(self, tmp_path):
+        # 组委会推理输入口径:{...}/{pid}/{xxx}.nii.gz —— 文件名与父目录名不同,
+        # 验证 depth=1 取的是直接父目录名(=PatientId=AccessionNumber),不是文件名。
+        nii = tmp_path / "PID777" / "scan_video.nii.gz"
+        _save_nifti(str(nii))
+        case = _build_dynamic_case(str(nii))
+        assert case["kind"] == "dynamic"
+        assert case["patient_id"] == "PID777"
+        assert case["subdir_uid"] == "PID777"
 
     def test_nii_uncompressed(self, tmp_path):
         # .nii(无 gzip)也是 dynamic
@@ -265,13 +276,9 @@ class TestBuildDynamicCase:
         assert case["patient_id"] == "P5"
 
     def test_shallow_path_falls_back_to_stem(self, tmp_path):
-        # 文件埋深不足 2 级:_DYNAMIC_PATIENT_DEPTH=2 取不到祖父目录,dirname 链
-        # 顶到祖先盘符根 → basename('')='' → 越界兜底文件 stem = 'lonely'。
-        # tmp_path 是 pytest 临时目录(深多层),要构造"埋深不足"得把文件直接
-        # 挂在 tmp_path 下、且 tmp_path 自身名短到 dirname 链能顶到盘符根:
-        #   tmp_path/lonely.nii.gz → dirname×2 = 盘符根 '' → 越界兜底 stem。
-        # 但 tmp_path 的祖先链足够深(dirname×2 仍在 pytest 临时目录树内),
-        # 故用 monkeypatch 把 _DYNAMIC_PATIENT_DEPTH 抬到能逼出越界的值,验证兜底路径。
+        # 兜底路径验证:把 _DYNAMIC_PATIENT_DEPTH 抬到超过 tmp_path 实际埋深,
+        # 逼出「dirname 链顶到根 → 越界 → 兜底取文件 stem(去 .nii.gz)」分支。
+        # (与 _DYNAMIC_PATIENT_DEPTH 的具体取值无关,monkeypatch 显式抬高。)
         nii = tmp_path / "lonely.nii.gz"
         _save_nifti(str(nii))
         import src.service.case_discovery as mod

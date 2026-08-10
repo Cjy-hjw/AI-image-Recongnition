@@ -57,4 +57,10 @@ RUN chmod +x /workspace/scripts/entrypoint.sh
 # `src.service.app:main()` 启动时 `set_runner(build_service_runner(...))` 注入真实
 # 推理 runner(见 src/service/runner.py);模型权重/config/precision 由环境变量
 # `AICOMP_WEIGHTS`/`AICOMP_CONFIG`/`AICOMP_PRECISION` 注入,缺省回落 CLI 同款路径。
+#
+# ⚠️ 调试旁路调用方式(2026-08-10 CI 踩坑修复):**不要** `docker run <image> <input>`
+# —— 位置参数会被默认 HTTP ENTRYPOINT(uvicorn)忽略,起成不退出的服务而挂起。
+# 要在容器里走单文件 CLI 分发(predict.py/video_predict.py),必须显式覆盖入口:
+#   docker run --rm --entrypoint /workspace/scripts/entrypoint.sh <image> <input>
+# 生产形态(平台探针打 8000)用下方默认 ENTRYPOINT,不加 --entrypoint。
 ENTRYPOINT ["python", "-m", "src.service.app"]

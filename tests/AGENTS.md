@@ -40,7 +40,7 @@
 | `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
 | `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
 
-## `test_phase_refactor.py` — 重构不变式(全套 **356 passed + 1 skipped**(357 collected,+8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,push 后核 headSha 绿),此文件 19)
+## `test_phase_refactor.py` — 重构不变式(全套 **356 passed + 1 skipped**(357 collected,+8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 19)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

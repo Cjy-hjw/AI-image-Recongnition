@@ -80,6 +80,12 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 
 ## 7. `entrypoint.sh` — 交付入口:扩展名分发 + 内容嗅探兜底(2026-07-11 加固)
 
+> **容器入口定位(2026-08-10 A2 起)**:entrypoint.sh 已从容器**生产入口**降级为**本地/CI 单文件调试旁路**——生产容器 `ENTRYPOINT = python -m src.service.app`(常驻 HTTP 服务,uvicorn 8000,见 Dockerfile)。本脚本的分发/嗅探/崩溃兜底逻辑仍是有价值的调试资产并被 `tests/test_entrypoint_dispatch.py` 回归守护,**但不再是 `docker run image <input>` 的默认入口**。
+>
+> **CI 调试旁路的正确调法(2026-08-10 CI 修复,踩过的坑)**:`docker run image <input>` 会把位置参数交给默认 HTTP ENTRYPOINT(uvicorn)直接忽略 → 起成不退出的服务挂起。要在容器里走 CLI 分发,**必须显式覆盖入口**:
+> `docker run --rm --entrypoint /workspace/scripts/entrypoint.sh <image> <input>`
+> (`.github/workflows/ci.yml` 的 `entrypoint-dispatch-smoke` job 即按此法,9 个 docker run 全部带 `--entrypoint`;R3 起静态 PNG/JPG 用例断言 status=PASSED——authenticity 权重缺失已降级 skipped 不再硬 ERROR;corrupted 用例仍断言 ERROR,来自 cv2.imread 解码失败分支。)
+
 **背景**:官方"动态图"具体交付格式从未在答疑中明确过(见 `docs/比赛对齐与风险.md`「动态图交付格式未知风险」)。纯扩展名白名单(`mp4|avi|mov|mkv|dcm|dicom` → `video_predict.py`,其余 → `predict.py`)是工程假设,格式超出预期时会静默误判成静态图,导致该样本 100% 丢失预测。
 
 **分发逻辑(`entrypoint.sh` 第 5 节)**:

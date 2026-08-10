@@ -117,6 +117,13 @@ jobs:
   # 封印 / 信号转发 / 崩溃兜底仍是已验证资产、有独立价值,故保留整组单文件分发
   # + 落盘冒烟(容器能按扩展名分发到 predict.py/video_predict.py、异常兜底不崩)。
   # 本 job 与 docker-build-smoke 各自独立 build 镜像(避免 job 间共享 runner 状态)。
+  #
+  # 2026-08-10 关键修复(此前该 job 从诞生起从未绿过、必挂起):A2 把镜像 ENTRYPOINT
+  # 从 entrypoint.sh(离线 CLI)切成了常驻 HTTP 服务 `python -m src.service.app`。
+  # 若照旧 `docker run image <input>` 直接喂位置参数,该参数会被 uvicorn 忽略 →
+  # 容器起成不退出的 HTTP 服务 → step 挂起 ~23min 被 cancelled(0% 通过率)。
+  # 故每个冒烟步骤都加 `--entrypoint /workspace/scripts/entrypoint.sh` 显式覆盖回
+  # CLI 分发入口,只测 bash 分发/兜底逻辑,不触发生产 HTTP 形态。
   entrypoint-dispatch-smoke:
     runs-on: ubuntu-latest
     steps:
@@ -126,13 +133,13 @@ jobs:
       - name: Generate synthetic static image (well-known minimal valid 1x1 PNG)
         run: echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" | base64 -d > /tmp/smoke_input.png
       - name: Smoke test — static image path (predict.py via entrypoint 分发)
-        # 无 authenticity_model.pth,gatekeeper 审计第一步(Authenticity)必然
-        # 硬报错(2026-07-10 修复:权重缺失 raise 而非静默随机分类)——预期
-        # status=ERROR,这本身就是"容器构建+启动+分发+异常兜底"全链路走通的证明,
-        # 不是失败。只要 result.json 落盘且 status/reason 字段完整即视为通过。
+        # R3(2026-08-10)后:authenticity 权重缺失在 build_auth_module 降级 skipped,
+        # 不再硬 ERROR。故预期 status=PASSED(soft 模式、诊断照出),这本身证明
+        # 「容器构建+启动+分发+gatekeeper 降级」全链路走通。
         run: |
           mkdir -p /tmp/smoke_out_static
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/smoke_input.png:/workspace/smoke_input.png:ro \
             -v /tmp/smoke_out_static:/workspace/data/output \
             thyroid-infer:ci-test /workspace/smoke_input.png
@@ -140,8 +147,9 @@ jobs:
           python3 -c "
           import json
           d = json.load(open('/tmp/smoke_out_static/result.json'))
-          assert d.get('status') == 'ERROR', f'预期status=ERROR(容器内无真实权重),实际:{d}'
-          assert d.get('reason'), f'reason不应为空: {d}'
+          # 2026-08-10 R3 起:authenticity 权重缺失在 build_auth_module 降级 skipped,
+          # **不再硬 ERROR**。故静态图预期 status=PASSED(soft,诊断照出)而非旧 ERROR。
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(R3后auth缺失降级,诊断照出),实际:{d}'
           print('OK: 静态图路径冒烟测试通过')
           "
       - name: Generate synthetic cine video (ffmpeg lavfi testsrc,无需外部输入文件)
@@ -157,6 +165,7 @@ jobs:
         run: |
           mkdir -p /tmp/smoke_out_video
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/smoke_input.mp4:/workspace/smoke_input.mp4:ro \
             -v /tmp/smoke_out_video:/workspace/data/output \
             thyroid-infer:ci-test /workspace/smoke_input.mp4 --skip_gatekeeper
@@ -192,6 +201,7 @@ jobs:
         run: |
           mkdir -p /tmp/smoke_out_dcm1
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/single.dcm:/workspace/single.dcm:ro \
             -v /tmp/smoke_out_dcm1:/workspace/data/output \
             thyroid-infer:ci-test /workspace/single.dcm --skip_gatekeeper
@@ -206,6 +216,7 @@ jobs:
         run: |
           mkdir -p /tmp/smoke_out_dcm4
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/cine.dcm:/workspace/cine.dcm:ro \
             -v /tmp/smoke_out_dcm4:/workspace/data/output \
             thyroid-infer:ci-test /workspace/cine.dcm --skip_gatekeeper
@@ -226,6 +237,7 @@ jobs:
         run: |
           mkdir -p /tmp/smoke_out_dcm_compressed
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/compressed.dcm:/workspace/compressed.dcm:ro \
             -v /tmp/smoke_out_dcm_compressed:/workspace/data/output \
             thyroid-infer:ci-test /workspace/compressed.dcm --skip_gatekeeper
@@ -240,6 +252,7 @@ jobs:
         run: |
           mkdir -p /tmp/smoke_out_dcm_compressed_cine
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/compressed_cine.dcm:/workspace/compressed_cine.dcm:ro \
             -v /tmp/smoke_out_dcm_compressed_cine:/workspace/data/output \
             thyroid-infer:ci-test /workspace/compressed_cine.dcm --skip_gatekeeper
@@ -265,6 +278,7 @@ jobs:
         run: |
           mkdir -p /tmp/smoke_out_jpg
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/smoke_input.jpg:/workspace/smoke_input.jpg:ro \
             -v /tmp/smoke_out_jpg:/workspace/data/output \
             thyroid-infer:ci-test /workspace/smoke_input.jpg
@@ -272,8 +286,7 @@ jobs:
           python3 -c "
           import json
           d = json.load(open('/tmp/smoke_out_jpg/result.json'))
-          assert d.get('status') == 'ERROR', f'预期status=ERROR(容器内无真实权重,同静态PNG用例),实际:{d}'
-          assert d.get('reason'), f'reason不应为空: {d}'
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(R3后auth缺失降级,同静态PNG用例),实际:{d}'
           print('OK: JPG 静态图冒烟测试通过')
           "
       - name: Smoke test — corrupted non-empty file (predict.py 必须 ERROR 不崩溃)
@@ -290,6 +303,7 @@ jobs:
           { printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR'; head -c 2048 /dev/urandom; } > /tmp/corrupted.png
           mkdir -p /tmp/smoke_out_corrupted
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/corrupted.png:/workspace/corrupted.png:ro \
             -v /tmp/smoke_out_corrupted:/workspace/data/output \
             thyroid-infer:ci-test /workspace/corrupted.png
@@ -308,6 +322,7 @@ jobs:
           ffmpeg -f lavfi -i testsrc=duration=1:size=4x4:rate=5 -y /tmp/tiny.mp4
           mkdir -p /tmp/smoke_out_tiny
           docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
             -v /tmp/tiny.mp4:/workspace/tiny.mp4:ro \
             -v /tmp/smoke_out_tiny:/workspace/data/output \
             thyroid-infer:ci-test /workspace/tiny.mp4 --skip_gatekeeper

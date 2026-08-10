@@ -800,3 +800,129 @@ class TestDomainRandomization:
         s_raw = grid_strength(block_artifact_energy(img))
         s_dr = grid_strength(block_artifact_energy(out))
         assert s_dr > s_raw, f"域随机化未植入 JPEG 栅格 (raw={s_raw:.3f}, dr={s_dr:.3f})"
+
+
+class TestAuthWeightFailureDegrades:
+    """R3: authenticity 权重故障/预测崩溃降级为审计跳过,不拖垮整例诊断。
+
+    赛道七真实性零计分,一个不计分组件的权重 stale 不该让整例临床诊断清零
+    (旧行为: load_weights raise → 入口兜成 ERROR → 整例零诊断)。
+    """
+
+    def test_build_auth_module_missing_weights_returns_none_not_raise(self):
+        # 缺权重: build_auth_module 返回 None(降级不可用),不再 raise
+        from src.inference.gatekeeper_runner import build_auth_module
+        result = build_auth_module("checkpoints/__absent_for_test__.pth")
+        assert result is None
+
+    def test_audit_marks_auth_skipped_when_module_unavailable(self, monkeypatch):
+        # auth_module 不可用(None)→ build_auth_module 降级 None → audit 标 auth_skipped、
+        # passed=True(soft)、诊断照常(不 raise)。dedup/tamper 用假对象隔离。
+        import src.inference.gatekeeper_runner as gk
+
+        monkeypatch.setattr(gk, "build_auth_module", lambda *a, **k: None)
+
+        class _FakeDedup:
+            def is_duplicate(self, img): return False, ""
+
+        class _FakeTamper:
+            last_soft_flags = []
+            def detect(self, img): return False, None, None
+
+        img = np.zeros((64, 64), np.uint8)
+        passed, audit = gk.run_gatekeeper_audit(
+            img, {"gatekeeper": {"enforcement_mode": "soft"}}, "cpu",
+            "checkpoints/x.pth", "out",
+            deduplicator=_FakeDedup(), auth_module=None,
+            tamper_detector=_FakeTamper())
+        assert passed is True                 # soft: 诊断照出
+        assert audit["auth_skipped"] is True  # authenticity 项标记跳过
+        assert audit["is_phantom"] == 0       # 未预测,不误报
+        assert audit["is_gan"] == 0
+
+    def test_audit_survives_auth_predict_crash(self, monkeypatch):
+        # auth_module.predict 运行期崩溃(如 3D 帧直连 cv2.absdiff)→ catch → 跳过,
+        # 不冒泡成整例 ERROR。
+        import src.inference.gatekeeper_runner as gk
+
+        class _CrashAuth:
+            def predict(self, img): raise ValueError("simulated ELA absdiff crash")
+
+        class _FakeDedup:
+            def is_duplicate(self, img): return False, ""
+
+        class _FakeTamper:
+            last_soft_flags = []
+            def detect(self, img): return False, None, None
+
+        img = np.zeros((64, 64), np.uint8)
+        passed, audit = gk.run_gatekeeper_audit(
+            img, {"gatekeeper": {"enforcement_mode": "soft"}}, "cpu",
+            "checkpoints/x.pth", "out",
+            deduplicator=_FakeDedup(), auth_module=_CrashAuth(),
+            tamper_detector=_FakeTamper())
+        assert passed is True
+        assert audit["auth_skipped"] is True
+
+    def test_explicit_none_auth_module_not_rebuilt_per_call(self, monkeypatch):
+        """Gate2 finding #4:显式传 auth_module=None(视频/服务预建但降级失败)时,
+        run_gatekeeper_audit **绝不能**重建——否则逐帧重复 load 权重 + N 次 WARNING,
+        踩 build_auth_module '只加载一次'契约。用哨兵区分'未传入'与'显式 None'。"""
+        import src.inference.gatekeeper_runner as gk
+
+        build_calls = {"n": 0}
+
+        def _spy_build(*a, **k):
+            build_calls["n"] += 1
+            return None
+
+        monkeypatch.setattr(gk, "build_auth_module", _spy_build)
+
+        class _FakeDedup:
+            def is_duplicate(self, img): return False, ""
+
+        class _FakeTamper:
+            last_soft_flags = []
+            def detect(self, img): return False, None, None
+
+        img = np.zeros((64, 64), np.uint8)
+        # 显式 None:模拟视频逐帧调用(预建 auth 已降级为 None)。连调 3 次(≈3 帧)。
+        for _ in range(3):
+            passed, audit = gk.run_gatekeeper_audit(
+                img, {"gatekeeper": {"enforcement_mode": "soft"}}, "cpu",
+                "checkpoints/x.pth", "out",
+                deduplicator=_FakeDedup(), auth_module=None,
+                tamper_detector=_FakeTamper())
+            assert passed is True
+            assert audit["auth_skipped"] is True
+        assert build_calls["n"] == 0, "显式 None 不应触发任何 build_auth_module 重建"
+
+    def test_unset_auth_module_builds_once_on_demand(self, monkeypatch):
+        """哨兵语义另一半:**未传入** auth_module(单图 predict.py 路径)→ 按需构建一次。
+        与上一测试互补,证明'未传入'与'显式 None'被正确区分。"""
+        import src.inference.gatekeeper_runner as gk
+
+        build_calls = {"n": 0}
+
+        def _spy_build(*a, **k):
+            build_calls["n"] += 1
+            return None  # 降级不可用,但确实被调用了一次
+
+        monkeypatch.setattr(gk, "build_auth_module", _spy_build)
+
+        class _FakeDedup:
+            def is_duplicate(self, img): return False, ""
+
+        class _FakeTamper:
+            last_soft_flags = []
+            def detect(self, img): return False, None, None
+
+        img = np.zeros((64, 64), np.uint8)
+        # 不传 auth_module → 走哨兵默认 → 按需 build 一次。
+        passed, audit = gk.run_gatekeeper_audit(
+            img, {"gatekeeper": {"enforcement_mode": "soft"}}, "cpu",
+            "checkpoints/x.pth", "out",
+            deduplicator=_FakeDedup(), tamper_detector=_FakeTamper())
+        assert passed is True
+        assert audit["auth_skipped"] is True
+        assert build_calls["n"] == 1, "未传入时应按需构建恰一次"

@@ -42,9 +42,11 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 ## 2. `gatekeeper_runner.py` — 4-Layer Audit
 
-### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None, auth_module=None, tamper_detector=None)` → `(passed: bool, audit: dict)`
+### `run_gatekeeper_audit(img_np, config, device, weights_path, output_dir, deduplicator=None, auth_module=_AUTH_UNSET, tamper_detector=None)` → `(passed: bool, audit: dict)`
 
 **Scope**: Production inference only. evaluate.py 仅导入 model_runner/postprocess/export 三模块；gatekeeper_runner 由 predict.py(单图) 和 video_predict.py(动态图) 使用。
+
+**`auth_module` 哨兵语义(2026-08-10 R3)**:默认值已是哨兵 `_AUTH_UNSET`,非 `None`——**不传**(单图)才触发按需懒建一次;显式传 `None`(视频/服务已预建但权重降级失败)**不重建**,避免逐帧重复 load 权重 + N 次 WARNING。判空用 `getattr(auth_module,"predict",None)`,`None`/哨兵/stub 无 predict 均标 `auth_skipped=True`。
 
 **`audit` 恒为 dict**(2026-07-29 契约变更;旧版通过时返回 `None`)——审计结论必须能落进 `result.json`,否则 phantom/synthetic 软 flag 只打印在 stdout、评测方拿不到。任何调用点都不得再假设"通过 ⇒ 第二个返回值是 None"。
 
@@ -62,7 +64,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 - **无状态污染**:`is_duplicate` 只读比对,不把当前帧 `add_image` 入库;故同一 cine 相邻近重复帧之间不会互相误判(去重库只播种训练集)。
 
 Pipeline:
-1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection。**2026-07-12 统一软flag制度**:分类结果**不再**驱动 REJECTED,仅作审计字段(`is_phantom`/`is_gan`)。权重缺失/损坏仍在 `AuthenticityModule.load_weights` 硬报错,红线未变——**审计命中软化 ≠ 故障软化**,文件损坏/权重缺失/解码失败一律仍走 ERROR。详见 `src/gatekeeper/AGENTS.md` §1。
+1. **Authenticity** — `AuthenticityModule` (13-dim GLCM+freq+ELA+DND+TAI → MLP) → phantom/synthetic detection。**2026-07-12 统一软flag制度**:分类结果**不再**驱动 REJECTED,仅作审计字段(`is_phantom`/`is_gan`)。**权重故障处理(2026-08-10 R3)**：`AuthenticityModule.load_weights` 内部对权重缺失/损坏仍可 raise，但 `build_auth_module` 调用方 catch 后**降级为返回 None + `auth_skipped=True`**——`run_gatekeeper_audit` 标 `auth_skipped=True`、`is_phantom=0`、`auth_probs=None`，诊断照常产出；这是显式跳过的诚实记录(WARNING + `auth_skipped` 字段)，非伪装 pass，依据是 auth 赛道七零计分、其故障不该让唯一得分项清零。**主模型等计分组件故障仍走 ERROR 硬报错，红线不变**。详见 `src/gatekeeper/AGENTS.md` §1。
 2. **Deduplication** — `Deduplicator` (pHash + cosine) seeded from train set。命中 ⇒ `would_reject_in_hard_mode=True`;**是否真拒绝取决于 `enforcement_mode`**(默认 soft 不拒绝,仅审计)。
 3. **Copy-Move** — `detect_copy_move()` dense block-matching。**恒为软flag**(`last_soft_flags`),与 CatNet 状态无关,详见下方第 5 点。
 4. **Splicing(硬粘贴)** — `detect_splicing()` 轴对齐长直缝 + 角点正交相交判据(压低误报至零)。**恒为软flag**,同上。

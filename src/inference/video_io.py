@@ -1,7 +1,8 @@
 """动态图/视频(cine)抽帧:MP4/AVI/MOV via OpenCV,多帧 DICOM via pydicom。
 
-返回灰度帧列表,供单帧模型逐帧推理。复用 `io.py` 的 PHI 匿名化字段
-(`_PHI_FIELDS`)对 cine DICOM 脱敏。采样下标由 `video_aggregate.uniform_sample_indices`
+返回灰度帧列表,供单帧模型逐帧推理。复用 `io.py` 的 PHI 匿名化函数
+(`_anonymize_phi`,标量匿名 + 序列删除)对 cine DICOM 脱敏。采样下标由
+`video_aggregate.uniform_sample_indices`
 统一计算,保证与聚合逻辑一致。
 """
 
@@ -9,7 +10,7 @@ import os
 import cv2
 import numpy as np
 
-from src.inference.io import _PHI_FIELDS, HAS_PYDICOM, _rescale_to_uint8, _to_gray
+from src.inference.io import _anonymize_phi, HAS_PYDICOM, _rescale_to_uint8, _to_gray
 from src.inference.video_aggregate import uniform_sample_indices
 
 _VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
@@ -102,9 +103,9 @@ def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
         # (默认 channel_order="rgb"),与 OpenCV 视频帧的 BGR 区分。
         frames = [_to_gray(arr[i], channel_order="rgb") for i in idxs]
 
-        for tag, anon in _PHI_FIELDS.items():
-            if tag in ds:
-                setattr(ds, tag, anon)
+        # PHI 匿名化:与 io.load_input_image 共用 _anonymize_phi(标量匿名+序列删除),
+        # 单一事实源,静/动口径一致(标签清单变更只需改 io.py 一处)。
+        _anonymize_phi(ds)
         anon_path = os.path.join(output_dir, "anonymized_cine.dcm")
         ds.save_as(anon_path)
         print(f"--> Saved anonymized DICOM cine to {anon_path}")

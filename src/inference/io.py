@@ -4,22 +4,39 @@ import os
 import cv2
 import numpy as np
 
-# HIPAA Safe Harbor 相关的 DICOM PHI 标签 → 匿名化目标值。
+# HIPAA Safe Harbor 相关的 DICOM PHI 标签 → 匿名化目标值(**标量**类字段)。
 # 覆盖患者身份、就诊、机构、设备及操作者标识等可重识别字段。
+# 注意:此字典只放**标量 VR**(PN/LO/SH/DA/TM/AS 等)可 setattr 字符串的字段;
+# 序列类(SQ)或应整体删除的字段放 _PHI_DELETE_TAGS,不能给 SQ setattr 字符串
+# (会破坏数据结构)。补全依据:R2 审查 + HIPAA Safe Harbor 18 类标识符——
+# 原清单只列 21 项,`save_as` 序列化整个 ds,清单外 PHI 标签会原样写进匿名副本。
 _PHI_FIELDS = {
     "PatientName": "ANONYMIZED",
     "PatientID": "ANONYMIZED",
     "PatientBirthDate": "00000101",
+    "PatientBirthTime": "",
     "PatientSex": "",
     "PatientAge": "",
     "PatientAddress": "ANONYMIZED",
     "PatientTelephoneNumbers": "",
     "OtherPatientIDs": "",
+    "OtherPatientNames": "",
+    "PatientMotherBirthName": "",
+    "IssuerOfPatientID": "",
+    "EthnicGroup": "",
+    "PatientReligiousPreference": "",
+    "PatientInstitutionResidence": "",
+    "Occupation": "",
+    "PatientComments": "",
+    "AdditionalPatientHistory": "",
+    "MilitaryRank": "",
     "ReferringPhysicianName": "ANONYMIZED",
     "PerformingPhysicianName": "ANONYMIZED",
+    "RequestingPhysician": "ANONYMIZED",
     "OperatorsName": "ANONYMIZED",
     "InstitutionName": "ANONYMIZED",
     "InstitutionAddress": "ANONYMIZED",
+    "InstitutionalDepartmentName": "",
     "StationName": "ANONYMIZED",
     "DeviceSerialNumber": "ANONYMIZED",
     "AccessionNumber": "ANONYMIZED",
@@ -28,7 +45,43 @@ _PHI_FIELDS = {
     "SeriesDate": "00000101",
     "AcquisitionDate": "00000101",
     "ContentDate": "00000101",
+    "StudyTime": "",
+    "SeriesTime": "",
+    "AcquisitionTime": "",
+    "ContentTime": "",
 }
+
+# 应**整体删除**(del 而非 setattr)的高危 PHI 标签。绝大多数是序列类(SQ VR)——
+# setattr 字符串会破坏 SQ 结构;末尾两项 ResponsiblePerson(PN)/ResponsibleOrganization(LO)
+# 是标量,放这里并非标错类型,而是与序列共用同一条 del 通道(语义同"整体抹除",del
+# 对存在标量与 SQ 同样正确)。**别据此把普通标量 PHI 也塞进删除表**——那是给"可整体
+# 抹除"的标签用的,常规标量走上面 _PHI_FIELDS 的 setattr 匿名值。
+_PHI_DELETE_TAGS = (
+    "OtherPatientIDsSequence",
+    "ReferringPhysicianIdentificationSequence",
+    "PerformingPhysicianIdentificationSequence",
+    "RequestingPhysicianIdentificationSequence",
+    "OperatorIdentificationSequence",
+    "PatientInsurancePlanCodeSequence",
+    "IssuerOfPatientIDQualifiersSequence",
+    "ResponsiblePerson",        # 标量(PN),非 SQ——见表头注释,共用 del 通道
+    "ResponsibleOrganization",  # 标量(LO),非 SQ——见表头注释,共用 del 通道
+)
+
+
+def _anonymize_phi(ds):
+    """就地匿名化 DICOM 数据集的 PHI 标签(静/动两路径共用,口径一致)。
+
+    标量 PHI(_PHI_FIELDS)→ setattr 匿名值;序列/删除类(_PHI_DELETE_TAGS)→ del。
+    只处理**已存在**的标签,不新增。成像必需标签(PixelData/Rows/Columns/
+    PhotometricInterpretation/BitsAllocated 等)不在清单内,绝不触碰。
+    """
+    for tag, anon_value in _PHI_FIELDS.items():
+        if tag in ds:
+            setattr(ds, tag, anon_value)
+    for tag in _PHI_DELETE_TAGS:
+        if tag in ds:
+            del ds[tag]
 
 try:
     import pydicom
@@ -93,7 +146,7 @@ def _to_gray(frame: np.ndarray, channel_order: str = "rgb") -> np.ndarray:
 def load_input_image(path: str, output_dir: str):
     """Load a B-mode ultrasound image (PNG/JPG/DCM).
 
-    For DICOM inputs, anonymizes HIPAA Safe Harbor PHI fields (see _PHI_FIELDS)
+    For DICOM inputs, anonymizes HIPAA Safe Harbor PHI fields (see _anonymize_phi)
     and saves the sanitized copy.
 
     Returns:
@@ -113,10 +166,9 @@ def load_input_image(path: str, output_dir: str):
             # _to_gray 内部对非 uint8(如 16-bit)走 min-max 归一化,等价原 rescale。
             img_np = _to_gray(ds.pixel_array)
 
-            # PHI metadata anonymization (HIPAA Safe Harbor) — 仅覆盖已存在的标签
-            for tag, anon_value in _PHI_FIELDS.items():
-                if tag in ds:
-                    setattr(ds, tag, anon_value)
+            # PHI metadata anonymization (HIPAA Safe Harbor) — 标量匿名 + 序列删除,
+            # 见 _anonymize_phi(静/动共用,只碰已存在的 PHI 标签,不动成像参数)。
+            _anonymize_phi(ds)
 
             # Save anonymized dicom to output
             anon_dicom_path = os.path.join(output_dir, "anonymized_image.dcm")

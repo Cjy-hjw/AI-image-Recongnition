@@ -114,13 +114,35 @@ for root, dirs, files in os.walk(local_base):
         try:
             remote_stat = sftp.stat(remote_file)
             local_stat = os.stat(local_file)
-            if remote_stat.st_size == local_stat.st_size:
+            # 增量跳过判据(R5 修复 + Gate2 收紧):**仅 size 相同不足以判定内容一致**——
+            # 同尺寸内容变更(改配置值、改字符串、换等长注释)会被静默跳过,服务器跑陈旧
+            # 代码且零告警。
+            #
+            # 判据为「size 相同 **且** mtime 近似相等(|Δ|<2s)」才跳过。关键是下方 put 后
+            # 用 `sftp.utime` 把**远端 mtime 盖成本地 mtime**——于是比较的是"上次部署时的
+            # 本地 mtime"与"当前本地 mtime"这两个**同源 epoch 值**,与服务器墙钟无关:
+            #   · 文件没改 → 两者相等 → 跳过;
+            #   · 文件改了(编辑必更新 mtime,即便 size 不变)→ Δ 变大 → 重传。
+            # 旧判据 `local.mtime <= remote.mtime+2` 用的是服务器上传时的墙钟,服务器时钟
+            # **超前**时 local 永远"不新于"remote → 同尺寸真改动被静默漏传(Gate2 finding)。
+            # 现判据双向对称、不受时钟偏差影响。2s 容差吸收 SFTP 秒级截断(utime 存整秒)。
+            if (remote_stat.st_size == local_stat.st_size
+                    and remote_stat.st_mtime is not None
+                    and abs(local_stat.st_mtime - remote_stat.st_mtime) < 2):
                 continue
         except IOError:
             pass
 
         print(f"Uploading: {rel_path if rel_path != '.' else ''}/{f}")
         sftp.put(local_file, remote_file)
+        # 关键:把远端 mtime 盖成本地 mtime,让下次比较基于同源 epoch(见上方判据注释)。
+        # paramiko 默认 put 不保留 mtime(远端取服务器上传时刻),不显式 utime 则时钟偏差
+        # 会让判据失效。失败不致命(退化为按 size 判)——只记警告不中断整批部署。
+        try:
+            local_stat = os.stat(local_file)
+            sftp.utime(remote_file, (local_stat.st_atime, local_stat.st_mtime))
+        except (IOError, OSError) as e:
+            print(f"  [WARNING] utime 同步失败(不影响本次上传,仅下次可能多传一次): {e}")
 
 sftp.close()
 ssh.close()

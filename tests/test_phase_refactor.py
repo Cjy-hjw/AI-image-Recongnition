@@ -156,6 +156,54 @@ def test_phi_fields_expanded():
     for must in ["PatientName", "AccessionNumber", "DeviceSerialNumber",
                  "OperatorsName", "StudyDate"]:
         assert must in _PHI_FIELDS
+    # R2 修复:补全 HIPAA Safe Harbor 高危 PHI(原 21 项清单遗漏,save_as 会残留)。
+    for newly in ["PatientComments", "RequestingPhysician", "OtherPatientNames",
+                  "PatientMotherBirthName", "EthnicGroup", "PatientBirthTime",
+                  "AdditionalPatientHistory", "PatientInstitutionResidence"]:
+        assert newly in _PHI_FIELDS, f"遗漏高危 PHI 标量 {newly}"
+    # 序列类(SQ)PHI 走删除通道,不能 setattr 字符串(会破坏 SQ 结构)。
+    from src.inference.io import _PHI_DELETE_TAGS
+    assert "OtherPatientIDsSequence" in _PHI_DELETE_TAGS
+
+
+def test_phi_anonymize_removes_new_fields(tmp_path):
+    """合成带新覆盖 PHI 标签的 DICOM,跑匿名化,断言高危 PHI 已清且成像参数完好。"""
+    import numpy as np
+    from pydicom.dataset import Dataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+    from src.inference.io import _anonymize_phi
+
+    ds = Dataset()
+    ds.Rows, ds.Columns = 8, 8
+    ds.BitsAllocated, ds.BitsStored, ds.HighBit = 8, 8, 7
+    ds.SamplesPerPixel, ds.PhotometricInterpretation = 1, "MONOCHROME2"
+    ds.PixelRepresentation = 0
+    ds.PixelData = np.zeros((8, 8), np.uint8).tobytes()
+    # 高危 PHI(原清单遗漏项):注入含明文的内容
+    ds.PatientComments = "患者张三,电话 13800000000"
+    ds.RequestingPhysician = "李医生"
+    ds.EthnicGroup = "汉族"
+    ds.OtherPatientIDsSequence = [Dataset()]  # SQ 序列类
+    ds.OtherPatientIDsSequence[0].PatientID = "ALT_ID"
+    fm = FileMetaDataset()
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    fm.MediaStorageSOPClassUID = generate_uid()
+    fm.MediaStorageSOPInstanceUID = generate_uid()
+    ds.file_meta = fm
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
+
+    _anonymize_phi(ds)
+
+    # 标量 PHI 已匿名/清空
+    assert str(ds.PatientComments) == ""
+    assert str(ds.RequestingPhysician) == "ANONYMIZED"
+    assert str(ds.EthnicGroup) == ""
+    # 序列类 PHI 已整体删除
+    assert "OtherPatientIDsSequence" not in ds
+    # 成像必需参数完好、像素能读回(匿名化不破坏成像)
+    assert ds.Rows == 8 and ds.PhotometricInterpretation == "MONOCHROME2"
+    assert ds.pixel_array.shape == (8, 8)
 
 
 def test_validate_step_fixed_gamma_prior():

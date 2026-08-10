@@ -72,10 +72,11 @@ class TestSchemaShape:
 class TestLocationOrdering:
     """LOCATION_LABELS 顺序即 `Location` 1..7 的定义,是单一权威。"""
 
-    def test_exact_order_from_official_doc(self):
-        """顺序取自《数据格式说明》`lesion_loc` 的列举次序,不得重排。"""
+    def test_exact_order_from_official_xlsx_cells(self):
+        """顺序取自实测官方 xlsx 单元格(`2左中叶`/`5右中叶`),按解剖习惯上→中→下;
+        《数据格式说明》的文字列举次序被实测证伪(照它写会错 4/7 类),不得据文档重排。"""
         assert LOCATION_LABELS == (
-            "左上叶", "左下叶", "左中叶", "右上叶", "右下叶", "右中叶", "峡部")
+            "左上叶", "左中叶", "左下叶", "右上叶", "右中叶", "右下叶", "峡部")
         assert NUM_LOCATIONS == 7
 
     def test_label_to_index_is_zero_based(self):

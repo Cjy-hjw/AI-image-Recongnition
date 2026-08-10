@@ -38,13 +38,17 @@
    恒 True;仅当配置显式 `enforcement_mode: hard` 且命中硬判据时才走拒绝分支
    (落 `prediction.json` REJECTED 占位,不产诊断)。
 
-## 加载失败/无有效诊断的病例落盘语义
+## 加载失败/无有效诊断/被拒绝的病例落盘语义
 
-V2.1 的病例级「失败/拒绝」落盘**复用 `write_case_v21` 的原子写**,而非 V2.0 的
-`save_rejection_json`(后者写 `result.json`,V2.1 目录里不该出现它)。占位 nodule
+病例级降级(ERROR / REJECTED)由 `_write_case_placeholder` 统一落盘:它**不走**
+`write_case_v21`(后者对 `rejected` case_result 会主动 raise),而是直接用
+`prediction_json.build_*` 组装占位 + `_atomic_write_json` 原子写(与 write_case_v21
+同款 tmp+os.replace),产出**结构合规**的 `prediction.json`;绝不写 V2.0 的
+`result.json`(V2.1 目录里不该出现它)。`status`=ERROR(推理崩溃)与 REJECTED
+(gatekeeper 主动拒绝)由 Conclusion 文案区分,语义诚实不混淆。占位 nodule
 只保证 JSON 结构合规(必填字段齐全、LocationProbs 和为 1),数值是保守占位
-(ETE=1 无侵犯/Location 均匀/T=0),并靠 `Interpretation.Conclusion` 写明 ERROR/REJECTED
-原因 —— 与 A3 的「阴性空输出」「占位维度」同一套降级哲学:**结构合规优先,数值诚实标注**。
+(ETE=1 无侵犯/Location 均匀/T=0)—— 与 A3 的「阴性空输出」「占位维度」同一套
+降级哲学:**结构合规优先,数值诚实标注**。
 
 @云TODO(云端首跑校正):
 - 权重/config 路径来自环境变量 `AICOMP_WEIGHTS`/`AICOMP_CONFIG`/`AICOMP_PRECISION`
@@ -203,7 +207,14 @@ def _process_case(case, output_dir, state, precision, max_frames):
         else:
             case_result = _run_dynamic_case(case, case_dir, state, precision, max_frames)
         processing_ms = int((time.perf_counter() - t0) * 1000)
-        _write_via_v21(case_dir, case, case_result, kind, processing_ms)
+        if case_result.get("rejected"):
+            # gatekeeper hard 拒绝:不走 write_case_v21(它对 rejected 直接 raise),
+            # 落 REJECTED 占位而非 ERROR——二者语义不同,诚实区分「被守门拒绝」与
+            # 「推理崩溃」,避免运维看到 ERROR 去排查其实是 gatekeeper 主动拒的病例。
+            _write_case_rejected(case_dir, case, processing_ms,
+                                 case_result.get("reason", "gatekeeper rejected"))
+        else:
+            _write_via_v21(case_dir, case, case_result, kind, processing_ms)
         logger.info(
             "[runner] 病例完成 patient_id=%s kind=%s 耗时=%dms",
             patient_id, kind, processing_ms)
@@ -259,6 +270,7 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
 
     # 逐帧 gatekeeper(复用跨病例已建的重型对象;与 video_predict 逐帧同款)。
     frame_audits = []
+    any_auth_skipped = False  # 任一幕 auth_skipped 即聚合 True(见下)
     for pos, frame_np in zip(frame_indices, frames):
         passed, audit = run_gatekeeper_audit(
             frame_np, state["config"], state["device"], state["weights"],
@@ -267,8 +279,15 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
         if not passed:  # 仅 hard 模式可达
             audit["rejected_frame_index"] = int(pos)
             return _rejection_result(audit)
+        if audit.get("auth_skipped"):
+            any_auth_skipped = True
         if audit["flagged"]:
             frame_audits.append({"frame_index": int(pos), **audit})
+    # 动态图聚合层 audit:R3 的 auth_skipped 必须透传——静态链路用 {"skipped":False,**audit}
+    # 保留了该键,动态聚合层若漏掉,运维在视频链路看不到 authenticity 项被跳过(Gate2 finding)。
+    # 判据取自逐帧 audit 的 auth_skipped(任一幕 True 即聚合 True),覆盖两种跳过原因:
+    # ①权重缺失降级(state["auth"] is None)②权重存在但 predict 在帧上崩溃。不能用
+    # `state["auth"] is None` 单独判——那只覆盖①,漏了②(终审 P2),与静态链路判据不一致。
     gatekeeper_audit = {
         "skipped": False,
         "enforcement_mode": resolve_enforcement_mode(state["config"]),
@@ -279,6 +298,9 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
         "would_reject_in_hard_mode": any(
             a["would_reject_in_hard_mode"] for a in frame_audits),
         "flagged_frames": frame_audits,
+        # auth_skipped 与帧是否 flagged 无关(auth 权重缺失/predict 崩溃时 is_phantom=0、
+        # 无命中、该帧不进 frame_audits),故不能从 frame_audits 里捞——循环里单独记。
+        "auth_skipped": any_auth_skipped,
     }
 
     try:
@@ -312,34 +334,55 @@ def _write_via_v21(case_dir, case, case_result, kind, processing_ms):
 
 
 def _write_case_error(case_dir, case, processing_ms, reason):
-    """单病例崩溃的降级落盘:复用 write_case_v21 的原子写,产出结构合规的
-    ERROR/REJECTED 占位 prediction.json(数值为保守占位,Interpretation 写明原因)。
+    """单病例崩溃的降级落盘(status=ERROR):见 _write_case_placeholder。"""
+    _write_case_placeholder(case_dir, case, processing_ms, "ERROR", reason)
+
+
+def _write_case_rejected(case_dir, case, processing_ms, reason):
+    """gatekeeper hard 拒绝的降级落盘(status=REJECTED):见 _write_case_placeholder。
+
+    与 ERROR 区分:REJECTED 是 gatekeeper **主动拒绝**该图(篡改/重复等硬判据命中),
+    不是推理崩溃。语义诚实区分,便于运维辨别「守门拒」而非误当成推理故障去排查。
+    """
+    _write_case_placeholder(case_dir, case, processing_ms, "REJECTED", reason)
+
+
+def _write_case_placeholder(case_dir, case, processing_ms, status, reason):
+    """病例级降级落盘(ERROR / REJECTED 共用):复用 write_case_v21 的原子写,产出
+    结构合规的占位 prediction.json(数值保守占位,Interpretation 写明 status + 原因)。
 
     红线:此函数自身绝不能抛(写盘失败只记日志)—— 否则隔离语义自相矛盾
-    (崩溃病例的兜底写盘再崩 = 该例零输出且整批被异常中断)。
+    (崩溃/拒绝病例的兜底写盘再崩 = 该例零输出且整批被异常中断)。
     """
+    conclusion = {
+        "ERROR": f"病例推理失败(降级占位): {reason}",
+        "REJECTED": f"病例被 gatekeeper 拒绝(降级占位): {reason}",
+    }.get(status, f"病例降级占位: {reason}")
+    key_finding = {
+        "ERROR": "该病例因运行期异常未能产出真实诊断,本 JSON 为结构合规占位",
+        "REJECTED": "该病例被真实性/规范性守门硬拒绝,未产出诊断,本 JSON 为结构合规占位",
+    }.get(status, "结构合规占位")
     try:
         from src.inference import prediction_json as pj
-        nodule = pj.build_nodule_entry(
-            nodule_id="N1",
-            mask_file=f"{case['subdir_uid']}/nodule_001.nii.gz",
-            detection_confidence=0.0,
-            malignancy_confidence=0.0,
-            tirads_class=1,
-        )
+        # 占位必须**阴性**(空结节),不得伪造一个结节:伪造的假结节(detection=0/TI-RADS=1/
+        # 左上叶)会被评测当成真实阳性检出计分,且其 MaskFile 指向一个从未写盘的 phantom
+        # mask 文件——既误导评测又在读取侧崩溃,比"诚实报阴性"恶劣得多(Gate2 finding)。
+        # 规范明写"阴性时 Nodules 为空数组 []",是合法输出。ERROR/REJECTED 病例本就无
+        # 有效诊断,诚实报阴性 + Interpretation 写明 status 与原因,绝不编造病灶。
         payload = pj.build_prediction_json(
             study_uid=case["patient_id"],
-            nodules=[nodule],
+            nodules=[],
             processing_time_ms=processing_ms,
             interpretation={
-                "Conclusion": f"病例推理失败(降级占位): {reason}",
-                "KeyFindings": ["该病例因运行期异常未能产出真实诊断,本 JSON 为结构合规占位"],
+                "Conclusion": conclusion,
+                "KeyFindings": [key_finding],
             })
         pj.validate_prediction_json(payload)
         _atomic_write_json(os.path.join(case_dir, "prediction.json"), payload)
     except Exception:  # noqa: BLE001 — 兜底写盘失败不得再抛,掩盖原始错误
         logger.exception(
-            "[runner] 病例级 ERROR 占位写盘失败(patient_id=%s)", case["patient_id"])
+            "[runner] 病例级 %s 占位写盘失败(patient_id=%s)",
+            status, case["patient_id"])
 
 
 def _atomic_write_json(path, payload):

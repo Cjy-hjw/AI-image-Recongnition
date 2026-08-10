@@ -247,6 +247,55 @@ class TestPerCaseFailureIsolation:
         assert payload["StudyUID"] == "BAD"
         assert "simulated diagnose crash" in payload["Interpretation"]["Conclusion"]
 
+    def test_gatekeeper_hard_reject_writes_rejected_placeholder(
+            self, mock_heavy, tmp_path, monkeypatch):
+        """gatekeeper hard 拒绝:该例落 REJECTED 占位(非 ERROR、不走 write_case_v21),
+        且不 raise 拖垮整批。"""
+        _make_dcm(str(tmp_path / "P_OK" / "S" / "ok.dcm"), patient_id="P_OK")
+        _make_dcm(str(tmp_path / "P_REJECTED" / "S" / "bad.dcm"),
+                  patient_id="P_REJECTED")
+        out = tmp_path / "out"
+
+        import src.inference.gatekeeper_runner as gatekeeper_mod
+        import src.inference.io as io_mod
+        # P_REJECTED 触发硬拒绝,其余仍 pass。用 img_np 的输入路径无法直接区分,
+        # 改为按调用次数+文件名:静态每例 run_gatekeeper 恰调一次,discover 排序后
+        # P_OK < P_REJECTED(P_OK 例先)。第二例即 P_REJECTED。
+        call_n = {"n": 0}
+
+        def _reject_second(img_np, *a, **k):
+            call_n["n"] += 1
+            if call_n["n"] == 2:
+                return False, {"flagged": True, "would_reject_in_hard_mode": True,
+                               "enforcement_mode": "hard",
+                               "reason": "simulated tamper hard-reject",
+                               "soft_flags": ["tamper"]}
+            return True, {"flagged": False, "would_reject_in_hard_mode": False,
+                          "enforcement_mode": "hard", "reason": "", "soft_flags": []}
+
+        monkeypatch.setattr(gatekeeper_mod, "run_gatekeeper_audit", _reject_second)
+
+        runner_mod.build_service_runner()(str(tmp_path), str(out))
+
+        # P_REJECTED 落 REJECTED 占位 prediction.json(非 ERROR、且未走 write_case_v21)
+        pids_written = {w["patient_id"] for w in mock_heavy["written"]}
+        assert "P_REJECTED" not in pids_written  # rejected 不进 write_case_v21
+        rej = out / "P_REJECTED" / "prediction.json"
+        assert rej.exists(), "gatekeeper 拒绝病例未落 REJECTED 占位 prediction.json"
+        payload = json.loads(rej.read_text(encoding="utf-8"))
+        from src.inference import prediction_json as pj
+        pj.validate_prediction_json(payload)
+        assert payload["StudyUID"] == "P_REJECTED"
+        assert "拒绝" in payload["Interpretation"]["Conclusion"]
+        assert "simulated tamper hard-reject" in payload["Interpretation"]["Conclusion"]
+        # Gate2 finding #1:占位必须**阴性**(空结节),绝不伪造结节——伪造的假结节会被
+        # 评测当真实阳性检出,且其 MaskFile 指向从未写盘的 phantom mask 文件。
+        assert payload["Prediction"]["Nodules"] == [], "REJECTED 占位不得伪造结节"
+        assert payload["Prediction"]["MaskFiles"] == [], "REJECTED 占位不得引用不存在的 mask"
+
+        # P_OK 例正常产出(被 REJECTED 例不影响,失败隔离红线)
+        assert "P_OK" in pids_written
+
     def test_loader_failure_isolated(self, mock_heavy, tmp_path, monkeypatch):
         """输入加载失败(如损坏 NIfTI)也只隔离该例,不拖垮整批。"""
         import src.inference.nifti_io as nifti_mod

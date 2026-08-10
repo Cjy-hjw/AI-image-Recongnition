@@ -94,18 +94,14 @@ class TestPredictRejectPath:
         assert rj.exists(), "predict.py 未落 result.json"
         data = json.loads(rj.read_text(encoding="utf-8"))
         status = data.get("status")
-        if status == "ERROR":
-            # 2026-07-10 Gate2审查修复：authenticity.py 权重缺失现在硬报错（此前
-            # 静默退化为随机初始化分类,一票否决门形同虚设且无人察觉)。本地/CI
-            # 环境通常没有真实 checkpoints/authenticity_model.pth,这正是修复后
-            # 的预期新行为(不是回归)——只要 reason 明确指向"权重缺失"就放行,
-            # 若是其它原因的 ERROR 则说明有真实回归,仍然失败。
-            reason = data.get("reason", "")
-            assert "AuthenticityModule" in reason and "不存在" in reason, \
-                f"ERROR 但原因不是预期的权重缺失,可能是真实回归: {data}"
-        else:
-            assert status in ("REJECTED", "PASSED"), \
-                f"status 非法: {status}\nSTDOUT:{r.stdout}"
+        # R3(2026-08-10)后的硬契约:authenticity 权重缺失在 build_auth_module 降级 None,
+        # **绝不再让整例走 ERROR**。故缺权重环境下 predict.py 的最终 status 必须是 PASSED
+        # (soft 模式、诊断照出)或 REJECTED(dedup/tamper 硬判据,平台浮点敏感),**不得 ERROR**。
+        # 这是正向断言"降级确实生效"(比原来'不是auth-ERROR'更强、且不耦合任何错误文案字面量):
+        # 若这里出现 ERROR,要么 R3 降级没生效、要么降级路径在别处崩,两者都是必须抓的回归。
+        assert status in ("REJECTED", "PASSED"), (
+            f"缺 authenticity 权重时 status={status!r}(期望 PASSED/REJECTED)。"
+            f"R3 后该故障应降级 skipped 而非整例 ERROR:\n{data}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

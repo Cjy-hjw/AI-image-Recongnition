@@ -173,12 +173,23 @@ def patient_grouped_split(
     for lab, plist in by_label.items():
         plist = sorted(plist)  # 固定顺序,保证 seed 可复现
         rng.shuffle(plist)
-        n_val = max(1, int(round(len(plist) * val_frac)))
+        # n_val 上界压到 len-1:保证该 label 类**至少留 1 患者给 train**,否则
+        # 单患者类(len==1)会被 max(1,·) 整个挖进 val→train 该类清空→class-weight
+        # 除零/单类 batch 崩 loss。len==1 时 min(max(1,1), 0)=0,唯一患者留 train
+        # (train 不缺类;val 缺一个稀有类可接受——该类本就无法有意义评估)。
+        # len>=2 时 max(1,·) 保 val 至少 1;len=2→1,len=10&frac=.2→2。
+        n_val = min(max(1, int(round(len(plist) * val_frac))), len(plist) - 1)
         val_patients.update(plist[:n_val])
 
     train, val = [], []
     for p, imgs in patient_to_imgs.items():
         (val if p in val_patients else train).extend(imgs)
+    # 防泄漏自检(QA_VP §1.4 防火墙):同患者所有图像应严格同侧,train/val 患者
+    # 互斥。此断言防未来有人误改成随机划分而不自知(见 memory/patient-leakage)。
+    train_pids = {s["patient_key"] for s in train}
+    val_pids = {s["patient_key"] for s in val}
+    assert not (train_pids & val_pids), \
+        f"患者跨 train/val 泄漏: {train_pids & val_pids}"
     return train, val
 
 

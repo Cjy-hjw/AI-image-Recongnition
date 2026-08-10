@@ -7,6 +7,14 @@ from src.gatekeeper.authenticity import AuthenticityModule
 from src.gatekeeper.deduplication import Deduplicator
 from src.gatekeeper.tampering_catnet import CatNetTamperingDetector
 
+# auth_module 参数的"未传入"哨兵:必须区分两种 None——
+#   ① 调用方**根本没传** auth_module(单图 predict.py 路径)→ 应按需构建一次;
+#   ② 调用方**显式传入 None**(视频/服务已在帧循环前 build_auth_module 但权重故障降级
+#      为 None)→ **绝不能每帧重建**,否则逐帧重复 load 权重 + 打 N 次 WARNING,破坏
+#      build_auth_module docstring 的"只加载一次"契约(Gate2 finding)。
+# 用独占哨兵而非 None 作默认值,才能把这两种情形分开。
+_AUTH_UNSET = object()
+
 
 def gatekeeper_cfg(config) -> dict:
     """取 `config["gatekeeper"]`,非 dict(缺键 / None / 标量 / 列表)一律返回 {}。
@@ -91,14 +99,24 @@ def build_seeded_deduplicator(config, device):
 def build_auth_module(weights_path):
     """构建并加载 AuthenticityModule，供视频逐帧复用（只加载一次权重）。
 
-    单图 predict.py 无需调用——run_gatekeeper_audit 内部按需懒建；
-    视频 video_predict.py 在帧循环前调用此函数，传入 auth_module 参数。
+    **R3 修复(2026-08-10)**:权重缺失/哈希不匹配/加载崩溃**不再 raise**,而是返回
+    **None**(不可用)——由 `run_gatekeeper_audit` 据此把 authenticity 项标为
+    "skipped"、诊断照常产出。理由:真实性在赛道七**零计分**,一个不计分组件的权重
+    故障绝不能让整例临床诊断(唯一得分项)清零(此前 raise → 入口兜成 ERROR →
+    整例零诊断,与统一软flag制度相悖)。
     """
     auth_module = AuthenticityModule()
     auth_weights_path = os.path.join(
         os.path.dirname(weights_path), "authenticity_model.pth"
     )
-    auth_module.load_weights(auth_weights_path)
+    try:
+        auth_module.load_weights(auth_weights_path)
+    except Exception as e:  # noqa: BLE001 — 不计分组件故障降级,不拖垮整例
+        print(
+            f"--> [WARNING] authenticity 权重加载失败,该项审计跳过(诊断照常): "
+            f"{type(e).__name__}: {e}",
+            flush=True)
+        return None
     return auth_module
 
 
@@ -179,15 +197,18 @@ def collect_soft_flags(tamper_detector) -> list:
 
 
 def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
-                         deduplicator=None, auth_module=None,
+                         deduplicator=None, auth_module=_AUTH_UNSET,
                          tamper_detector=None):
     """Run full gatekeeper audit (authenticity, dedup, tampering).
 
     Args:
         deduplicator:    可选，预建 Deduplicator（视频复用，省去重复播种）。
         auth_module:     可选，预建 AuthenticityModule（视频复用，省去重复加载权重）。
+                         **未传入**（默认哨兵 `_AUTH_UNSET`）→ 内部按需构建一次（单图路径，
+                         向后兼容）；**显式传入 None**（视频/服务已预建但权重故障降级为 None）
+                         → 直接标 skipped、**不重建**（否则逐帧重复 load + N 次 WARNING）。
         tamper_detector: 可选，预建 CatNetTamperingDetector（视频复用，省去重复文件探测）。
-        三者均为 None 时内部即时构建——单图路径行为不变，向后兼容。
+        deduplicator / tamper_detector 为 None 时内部即时构建——单图路径行为不变。
 
     Returns:
         (passed: bool, audit: dict)
@@ -210,10 +231,38 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
     """
     print("Running Gatekeeper Audit...")
     mode = resolve_enforcement_mode(config)
-    if auth_module is None:
+    if auth_module is _AUTH_UNSET:
+        # 未传入(单图 predict.py 路径)→ 按需构建一次(权重故障降级为 None,不 raise)。
         auth_module = build_auth_module(weights_path)
-    # 权重缺失/损坏仍在 AuthenticityModule.load_weights 内硬报错(未改动,红线保留)。
-    is_phantom, auth_probs = auth_module.predict(img_np)
+    # 此时 auth_module 为:真实模块 / None。None 有两个来源——按需构建降级、或调用方
+    # 显式传入 None(视频/服务已预建但降级失败)。两者都当"该项不可用"处理,**不重建**:
+    # 视频/服务逐帧传显式 None 时,若这里无条件 build_auth_module 会每帧重复 load 权重 +
+    # 打 N 次 WARNING,踩 build_auth_module "只加载一次"契约(Gate2 finding)。权重迟到
+    # 是交付期问题(容器须打包权重,见 memory/delivery-container-missing-weights),不在
+    # 推理热路径靠逐帧重试兜。
+    # R3 修复(2026-08-10):authenticity 在赛道七**零计分**,其权重故障/预测崩溃
+    # 绝不该让整例临床诊断(唯一得分项)清零。权重不可用时此项标 skipped、诊断照常;
+    # 预测运行期异常(如 3D 帧直连 cv2.absdiff 崩)同样 catch → skipped,不冒泡成整例 ERROR。
+    auth_skipped = False
+    is_phantom = 0
+    auth_probs = None
+    # duck-typing 取 predict:一并兜住"None 无 predict"(降级失败/显式传入)与"stub 对象无
+    # predict",且不触发 pyright 对哨兵 object 默认值的属性误报;运行时语义与
+    # `if auth_module is None` 等价(None/哨兵已在上面解析)。测试注入的 _CrashAuth 有
+    # predict → 正常进入 try、异常被 catch,crash 降级路径仍被真实覆盖。
+    auth_predict = getattr(auth_module, "predict", None)
+    if auth_predict is None:
+        auth_skipped = True
+    else:
+        try:
+            is_phantom, auth_probs = auth_predict(img_np)
+        except Exception as e:  # noqa: BLE001 — 不计分组件崩溃降级,不拖垮整例
+            print(
+                f"--> [WARNING] authenticity 预测失败,该项审计跳过(诊断照常): "
+                f"{type(e).__name__}: {e}",
+                flush=True)
+            auth_skipped = True
+            is_phantom, auth_probs = 0, None
 
     if deduplicator is None:
         deduplicator = build_seeded_deduplicator(config, device)
@@ -281,6 +330,9 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
         "is_gan": int(is_phantom == 2),
         "is_duplicate": int(is_duplicate),
         "is_tampered": int(is_tampered),
+        # authenticity 可用性(R3):权重故障/预测崩溃时为 True,该项不计入审计、
+        # 诊断照常(真实性在赛道七零计分,不该因它让整例零诊断)。
+        "auth_skipped": auth_skipped,
         # copy_move/splice/BAG-相位软命中详情。**只计入 flagged,绝不进
         # would_reject_in_hard_mode**——三者恒为软判据(copy_move 在 359 张真实图上
         # 误报 27.3%),升级为拒绝依据会直接踩「宁可漏检不可误杀真实影像」红线。

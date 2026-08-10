@@ -366,7 +366,7 @@ NIfTI header 的 `dim` 是 **(X,Y,Z) 列主序**,numpy 图像是 **(H,W) 行主�
 - 父目录自动创建(官方 `answer/{eval_id}/{StudyUid}/{SeriesUid}/` 是推理时动态建的)。
 - `affine` 默认单位阵:超声无标准空间信息,评测按体素重叠度匹配主病灶,不依赖世界坐标。
 
-### `load_nifti_frames(path, output_dir=None, max_frames=32)` → 4 元组
+### `load_nifti_frames(path, output_dir=None, max_frames=32)` → 5 元组
 
 **签名与 `video_io.load_video_frames(path, output_dir, max_frames)` 逐位对齐**,入口层
 可直接 `loader = load_nifti_frames if is_nifti_path(p) else load_video_frames` 后统一
@@ -376,9 +376,12 @@ NIfTI header 的 `dim` 是 **(X,Y,Z) 列主序**,numpy 图像是 **(H,W) 行主�
 且报错与"参数错位"毫无关联极难定位。`tests/test_nifti_io.py::TestLoaderSignatureAlignment`
 用 `inspect.signature` 锁死这一对齐。
 
-返回 `(frames, frame_indices, is_dicom=False, error_msg)`,错误契约与 `video_io` 一致
-(失败返回错误信息而非抛异常)。`frame_indices` 是 **0-based 原始帧号**;官方 xlsx 的
-`ANNOTATION->SliceIndex` 是 **1-based**,跨界需 ±1。
+返回 `(frames, frame_indices, is_dicom=False, error_msg, n_total_frames)`,错误契约与
+`video_io` 一致(失败返回错误信息而非抛异常,`n_total_frames` 失败分支为 0)。`frame_indices`
+是 **0-based 原始帧号**;官方 xlsx 的 `ANNOTATION->SliceIndex` 是 **1-based**,跨界需 ±1。
+`n_total_frames` 为原始体数据 Z 轴长度(非抽样数),供 `scatter_frames_to_full_length`
+把抽样帧 mask 回填成全帧序列 3D mask(规范 §五.2)。`video_io.load_video_frames` 同返回
+5 元组,失败 `n_total_frames=0`。
 
 ### `scatter_frames_to_full_length(frame_masks, frame_indices, n_total_frames)` → `(n,H,W)`
 

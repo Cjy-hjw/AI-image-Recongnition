@@ -17,6 +17,7 @@ import os
 
 import torch
 
+from src.inference.nifti_io import load_nifti_frames, is_nifti_path
 from src.inference.video_io import load_video_frames
 from src.inference.gatekeeper_runner import (
     run_gatekeeper_audit, build_seeded_deduplicator,
@@ -78,13 +79,19 @@ def main():
         })
         return
 
-    # 1. 抽帧 & 脱敏
-    frames, frame_indices, is_dicom, error_msg = load_video_frames(
+    # 1. 抽帧 & 脱敏。按 is_nifti_path 选 loader:NIfTI(.nii/.nii.gz,官方动图原始
+    #    格式)走 load_nifti_frames,其余(视频/cine DICOM)走 load_video_frames。
+    #    两者签名逐位对齐 (path, output_dir, max_frames),返回 5 元组。
+    loader = load_nifti_frames if is_nifti_path(args.input_video) else load_video_frames
+    frames, frame_indices, is_dicom, error_msg, n_total_frames = loader(
         args.input_video, args.output_dir, args.max_frames)
     if frames is None:
         print(f"Error: {error_msg}")
         save_rejection_json(args.output_dir, {"status": "ERROR", "reason": error_msg})
         return
+    # n_total_frames 暂存不用(A3 阶段 scatter_frames_to_full_length 会消费),
+    # 但必须在此接住以避免 loader 5 元组 ValueError。
+    _ = n_total_frames
     print(f"--> Decoded {len(frames)} sampled frames from {os.path.basename(args.input_video)}")
 
     # 2-5. 建模 + gatekeeper + 逐帧推理 + 聚合 + 导出。整体包一层 except Exception：

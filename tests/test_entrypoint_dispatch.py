@@ -192,6 +192,20 @@ class TestDispatch:
         assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout, \
             f"扩展名 .{ext} 应路由到 video\n{r.stdout}"
 
+    @pytest.mark.parametrize("name", ["case.nii.gz", "case.nii",
+                                       "CASE.NII.GZ", "CASE.NII"])
+    def test_nifti_inputs_route_to_video(self, name, tmp_path):
+        """.nii.gz/.nii 是官方动图原始格式(3D NIfTI),必须归 dynamic 桶→
+        video_predict.py。`##*.` 对双段后缀 .nii.gz 只切到 .gz,若不显式全名
+        匹配会被误判成 static→predict.py,导致官方动图 100% 零预测。"""
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        r = _run_entrypoint(f"/tmp/{name}", shim_dir=shim, tmp_path=tmp_path)
+        assert r.returncode == 0, f"STDERR:{r.stderr}"
+        assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout, \
+            f"NIfTI {name} 应路由到 video_predict.py\n{r.stdout}"
+
     @pytest.mark.parametrize("ext", ["png", "jpg", "jpeg", "bmp", "tif", "PNG"])
     def test_static_inputs_route_to_predict(self, ext, tmp_path):
         shim = str(tmp_path / "shim")
@@ -363,6 +377,24 @@ class TestContentSniffFallback:
         assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout, \
             f"DICOM 魔数应重路由到 video_predict.py,不受扩展名白名单限制\n{r.stdout}"
         assert "WARNING" in r.stdout, f"扩展名与内容(DICOM)不一致应报警告\n{r.stdout}"
+
+    def test_nifti_file_not_hard_fails_as_unknown(self, tmp_path):
+        """.nii.gz 文件真实存在但 file(1) 只报 application/gzip(无法区分是不是
+        NIfTI),若无扩展名放行会落进 *)→unknown→exit 1 误杀官方动图。验证靠
+        扩展名显式识别→dynamic,不进 unknown 硬失败,也不分发到 predict.py。"""
+        shim = str(tmp_path / "shim")
+        os.makedirs(shim)
+        _make_python_shim(shim)
+        # 写一个真实存在的 .nii.gz 文件(gzip 头 + 任意内容,file(1) 会报 gzip)
+        case = tmp_path / "case.nii.gz"
+        case.write_bytes(b"\x1f\x8b\x08\x00" + b"\x00" * 32)  # gzip magic + filler
+        r = _run_entrypoint(str(case), shim_dir=shim, tmp_path=tmp_path)
+        assert r.returncode == 0, f".nii.gz 不应被 unknown 硬失败\nSTDOUT:{r.stdout}\nSTDERR:{r.stderr}"
+        assert "SHIM_ARGS: video_predict.py --input_video" in r.stdout, \
+            f".nii.gz 应路由到 video_predict.py\n{r.stdout}"
+        # 不能误判成 static
+        assert "SHIM_ARGS: predict.py" not in r.stdout, \
+            f".nii.gz 不应被误路由到 predict.py\n{r.stdout}"
 
     def test_unrecognized_content_hard_fails_with_error_json(self, tmp_path):
         # 文件真实存在且可读,但内容既非 DICOM 也非 image/*、video/* -> 不能瞎猜路由,

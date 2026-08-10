@@ -61,12 +61,13 @@ class TestDimensionConvention:
         p = str(tmp_path / "v.nii.gz")
         nib.save(nib.Nifti1Image(vol, np.eye(4)), p)
 
-        frames, idxs, is_dicom, err = load_nifti_frames(p)
+        frames, idxs, is_dicom, err, n_total = load_nifti_frames(p)
         assert err is None
         assert len(frames) == 3
         assert frames[0].shape == (_H, _W), "读入应还原成 numpy 的 (H,W)"
         assert idxs == [0, 1, 2]
         assert is_dicom is False
+        assert n_total == 3, "n_total_frames 应为体数据总帧数(Z 轴长度)"
 
 
 class TestBinaryValueRange:
@@ -125,27 +126,31 @@ class TestSaveGuards:
 class TestLoadGuards:
     def test_missing_file_returns_error_not_raise(self):
         """与 video_io 一致的错误契约:返回错误信息而非抛异常,由入口层兜成 ERROR JSON。"""
-        frames, idxs, _, err = load_nifti_frames("/nonexistent/x.nii.gz")
+        frames, idxs, _, err, n_total = load_nifti_frames("/nonexistent/x.nii.gz")
         assert frames is None and idxs == [] and err
+        assert n_total == 0, "失败分支 n_total_frames 必须为 0"
 
     def test_2d_nifti_treated_as_single_frame(self, tmp_path):
         p = str(tmp_path / "s.nii.gz")
         nib.save(nib.Nifti1Image(np.zeros((_W, _H), np.int16), np.eye(4)), p)
-        frames, idxs, _, err = load_nifti_frames(p)
+        frames, idxs, _, err, n_total = load_nifti_frames(p)
         assert err is None and len(frames) == 1 and frames[0].shape == (_H, _W)
+        assert n_total == 1, "2D NIfTI 视作单帧,n_total=1"
 
     def test_4d_with_real_z_axis_rejected(self, tmp_path):
         """Z>1 的 4D 是真 3D+时间序列,本项目不支持——明确报错好过静默取第一层。"""
         p = str(tmp_path / "q.nii.gz")
         nib.save(nib.Nifti1Image(np.zeros((_W, _H, 5, 3), np.int16), np.eye(4)), p)
-        frames, _, _, err = load_nifti_frames(p)
+        frames, _, _, err, n_total = load_nifti_frames(p)
         assert frames is None and "4D" in err
+        assert n_total == 0, "失败分支 n_total_frames 必须为 0"
 
     def test_max_frames_subsamples(self, tmp_path):
         p = str(tmp_path / "long.nii.gz")
         nib.save(nib.Nifti1Image(np.zeros((_W, _H, 20), np.int16), np.eye(4)), p)
-        frames, idxs, _, err = load_nifti_frames(p, max_frames=5)
+        frames, idxs, _, err, n_total = load_nifti_frames(p, max_frames=5)
         assert err is None and len(frames) == 5 == len(idxs)
+        assert n_total == 20, "n_total_frames 应为原始 Z 轴长度(20),非抽样数(5)"
 
     def test_negative_values_normalized_to_uint8(self, tmp_path):
         """NIfTI 常见 int16/float32 且可含负值,须经 min-max 归一化到 uint8,
@@ -154,10 +159,11 @@ class TestLoadGuards:
         vol[0, 0, 0] = 500
         p = str(tmp_path / "neg.nii.gz")
         nib.save(nib.Nifti1Image(vol, np.eye(4)), p)
-        frames, _, _, err = load_nifti_frames(p)
+        frames, _, _, err, n_total = load_nifti_frames(p)
         assert err is None
         assert frames[0].dtype == np.uint8
         assert frames[0].min() >= 0 and frames[0].max() <= 255
+        assert n_total == 2, "2 帧体数据 n_total=2"
 
 
 class TestPathDetection:
@@ -195,8 +201,9 @@ class TestLoaderSignatureAlignment:
     def test_three_positional_args_work(self, tmp_path):
         p = str(tmp_path / "v.nii.gz")
         nib.save(nib.Nifti1Image(np.zeros((_W, _H, 20), np.int16), np.eye(4)), p)
-        frames, idxs, _, err = load_nifti_frames(p, str(tmp_path), 5)
+        frames, idxs, _, err, n_total = load_nifti_frames(p, str(tmp_path), 5)
         assert err is None and len(frames) == 5 == len(idxs)
+        assert n_total == 20
 
 
 class TestScatterToFullLength:

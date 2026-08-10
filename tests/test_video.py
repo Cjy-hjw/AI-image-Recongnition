@@ -191,8 +191,9 @@ class TestColorDicomSingleFrame:
 class TestVideoIO:
     def test_unsupported_format_returns_error(self, tmp_path):
         bad = str(tmp_path / "x.txt")
-        frames, idx, is_dcm, err = load_video_frames(bad, str(tmp_path))
+        frames, idx, is_dcm, err, n_total = load_video_frames(bad, str(tmp_path))
         assert frames is None and "Unsupported" in err
+        assert n_total == 0, "失败分支 n_total_frames 必须为 0"
 
     def test_video_roundtrip(self, tmp_path):
         import cv2
@@ -210,13 +211,15 @@ class TestVideoIO:
         if not os.path.exists(vpath) or os.path.getsize(vpath) == 0:
             pytest.skip("video file not produced (codec issue)")
 
-        frames, idx, is_dcm, err = load_video_frames(vpath, str(tmp_path), max_frames=5)
+        frames, idx, is_dcm, err, n_total = load_video_frames(vpath, str(tmp_path), max_frames=5)
         if frames is None:
             pytest.skip(f"decode unavailable: {err}")
         assert err is None and is_dcm is False
         assert 0 < len(frames) <= 5
         assert all(f.ndim == 2 and f.dtype == np.uint8 for f in frames)
         assert len(idx) == len(frames)
+        # 成功路径 n_total_frames 必须为正(原始视频总帧数,非抽样帧数)
+        assert n_total > 0, "成功路径 n_total_frames 应为原始视频总帧数"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

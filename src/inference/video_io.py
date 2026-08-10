@@ -23,11 +23,14 @@ def load_video_frames(path: str, output_dir: str, max_frames: int = 32):
     """读取视频/cine DICOM,均匀抽至多 max_frames 帧。
 
     Returns:
-        (frames, frame_indices, is_dicom, error_msg)
-        frames        — list[np.ndarray] 灰度 uint8,失败为 None
-        frame_indices — 每帧对应的原始帧号(用于关键帧定位/报告)
-        is_dicom      — 输入是否 DICOM
-        error_msg     — 失败原因,成功为 None
+        (frames, frame_indices, is_dicom, error_msg, n_total_frames)
+        frames          — list[np.ndarray] 灰度 uint8,失败为 None
+        frame_indices   — 每帧对应的原始帧号(用于关键帧定位/报告)
+        is_dicom        — 输入是否 DICOM
+        error_msg       — 失败原因,成功为 None
+        n_total_frames  — 原始视频/体数据的**总帧数**(非抽样帧数);
+                          供 scatter_frames_to_full_length 把抽样帧 mask 回填
+                          成全帧序列 3D mask(规范 §五.2)。失败分支返回 0。
     """
     lower = path.lower()
     is_dicom = lower.endswith(_DICOM_EXTS)
@@ -39,14 +42,14 @@ def load_video_frames(path: str, output_dir: str, max_frames: int = 32):
     return None, [], False, (
         f"Unsupported video format: {os.path.basename(path)} "
         f"(supported: {_VIDEO_EXTS + _DICOM_EXTS})"
-    )
+    ), 0
 
 
 def _load_cv_video(path: str, max_frames: int):
     """OpenCV 解码视频，seek 采样避免全量读入 OOM。"""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        return None, [], False, f"Could not open video: {path}"
+        return None, [], False, f"Could not open video: {path}", 0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total <= 0:
         # 某些编码器帧数未知，回退全量读入（超声 cine 通常极短）
@@ -58,10 +61,10 @@ def _load_cv_video(path: str, max_frames: int):
             raw.append(frame)
         cap.release()
         if not raw:
-            return None, [], False, f"No frames decoded from video: {path}"
+            return None, [], False, f"No frames decoded from video: {path}", 0
         idxs = uniform_sample_indices(len(raw), max_frames)
         frames = [_to_gray(raw[i], channel_order="bgr") for i in idxs]
-        return frames, idxs, False, None
+        return frames, idxs, False, None, len(raw)
     idxs = uniform_sample_indices(total, max_frames)
     frames = []
     decoded_idxs = []
@@ -74,8 +77,8 @@ def _load_cv_video(path: str, max_frames: int):
             decoded_idxs.append(int(idx))
     cap.release()
     if not frames:
-        return None, [], False, f"No frames decoded from video: {path}"
-    return frames, decoded_idxs, False, None
+        return None, [], False, f"No frames decoded from video: {path}", 0
+    return frames, decoded_idxs, False, None, total
 
 
 def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
@@ -84,7 +87,7 @@ def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
     复用 _PHI_FIELDS 做 HIPAA 脱敏并存匿名化副本(与 io.load_input_image 一致)。
     """
     if not HAS_PYDICOM:
-        return None, [], True, "DICOM cine provided but pydicom is not installed."
+        return None, [], True, "DICOM cine provided but pydicom is not installed.", 0
     try:
         import pydicom
 
@@ -105,6 +108,6 @@ def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
         anon_path = os.path.join(output_dir, "anonymized_cine.dcm")
         ds.save_as(anon_path)
         print(f"--> Saved anonymized DICOM cine to {anon_path}")
-        return frames, idxs, True, None
+        return frames, idxs, True, None, n_total
     except Exception as e:  # noqa: BLE001 — 守卫契约,失败返回错误信息
-        return None, [], True, f"Error reading/anonymizing DICOM cine: {e}"
+        return None, [], True, f"Error reading/anonymizing DICOM cine: {e}", 0

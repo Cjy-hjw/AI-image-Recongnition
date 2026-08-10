@@ -129,7 +129,7 @@ class TestVideoSoftFlagStillDiagnoses:
         indices = list(range(self.N_FRAMES))
         monkeypatch.setattr(
             video_mod, "load_video_frames",
-            lambda *a, **k: (frames, indices, False, None))
+            lambda *a, **k: (frames, indices, False, None, len(frames)))
         self._stub_heavy_objects(monkeypatch, video_mod)
 
         calls = {"n": 0}
@@ -195,7 +195,7 @@ class TestVideoSoftFlagStillDiagnoses:
 
         frames = [(np.random.rand(96, 96) * 255).astype(np.uint8) for _ in range(2)]
         monkeypatch.setattr(
-            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None))
+            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None, len(frames)))
         out = tmp_path / "out"
         monkeypatch.setattr(sys, "argv", [
             "video_predict.py", "--input_video", str(tmp_path / "fake.mp4"),
@@ -250,7 +250,7 @@ class TestBadFrameIsolation:
         indices = list(range(n_frames))
         monkeypatch.setattr(
             video_mod, "load_video_frames",
-            lambda *a, **k: (frames, indices, False, None))
+            lambda *a, **k: (frames, indices, False, None, len(frames)))
 
         real_diagnose = case_pipeline._diagnose_frame
         from src.inference.postprocess import NonFiniteProbabilityError
@@ -373,7 +373,7 @@ class TestBadFrameIsolation:
 
         frames = [np.full((96, 96), 30, dtype=np.uint8) for _ in range(2)]
         monkeypatch.setattr(
-            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None))
+            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None, len(frames)))
 
         def _boom(*a, **k):
             raise RuntimeError("CUDA out of memory (simulated)")
@@ -405,7 +405,7 @@ class TestBadFrameIsolation:
                   np.zeros((96, 96, 3), np.uint8),          # 帧1 彩色(3通道→ndim=3)
                   np.full((96, 96), 30, np.uint8)]          # 帧2 正常
         monkeypatch.setattr(
-            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1, 2], False, None))
+            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1, 2], False, None, len(frames)))
         out = tmp_path / "out"
         monkeypatch.setattr(sys, "argv", [
             "video_predict.py", "--input_video", str(tmp_path / "fake.mp4"),
@@ -430,7 +430,7 @@ class TestBadFrameIsolation:
         from src.inference import case_pipeline
         frames = [np.full((96, 96), 10, np.uint8) for _ in range(2)]
         monkeypatch.setattr(
-            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None))
+            video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None, len(frames)))
         # 强制聚合返回 -1(模拟全帧失败守卫被绕过的极端情形)
         monkeypatch.setattr(
             case_pipeline, "aggregate_frame_predictions",

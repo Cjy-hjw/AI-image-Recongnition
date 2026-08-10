@@ -47,6 +47,7 @@ Interpretation        object 推荐(Conclusion + KeyFindings)
 """
 
 import math
+import re
 
 # 甲状腺外侵犯:输出编码(规范 §五.4)。
 ETE_NONE = 1
@@ -68,17 +69,26 @@ _ETE_LABEL_TO_CODE = {
     "NA/UNK": ETE_NONE,
 }
 
-# 主病灶位置:输出 `Location` 1..7 与 `LocationProbs[7]` 的**固定顺序**,取自
-# 《数据格式说明》`lesion_loc` 的列举次序。顺序一旦写错,概率分布与类别标签系统性
-# 错位,而 JSON 完全合法、本地永远测不出来 —— 故此处是单一权威定义,训练侧构造标签
-# 必须 import 本常量,不得另抄一份。
+# 主病灶位置:输出 `Location` 1..7 与 `LocationProbs[7]` 的**固定顺序**。
+#
+# ⚠️ **顺序取自官方 xlsx 的实际单元格值,不是《数据格式说明》的文字列举次序** ——
+# 二者不一致,照文档写会错 4/7 类。2026-08-01 实测官方标注表 `主病灶位置` 列的
+# 单元格形如 `1左上叶` / `2左中叶` / `5右中叶`(编码与标签写在同一格),据此:
+#     1=左上叶  2=左中叶  5=右中叶
+# 而《数据格式说明》的列举次序是「左上叶、左下叶、左中叶、右上叶、右下叶、右中叶、
+# 峡部」,按它推则 2=左下叶、5=右下叶,与实测**直接冲突**。唯一自洽的解释是真实编码
+# 按解剖习惯「上→中→下」排列(文档只是在列举有哪些类别,并非在定义编码)。
+#
+# 该错位不会引发任何报错:概率分布与类别标签系统性错位,JSON 完全合法,指标只是
+# "偏低",本地永远查不出根因。故此处是**单一权威定义**,训练侧构造标签必须
+# `import` 本常量,不得另抄一份,更不得照抄文档列举顺序。
 LOCATION_LABELS = (
     "左上叶",   # 1
-    "左下叶",   # 2
-    "左中叶",   # 3
+    "左中叶",   # 2  ← 实测证据:xlsx 单元格 `2左中叶`
+    "左下叶",   # 3
     "右上叶",   # 4
-    "右下叶",   # 5
-    "右中叶",   # 6
+    "右中叶",   # 5  ← 实测证据:xlsx 单元格 `5右中叶`
+    "右下叶",   # 6
     "峡部",     # 7
 )
 NUM_LOCATIONS = len(LOCATION_LABELS)
@@ -106,7 +116,15 @@ def ete_label_to_code(label) -> int:
 
 
 def location_label_to_index(label):
-    """xlsx 的 `lesion_loc` 中文标签 → 0-based 索引(用于构造训练标签)。
+    """xlsx 的 `主病灶位置` 值 → 0-based 索引(用于构造训练标签)。
+
+    **必须容忍"数字+中文"混写**:2026-08-01 实测官方标注表的单元格不是纯中文,
+    而是形如 `2左中叶` / `5右中叶`(编码前缀与标签写在同一格)。纯字符串相等匹配
+    会对**所有**行返回 None,导致位置任务一个训练样本都拿不到,而代码不报任何错。
+    同类混写遍布该表:`1阳性`/`4恶性肿瘤`/`5 V类`/`1有`/`0无`。
+
+    解析优先级:① 先取数字前缀(最权威,直接就是官方编码);② 无数字前缀时回退到
+    中文标签匹配(兼容纯文本导出的场景)。
 
     Returns:
         int 0..6,或 `None` 表示该样本无位置标签(阴性/未知),**不应参与位置损失**。
@@ -115,12 +133,25 @@ def location_label_to_index(label):
     if label is None:
         return None
     s = str(label).strip()
-    if s in LOCATION_NULL_LABELS:
+    if not s:
         return None
-    try:
-        return LOCATION_LABELS.index(s)
-    except ValueError:
-        return None
+
+    # ① 数字前缀:`2左中叶` → 2 → 0-based 1
+    m = re.match(r"^\s*(\d+)", s)
+    if m:
+        code = int(m.group(1))
+        if 1 <= code <= NUM_LOCATIONS:
+            return code - 1
+        return None  # 0 或 >7:阴性/未知编码
+
+    # ② 回退中文匹配(去掉可能的空白)
+    for null_label in LOCATION_NULL_LABELS:
+        if null_label in s:
+            return None
+    for i, name in enumerate(LOCATION_LABELS):
+        if name in s:
+            return i
+    return None
 
 
 def uniform_location_probs():

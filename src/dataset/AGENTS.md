@@ -27,6 +27,18 @@
 - **构造**: `MultiSourceThyroidDataset(sources, img_size=256, transform=None)`,`sources` 为 `[{name, path, label_mask, ratio}, ...]`。逐源建 `ThyroidDataset(source_label_mask=label_mask)`,内部 `index_map`(全局 idx → (源序号, 源内 idx))做透明拼接。
 - **按源采样配额**: `get_sample_weights()` 返回逐样本权重 `ratio / n_source`(源内均分该源的目标占比),喂给 `WeightedRandomSampler` 即可让小源不被大源淹没。空源安全(不贡献样本、不崩)。
 
+### 官方数据加载器 `official_loader.py`(Phase 1,2026-08-10)
+
+把官方标注(xlsx + `.dcm`/`.nii.gz` + NIfTI mask)转成与 `ThyroidDataset` **同构**样本 `(img[1,H,W]/255, mask, labels+valid_*)`,无改动接入 `train_step` masked-loss。三件套照 `pathology_dataset.py`:`parse_annotation_xlsx`(pandas 读 `ROI级别` sheet)→ `build_official_samples`(静动分派 + RoiName 对 mask)→ `OfficialThyroidDataset` → `build_official_datasets`(复用 `patient_grouped_split` 防泄漏)。
+
+- **按字段名解析、禁硬编码列号**(各轮列号不一致,`docs/训练数据定稿.md §4.2`);列名候选在 `_FIELD_ALIASES`,**部分列名待真实 xlsx 复核**(数据禁本地,云端/A800 验;字段名式解析→只改 `_FIELD_ALIASES` 即适配)。
+- **masked-loss 判据 = 该临床列是否为空**(空→`valid_{task}=0`、有值→1),逐列逐行,**非**"是否 M 行"(定稿 §2.2:非 M 行 ~13% 也有标注)。
+- **标签常量硬依赖 `prediction_json`**(禁重定义,Plan M3):`location_label_to_index`(数字前缀优先)、`_ETE_LABEL_TO_CODE`(权威 ETE 标签表)。⚠️ **ETE 混写坑 + 未知/阴性串红线(S3,含 /code-review 补强)**:`ete_label_to_code` 只做纯中文精确匹配、不认 `2甲状腺包膜` 数字前缀,且对**任何未知串**都返 1(无)——那是**输出侧**占位策略,训练侧套用会把真侵犯样本当"无侵犯"学。且 `_ETE_LABEL_TO_CODE` 本身含输出侧归并项 `NA/UNK`/`无病灶（阴性）`→码1,**训练侧不能吃全表**。`official_loader._parse_ete_code` 解析优先级:① `阴性`/`无病灶` 显式排除(**优先于数字前缀**,与 S4 阴性→valid=0 一致)→None;② 数字前缀 1..4 即官方码;③ `NA/UNK`→None;④ 规范短标签精确命中 `_ETE_LABEL_TO_CODE` 才返码;⑤ 其余→**None→`valid_extrathy_ext=0`**(masked-loss 跳过)。**@云TODO**:非规范措辞(`无侵犯`/`毗邻软组织侵犯`)当前 safe-drop 到 valid=0(欠采不误标),真实 xlsx 到位须重锁——**禁激进子串匹配**(否定陷阱 `无血管侵犯` 含"血管");digit-prefix 路径覆盖定稿混写常态,是可靠主路。
+- **静动分派**:静态 `{pid}/{SeriesUid}/*.dcm`、动态 `{pid}/{pid}/{pid}.nii.gz`(定稿 §1.11);动态主病灶无 SliceIndex → **从 mask 非零帧定位**,每非零帧一样本(@云TODO:是否覆盖全部非零帧待复核)。
+- 三新维度键(`lesion_loc`/`extrathy_ext`/`clin_t_stage`)**只产出、暂不消费**,消费待 Phase 2 三头 + 损失接线(当前 `train_step` 忽略额外键,无害)。
+- 复用:`io._to_gray`(读 .dcm,不整段调 `load_input_image` 避免 PHI 匿名化写盘)、`nifti_io.load_nifti_frames`(含 (X,Y,Z)↔(H,W) 转置约定,mask 读取也复用勿另抄)。
+- 单测 `tests/test_official_loader.py`(合成 .dcm/.nii.gz/xlsx,8 用例:混写解析/静动分派/清晰帧跳过/输出契约静+动/患者无泄漏/ETE越界+纯中文/阴性位置valid=0/动态无mask跳过;本地 UTF-8 全绿)。
+
 ---
 
 ## 2. AUGMENTATION PIPELINE (`augmentation/`)

@@ -26,7 +26,21 @@
 
 ---
 
-## `test_phase_refactor.py` — 重构不变式(全套 **348 passed + 1 skipped**(349 collected),此文件 19)
+## `test_official_loader.py` — 官方数据加载器契约(8 用例,2026-08-10)
+
+合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
+
+| Test | 验证内容 |
+|:---|:---|
+| `test_parse_xlsx_mixed_cells` | 混写单元格按 prediction_json 权威常量解析(2左中叶→idx1、ETE 2甲状腺包膜→码2-1)、空列→valid=0 |
+| `test_build_samples_dispatch_and_skip` | 静动分派、清晰帧行跳过、动态按非零 mask 帧展开 |
+| `test_output_contract_static` / `_dynamic` | 输出契约 img[1,S,S]∈[0,1]/mask 二值/labels 含 valid_*;动态取正确非零帧 |
+| `test_patient_grouped_split_no_leak` | train/val 患者无交集(rules.md §5 防泄漏) |
+| `test_ete_parse_edge_cases` | ETE 纯中文回退、越界数字(如 `0无`)不产生负类索引 |
+| `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
+| `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
+
+## `test_phase_refactor.py` — 重构不变式(全套 **356 passed + 1 skipped**(357 collected,+8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,push 后核 headSha 绿),此文件 19)
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

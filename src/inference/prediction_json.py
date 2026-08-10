@@ -6,12 +6,12 @@
 ## 官方 schema(必填项一个都不能少,缺字段该结节该项判 0)
 
 ```
-StudyUID              str    检查唯一标识
+StudyUID              str    V2.1 起填 PatientId(目录以 PatientId 为一级,非真正 StudyUid)
 ProcessingTime_ms     int    推理总耗时(毫秒)
-Prediction.MaskFiles  str[]  所有预测结节 Mask 文件名列表
+Prediction.MaskFiles  str[]  所有预测结节 Mask 相对病例一级目录的路径列表
 Prediction.Nodules[]  array  结节详情(阴性时为空数组 [])
   ├ NoduleID                str    如 "N1"
-  ├ MaskFile                str    对应 mask 文件名
+  ├ MaskFile                str    对应 mask 相对病例一级目录路径(如 SERIES_UID/nodule_001.nii.gz)
   ├ Detection.confidence    float  [0,1] 病灶级检测置信度
   ├ Malignancy.predicted    bool   true=恶性
   ├ Malignancy.confidence   float  [0,1] 恶性置信度
@@ -212,6 +212,45 @@ def _clamp01(x, field):
     return min(1.0, max(0.0, v))
 
 
+def _validate_relative_mask_path(mask_file: str) -> None:
+    """校验 MaskFile 是「相对病例一级目录的路径」,符合官方 V2.1 契约。
+
+    官方硬约束(违反会被评测判违规):
+      1. **禁绝对路径** —— 不以 `/`、`\` 或盘符(如 `C:`)开头。绝对路径让评测
+         无法在病例目录下定位文件,且暴露提交方本地文件系统结构。注意不能用
+         `os.path.isabs` 判定:它在 Windows 上对 `/abs/x.nii.gz` 返回 False(Windows
+         仅认盘符开头为绝对路径),会让评测平台(Linux)判违规的 POSIX 绝对路径
+         在本地静默通过,故显式查首字符与盘符,跨平台一致。
+      2. **禁 `..` 越界** —— 路径任意段不得为 `..`。`../` 可跳出病例目录读到
+         提交根以外文件,是评测侧明令禁止的越界访问。
+
+    合法形态示例:`SERIES_UID/nodule_001.nii.gz`(静态图)、
+    `ACCESSION_NUM/nodule_001.nii.gz`(动态图)。纯文件名也合法(V2.0 旧格式
+    仍兼容,但 V2.1 起官方要求相对路径)。
+
+    Raises:
+        PredictionSchemaError: 绝对路径或含 `..` 段。
+    """
+    s = str(mask_file)
+    if not s:
+        raise PredictionSchemaError("MaskFile 不得为空")
+    # 绝对路径:不以 `/` 或 `\` 开头(POSIX 绝对路径),也不是 Windows 盘符
+    # `C:` 形态。**不能只用 `os.path.isabs`** —— 它在 Windows 上对 `/abs/x.nii.gz`
+    # 返回 False(Windows 仅认盘符开头为绝对路径),会让评测平台(Linux)会判违规的
+    # POSIX 绝对路径在本地静默通过,两边行为分叉。此处显式查首字符与盘符,跨平台一致。
+    if s.startswith(("/", "\\")):
+        raise PredictionSchemaError(
+            f"MaskFile 禁绝对路径(V2.1 须相对病例一级目录): {s}")
+    if re.match(r"^[A-Za-z]:[\\/]", s):
+        raise PredictionSchemaError(
+            f"MaskFile 禁绝对路径(V2.1 须相对病例一级目录): {s}")
+    # 按路径分隔符切分,逐段查 `..`(覆盖正斜杠/反斜杠、混合写法)。
+    parts = re.split(r"[\\/]+", s)
+    if any(part == ".." for part in parts):
+        raise PredictionSchemaError(
+            f"MaskFile 禁含 `..`(V2.1 禁越界访问病例目录外文件): {s}")
+
+
 def build_nodule_entry(
     nodule_id: str,
     mask_file: str,
@@ -229,8 +268,10 @@ def build_nodule_entry(
 
     Args:
         nodule_id: 如 `"N1"`。
-        mask_file: mask 文件名(**仅文件名,不含路径** —— 规范的 MaskFiles 是文件名列表,
-            路径由 `{StudyUid}/{SeriesUid}/` 目录结构隐含)。
+        mask_file: mask 文件路径(**相对病例一级目录的路径**,V2.1 契约 ——
+            如 `SERIES_UID/nodule_001.nii.gz` 或 `ACCESSION_NUM/nodule_001.nii.gz`;
+            纯文件名也合法但已非官方推荐形态)。禁绝对路径、禁 `..` 越界,
+            违反抛 `PredictionSchemaError`(见 `_validate_relative_mask_path`)。
         detection_confidence: [0,1],病灶级(动态图代表整个序列)。
         malignancy_confidence: [0,1] 恶性概率。`Malignancy.predicted` 由它与
             `malignancy_threshold` 比较得出,**不单独传入** —— 两者分开传会出现
@@ -247,8 +288,11 @@ def build_nodule_entry(
         t_confidence: [0,1]。
 
     Raises:
-        PredictionSchemaError: 任一字段越界或类型不合规。
+        PredictionSchemaError: 任一字段越界或类型不合规;`mask_file` 不是合法
+            相对路径(绝对路径或含 `..`)。
     """
+    _validate_relative_mask_path(mask_file)
+
     if location_probs is None:
         probs = uniform_location_probs()
     else:
@@ -304,7 +348,9 @@ def build_prediction_json(
     """组装完整 `prediction.json`。
 
     Args:
-        study_uid: 检查唯一标识。
+        study_uid: **V2.1 起此值填 PatientId**(目录结构以 PatientId 为一级目录,
+            `StudyUID` 字段在官方 V2.1 契约里值即 PatientId,而非真正的 StudyUid)。
+            本函数不对其做语义校验,只原样写入,调用方负责传入正确的 PatientId。
         nodules: `build_nodule_entry` 产出的条目列表。**空列表即阴性病例**
             (规范:阴性时 `Nodules` 为空数组 `[]`),是合法输出而非错误。
         processing_time_ms: 推理总耗时(毫秒)。
@@ -370,6 +416,11 @@ def validate_prediction_json(payload: dict) -> None:
         raise PredictionSchemaError(
             f"Prediction.MaskFiles 与 Nodules[].MaskFile 不一致: "
             f"{mask_files} vs {[n.get('MaskFile') for n in nodules]}")
+
+    # V2.1:MaskFile 必须是相对病例一级目录的路径,禁绝对路径/`..`越界。
+    # build 侧已校验,本闸门对手工拼装/跨版本反序列化的畸形 payload 同样拦截。
+    for mf in mask_files:
+        _validate_relative_mask_path(mf)
 
     for i, n in enumerate(nodules):
         path = f"Prediction.Nodules[{i}]"

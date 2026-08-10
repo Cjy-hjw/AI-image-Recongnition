@@ -137,8 +137,11 @@ class TestInferAncestorName:
         p = "case.nii.gz"
         assert _infer_ancestor_name(p, 2) == "case"
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows 原生分隔符仅 nt 下被 os.path 解析;posix 把反斜杠当文件名普通字符,本用例无意义")
     def test_windows_path_separators(self):
-        # os.path 跨平台;Windows 分隔符也要正常解析
+        # os.path 跨平台语义:Windows 原生路径(盘符+反斜杠)仅在 nt 下被正确解析。
+        # CI 跑 Linux,posix 语义下反斜杠不是分隔符,`C:\data\P1\...` 会被当作单段
+        # 文件名,dirname 顶到根后兜底取整个串——断言恒挂。故仅 Windows 本地跑。
         p = r"C:\data\P1\series\img.dcm"
         assert _infer_ancestor_name(p, 2) == "P1"
 

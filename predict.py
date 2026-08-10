@@ -1,13 +1,12 @@
 import argparse
 import os
-import cv2
 import torch
 from src.inference.io import load_input_image
 from src.inference.gatekeeper_runner import run_gatekeeper_audit
-from src.inference.model_runner import build_model, load_config, preprocess_image, run_forward
-from src.inference.postprocess import (
-    decode_predictions, build_tirads_breakdown, build_probability_export)
+from src.inference.model_runner import build_model, load_config
+from src.inference.postprocess import build_probability_export
 from src.inference.calibration import TemperatureScaler
+from src.inference.case_pipeline import diagnose_static_case
 from src.inference.export import save_prediction_artifacts, save_rejection_json, maybe_save_gradcam
 from src.utils.report_generator import generate_report
 
@@ -74,18 +73,18 @@ def main():
             return
 
         model = build_model(config, args.weights, device)
-        img_tensor = preprocess_image(img_np, config["data"]["img_size"], device)
-        outputs = run_forward(model, img_tensor, args.precision, device)
 
         cal_path = config.get("calibration", {}).get("param_file", "checkpoints/calibration.json")
         calibrator = TemperatureScaler.from_file(cal_path)
-        preds = decode_predictions(outputs, calibrator=calibrator)
-        mask_resized = cv2.resize(
-            preds["mask_binary"], (img_np.shape[1], img_np.shape[0]),
-            interpolation=cv2.INTER_NEAREST)
-        breakdown = build_tirads_breakdown(
-            preds["comp_idx"], preds["echo_idx"],
-            preds["shape_idx"], preds["margin_idx"], preds["foci_prob"])
+        # 推理核心抽到 case_pipeline(与 service 共用同一诊断逻辑,只两端各自落盘)。
+        # preprocess/forward/decode/mask resize/tirads breakdown 全在里面;概率含
+        # NaN/Inf 时 decode 抛 NonFiniteProbabilityError,被下面 except Exception 兜成 ERROR。
+        case = diagnose_static_case(
+            model, img_np, config, calibrator, args.precision, device)
+        preds = case["preds"]
+        mask_resized = case["mask_resized"]
+        breakdown = case["breakdown"]
+        img_tensor = case["img_tensor"]
 
         image_name = os.path.basename(args.input_image)
         report_txt = generate_report(

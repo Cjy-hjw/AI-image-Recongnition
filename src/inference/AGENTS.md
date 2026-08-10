@@ -19,6 +19,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `nifti_io.py` | **2026-08-01 新增,尚未接入主流程**。NIfTI(.nii/.nii.gz)读写:`save_binary_mask`(交付 mask,值域强制 `{0,1}`)、`load_nifti_frames`(动图输入,签名与 `load_video_frames` 逐位对齐)、`scatter_frames_to_full_length`(抽样帧回填全帧序列)、`is_nifti_path`。见 §8 |
 | `nodule_split.py` | **2026-08-01 新增,尚未接入主流程**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。见 §9 |
 | `prediction_json.py` | **2026-08-01 新增,尚未接入主流程**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。见 §10 |
+| `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6 |
 
 ---
 
@@ -225,6 +226,61 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 ### `maybe_save_gradcam(model, img_tensor, img_np, output_dir, branch="cls")` → `(gradcam_done, gradcam_path)`
 - 收敛 `predict.py`(单图)与 `video_predict.py`(关键帧)**共用**的 Grad-CAM 落盘+存在性判定:在 `output_dir` 下生成 `gradcam_cls.png`,文件确实写出时 `gradcam_done=1`(供 `result.json` 的 `gradcam_generated`)。
 - 报告附注文字(单图「恶性激活热图」/ cine「关键帧恶性激活热图」)语义不同,由各调用方在 `gradcam_done` 为真时自行追加,不放进本函数。
+
+---
+
+## 6. `case_pipeline.py` — 单病例诊断核心(CLI 与 service 共用)
+
+**A0 重构新增**。把 `predict.py`(静态)/`video_predict.py`(动态)两个 `main()` 里
+「输入加载完成 → 落盘之前」那段**纯推理核心**抽到此处,CLI 与 `src/service/` runner
+共用同一份诊断逻辑,零行为变更。service 不能复用 CLI 的 `if __name__=="__main__"`
+主函数,故只抽这一层,两端各自落盘(CLI 落 V2.0 `result.json`,service 落 V2.1
+`prediction.json`)。
+
+**边界:什么在这里,什么留在调用方(main/runner)**。本模块**无副作用、不落盘**——只做
+纯核心:`preprocess → run_forward → decode → mask resize → tirads breakdown`(静态)+
+逐帧诊断(坏帧隔离)/聚合/关键帧选择(动态)。留在调用方:**`build_model`/`TemperatureScaler`
+构造**(有构建成本,service 要跨病例复用)、**输入加载**(`load_input_image`/
+`load_video_frames`/`load_nifti_frames`,含 DICOM 匿名化写盘副作用)、**gatekeeper 审计**
+(有副作用 + hard 一票否决 return 属调用方控制流)、**落盘与 Grad-CAM**。
+
+### `diagnose_static_case(model, img_np, config, calibrator, precision, device)` → `dict`
+
+单张静态图核心(输入已加载+已过 gatekeeper)。返回键:
+- `preds`: `decode_predictions` 全量输出(含软 `pred_mask`/`mask_binary`、各头 `*_idx`/`*_prob`、`mal_prob`/`mal_probs`);
+- `img_tensor`: `preprocess_image` 产出的普通张量(供调用方在 inference_mode 之外重跑 Grad-CAM 复用);
+- `mask_resized`: `mask_binary` 用 `INTER_NEAREST` 缩放回**原图 H×W**;
+- `breakdown`: `build_tirads_breakdown` 的 TI-RADS 分项。
+
+**Raises `NonFiniteProbabilityError`**:概率/mask 含 NaN/Inf 时 `decode_predictions` 硬拦,
+冒泡给调用方转 ERROR(与原 `predict.main()` 的 except Exception 兜底一致)。
+
+### `diagnose_dynamic_case(model, frames, frame_indices, config, calibrator, precision, device)` → `dict`
+
+动态图(cine)核心(输入已抽帧+已过 gatekeeper)。返回键:`per_frame`/`agg`/`kf_preds`/
+`kf_frame_np`/`kf_tensor`/`failed_frames`/`breakdown`/`mask_resized`。
+- **坏帧隔离**(与原 `video_predict.main()` 逐字节一致):逐帧 `_diagnose_frame`,**只捕
+  `NonFiniteProbabilityError`(概率/mask NaN/Inf)+ `AssertionError`(帧形状/维度非法)**
+  丢该帧记入 `failed_frames` 后 continue;`RuntimeError`(CUDA OOM/权重维度不符)、
+  `cv2.error` 等真故障**冒泡**由调用方转 ERROR。
+- **关键帧张量防错位**:`kf_tensor`(GPU 张量)只保留**当前最恶性帧**那一个,显存从 N 帧
+  降到 1 帧(防官方 32G 上界 OOM);判据用**严格 `>`**,与 `aggregate_frame_predictions`
+  的 `max`(相等取首个)严格同序。`kf_img_tensor_pos != agg["keyframe_index"]` 一致性锁:
+  两条 max 判据分叉(近乎不可能)时打 warning + 重算关键帧张量,不静默用错帧张量。
+- `per_frame` 每帧存 `{frame_index, mal_prob, preds, frame_np}`(preds 含软 `pred_mask`,
+  供 V2.1 逐帧 mask 落盘);`mask_resized` 为**关键帧** `mask_binary` 缩放回原图 H×W。
+
+**Raises `DynamicCaseError(reason, diagnostic)`**:两种「无有效诊断」——**全帧数值失败**
+(`if not per_frame:` 显式守卫,不靠 assert)与**无有效关键帧**
+(`agg["keyframe_index"] < 0` 双重守卫,防 Python 负索引静默取末帧致错位)——携带诊断字段
+(`n_frames_*`/`failed_*`)由调用方 catch 转 `save_rejection_json`。本层不落盘,把「怎么落」
+的控制流交回 main/runner(与原 `video_predict.main()` 两处 `save_rejection_json`+`return`
+逐字节等价)。
+
+### 私有 `_diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None)`
+
+单帧前向 → 解码,返回 `(preds, img_tensor)`。与原 `video_predict.diagnose_frame` 同义
+(该函数保留为向后兼容 shim)。
 
 ---
 

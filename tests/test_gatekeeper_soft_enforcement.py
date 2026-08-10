@@ -241,6 +241,7 @@ class TestBadFrameIsolation:
             (错位时该字段仍是对的,矛盾恰恰在产物与字段之间)。
         """
         import video_predict as video_mod
+        from src.inference import case_pipeline
 
         # 每帧填成不同的常数灰度值,作为"这一帧的身份指纹"——被跳过的帧不参与
         # 诊断,而 _fake_diagnose 靠指纹反查自己拿到的是第几帧,无需依赖调用顺序。
@@ -251,7 +252,7 @@ class TestBadFrameIsolation:
             video_mod, "load_video_frames",
             lambda *a, **k: (frames, indices, False, None))
 
-        real_diagnose = video_mod.diagnose_frame
+        real_diagnose = case_pipeline._diagnose_frame
         from src.inference.postprocess import NonFiniteProbabilityError
 
         def _fake_diagnose(model, frame_np, precision, device, img_size, calibrator=None):
@@ -271,7 +272,7 @@ class TestBadFrameIsolation:
                 preds["mal_prob"] = float(probs[1])
             return preds, img_tensor
 
-        monkeypatch.setattr(video_mod, "diagnose_frame", _fake_diagnose)
+        monkeypatch.setattr(case_pipeline, "_diagnose_frame", _fake_diagnose)
 
         argv = [
             "video_predict.py", "--input_video", str(tmp_path / "fake.mp4"),
@@ -368,6 +369,7 @@ class TestBadFrameIsolation:
         评测方拿到一份看似正常的诊断,而实际上模型根本没正常跑。
         """
         import video_predict as video_mod
+        from src.inference import case_pipeline
 
         frames = [np.full((96, 96), 30, dtype=np.uint8) for _ in range(2)]
         monkeypatch.setattr(
@@ -376,7 +378,7 @@ class TestBadFrameIsolation:
         def _boom(*a, **k):
             raise RuntimeError("CUDA out of memory (simulated)")
 
-        monkeypatch.setattr(video_mod, "diagnose_frame", _boom)
+        monkeypatch.setattr(case_pipeline, "_diagnose_frame", _boom)
         out = tmp_path / "out"
         monkeypatch.setattr(sys, "argv", [
             "video_predict.py", "--input_video", str(tmp_path / "fake.mp4"),
@@ -425,12 +427,13 @@ class TestBadFrameIsolation:
         修掉的 key_tensors 错位同性质(负索引静默错位)。
         """
         import video_predict as video_mod
+        from src.inference import case_pipeline
         frames = [np.full((96, 96), 10, np.uint8) for _ in range(2)]
         monkeypatch.setattr(
             video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None))
         # 强制聚合返回 -1(模拟全帧失败守卫被绕过的极端情形)
         monkeypatch.setattr(
-            video_mod, "aggregate_frame_predictions",
+            case_pipeline, "aggregate_frame_predictions",
             lambda pf: {"n_frames": len(pf), "mal_prob_mean": 0.0, "mal_prob_max": 0.0,
                         "mal_prob_min": 0.0, "keyframe_index": -1,
                         "keyframe_frame_index": -1, "final_is_malignant": 0})

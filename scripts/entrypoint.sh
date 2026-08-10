@@ -104,10 +104,21 @@ echo "============================================="
 #         ERROR 是诚实的失败状态,比误判成静态图导致整段动态图样本丢失预测更安全。
 INPUT_PATH="$1"
 shift || true
-ext_lc=$(echo "${INPUT_PATH##*.}" | tr 'A-Z' 'a-z')
-case "$ext_lc" in
-    mp4|avi|mov|mkv|dcm|dicom) ext_kind="dynamic" ;;
-    *)                         ext_kind="static" ;;
+# 5.1 扩展名路由。`.nii.gz` 是双段后缀,`##*.` 只能切到最后一段(.gz),会把
+# 官方动图(.nii.gz)误判成 static 桶 → predict.py 零预测;故对 `.nii.gz`/`.nii`
+# 用全名匹配单独判定,归 dynamic(3D 动图,走 video_predict.py)。
+case "$INPUT_PATH" in
+    *.nii.gz|*.nii|*.NII.GZ|*.NII)
+        ext_kind="dynamic"
+        ext_lc=$(echo "${INPUT_PATH##*.}" | tr 'A-Z' 'a-z')
+        ;;
+    *)
+        ext_lc=$(echo "${INPUT_PATH##*.}" | tr 'A-Z' 'a-z')
+        case "$ext_lc" in
+            mp4|avi|mov|mkv|dcm|dicom) ext_kind="dynamic" ;;
+            *)                         ext_kind="static" ;;
+        esac
+        ;;
 esac
 
 # out_dir 解析(等号/空格两种 --output_dir 写法都认,没传则落 predict.py 同款默认值)。
@@ -129,6 +140,14 @@ sniff_kind="skip"
 if [ -f "$INPUT_PATH" ] && [ -r "$INPUT_PATH" ]; then
     dicom_magic=$(dd if="$INPUT_PATH" bs=1 skip=128 count=4 2>/dev/null | tr -d '\0')
     if [ "$dicom_magic" = "DICM" ]; then
+        sniff_kind="dynamic"
+    # NIfTI(.nii/.nii.gz):file(1) 对 .nii.gz 只报 application/gzip,无法区分是不是
+    # NIfTI,会落进下方 *)→unknown→exit 1 误杀官方动图。靠扩展名显式判定→dynamic,
+    # 跳过 unknown(3D 动图,走 video_predict.py)。魔数兜底不可行:NIfTI 无 DICM 那样
+    # 的固定魔数,gzip 头也无法区分内部是否为 NIfTI。
+    elif case "$INPUT_PATH" in
+             *.nii.gz|*.nii|*.NII.GZ|*.NII) true;; *) false;;
+         esac; then
         sniff_kind="dynamic"
     elif command -v file >/dev/null 2>&1; then
         content_mime=$(file --mime-type -b "$INPUT_PATH" 2>/dev/null)

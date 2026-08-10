@@ -107,7 +107,7 @@ def load_nifti_frames(path: str, output_dir: str = None, max_frames: int = 32):
     入口层可直接按扩展名选 loader 再统一传参,无需分支:
 
         loader = load_nifti_frames if is_nifti_path(p) else load_video_frames
-        frames, idxs, is_dcm, err = loader(p, output_dir, max_frames)
+        frames, idxs, is_dcm, err, n_total = loader(p, output_dir, max_frames)
 
     `output_dir` 本身**不被使用**(NIfTI 无 DICOM 那样的 PHI 元数据,无需落匿名化
     副本),但必须占住第二个位置参数 —— 否则上面那行统一调用会把 output_dir 字符串
@@ -115,12 +115,15 @@ def load_nifti_frames(path: str, output_dir: str = None, max_frames: int = 32):
     .nii.gz 样本零预测,而错误信息与"路径参数错位"毫无关联,极难定位。
 
     Returns:
-        (frames, frame_indices, is_dicom, error_msg)
-        frames        — list[np.ndarray] 灰度 uint8,失败为 None
-        frame_indices — 每帧对应的**原始帧号**(0-based;注意官方 xlsx 的
-                        `ANNOTATION->SliceIndex` 是 **1-based**,跨界时需 ±1)
-        is_dicom      — 恒 False(NIfTI 不是 DICOM,无 PHI 脱敏需求)
-        error_msg     — 失败原因,成功为 None
+        (frames, frame_indices, is_dicom, error_msg, n_total_frames)
+        frames          — list[np.ndarray] 灰度 uint8,失败为 None
+        frame_indices   — 每帧对应的**原始帧号**(0-based;注意官方 xlsx 的
+                          `ANNOTATION->SliceIndex` 是 **1-based**,跨界时需 ±1)
+        is_dicom        — 恒 False(NIfTI 不是 DICOM,无 PHI 脱敏需求)
+        error_msg       — 失败原因,成功为 None
+        n_total_frames  — 原始体数据的**总帧数**(Z 轴长度);供
+                          `scatter_frames_to_full_length` 把抽样帧的 mask 回填成
+                          全帧序列 3D mask(规范 §五.2)。失败分支返回 0。
 
     ⚠️ **抽样与规范的冲突(接入前必须处理)**:规范 §五.2 要求动态数据"必须预测并
     输出所有帧"的 3D mask(Z 轴对应全视频帧序列)。本函数默认只抽 32 帧,故调用方
@@ -139,7 +142,7 @@ def load_nifti_frames(path: str, output_dir: str = None, max_frames: int = 32):
     if not HAS_NIBABEL:
         return None, [], False, (
             "NIfTI 输入但 nibabel 未安装(动态图原始数据为 .nii.gz,见《数据格式说明》)"
-        )
+        ), 0
     try:
         img = nib.load(path)
         arr = np.asarray(img.dataobj)
@@ -155,22 +158,22 @@ def load_nifti_frames(path: str, output_dir: str = None, max_frames: int = 32):
             if arr.shape[2] != 1:
                 return None, [], False, (
                     f"4D NIfTI 且 Z 轴长度 {arr.shape[2]} != 1(真 3D+时间序列),本项目不支持"
-                )
+                ), 0
             arr = np.transpose(arr[:, :, 0, :], (2, 1, 0))
         else:
-            return None, [], False, f"不支持的 NIfTI 维度 ndim={arr.ndim} shape={arr.shape}"
+            return None, [], False, f"不支持的 NIfTI 维度 ndim={arr.ndim} shape={arr.shape}", 0
 
         n_total = arr.shape[0]
         if n_total == 0:
-            return None, [], False, f"NIfTI 无有效帧: {path}"
+            return None, [], False, f"NIfTI 无有效帧: {path}", 0
 
         idxs = uniform_sample_indices(n_total, max_frames)
         # _to_gray 统一位深/通道:NIfTI 常见 int16/float32,须 min-max 归一化到 uint8,
         # 与 DICOM/视频两条既有路径口径一致(单帧独立归一化)。
         frames = [_to_gray(arr[i]) for i in idxs]
-        return frames, list(idxs), False, None
+        return frames, list(idxs), False, None, n_total
     except Exception as e:  # noqa: BLE001 — 守卫契约,失败返回错误信息不抛
-        return None, [], False, f"Error reading NIfTI: {type(e).__name__}: {e}"
+        return None, [], False, f"Error reading NIfTI: {type(e).__name__}: {e}", 0
 
 
 def scatter_frames_to_full_length(frame_masks, frame_indices, n_total_frames):

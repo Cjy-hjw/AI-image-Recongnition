@@ -391,7 +391,7 @@ def _read_nifti_binmasks(path: str) -> Tuple[List[np.ndarray], List[int]]:
     复用 load_nifti_frames 的 (X,Y,Z)↔(H,W) 转置约定(勿另抄,定稿最易错处);
     max_frames<=0 取全帧;任意非零→前景。读失败返回 ([], [])。
     """
-    frames, idxs, _, err = load_nifti_frames(path, max_frames=-1)
+    frames, idxs, _, err, _ = load_nifti_frames(path, max_frames=-1)
     if err or not frames:
         return [], []
     binf = [(np.asarray(f) > 0).astype(np.uint8) for f in frames]
@@ -406,7 +406,7 @@ def _nonzero_mask_frames(mask_path: str) -> List[int]:
 
 def _read_nifti_frame_gray(path: str, frame_index: int) -> np.ndarray:
     """读动态 `.nii.gz` 指定原始帧号的灰度帧 (H,W) uint8。"""
-    frames, idxs, _, err = load_nifti_frames(path, max_frames=-1)
+    frames, idxs, _, err, _ = load_nifti_frames(path, max_frames=-1)
     if err or not frames:
         raise RuntimeError(f"读动图失败 {path}: {err}")
     pos = idxs.index(frame_index) if frame_index in idxs else frame_index

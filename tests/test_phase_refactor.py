@@ -14,6 +14,7 @@ import numpy as np
 from src.models.multi_task_model import MultiTaskThyroidModel, ModelOutputs
 from src.models.cbm_head import ConceptEmbeddingCBMHead, CBMHeadOutput
 from src.models.loss import MultiTaskLoss
+from src.models.losses.components.regularizers import compute_regularizers
 from src.inference.model_runner import run_forward
 from src.inference.export import _resolve_gradcam_target_layer
 from src.utils.grad_cam import GradCAM
@@ -278,6 +279,37 @@ def test_famo_load_rejects_task_count_mismatch():
         dst_famo.load_state_dict(src_famo.state_dict())
 
 
+def test_famo_directional_correctness():
+    """R6 方向修复回归锁:FAMO 权重更新方向 = "救最差的欠优化任务"。
+
+    2026-08-11 R6 将更新方向从 `improvement - avg_improvement`(给强任务加权)
+    修正为 `delta = avg_improvement - improvement`(给慢任务加权)。
+    本用例锁死该方向:改善慢的弱任务(index 1)须拿到更高 logit 与权重。
+    若有人把符号误改回旧方向,此测试必红,防止回归。
+    """
+    from src.models.famo import FAMOScheduler
+    famo = FAMOScheduler(num_tasks=2, beta=0.05, gamma=0.0)
+    famo.prev_loss = torch.tensor([1.0, 1.0])
+    losses = torch.tensor([0.5, 0.95])          # task0 改善快(强)、task1 改善慢(弱)
+    _, weights = famo.get_weighted_loss(losses, update_weights=True)
+
+    # 与主会话实测一致:gamma=0 时 w_logits=[-0.011, +0.011],weights=[0.494, 0.506]
+    # ① 弱任务(慢)logit > 强任务(快)logit
+    assert famo.w_logits[1] > famo.w_logits[0], (
+        f"弱任务(index1)logit({famo.w_logits[1]:.4f})应高于强任务(index0)"
+        f"({famo.w_logits[0]:.4f})——方向须为'救最差任务'"
+    )
+    # ② 弱任务 weight > 0.5
+    assert weights[1] > 0.5, (
+        f"弱任务(index1)权重({weights[1]:.4f})应 > 0.5,强任务才应被摊薄"
+    )
+    # ③ 弱任务 logit > 0 且强任务 logit < 0
+    assert famo.w_logits[1] > 0 and famo.w_logits[0] < 0, (
+        f"弱任务logit={famo.w_logits[1]:.4f}应>0、强任务logit="
+        f"{famo.w_logits[0]:.4f}应<0(实测±0.011)"
+    )
+
+
 def test_criterion_persists_dual_params_and_lambda():
     """criterion.state_dict 覆盖 AUCM 对偶参数与 lambda_latent;往返后精确恢复。"""
     crit = MultiTaskLoss()
@@ -294,6 +326,37 @@ def test_criterion_persists_dual_params_and_lambda():
     assert torch.allclose(restored.mal_loss_fn.a, crit.mal_loss_fn.a)
     assert torch.allclose(restored.mal_loss_fn.alpha, crit.mal_loss_fn.alpha)
     assert torch.allclose(restored.lambda_latent, crit.lambda_latent)
+
+
+def test_latent_lagrangian_constraint_direction():
+    """拉格朗日乘子更新方向(约束满足松绑/违反加压)与 #120 符号结论一致。
+
+    L = f + lambda*(loss_l2 - budget),budget=0.1,lambda>=0。标准对偶上升:
+    lambda <- lambda + eta*g,其中 g = loss_l2-budget。g>0(违反)时 lambda 上升加压,
+    g<=0(满足)时 lambda 下降松绑。多乘子子句是"满足时符号反转"的误报反例——
+    满足时 loss_l2 项为负并不翻转参数推方向(grad_p=L)*lambda*grad_p(loss_l2),
+    lambda>0 恒成立故参数恒把残差往小推),flip 只在乘子上升率,不推参数反向。
+    """
+    lm = torch.nn.Linear(16, 2, bias=False)
+    z = torch.randn(8, 16)
+    alpha = torch.full((8, 1), 1.0)
+
+    def g_lam(wfill):
+        lm.weight.data.fill_(wfill)
+        res = lm(z) * alpha
+        _, l2 = compute_regularizers(
+            torch.zeros(1, requires_grad=True),
+            {"latent_res": res, "spin_l1": torch.tensor(0.0)},
+            torch.tensor(0.05), 0.1, 0.0,
+        )
+        g = l2.item() - 0.1
+        return l2.item(), g, max(1e-4, 0.05 + 1e-3 * g)
+
+    l2_s, g_s, lam_s = g_lam(0.01)   # 约束满足: l2 << budget
+    l2_v, g_v, lam_v = g_lam(0.3)   # 约束违反: l2 >> budget
+    assert g_s < 0 and lam_s < 0.05, f"satisfied 应松绑: g={g_s:+.4f} lam={lam_s:.5f}"
+    assert g_v > 0 and lam_v > 0.05, f"violated 应加压: g={g_v:+.4f} lam={lam_v:.5f}"
+    assert l2_s < 0.1 < l2_v
 
 
 if __name__ == "__main__":

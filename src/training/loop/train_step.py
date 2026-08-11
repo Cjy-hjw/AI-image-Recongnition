@@ -3,6 +3,7 @@ import torch
 from src.dataset.augmentation import apply_mixup_or_cutmix
 from src.training.loop.slr import compute_slr_weights
 from src.training.loop.vclub import vclub_learning_step, compute_vclub_mi_bound
+from src.training.stages import compute_gamma_prior
 
 
 def train_batch(
@@ -85,7 +86,7 @@ def train_batch(
 
     optimizer.zero_grad()
 
-    gamma_prior = max(0.0, min(1.0, (epoch - 20) / 20.0))
+    gamma_prior = compute_gamma_prior(epoch)
     amp_enabled = config["train"].get("amp", True)
     with torch.autocast(device_type="cuda", enabled=amp_enabled, dtype=torch.bfloat16):
         outputs = model(images, gamma_prior=gamma_prior)

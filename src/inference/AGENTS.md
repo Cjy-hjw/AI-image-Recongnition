@@ -101,7 +101,7 @@ Phase 1 给 `decode_predictions` 全部分类头加了 NaN/Inf 硬校验(`_asser
 `video_predict.py` 逐帧循环现在的契约(2026-07-30 二轮收紧):
 - **只捕 `(NonFiniteProbabilityError, AssertionError)` 两类**,记入 `failed_frames` 后 `continue`。前者是 `_assert_finite` 抛的**专属子类**(2026-07-30 新增,`ValueError` 子类),后者是 `preprocess_image` 的帧形状/维度校验(`assert img_np.ndim == 2`)。**初版用宽口 `except ValueError`,会把 cv2/numpy 在畸形帧上抛的同类型异常误当"可丢帧"吞掉**——故障被伪装成"少几帧"的 PASSED(/code-review Angle C 实测 `cv2.error` 非 ValueError 子类、但 numpy 会抛 ValueError,故必须用专属类型精确区分)。`RuntimeError`(CUDA OOM/权重维度不符)、`cv2.error`、`KeyboardInterrupt` 等真故障必须冒泡成 ERROR。
 - **mask 也罩 `_assert_finite`**(2026-07-30):分类头有硬拦、mask 若漏拦,NaN logits 经 sigmoid 得 NaN,`(NaN>0.5)` 恒 False → **静默产出全零分割图**而 status=PASSED、报告正常,评测只看 JSON 察觉不到分割已废。
-- **`frame_np` 存 per_frame 元素,`img_tensor` 改为只留当前最恶性帧**(2026-07-30 显存优化):32 帧(或不限帧 DICOM cine)的 GPU 张量全量常驻会在官方平台 32G 显存硬上界(rules.md §2 Q33)上叠加模型+Grad-CAM 而 OOM,本地 A800 80G 测不出。逐帧用严格 `>` 刷新 `kf_tensor`(与 `aggregate_frame_predictions` 的 `max(range(n),key=...)` 取首个最大严格同序),显存常驻从 32 帧降到 1 帧;关键帧处有 `kf_img_tensor_pos != agg["keyframe_index"]` 一致性锁(不等则 warning + 重算)。**错位陷阱(2026-07-29 实测复现)**:旧版 `key_tensors` 平行 dict 以全帧下标为键、`keyframe_index` 是 per_frame 下标,跳帧后两空间错位且 `key_tensors[kf_pos]` 恒取得到值、不抛 KeyError,mask/Grad-CAM 静默出自错帧;`frame_np` 存进 per_frame 元素后下标空间只剩一个。
+- **`frame_np` 存 per_frame 元素,`img_tensor` 改为只留当前最恶性帧**(2026-07-30 显存优化):32 帧(或不限帧 DICOM cine)的 GPU 张量全量常驻会在官方平台 14G 显存上界(实际约 16G/容器、当前分配 14G,rules.md §2)上叠加模型+Grad-CAM 而 OOM,本地 A800 80G 测不出。逐帧用严格 `>` 刷新 `kf_tensor`(与 `aggregate_frame_predictions` 的 `max(range(n),key=...)` 取首个最大严格同序),显存常驻从 32 帧降到 1 帧;关键帧处有 `kf_img_tensor_pos != agg["keyframe_index"]` 一致性锁(不等则 warning + 重算)。**错位陷阱(2026-07-29 实测复现)**:旧版 `key_tensors` 平行 dict 以全帧下标为键、`keyframe_index` 是 per_frame 下标,跳帧后两空间错位且 `key_tensors[kf_pos]` 恒取得到值、不抛 KeyError,mask/Grad-CAM 静默出自错帧;`frame_np` 存进 per_frame 元素后下标空间只剩一个。
 - **全帧失败**用显式 `if not per_frame:` 守卫落 ERROR + `failed_frames` 明细,**不靠 `assert`**(assert 在 `python -O` 下会被整条剥离)。另有 `if agg["keyframe_index"] < 0:` **双重守卫**(2026-07-30):即便全帧失败守卫未来被误改成只 print 不 return,`per_frame[-1]` 负索引**不抛异常**而静默取末帧,mask/Grad-CAM 出自末帧而 JSON 写 -1,与 key_tensors 错位同性质。
 - **丢帧如实记录,不静默少算**:`result.json` 顶层 `n_frames_sampled` 改取**抽样帧数** `len(frames)`(此前取 `agg["n_frames"]` 即成功帧数),并新增 `n_frames_diagnosed`/`n_frames_failed`/`failed_frame_indices`/`failed_frames`(含每帧 `reason`)。**ERROR 路径键集与 PASSED 对齐**(2026-07-30):全帧失败/无关键帧的 ERROR JSON 也带 `n_frames_diagnosed`/`failed_frame_indices`,下游按"两路径共有 schema 超集"统一解析时不会 KeyError。无失败时 `sampled == diagnosed`、`failed_*` 为空,退化为原行为。
 - **静态图 `predict.py` 不软化**:单图 NaN = 该图没有任何有效诊断,编一份出来是假的;`report_generator.generate_report` 对 NaN `malignancy_prob` 本就是硬报错(2026-07-10 决定,`nan >= 0.5` 恒 False 会静默输出"良性倾向",癌症筛查假阴性),且 ERROR 的 result.json 本身是合法 JSON,比 NaN 污染的"PASSED"更可解析。
@@ -267,7 +267,7 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
   丢该帧记入 `failed_frames` 后 continue;`RuntimeError`(CUDA OOM/权重维度不符)、
   `cv2.error` 等真故障**冒泡**由调用方转 ERROR。
 - **关键帧张量防错位**:`kf_tensor`(GPU 张量)只保留**当前最恶性帧**那一个,显存从 N 帧
-  降到 1 帧(防官方 32G 上界 OOM);判据用**严格 `>`**,与 `aggregate_frame_predictions`
+  降到 1 帧(防官方 14G 上界 OOM);判据用**严格 `>`**,与 `aggregate_frame_predictions`
   的 `max`(相等取首个)严格同序。`kf_img_tensor_pos != agg["keyframe_index"]` 一致性锁:
   两条 max 判据分叉(近乎不可能)时打 warning + 重算关键帧张量,不静默用错帧张量。
 - `per_frame` 每帧存 `{frame_index, mal_prob, preds, frame_np}`(preds 含软 `pred_mask`,

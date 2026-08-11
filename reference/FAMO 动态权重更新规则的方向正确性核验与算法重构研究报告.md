@@ -1,5 +1,10 @@
 # FAMO 动态权重更新规则的方向正确性核验与算法重构研究报告
 
+> **📌 报告元信息（后续 agent 必读）**
+> - **入库日期**：2026-08-11
+> - **适用场景**：对应已落地的 FAMO 方向修复——`src/models/famo.py` 符号反转（`delta = avg_improvement - improvement`）+ `weights.detach` + 分母 1e-2。
+> - **结论现状**：**有效，最新** —— FAMO 极性颠倒（分类 AUC 退化至 0.51-0.53）的根因与修复方向已落地，方向性断言（Directional Assertion）补测约束仍有效。
+
 ## 摘要与核心结论
 
 本报告针对甲状腺超声多任务模型（包含分割、概念、物理先验、良恶性分类、SupCon 共 5 个任务）中 FAMO（Fast Adaptive Multitask Optimization）动态损失加权模块的方向正确性进行了深入的数学推导、原论文对拍与工程核验。结合 NeurIPS 2023 原论文（Liu et al., arXiv:2306.03792）的算法规范、数值仿真实验以及内部模型退化现象，得出以下确定性结论：  

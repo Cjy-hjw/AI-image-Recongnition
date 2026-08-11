@@ -27,7 +27,20 @@ pylibjpeg>=2.1.0,<2.2.0            # 核心包:与两后端插件同源封顶。
                                   # <2.2.0 挡未来版本可能把 numpy 依赖抬到 >=2.0 与本项目冲突。
 pylibjpeg-libjpeg>=2.0.0,<2.2.0    # JPEG baseline/extended/lossless
 pylibjpeg-openjpeg>=2.0.0,<2.3.0   # JPEG2000
-opencv-python-headless>=4.8.0
+# ⚠️ 上限 <5 是硬约束(2026-08-11 双环境对拍实测,勿放开):
+# OpenCV 5.0 改了 cv2.HoughLinesP 的返回值形状,导致 src/gatekeeper/ 的 detect_splicing
+# 内部解包抛 `TypeError: cannot unpack non-iterable numpy.int32 object`——
+# 同一 torch2.8 环境下 cv2 5.0.0 → tests/test_gatekeeper.py 7 failed;降到 4.14.0 → 54 passed。
+#
+# 🔴 **别因为"当前 CI 装的是 4.x、看起来没事"就删掉这个上限**(pip dry-run 实测,py3.10):
+#   ① 本文件现有 numpy<2 + opencv 不封顶 → 解析出 numpy-1.26.4 + **opencv 4.11.0.86**(安全);
+#   ② 本文件现有 numpy<2 + opencv <5     → 同上,opencv 4.11.0.86(安全);
+#   ③ **放开 numpy 到 >=2 + opencv 不封顶 → numpy-2.2.6 + opencv 5.0.0.93,当场踩雷**。
+# 即:今天挡住 5.0 的其实是 `numpy<2` 的连带效果,**不是**谁主动挡的。而 numpy<2 只对旧交付
+# base(pytorch:2.1.0)成立——**上云换官方 torch2.8 base 时 numpy 必须放开到 >=2**(见
+# docs/torch2.8迁移方案.md §2),那一刻本行若没有 <5,pip 就会径直装 5.0。
+# 官方禁联网 + 模型只提交一次,构建那一刻装错版本零补救余地。**这个上限就是为那一刻准备的。**
+opencv-python-headless>=4.8.0,<5
 # NIfTI 读写(2026-08-01 官方《赛事开发规范 V1.0》§五.2 硬约束):预测结节 mask
 # **必须**为 .nii/.nii.gz,且《数据格式说明》确认动图原始数据同为 .nii.gz(静态图
 # 才是 DICOM)。缺此依赖 = 合规 mask 产不出 + 动图读不进来,两条路都零分。

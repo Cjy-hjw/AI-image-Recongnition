@@ -28,7 +28,7 @@
   pcgrad.pc_backward([loss_seg, loss_cls])  # 自动backward+投影
   pcgrad.step()
   ```
-- **显存**: <5%额外开销,适合官方32G约束
+- **显存**: <5%额外开销,适合官方14~16G(实际约16G/容器、当前分配14G)约束
 
 ---
 

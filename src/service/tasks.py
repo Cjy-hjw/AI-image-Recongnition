@@ -8,8 +8,8 @@ torch 推理是同步阻塞的 CPU/GPU 代码 —— 若用 `asyncio.create_task
 强制重启,**整场评测的进度全部作废且不可恢复**。
 
 故推理一律丢进 `ThreadPoolExecutor`(worker=1,见 `config.INFERENCE_WORKERS`),
-event loop 只负责收请求和回调,永远不阻塞。worker 应为 1 的理由:单卡 32G 显存
-(官方答疑 Q33)并发推理会 OOM,且模型非线程安全 —— 排队串行是唯一安全解。⚠️ 实际
+event loop 只负责收请求和回调,永远不阻塞。worker 应为 1 的理由:单卡 14~16G 显存
+(平台实际约 16G/容器、当前分配 14G,2026-08-11 修正口径)并发推理会 OOM,且模型非线程安全 —— 排队串行是唯一安全解。⚠️ 实际
 `config.INFERENCE_WORKERS` 可由环境变量 `AICOMP_INFERENCE_WORKERS` 覆盖,运维注入 >1 即
 破坏此串行/防 OOM 前提——交付容器勿设该变量。
 """

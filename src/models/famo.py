@@ -35,13 +35,20 @@ class FAMOScheduler:
             and self.prev_loss.sum() > 0
             and not torch.isnan(losses_tensor).any()
         ):
-            # Task improvement rate: (L_{t-1} - L_t) / L_{t-1} with 1e-4 epsilon and gradient clipping
+            # Task improvement rate: (L_{t-1} - L_t) / L_{t-1} with 1e-2 epsilon and gradient clipping.
+            # Epsilon widened 1e-4 -> 1e-2 (2026-08-11 R6 / DR §3.1): Dice loss decays toward ~1e-3
+            # late in training, where a 1e-4 denominator makes the ratio explode on batch noise.
             improvement = (self.prev_loss - losses_tensor.detach()) / (
-                torch.abs(self.prev_loss) + 1e-4
+                torch.abs(self.prev_loss) + 1e-2
             )
             improvement = torch.clamp(improvement, min=-2.0, max=2.0)
             avg_improvement = improvement.mean()
-            delta = improvement - avg_improvement
+            # 2026-08-11 R6 sign fix (DR report §2.2): delta = avg - I_k gives MORE weight to
+            # slow-improving (under-optimized) tasks — this is the "save the worst task" direction.
+            # The previous `improvement - avg_improvement` did the opposite (boosted the strongest
+            # task), letting the seg backbone dominate the shared representation and dragging
+            # classification AUC down to ~0.51-0.53. sum(avg - I) == 0 keeps logit mean from drifting.
+            delta = avg_improvement - improvement
 
             # Dynamically adjust weights to maximize the worst-performing task
             self.w_logits = (
@@ -54,8 +61,13 @@ class FAMOScheduler:
             # Store current losses for next iteration
             self.prev_loss.copy_(losses_tensor.detach())
 
-        # Weighted loss summation
-        weighted_loss = (losses_tensor * weights).sum()
+        # Weighted loss summation. weights.detach() makes the scheduling coefficients
+        # pure constants w.r.t. autograd: task weights are a hand-written update rule,
+        # not learned by backprop. losses_tensor itself is NOT detached, so backbone /
+        # task-head gradients still flow normally — only the weight scalars are frozen.
+        # (w_logits is a plain tensor with requires_grad=False today, so no gradient is
+        # injected currently; detach() makes that guarantee explicit and future-proof.)
+        weighted_loss = (losses_tensor * weights.detach()).sum()
         return weighted_loss, weights
 
     def state_dict(self) -> dict:

@@ -38,7 +38,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `components/concepts.py` | `resolve_mix_params(outputs, mix_info)`, `compute_concept_losses(outputs, targets, lam, index, mask_weight, label_smoothing, tirads_matrix)` |
 | `components/malignancy.py` | `compute_malignancy_losses(mal_loss_fn, supcon_loss_fn, outputs, targets, mask_weight, slr_weights)` |
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |
-| `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` |
+| `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` — 拉格朗日约束 g=loss_l2-delta_budget≤0。参数方向:grad=λ·grad(loss_l2),λ>0 恒成立故残差恒被往小推,约束满足(g≤0)只减量级不翻转方向;乘子 `λ←λ+η·g` 违反加压/满足松绑(2026-08-11 #120 核实为误报,方向正确,见文件内注释) |
 
 **Rule**: 新损失函数放入 losses/ 子模块或 losses/components/ 文件，由 multitask.py 调用。`loss.py` is a shim only.
 
@@ -135,6 +135,16 @@ The Lagrangian multiplier `alpha` in `AUCMLossApprox` must be optimized in the m
 
 - **Stage 1 (Epoch 1-40)**: Handled by `enable_mal_loss=False`, which multiplies `loss_mal` and `loss_supcon` by `0.0` inside `MultiTaskLoss.forward()`.
 - **Stage 3 (Epoch 101-120)**: `update_famo_weights=False` is passed to disable FAMO dynamic weighting.
+
+### FAMO 权重更新方向（2026-08-11 R6 修复）
+
+**目标 =「救最差任务」**：给**改善慢（欠优化）的任务**加更高权重，给改善快（强）任务减权，防止强任务（分割）主干梯度支配共享表征、压垮分类。
+
+- **更新规则（已修复）**：`delta = avg_improvement - improvement` → 改善慢的任务获正 `delta`、权重上升；改善快的任务获负 `delta`、权重下降。
+- **旧（错，勿回退）**：`delta = improvement - avg_improvement` 方向与之相反，构成"马太效应"——给改善快的强任务加权，与"救最差任务"意图完全相反，曾致分割主干强梯度支配共享表征、分类 AUC 退化到 0.51–0.53。
+- **分母 epsilon 1e-4 → 1e-2**：Dice loss 后期衰减到 ~1e-3，旧 1e-4 分母会因 batch 噪声爆炸。
+- **`weighted_loss` 加 `weights.detach()`**：权重是手写调度规则、不参与反传。
+- **方法论定位**：当前实现是**线性启发式**（`I_k ≈ -v_k`），**非原论文**（NeurIPS 2023, Liu et al., arXiv:2306.03792）的对数空间标准 FAMO（`∑z_k·log(L_k)`，对数损失空间 + 对数改进率）。原论文方案 B（对数空间重构）已记 backlog，本次只做了方案 A（修正符号方向）。方向正确性核验与算法重构详见 `reference/FAMO 动态权重更新规则的方向正确性核验与算法重构研究报告.md`。
 
 ---
 

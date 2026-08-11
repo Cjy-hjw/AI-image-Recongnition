@@ -120,6 +120,15 @@ def main():
             ts = torch.load(state_path, map_location=device)
             criterion.load_state_dict(ts["criterion"])
             criterion.famo.load_state_dict(ts["famo"])
+            # 2026-08-11 R6: FAMO 方向已修复(见 src/models/famo.py),旧 checkpoint 的
+            # w_logits 是"反方向"产物(给强任务加权),语义颠倒不可继承。强制重置为均权重
+            # 从零重启调度——旧 best=0.5653 那批本就是错方向产物,不值得继承。
+            criterion.famo.w_logits = torch.zeros(criterion.famo.num_tasks)
+            criterion.famo.prev_loss = torch.zeros(criterion.famo.num_tasks)
+            print(
+                "--> [R6] FAMO w_logits/prev_loss reset to zero "
+                "(direction fix invalidates old reversed logits)."
+            )
             best_val_score = ts.get("best_val_score", best_val_score)
             print(
                 f"--> Restored training state from epoch {ts.get('epoch')} "

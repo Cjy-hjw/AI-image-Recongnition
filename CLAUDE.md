@@ -2,7 +2,7 @@
 
 > 甲状腺超声多任务诊断系统(2026 全国医保影像AI识图大赛 · 赛道七)。
 > 下方 `@` 导入的运行规则与质量门**强制生效**,等同正文。
-
+另外别忘了用context-mode;
 ## 强制规则(导入)
 
 @rules.md
@@ -84,7 +84,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 
 
 
-- **比赛约束**:赛道七**仅「自有模型组」**,交付为离线推理容器(`predict.py` 单图 + `video_predict.py` 动态图,`entrypoint.sh` 按扩展名自动分发),打包 gatekeeper + TaskAlignmentAdaptor + CBM 报告生成器。
+- **比赛约束**:赛道七**仅「自有模型组」**,交付为**常驻 HTTP 推理服务**(容器 `ENTRYPOINT = python -m src.service.app`,uvicorn 监听 8000;`/call` 收批量目录任务丢线程池、`/health` 供平台探针、跑完回调;逐病例输出 `{PatientId}/prediction.json` + 逐结节 `.nii.gz`)。`predict.py`/`video_predict.py`/`entrypoint.sh`(按扩展名分发)已从生产入口**降级为本地/CI 单文件调试旁路**。打包 gatekeeper + TaskAlignmentAdaptor + CBM 报告生成器。
 - **当前卡点**:官方数据 **2026-08-01 初赛启动**后才可用、**禁本地、JPG、含动静态图**。**2026-07-28 官方赛前动员会已豁免赛道七全部医保安全考核**(真实性/规范性无 Sins 得分,总分 = 临床诊断得分 × 100),故卡点收敛为**良恶性/分级/分型这一条线**——真实性/规范性降级为不计分的防御性工程,勿再按"核心三项"分配精力。另有两项官方新约束:① 所有分类/分级/分型**必须输出概率分布,否则计 0 分**(已落地);② 新增 ETE 4级分级 / 7类病灶位置 / T临床显著性三项维度,**官方只给数量未给类别定义**,是当前最大未知。进度见 `docs/之前表现.md`、`docs/比赛对齐与风险.md`、`docs/赛前动员会-五大核心评审目标与属性分类.md`(官方原文)。
 - **环境**:训练在服务器 A800;本地 Python 见全局 `~/.claude/CLAUDE.md`。
 - **代理配置(本地访问外网必需)**:访问 HuggingFace/GitHub/外网资源时,**PowerShell 必须先设置代理环境变量**:

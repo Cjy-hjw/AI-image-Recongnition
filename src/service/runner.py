@@ -11,6 +11,10 @@
 - `dataset_path` = 平台 `/call` 下发的**批量病例目录**;
 - `output_dir`   = `config.answer_dir(evaluation_id)` = `{ANSWER_ROOT}/{evaluation_id}`,
   `tasks._run` 已 `makedirs` 好,runner 只管往里写每病例 `{PatientId}/...`。
+  case_dir 为**一级** `{output_dir}/{PatientId}`(V2.1 官方契约:prediction.json 落顶层
+  `{PatientId}/prediction.json`,mask 落 `write_case_v21` 内部建的 `{PatientId}/{subdir_uid}/`
+  子目录)。⚠️ 同 PatientId 多序列的 prediction.json 互相覆盖是已知问题,正确组织方式取决于
+  官方 schema,归入 #117 待官方明确(#122 曾私自加二级目录破坏顶层契约致零分,已回退)。
 
 ## 批处理流水线
 
@@ -19,7 +23,9 @@
           static  → load_input_image(含 DICOM 匿名化落盘) → gatekeeper → diagnose_static_case
           dynamic → load_nifti_frames → 逐帧 gatekeeper → diagnose_dynamic_case
           ↓
-          case_dir = {output_dir}/{patient_id}  →  write_case_v21(..., kind, processing_ms)
+          case_dir = {output_dir}/{patient_id} →  write_case_v21(..., kind, processing_ms)
+          (一级 case_dir;write_case_v21 内部建 {patient_id}/{subdir_uid}/ 放 mask,
+           prediction.json 落顶层 {patient_id}/。同 PatientId 多序列覆盖问题见 #117)
 
 ## 三条红线(对应 QA_VP §1.7 / rules.md §5 先证后改)
 
@@ -198,6 +204,14 @@ def _process_case(case, output_dir, state, precision, max_frames):
     """单病例流水线:计时 → 分派静/动 → write_case_v21;独立 try/except 失败隔离。"""
     patient_id = case["patient_id"]
     kind = case["kind"]
+    # case_dir 必须是**一级** `{output}/{PatientId}`——`write_case_v21` 内部负责建
+    # `{case_dir}/{subdir_uid}/nodule.nii.gz` 子目录,且官方 V2.1 契约要求
+    # `prediction.json` 落在顶层 `{PatientId}/prediction.json`(docs/训练数据定稿.md §1.2)。
+    # ⚠️ 2026-08-11 #122 曾把这里改成两级 `{pid}/{subdir_uid}` 想防同 PatientId 多序列
+    # 覆盖,但那会叠成 `{pid}/{subdir}/{subdir}/mask` + prediction.json 掉出顶层→整例零分
+    # (Gate2 对抗审计实测坐实)。已回退。**同 PatientId 多序列的 prediction.json 互相覆盖
+    # 是真问题,但正确组织方式(一患者一份含多结节 vs 每序列一份)取决于官方规格,归入 #117
+    # 待官方 schema 明确后统一处理,不在此私自加层级破坏顶层契约。**
     case_dir = os.path.join(output_dir, str(patient_id))
     t0 = time.perf_counter()
     try:

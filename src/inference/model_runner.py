@@ -68,8 +68,23 @@ def build_model(config: dict, weights: str, device: torch.device):
             )
         print(f"Loaded model weights from {weights}")
     else:
+        # 2026-08-11 #115: 主诊断模型(计分组件)权重文件缺失的分流——
+        #   PRODUCTION=1(交付容器)→ 硬报错。随机初始化的主模型会输出"结构合法但
+        #     数值全错"的垃圾诊断,比崩溃更阴(见 memory/delivery-container-missing-weights):
+        #     容器漏 COPY 权重(#111 场景)时 os.path.exists 为 False,静默随机初始化会让
+        #     整批病例拿到看似专业实则随机的 TI-RADS/良恶性,零分且无人察觉。生产必须拒启。
+        #   非 PRODUCTION(CI 冒烟/本地调试)→ 保留随机降级 + warning:CI 无 checkpoint 环境
+        #     靠此跑机制层冒烟(test_smoke_entrypoints / test_model_runner 缺权重降级用例)。
+        #   与 QA_VP §1.7「计分组件权重故障仍硬报错」口径一致(零计分的 authenticity 才降级 skipped)。
+        if os.environ.get("PRODUCTION") == "1":
+            raise RuntimeError(
+                f"[FATAL] 主诊断模型权重文件不存在,PRODUCTION 模式拒绝随机初始化启动:{weights}\n"
+                "  随机初始化的主模型会输出结构合法但数值全错的垃圾诊断(整批零分且难察觉)。\n"
+                "  核对交付容器 Dockerfile 是否 COPY 了 checkpoints/ 权重(见交付 ToDO #111)。"
+            )
         print(
-            "[WARNING] Trained checkpoint not found. Using default initialized weights."
+            "[WARNING] Trained checkpoint not found. Using default initialized weights. "
+            "(非 PRODUCTION 调试降级;生产容器请设 PRODUCTION=1 使缺权重硬报错)"
         )
     model.eval()
     return model

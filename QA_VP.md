@@ -93,6 +93,16 @@ All deep learning implementations MUST be verified by quantifiable automated tes
 
 Audit all PyTorch/training code changes against this checklist:
 
+### 2.0 对抗性审计心态(Adversarial Review Posture · 所有 review 子agent 的默认前提)
+*   **Safety Risk**: 以"默认代码没问题、只是扫一眼确认"的心态做 review,会系统性放过隐蔽缺陷——审查者一旦预设正确,就只找符合预期的证据(确认偏误),对反常之处倾向"应该没事"而非追查。本项目的数学管道(梯度路由/符号极性/对偶优化)缺陷往往不崩溃、只让指标悄悄退化,最需要主动出击才能挖出。
+*   **Rule(默认有 bug,主动证伪)**: **所有 review/审查子agent 一律以"这段代码有 bug,我的任务是把它找出来"为默认前提**,而非"确认它没问题"。具体:
+    - **举证责任反转**:对每个关键判断(符号方向、detach 隔离、维度契约、边界条件),默认它**错**,由代码/实测来证明它对;证不出"对"就当"存疑"上报,不得因"看起来对"放过。
+    - **主动构造反例/对拍**:别只顺着 happy path 读。构造能触发 bug 的输入(边界值、首步/空状态、NaN、单类 batch、CUDA vs CPU 分叉),实跑看是否崩或结果反常(rules.md §5 先证后改·对拍实验)。
+    - **质疑而非复述**:被审代码的注释/文档/commit message 声称的行为**一律不采信**,以实测为准("别信文档声称,用数字实测",§1.7 已有先例:copy_move 文档写"零误报"实测 27.3%)。
+    - **列出"没找到 bug 的地方"也要说依据**:判一个点 PASS,必须给出"我尝试了 X 反例、实测 Y、故排除",而非沉默略过。
+*   **边界**:对抗心态是**找真 bug**,不是为凑数报假问题——每条 finding 必须可复现(给出触发输入 + 期望 vs 实际)。报一堆基于误解 PyTorch 语义的"耸动假报"和放过真 bug 同样有害(2026-08-11 一次 code-review 8 条 findings 有 7 条源于对 detach/nn.Parameter/门控语义的误读)。**默认有 bug 是搜索姿态,不是结论姿态**:大胆假设、实测求证、证伪即撤。
+*   **谁强制**:Gate2 派出的每个 reviewer 子agent(rules.md §2)prompt 里都应显式带上本条心态;高风险数学改动(FAMO/AUCM/梯度路由)尤其不得走"确认式"轻审。
+
 ### 2.1 Signs and Polarity Auditing (Minimax & Objective Alignment)
 *   **Minimax Dual Variables**: In minimax optimization (e.g. AUC-Margin), verify that the dual variable gradient is correctly inverted before standard optimization step:
     ```python

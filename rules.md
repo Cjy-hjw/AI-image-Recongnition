@@ -19,6 +19,14 @@ Before deploying or starting full training, you **MUST** execute the double-gate
     - **第二步 → `QA_VP.md §1/§2` 领域清单**: 第一步扫完后，对照 §1.1 梯度隔离 / §1.2 优化器绑定 / §1.3 FP16 数值 / §1.4 患者泄漏 / §1.5 损失维度 / §1.6 DICOM 脱敏 / **§1.7 推理侧红线**（误报/维度契约/降级路径） / §2.1 符号极性 / §2.2 广播，逐条核对**改动触及的**项（未触及的跳过）。
     - **谁做**: 高风险改动（梯度路由/优化器绑定/损失数学/gatekeeper 降级路径）→ 派 `model="sonnet"` 及以上子 agent 审；低风险改动 → 主会话自审。**Gate2 禁用 haiku**（能力不足）。
     - **反例（本次教训）**: 只跑第一步(独立 agent 8 角度)跳过 QA 清单 = 漏领域红线；只走清单跳过第一步 = 漏通用缺陷。
+    - **🔴 审查 agent 的证据必须不可伪造（2026-08-12 新增，本轮 6 条误报实证）**：审查 agent 报的 finding **不得直接采信**。这轮独立 sonnet 报 5 条，**3 条误报**；memory 整理 agent 又误判 1 条。归类后病根有三：① **读片段就外推**（说「gamma 不在优化器」但没读排除条件是 `"vclub" in name`；说「opencv 要 numpy≥2 会冲突」但只看本地已装版本的元数据、没跑 pip 解析；说「runner.py 已加 encoding」但 grep 实为零命中）② **概念性误解**（说 `_seed_worker` 在 `persistent_workers` 下「压窄训练多样性」——设种子不减少单次运行内的随机性）③ 🔴 **声称验证但结论相反**（说「`WeightedRandomSampler` 不消费 generator」，**自称读过 torch2.8 源码**，而源码 `__iter__` 明写 `torch.multinomial(..., generator=self.generator)`）。第三类最危险：**要求 agent 写「你做了什么验证」，反而给了它编造证据的模板**。故：
+      1. **交验证产物，不交验证自述**：让 agent 把验证脚本落到文件并回传**路径 + 完整 stdout**。脚本可重跑，自述不可核验。
+      2. **每条 finding 强制标 evidence 类型**：`实跑`(附命令+输出) / `读码推断`(附 `文件:行号`) / `推测`。**「读码推断」默认降级为待验证**，不能直接算 finding。
+      3. **高杠杆 finding 主会话必须自己重跑**：凡是会改变「能不能 commit」的结论，一律主会话独立复核。本轮 3 条误报全靠重跑抓出（实测 sampler 同 seed 逐 epoch 序列、pip dry-run 三场景对照）。
+      4. **不让 agent 判「能否 commit」**：它给证据，主会话做裁决。本轮它判「不可 commit」，而三个阻塞项全是误报，照单全收就白改一通。
+      5. **分工摆正**：sonnet 的价值在**广度覆盖**（本轮确实抓到 2 条主会话不会注意的真 bug：测试里 `WEIGHT_DECAY` 写成 `1e-4` 而 config 是 `5e-4`、`src/models/AGENTS.md` 残留已被提取的内联公式），**不在判断力**。深度裁决归主会话。
+      6. **「过时」标注同样要实跑核实**：memory 整理时曾把一条**正确**的 GBK 记录标成「已修复、可本地跑」（依据是 grep 到某字符串），实跑 `verify_model.py` 当场 `UnicodeDecodeError`。**差点反向误导后人**——判定「已过时」与判定「是 bug」同等需要证据。
+
     - **反例二（2026-07-30 真实违规·谎报审查）**：#87 高风险改动（`authenticity.py` 的 `EXPECTED_CKPT_SHA256` 封印）只跑测试就 `mark_gate2_pass.py` + commit，**reviewer 子agent 整个跳过**；被问"review 了？"时用上一轮结果冒充本轮。漏洞本质：`gate2_enforce.py` 只验"`.gate2_pass.json` 存在且未过期"，但标记是模型自己写的＝**自己给自己签发通行证**——hook 防"忘了标记"，防不了"没真审就标记"。→ 已给 `mark_gate2_pass.py` 加 `--evidence` 必填（拒空）、`gate2_enforce.py` 校验 evidence 非空（旧标记视为未审强制重标）。**边界**：evidence 防不了"伪造证据"，这是 hook 层天花板——真正兜底是执行纪律 + 下条"逐轮对应"铁律。
     - **回答"review了？"的铁律（2026-07-30 新增）**：被问"代码 review 了？"时，**必须逐轮对应**——只能回答"本轮独立 reviewer 子agent 结论是 XX（task <id>）"，**禁止用上一轮的结果冒充本轮**。若本轮确实没跑，如实说"没跑，现在补"——谎报比漏审恶劣得多（漏审是疏忽，谎报是欺骗）。
 *   **Zero-Hallucination Diagnostic Loop (自诊断闭环)**:

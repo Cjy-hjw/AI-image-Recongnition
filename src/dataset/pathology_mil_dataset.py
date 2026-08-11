@@ -48,7 +48,7 @@ class PathologyMILDataset(Dataset):
     __getitem__ 返回 (bag[N,1,H,W]f32∈[0,1], label:int, patient_key:str)。
     N 因患者而异 → DataLoader 须用 batch_size=1 或自定义 collate(见训练脚本)。
 
-    max_frames_per_bag:单患者帧数上界(防 OOM,32G 显存下逐帧过 backbone)。
+    max_frames_per_bag:单患者帧数上界(防 OOM,14~16G 显存下逐帧过 backbone)。
         超出则**随机采样**(可复现 seed),不足则全取。
     """
 

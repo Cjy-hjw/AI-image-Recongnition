@@ -180,7 +180,10 @@ The model itself is stateless regarding time. The annealing factor `gamma_prior`
 
 ```python
 # 训练时(train_step.py):epoch 1-20 gamma=0, 21-40 线性升到 1, 41+ gamma=1
-gamma_prior = max(0.0, min(1.0, (epoch - 20) / 20.0))
+# 公式已提取为 src/training/stages.py 的模块级函数(2026-08-11,原内联在 train_batch 里
+# 无法单测);数值锁定见 tests/test_stage_schedule.py::test_gamma_prior_annealing。
+from src.training.stages import compute_gamma_prior
+gamma_prior = compute_gamma_prior(epoch)      # = max(0.0, min(1.0, (epoch - 20) / 20.0))
 outputs = model(images, gamma_prior=gamma_prior)
 
 # 验证时(validate_step.py, Phase B 固定):gamma_prior = 1.0(不再随 epoch 漂移)
@@ -191,6 +194,13 @@ outputs = model(images, gamma_prior=1.0)
 - **训练 Epoch 21-40**: `gamma_prior` linearly increases from 0 to 1
 - **训练 Epoch 41+**: `gamma_prior = 1.0` (full physical prior active)
 - **验证全阶段**: `gamma_prior = 1.0`(Phase B 固定,避免 val 指标随 epoch 漂移)
+
+🔴 **γ 升满的时点与 Stage2 起点紧邻,是 2026-08-11 分割崩塌的四因之一**:γ 在 **epoch 40** 恰好到 1.0,
+而 Stage2 从 **epoch 41** 起同时触发 lr 100 倍跳变 + 全模型解冻 + `enable_mal_loss` 首启。
+物理先验通路(`multi_task_model.py:229` 的 `soft_mask` **有意不 detach**)是 `loss_mal → seg_backbone`
+的唯一非 detach 路径,γ 由 0 到 1 等于把分类损失对分割主干的回传从关到全开——四件事挤在同一个 epoch,
+分割 3 个 epoch 内从 97.71% 塌到 80.6%。详见 `src/training/stages.py` 的
+`compute_gamma_prior` docstring 与 `docs/项目现状总纲.md` §6。**三头训练另建调度时须错开这些时点。**
 
 ---
 

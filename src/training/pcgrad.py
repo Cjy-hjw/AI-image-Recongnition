@@ -21,7 +21,7 @@ PCGrad (Projecting Conflicting Gradients) 优化器
 
 References:
 - PCGrad Paper: https://arxiv.org/abs/2001.06782
-- 32G显存约束：PCGrad额外显存开销<5%，适合官方平台
+- 14~16G显存约束：PCGrad额外显存开销<5%，适合平台实际约16G/容器(当前分配14G)
 
 Usage:
     >>> optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)

@@ -13,7 +13,7 @@ data:
   batch_size: 64              # Reduced from 128 to prevent NaN accumulation
   img_size: 512             # Resized resolution。注意:该值烘焙进 checkpoint(prior_extractor.x_coords/y_coords
                             # 按 img_size 存的固定形状 buffer),换分辨率≠热插拔——实测 512→1024 直接 load_state_dict
-                            # size mismatch 报错(2026-07-11 A800 32G显存复核验证)。当前所有已训练 checkpoint 均为
+                            # size mismatch 报错(2026-07-11 A800 80G 复核验证)。当前所有已训练 checkpoint 均为
                             # 512;若要上 1024 必须用该分辨率重新训练/生成新 checkpoint,不能只改这个数字。
 
 # Post-hoc 置信度校准(温度缩放)。param_file 缺失时全任务 T=1.0(不校准,输出不变);

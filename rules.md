@@ -28,7 +28,7 @@ Before deploying or starting full training, you **MUST** execute the double-gate
   - **反例（2026-07-29 真实违规）**：改完概率输出 + gatekeeper 软化后，只跑了搭配规范**第二步**（QA_VP 清单 + reviewer），**跳过第一步**（通用 8 角度扫描，当时载体为 `/code-review` skill，2026-08-11 起已改独立子agent）就 commit+push；事后补跑第一步查出 6 问题，其中一条是修 Gate2 nits 时**自己引入的回归**（`_assert_finite` 在逐帧循环里无隔离，单帧 NaN 拖垮整段视频）。教训：① **两步缺一都漏**（执行纪律问题非规则缺陷）；② **修复本身也要过 Gate2**——按审查意见改完的代码与原始改动同等风险，本次正是"补丁引入新回归"。
   - **顺序不可颠倒**：先独立 sonnet 子agent（通用 8 角度，禁 haiku，**不再用 `/code-review` skill**，见 §2 搭配规范第一步）→ 再 `QA_VP.md` 领域清单。颠倒或只做一步都视为未完成 Gate2。
 * **Rule (CI 只验证已 push 的 commit)**: 声称「CI 通过」前,必须跑 `gh run list --branch <branch> --limit 1`(走代理)核对其 `headSha` **正是本轮 commit** 且 `conclusion=success`——`pull_request` 事件的 run message 取自 PR 而非最新 commit,只能凭 SHA 判定。本地未 push 的改动 CI 从未覆盖,不得用本地 pytest 全绿或历史 commit 绿灯冒充;对不上则如实说明「本地绿、CI 未覆盖本轮」。
-* **OOM Preventative Rule → `src/models/AGENTS.md` §4**: See model architecture constraints for spatial attention resolution limits. **官方平台算力硬上界(答疑第4期 Q33):单卡 32G 显存、16 核 CPU、96G 内存、419 TFLOPS(FP16 稀疏)**——batch/分辨率/AMP 规划不得超此显存;本地 A800(80G)上不 OOM 不代表平台 32G 不 OOM,交付前须按 32G 复核。
+* **OOM Preventative Rule → `src/models/AGENTS.md` §4**: See model architecture constraints for spatial attention resolution limits. 🔴 **平台显存实际约束(2026-08-11 用户实况修正,推翻旧"32G"口径):控制台资源类型标称 GPU5090*1,但每个容器实际可分配显存仅 **约 16G**(用户当前容器选 14G),CPU 16 核 / 内存 64G**——batch/分辨率/AMP/梯度累积**一律按 14~16G 规划,不得再按 32G**;本地 A800(80G)不 OOM 完全不代表平台不 OOM(差 5 倍显存)。答疑第 4 期 Q33 的"32G 显存 / 96G 内存"是标称上界,与实际容器配额不符,以容器实况为准。**显存数字尚未在容器内 `nvidia-smi` 实测,实测前取保守值 14G**;详见 `docs/项目现状总纲.md` §3。
 
 ## 3. Early Failure & Short-circuiting (Early Stopping Validation)
 To prevent wasting GPU hours on diverging models, we enforce a training gatekeeper rule:

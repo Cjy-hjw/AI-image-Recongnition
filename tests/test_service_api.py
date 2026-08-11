@@ -289,7 +289,7 @@ class TestConfigPaths:
         assert config_mod.SERVICE_PORT == 8000
 
     def test_single_inference_worker(self, svc):
-        """单卡 32G 显存(官方答疑 Q33)并发推理会 OOM,且模型非线程安全。"""
+        """单卡 14~16G 显存(平台实际约 16G/容器、当前分配 14G,2026-08-11 修正口径)并发推理会 OOM,且模型非线程安全。"""
         _, config_mod, _ = svc
         assert config_mod.INFERENCE_WORKERS == 1
 

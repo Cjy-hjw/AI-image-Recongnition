@@ -20,6 +20,28 @@ def get_stage_number(epoch: int) -> int:
         return 3
 
 
+def compute_gamma_prior(epoch: int) -> float:
+    """物理先验通路的线性退火系数 γ_prior(epoch → [0,1])。
+
+    `multi_task_model.forward(x, gamma_prior=γ)` 用它缩放 `e_prior = prior_mlp(v_phys) * γ`。
+    该通路(`soft_mask → prior_extractor → prior_mlp → e_prior → cbm_head`,
+    `multi_task_model.py:229` 的 `soft_mask` **有意不 detach**,见
+    `scripts/verify/gates/gate8_adaptor_isolation.py` 注释)是 `loss_mal → seg_backbone`
+    的**唯一非 detach 路径**——γ 从 0 升到 1 等于把分类损失对分割主干的回传从关到全开。
+
+    退火表:epoch ≤20 → 0(完全关闭);epoch 30 → 0.5;epoch ≥40 → 1.0(满强度)。
+
+    ⚠️ **与 Stage2 边界的耦合(2026-08-11 崩塌事故根因之一)**:γ 在 epoch 40 恰好升满,
+    而 Stage2 从 epoch 41 起同时触发 lr 100 倍跳变 + 全模型解冻 + `enable_mal_loss`
+    首次开启——四件事挤在同一个 epoch,分割 3 个 epoch 内从 97.71% 塌到 80.6%。
+    详见 `docs/项目现状总纲.md` §6。三头训练**另建调度**,勿复用本函数与
+    `configure_stage_parameters` 的 epoch 划分。
+
+    数值锁定见 `tests/test_stage_schedule.py::test_gamma_prior_annealing`。
+    """
+    return max(0.0, min(1.0, (epoch - 20) / 20.0))
+
+
 def configure_stage_parameters(
     model: nn.Module,
     criterion: nn.Module,
@@ -41,10 +63,38 @@ def configure_stage_parameters(
       与本清单一致;勿据"仅激活分割头"误读为冻主干。**use_lora 模型例外**:
       `set_training_stage` 会把非冻子模块 `requires_grad=True`,重解冻 `__init__` 为
       LoRA 冻的基座骨干——use_lora 走独立训练脚本(train_thyroidxl 等),勿套此三阶段循环。
+    - ⚠️ **"概念联合训练"在混训模式(`--mix-thyroidxl`)下名不副实**:该模式两源的概念
+      标签**全部被屏蔽** —— TN3K 的 5 概念是 mask 反推的伪标签,由源级 `label_mask`
+      压 0(否则伪标签当真监督污染概念头);ThyroidXL 根本没有概念标注,逐样本 meta
+      亦写 0。于是每个样本的 concept valid 全 0,**概念分支参数虽 requires_grad=True
+      但梯度恒 0,整个 Stage1 是纯分割训练**。这是有意为之(屏蔽是对的),但由此可推:
+      混训产出的 checkpoint **不得**用于输出概念概率 / CBM 报告 —— 那些头从未受过监督,
+      输出的是 confident 垃圾,而官方要求概率分布,等于送分变 0 分。
+      见 `docs/交付前核对清单.md` 的同名红线。
 
     Stage 2 (Epoch 41-100): 全模型解冻
     - 所有参数解冻，5 通道 FAMO 细粒度调度
     - Cosine Annealing 衰减
+
+    🔴 **Stage 2 已知缺陷 —— 三头训练禁止复用本函数(2026-08-11 实测事故)**
+    本段调度自 2026-06-21(commit `ef5dfd8`)引入后**从未被真实执行过**;2026-08-11
+    从混训 e40 权重续训是历史第一次上路,**3 个 epoch 内分割从 97.71% 塌到 80.6%**
+    (train_seg 0.185→0.384、val_loss 7.92→17.39),已中止。根因是 Stage2 起点把四件
+    高风险事挤在同一个 epoch:
+      ① **lr 100 倍跳变**:Stage1 e40 = lr_base×0.01 = 2.40e-5 → Stage2 e41 =
+         lr_base×0.99938 = 2.399e-3(且 train.py 在 stage 边界重建 AdamW,无动量承接);
+      ② **全模型解冻**(本段 `is_param_trainable(stage=2)` 恒 True);
+      ③ `enable_mal_loss=(stage>1)` 由 False→True,恶性损失首次参与;
+      ④ `compute_gamma_prior` 恰在 e40 升满 1.0,物理先验通路(loss_mal→seg_backbone
+         的唯一非 detach 路径)梯度由恒 0 变满强度。
+    `reference/` 的 DR 报告(2026-07-09 / 2026-08-10,均**晚于**本代码)把"全参数端到端
+    联合微调"判为**退化风险「高」**,推荐"冻头 → 只解冻 Top-2 层 + LLRD(主干 lr =
+    新头的 1/10~1/100)"——该结论从未回填本文件,但**已写进 `docs/训练架构方案.md`**。
+    → **官方数据三头训练按 `docs/训练架构方案.md` 另建 A/B/C 阶段调度
+    (Ep1-10 冻主干温升新头 / Ep11-30 LLRD 解冻 Top-2 / Ep31-35 概率校准),
+    不得复用本函数的 1-40/41-100/101-120 划分**;模型只能提交一次,踩在官方数据上无法补救。
+    边界跳变的数值锁定见 `tests/test_stage_schedule.py`,事故全记录见
+    `docs/项目现状总纲.md` §6。
 
     Stage 3 (Epoch 101-120): 分类器微调
     - 冻结双主干、分割解码器、物理先验网络

@@ -8,6 +8,8 @@
 | `pseudo_labels.py` | `extract_features_from_mask_and_image()` — 从原图+mask 提取 TI-RADS 伪标签(composition, echogenicity, shape, margin, foci) |
 | `split_tn3k.py` | `format_split()` + `_split_samples()` — 数据集格式化与划分 |
 | `convert_ddti.py` | DDTI 数据集(XML 标注)→ 统一图像+mask+CSV 格式转换 |
+| `diag_pathology.py` | 一次性诊断:27021604 batch1 CSV fname 与磁盘文件名不匹配排查(A800 本地一次性,非 CLI) |
+| `duipai_probe_vs_head.py` | 一次性对拍:probe(AUC0.705) vs 训练 linear_head(0.50-0.55) 泄漏根因锁死(A800 一次性,佐证随机KFold泄漏) |
 
 `format_tn3k.py`(项目根)是 thin CLI,从 `scripts/data/` 导入。
 

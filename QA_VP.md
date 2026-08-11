@@ -38,8 +38,9 @@ All deep learning implementations MUST be verified by quantifiable automated tes
 ### 1.4 Data Leakage & Domain Shift Auditing
 *   **Safety Risk**: Patient overlap between splits causes false confidence in metrics. Dynamic statistic recalculation on validation data leaks future statistics.
 *   **Rule**: Patient IDs in train, val, and holdout splits must be completely disjoint. The dataset partition MUST be strictly grouped by patient identity, and never split randomly by raw image filenames or index numbers.
-*   **当前实现现状(2026-06,Phase D 已修复)**:
+*   **当前实现现状(2026-06,Phase D;⚠️仅适用无患者元数据的 TN3K)**:
     - TN3K 原始数据**无患者级元数据**。此前用 `PAT_{img_id//2}` 合成伪患者 ID 制造了"按患者隔离"的假象;Phase D 已废弃伪分组,改为**纯随机图像级划分**(`_split_samples`),每张图即为独立身份、train/val 图像级互斥、固定 seed 可复现。
+    - **⚠️ 此纯随机划分仅因 TN3K 无患者标识才成立,不与上方 Rule 冲突;有患者元数据的数据集(27021604 / ThyroidXL / 官方数据)一律按患者分组(`GroupKFold(patient_id)` / `patient_grouped_split`),遵 rules.md §5 铁律,禁随机划分。**
     - holdout 来自 TN3K 独立 `test-image/` 目录,与 train/val 物理隔离,**无泄漏**;Holdout AUC 可信。
     - `gate5_data_leakage.py` 已补**双检查**:train↔val 互斥 + holdout↔trainval 图像级重叠校验,覆盖范围完整。
 *   **Verification**:
@@ -129,7 +130,7 @@ Audit all PyTorch/training code changes against this checklist:
 Before any code modification is merged, submitted, or deployed:
 1.  **Ruff & Pyright Validation**: Ensure no syntax, typing, or formatting errors exist.
 2.  **Forward/Backward Test execution**: Run `python scripts/verify_model.py` and verify all Gate checks pass.
-3.  **Checklist Audit**: 逐条核对本协议 §1/§2 中**改动触及的**领域项(未触及的跳过)。审查流程与 skill 搭配见 `rules.md §2`。
+3.  **Checklist Audit**: 逐条核对本协议 §1/§2 中**改动触及的**领域项(未触及的跳过)。审查流程与搭配（第一步独立 reviewer 子agent 8 角度 + 第二步领域清单）见 `rules.md §2`。
 4.  **Zero Placeholder Rule**: Do not use placeholders or mocked outputs. All code must be fully operational.
 
 **CI 自动化(`.github/workflows/ci.yml`,PR/push 到 main 触发)**:`import-linter` job 校验架构分层契约(`.importlinter` 4 条 forbidden 契约);`test` job 跑 Gate 1(`verify_model.py` 八门,2026-07-11 补 Gate 8 cls→seg 梯度隔离审计)+ 全套 pytest 回归;`docker-build-smoke` job(2026-07-11 新增,host runner 真实 `docker build` + 静态图/动态图容器冒烟,验证镜像本身而非模拟环境)。CI 红 = 合并前的硬阻断,等同上述第 2 步的远程强制执行。**例外(2026-07-11 commit `12caa3d` 新增 `paths-ignore: '**/*.md'`)**:纯 `.md` 文档改动不触发 CI——用 `gh run list` 核对某 commit 的 CI 结果时,若该 commit 只改了文档,查不到对应 run 是**预期行为**(本就不该跑),不是「CI 未覆盖」,勿误判为需要补跑。

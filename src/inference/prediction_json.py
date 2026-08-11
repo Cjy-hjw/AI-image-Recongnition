@@ -1,4 +1,4 @@
-"""按官方规范构造 `prediction.json`(2026-08-01《赛事开发规范 V1.0》§五.4)。
+"""按官方规范构造 `prediction.json`(2026-08-01 发布,现以《赛事开发规范 V2.1》为准;V1.0/V2.0 已由提交方删除,仅留 V2.1)。
 
 本模块只做**数据结构组装与合规校验**,不含任何模型推理逻辑 —— 目的是让输出契约
 有一个单一权威实现,两条输入链路(静态图/动态图)共用,新增字段只改这一处。
@@ -48,6 +48,7 @@ Interpretation        object 推荐(Conclusion + KeyFindings)
 
 import math
 import re
+from typing import Optional
 
 # 甲状腺外侵犯:输出编码(规范 §五.4)。
 ETE_NONE = 1
@@ -168,6 +169,9 @@ def uniform_location_probs():
     ⚠️ 该偏差是**刻意保留**的:占位输出必须明显有偏,避免被误认为真实预测。
     位置分类头未训练前,调用方应显式传 `location=LOCATION_NONE`(0) 或文档化此
     局限,而不是依赖均匀分布的"中性"假象。
+    ⚠️ 现状(v21_output.py `_shared_nodule_context` 实际传 `location=None`):此建议
+    路径尚未被生产调用方采纳,位置头未训前占位 Location 落"左上叶"(argmax 均匀+1)——
+    待位置头训练后由真实预测替代,见 #116/三头 Phase2。
     """
     p = 1.0 / NUM_LOCATIONS
     probs = [p] * NUM_LOCATIONS
@@ -259,7 +263,7 @@ def build_nodule_entry(
     tirads_class: int,
     ete_code: int = ETE_NONE,
     location_probs=None,
-    location: int = None,
+    location: Optional[int] = None,
     t_clin_sig: int = 0,
     t_confidence: float = 0.0,
     malignancy_threshold: float = 0.5,
@@ -343,7 +347,7 @@ def build_prediction_json(
     study_uid: str,
     nodules,
     processing_time_ms: int,
-    interpretation: dict = None,
+    interpretation: Optional[dict] = None,
 ) -> dict:
     """组装完整 `prediction.json`。
 

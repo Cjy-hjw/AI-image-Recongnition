@@ -9,7 +9,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 | File | Responsibility |
 |:---|:---|
 | `io.py` | Image loading (DICOM + PNG/JPG) and PHI anonymization;通道/位深归一化工具 `_to_gray`/`_rescale_to_uint8` 下沉于此(静/动两路径共用,video_io re-import)。`_to_gray` 覆盖全部通道形态((H,W)/(H,W,1)/(H,W,3)/RGBA/channel-first/多光谱 均收敛 2D,杜绝 3D 漏过致下游 `preprocess_image` 5 维崩溃),并以 `channel_order` 区分 RGB(DICOM 像素)与 BGR(OpenCV 视频帧)避免多普勒伪彩加权错位。单图 DICOM 经 `_to_gray` 收敛灰度 |
-| `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline (predict.py 单图 + video_predict.py 动态图)。**2026-07-29 新增 `collect_soft_flags()`**:把 `CatNetTamperingDetector.last_soft_flags` 归一化成可 JSON 序列化结构落进 audit——此前生产代码零读取该属性,仅 copy_move/splice/BAG 命中的图 `flagged` 为 False、result.json 完全沉默,而 copy_move 在 359 张真实图上误报 27.3%,信号全丢 |
+| `gatekeeper_runner.py` | 4-layer gatekeeper audit pipeline(实为 **3 阶段** auth→dedup→tamper;copy_move/splice 为 CatNet `detect()` 内部子判据,非独立层)(predict.py 单图 + video_predict.py 动态图)。**2026-07-29 新增 `collect_soft_flags()`**:把 `CatNetTamperingDetector.last_soft_flags` 归一化成可 JSON 序列化结构落进 audit——此前生产代码零读取该属性,仅 copy_move/splice/BAG 命中的图 `flagged` 为 False、result.json 完全沉默,而 copy_move 在 359 张真实图上误报 27.3%,信号全丢 |
 | `model_runner.py` | Model build, image preprocessing, forward pass |
 | `postprocess.py` | Prediction decoding and TI-RADS breakdown(可选接 `calibration.TemperatureScaler` 做温度缩放) |
 | `calibration.py` | Post-hoc 置信度校准(温度缩放):`TemperatureScaler`(每任务标量 T,缺参数即 T=1.0 降级)+ 离线拟合 `fit_temperature`/`fit_ordinal_temperature` + 诊断 `compute_ece`/`reliability_diagram`。真实数据 2026-08-01 初赛才到,现仅骨架 |

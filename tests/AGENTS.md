@@ -44,14 +44,14 @@
 | `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
 | `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
 
-## `test_phase_refactor.py` — 重构不变式(全套 **588 passed + 1 skipped**(2026-08-11 本地实测;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
+## `test_phase_refactor.py` — 重构不变式(全套 **590 passed + 1 skipped**(2026-08-11 R6 后实测,R6 新增 test_famo_directional_correctness + test_latent_lagrangian_constraint_direction 2 例;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
 
 > **2026-08-10 Phase 5 加入新测试后,全套 = 357 collected → 更新**:表格其余文件外,另加
 > `test_nifti_io`(24)/`test_nodule_split`(28)/`test_prediction_json`(45)/`test_v21_output`(11)/
 > `test_service_runner`(11)/`test_case_discovery`(39)/`test_service_api`(20)。**本地收集总数 463
 > tests collected**(2026-08-10 实测;含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。根
 > `AGENTS.md`/`tests/AGENTS.md` 里先前的 356/580 是不同口径基线(580 含 Phase 5 前的旧计数,现
-> 按 grep `def test_` 实测校准为 **463**;Phase 5 V2.1 交付四模块测试另行核算)。
+> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-11 复核:grep `def test_`≈514、pytest 全套 **590 passed**;463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准**)。
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

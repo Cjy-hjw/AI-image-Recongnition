@@ -40,7 +40,7 @@
    与逐帧坏帧隔离(case_pipeline)同一哲学,粒度提到病例级。
 3. **匿名化/gatekeeper 不因批量而跳过**:每病例照跑 `load_input_image` 的 DICOM
    PHI 匿名化与逐帧 gatekeeper 审计,与 CLI(`predict.py`/`video_predict.py`)同语义。
-   gatekeeper 默认 soft(赛道七豁免,误拒一次白丢该病例全部临床得分),故 `passed`
+   gatekeeper 默认 soft(赛道七豁免,误拒一次白丢该病例全部临床得分),故 soft 下 `passed`
    恒 True;仅当配置显式 `enforcement_mode: hard` 且命中硬判据时才走拒绝分支
    (落 `prediction.json` REJECTED 占位,不产诊断)。
 
@@ -51,10 +51,11 @@
 `prediction_json.build_*` 组装占位 + `_atomic_write_json` 原子写(与 write_case_v21
 同款 tmp+os.replace),产出**结构合规**的 `prediction.json`;绝不写 V2.0 的
 `result.json`(V2.1 目录里不该出现它)。`status`=ERROR(推理崩溃)与 REJECTED
-(gatekeeper 主动拒绝)由 Conclusion 文案区分,语义诚实不混淆。占位 nodule
-只保证 JSON 结构合规(必填字段齐全、LocationProbs 和为 1),数值是保守占位
-(ETE=1 无侵犯/Location 均匀/T=0)—— 与 A3 的「阴性空输出」「占位维度」同一套
-降级哲学:**结构合规优先,数值诚实标注**。
+(gatekeeper 主动拒绝)由 Conclusion 文案区分,语义诚实不混淆。占位产出**阴性空结节**
+(`Nodules=[]`,规范明写"阴性为空数组",合法;见 `_write_case_placeholder` 注释——伪造
+假结节会被当阳性计分,比报阴性恶劣)。⚠️ 区别于 v21_output 里「真实病例、新分类头未训」
+的**节点级**占位(ETE=1 无侵犯/Location 均匀/T=0):那是真实病例真输出但个别维度留位,
+非降级;两层不同,勿混。降级哲学:**结构合规优先,数值诚实标注**。
 
 @云TODO(云端首跑校正):
 - 权重/config 路径来自环境变量 `AICOMP_WEIGHTS`/`AICOMP_CONFIG`/`AICOMP_PRECISION`

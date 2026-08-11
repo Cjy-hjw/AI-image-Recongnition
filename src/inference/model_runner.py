@@ -72,7 +72,10 @@ def build_model(config: dict, weights: str, device: torch.device):
         #   PRODUCTION=1(交付容器)→ 硬报错。随机初始化的主模型会输出"结构合法但
         #     数值全错"的垃圾诊断,比崩溃更阴(见 memory/delivery-container-missing-weights):
         #     容器漏 COPY 权重(#111 场景)时 os.path.exists 为 False,静默随机初始化会让
-        #     整批病例拿到看似专业实则随机的 TI-RADS/良恶性,零分且无人察觉。生产必须拒启。
+        #     整批病例拿到看似专业实则随机的 TI-RADS/良恶性,零分且无人察觉。故 PRODUCTION 下抛错拒绝随机初始化。
+        #     ⚠️ 局限(#115/#123 未闭环):HTTP 服务惰性构建(runner 首次 /call 才调 build_model),
+        #     此 raise 会被 tasks._run 兜成病例级 FAILED、容器 /health 仍 200——即"伪装健康跑零分",
+        #     并非真正"拒启"。真正的服务启动硬门(main() 启动期主动 build 一次、失败即退出容器)见 #123。
         #   非 PRODUCTION(CI 冒烟/本地调试)→ 保留随机降级 + warning:CI 无 checkpoint 环境
         #     靠此跑机制层冒烟(test_smoke_entrypoints / test_model_runner 缺权重降级用例)。
         #   与 QA_VP §1.7「计分组件权重故障仍硬报错」口径一致(零计分的 authenticity 才降级 skipped)。

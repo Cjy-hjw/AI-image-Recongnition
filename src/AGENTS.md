@@ -24,7 +24,7 @@
 | File | Responsibility |
 |:---|:---|
 | `io.py` | `load_input_image()` — DICOM PHI anonymization (21 PHI fields, HIPAA Safe Harbor) + standard image loading |
-| `gatekeeper_runner.py` | `run_gatekeeper_audit()` — 4-layer gatekeeper (auth + dedup + copy-move + splicing)，返回 `(passed, audit: dict)`；`resolve_enforcement_mode()` 读 `gatekeeper.enforcement_mode`（默认/交付 `soft`：命中只 flag、诊断照出；`hard` 才 REJECTED）。predict.py 单图 + video_predict.py 动态图 |
+| `gatekeeper_runner.py` | `run_gatekeeper_audit()` — **3 阶段** gatekeeper（auth → dedup → tamper；copy-move/splice 为 CatNet `detect()` 内部子判据，非独立层），返回 `(passed, audit: dict)`；`resolve_enforcement_mode()` 读 `gatekeeper.enforcement_mode`（默认/交付 `soft`：命中只 flag、诊断照出；`hard` 才 REJECTED）。predict.py 单图 + video_predict.py 动态图 |
 | `model_runner.py` | `build_model()`, `preprocess_image()`, `run_forward()` — `torch.inference_mode()` + autocast + clamp [-15,15] |
 | `postprocess.py` | `decode_predictions()`, `build_tirads_breakdown()` |
 | `export.py` | `save_prediction_artifacts()`, `save_rejection_json()`, `save_gradcam_overlay()`, `maybe_save_gradcam()`(predict/video 共用) |

@@ -92,6 +92,21 @@ def test_build_model_falls_back_to_random_init_when_file_missing(tmp_path):
     assert loaded is not None
 
 
+def test_build_model_raises_on_missing_file_in_production(tmp_path, monkeypatch):
+    """2026-08-11 #115: PRODUCTION=1 下主诊断模型权重文件缺失必须硬报错，不得随机初始化。
+
+    交付容器漏 COPY 权重(#111 场景)时 os.path.exists 为 False，旧代码静默随机初始化
+    → 整批病例拿到结构合法但数值全错的垃圾诊断(零分且难察觉)。生产模式必须拒启。
+    非 PRODUCTION 降级路径由上一个用例守护，二者互补。"""
+    monkeypatch.setenv("PRODUCTION", "1")
+    missing_path = tmp_path / "does_not_exist.pth"
+    try:
+        build_model(CONFIG, str(missing_path), torch.device("cpu"))
+        assert False, "PRODUCTION=1 缺权重文件时 build_model 必须抛 RuntimeError"
+    except RuntimeError as e:
+        assert "FATAL" in str(e) and "权重" in str(e)
+
+
 class TestRunForwardCpuFp16Fallback:
     """2026-07-11 血泪教训（两轮）：
     第一轮——CI docker-build-smoke 在纯 CPU 容器（torch==2.1.0，Dockerfile 锁定

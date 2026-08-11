@@ -8,6 +8,16 @@ WORKDIR /workspace
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# 2026-08-11 #115 注记(此处不设 ENV PRODUCTION=1,原因见下):
+# 主诊断模型权重缺失的硬报错(model_runner.py build_model 的 PRODUCTION 分流)本意是
+# 防交付容器漏 COPY 权重时静默随机初始化出垃圾诊断。但**镜像本身不打权重**
+# (checkpoints/ 走官方平台人工上传,见 ci.yml 铁律3注释),CI 的 docker-build-smoke /
+# entrypoint-dispatch-smoke 正是靠「无权重→随机降级」跑机制层冒烟。若在此无条件
+# ENV PRODUCTION=1,会让这些 CI job 因缺权重硬报错而崩(自造回归)。
+# 正解:PRODUCTION=1 由**交付封装那一步**(最终权重就位后,见交付 ToDO #111/#112 +
+# seal_container)注入,或部署时 docker run -e PRODUCTION=1。届时权重已在,硬报错只在
+# 「该有权重却没有」的真故障时触发,不误伤 CI 无权重冒烟。
+
 # 安装系统级底层依赖（OpenCV、基础构建工具、entrypoint.sh 内容嗅探依赖的 file 命令）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \

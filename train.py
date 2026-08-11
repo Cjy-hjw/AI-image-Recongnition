@@ -3,9 +3,9 @@ import argparse
 import yaml
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from src.dataset.loader import ThyroidDataset
+from src.dataset.loader import ThyroidDataset, MultiSourceThyroidDataset
 from src.dataset.augmentation import get_train_transforms
 from src.models.multi_task_model import MultiTaskThyroidModel
 from src.models.loss import MultiTaskLoss
@@ -27,6 +27,15 @@ def main():
         action="store_true",
         help="Skip authenticity classifier training when weights exist",
     )
+    parser.add_argument(
+        "--mix-thyroidxl",
+        type=str,
+        default=None,
+        metavar="THYROIDXL_SEG_DIR",
+        help="启用 TN3K + ThyroidXL 分割混训(补 A0 证实的跨域失效,见 docs/项目现状总纲 §6)。"
+             "值 = format_thyroidxl.py 产出的 data/thyroidxl_seg 目录。"
+             "不传则维持纯 TN3K 单源(默认,不破坏现有行为)。",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -39,24 +48,87 @@ def main():
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
-    train_dataset = ThyroidDataset(
-        data_dir=config["data"]["train_path"],
-        img_size=config["data"]["img_size"],
-        transform=get_train_transforms(),
-    )
+    # ── 训练数据源:纯 TN3K(默认) 或 TN3K+ThyroidXL 混训(--mix-thyroidxl)──────────
+    # 混训动机(A0 零训练实测):TN3K 分割主干单域过拟合,跨域 ThyroidXL 仅 18% Dice。
+    # 契约红线(sonnet 对抗审):
+    #   ① TN3K 源级 label_mask 屏蔽 5 概念+malignancy(概念是 mask 反推伪标签 split_tn3k.py),
+    #      仅留 mask:1——否则伪标签当真监督污染概念头。
+    #   ② ThyroidXL 源级补 5 概念=0 双保险(逐样本 meta 已写全,源级再兜底防漏键落 loader 默认1);
+    #      mask/malignancy 用 format_thyroidxl.py 逐样本 meta 真值(无 mask 样本 valid_mask=0 零梯度)。
+    #   ③ 采样器 num_samples=len(mds)、replacement=True——若用默认 shuffle 或 num_samples 过小,
+    #      ThyroidXL(n=9864)每样本每 epoch 抽不到 0.5 次,配比意图落空。
+    train_transform = get_train_transforms()
+    if args.mix_thyroidxl is not None:  # 空串/坏路径进此分支,由下方空源 raise 兜住,不静默落回纯 TN3K
+        _tn3k_src = {
+            "name": "tn3k", "path": config["data"]["train_path"],
+            "label_mask": {"malignancy": 0, "composition": 0, "echogenicity": 0,
+                           "shape": 0, "margin": 0, "foci": 0, "mask": 1},
+            "ratio": 1.0,
+        }
+        _xl_src = {
+            "name": "thyroidxl", "path": os.path.join(args.mix_thyroidxl, "train"),
+            "label_mask": {"composition": 0, "echogenicity": 0, "shape": 0,
+                           "margin": 0, "foci": 0},  # mask/malignancy 用逐样本 meta 真值
+            "ratio": 0.6,
+        }
+        train_dataset = MultiSourceThyroidDataset(
+            sources=[_tn3k_src, _xl_src],
+            img_size=config["data"]["img_size"], transform=train_transform,
+        )
+        _n_tn = len(train_dataset.datasets[0])
+        _n_xl = len(train_dataset.datasets[1])
+        # 中4(Gate2):空源静默降级红线——ThyroidDataset 对不存在/空目录只跳过(loader.py:25),
+        # MultiSource 对空源 per_sample_w=0,sampler 不崩但 XL 权重全 0 → 实际纯 TN3K,
+        # 配比意图静默落空(print 仍报 62.5:37.5)。混训必须两源都非空,否则显式拒绝。
+        if _n_tn == 0 or _n_xl == 0:
+            raise RuntimeError(
+                f"[混训] 数据源为空(TN3K={_n_tn} ThyroidXL={_n_xl}):核对 "
+                f"--mix-thyroidxl={args.mix_thyroidxl!r}(应含 train/ 子目录,先跑 "
+                f"scripts/data/format_thyroidxl.py 生成)与 config train_path。"
+                "拒绝静默降级为纯 TN3K。")
+        print(f"[混训] TN3K={_n_tn} + ThyroidXL={_n_xl} = {len(train_dataset)} "
+              f"(抽样占比≈62.5%:37.5%,补 A0 证实的跨域失效)")
+    else:
+        train_dataset = ThyroidDataset(
+            data_dir=config["data"]["train_path"],
+            img_size=config["data"]["img_size"],
+            transform=train_transform,
+        )
+    # val 严格纯 TN3K(高4 护栏):TN3K val Dice 是「混训毁没毁主域」的唯一探针,
+    # 绝不混 ThyroidXL 稀释退化信号;epoch10 熔断 + 早停据此天然守护 TN3K 98%。
     val_dataset = ThyroidDataset(
         data_dir=config["data"]["val_path"], img_size=config["data"]["img_size"]
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["data"]["batch_size"],
-        shuffle=True,
-        num_workers=config["environment"]["num_workers"],
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
+    # 混训用 WeightedRandomSampler(按源 ratio 配比),与 shuffle 互斥(同传 PyTorch 报错)。
+    if args.mix_thyroidxl is not None:  # 与上方数据集分支判据一致(空串已被空源 raise 拦截)
+        _sampler = WeightedRandomSampler(
+            train_dataset.get_sample_weights(),
+            # num_samples=len(mds):按源权重质量(TN3K 1.0 : XL 0.6)抽样。单 TN3K 样本每 epoch
+            # 期望被抽 ~1.2 次、XL 每 epoch 去重可见 ~4700 张不同跨域图(0.8 draw/样本)。
+            # 用 len(mds) 而非更小值:num_samples 过小会让 XL(n=9864)每样本抽不到 0.5 次。
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["data"]["batch_size"],
+            sampler=_sampler,
+            num_workers=config["environment"]["num_workers"],
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["data"]["batch_size"],
+            shuffle=True,
+            num_workers=config["environment"]["num_workers"],
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config["data"]["batch_size"],

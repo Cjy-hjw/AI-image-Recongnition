@@ -130,8 +130,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t thyroid-infer:ci-test .
-      - name: Generate synthetic static image (well-known minimal valid 1x1 PNG)
-        run: echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" | base64 -d > /tmp/smoke_input.png
+      - name: Install host fixture deps (numpy/opencv/pydicom — 供所有合成 fixture 生成)
+        # host runner 不预装 opencv/pydicom;下面各步骤生成的都是喂给容器的输入
+        # fixture(PNG/JPG/DICOM),与容器内推理环境无关。必须在**第一个用 cv2 的
+        # 生成步骤之前**装好,否则 Generate synthetic static image 的 import cv2 会
+        # ModuleNotFoundError(2026-08-11 修复:此前 opencv 装在 DICOM 步骤前、静态
+        # PNG 步骤后,PNG 从 1x1 base64 改用 cv2 生成 64x64 后就撞上了这个顺序坑)。
+        run: pip install numpy opencv-python-headless pydicom
+      - name: Generate synthetic static image (64x64 random noise, real decodable PNG)
+        # 2026-08-10 修复:此前用"1x1 极简 PNG"——cv2.imread 能解码,但 libpng 对
+        # 1x1 报 `IDAT: Extra compressed data`/`Not enough image data`,真实超声图
+        # 不可能 1x1,改用 numpy 生成 64x64 真实随机噪声图(与 JPG 用例同生成逻辑),
+        # 让 predict.py 走到真正的推理而非在图像加载就失败。
+        run: |
+          python3 -c "
+          import numpy as np, cv2
+          arr = (np.random.rand(64, 64) * 255).astype('uint8')
+          cv2.imwrite('/tmp/smoke_input.png', arr)
+          "
       - name: Smoke test — static image path (predict.py via entrypoint 分发)
         # R3(2026-08-10)后:authenticity 权重缺失在 build_auth_module 降级 skipped,
         # 不再硬 ERROR。故预期 status=PASSED(soft 模式、诊断照出),这本身证明
@@ -185,9 +201,8 @@ jobs:
       # tests/test_smoke_entrypoints.py::TestDicomInputPaths 本地单测复用)在
       # host runner 生成真实可被 pydicom.dcmread() 解析的合成 DICOM，经真实容器
       # 验证不崩溃 —— 与上面 2 步一样，只验证容器机制，不验证预测数值。
-      - name: Install pydicom (host runner, only for synthetic DICOM fixture generation)
-        # opencv-python-headless 供 --compressed 分支用 cv2.imencode 生成 JPEG 压缩帧
-        run: pip install pydicom numpy opencv-python-headless
+      # (pydicom/numpy/opencv 已在 job 开头 "Install host fixture deps" 统一装好,
+      #  此处不再重复安装;--compressed 分支用 cv2.imencode 生成 JPEG 压缩帧。)
       - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine + compressed x2)
         run: |
           python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/single.dcm --frames 1 --rows 64 --cols 64

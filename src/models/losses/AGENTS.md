@@ -29,8 +29,8 @@
 - 无效样本**真正零梯度**（未进入计算图）
 
 **概念损失** (`components/concepts.py`):
-- 暂未实现per-sample mask（P1待办）
-- 当前全batch计算，异构源暂靠 adapter 层 `task_mask` valid=0 从源头不产假标签
+- **已实现 per-sample mask**（`label_validity` 逐样本屏蔽、sum/有效数归约，见 `concepts.py:155`；与 `models/AGENTS.md §7b` 一致，旧"P1待办"已完成）
+- 异构源另由 adapter 层 `task_mask` valid=0 从源头不产假标签，双重保险
 
 **良恶性损失** (`components/malignancy.py`):
 - 已支持`label_validity`参数（line 31-57）
@@ -50,7 +50,9 @@
 ```python
 # 唯一路径：利用组件内 valid_mask / label_validity 支持
 targets['valid_mask'] = task_mask['mask'].float()        # 分割 per-sample 屏蔽
-targets['label_validity'] = task_mask['malignancy']      # 良恶性 AUCM 屏蔽
+targets['label_validity'] = task_mask['malignancy']      # 良恶性 AUCM 屏蔽(单张量)
+# ⚠️ 概念损失(composition/echo/shape/margin/foci)走 **dict** 形态:concepts.py:156 按 `lv[task]`
+#    索引,若供概念头须传 {'composition':tensor, ...} dict,照抄上面单张量会 KeyError。确切键见 components/concepts.py
 
 loss_fn = MultiTaskLoss(...)
 total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
@@ -60,7 +62,7 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
 ### Gate2审查结果（commit d4c00ff → 54f0302 清理）
 - **P0-1修复**：multitask.py利用现有`valid_mask`支持，避免后处理梯度泄漏
 - **54f0302 清理**：删除劣质的 MaskedMultiTaskLoss 后处理路径（已被上述真屏蔽取代）
-- **待办**：概念损失per-sample mask（P1）
+- **已完成**：概念损失 per-sample mask（`label_validity`，见上「概念损失」段）
 
 ---
 
@@ -87,4 +89,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`（161 passed total suite）
+执行: `pytest tests/test_masked_loss.py -v`（全套现 590 passed，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准）

@@ -26,8 +26,8 @@
 | `verify/runner.py` | `verify()` — orchestrates gate1→gate8, returns True/False |
 | `verify/gates/gate1_shapes.py` | Output tensor shape assertions |
 | `verify/gates/gate2_vclub.py` | vCLUB gradient isolation (encoder grad sum < 1e-7) |
-| `verify/gates/gate3_auc_margin.py` | AUC-Margin dual params + BatchNorm freeze check |
-| `verify/gates/gate4_famo.py` | FAMO 5-channel weight dynamics |
+| `verify/gates/gate3_auc_margin.py` | AUC-Margin dual params + BatchNorm freeze check + **alpha 极性方向断言**(R6 2026-08-11 补,防"只验变化不验方向") |
+| `verify/gates/gate4_famo.py` | FAMO 5-channel weight dynamics + **方向断言**(救最差任务:慢任务权重↑,R6 2026-08-11 补) |
 | `verify/gates/gate5_data_leakage.py` | 图像级泄漏双检查:train↔val + holdout↔trainval(目录缺失优雅跳过) |
 | `verify/gates/gate6_stage1_masking.py` | Stage 1 gradient masking (loss_mal=0.0, zero leakage) |
 | `verify/gates/gate7_optimizer_lr.py` | Optimizer LR alignment across 3 stages |

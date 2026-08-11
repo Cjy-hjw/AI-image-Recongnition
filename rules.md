@@ -18,15 +18,15 @@ Before deploying or starting full training, you **MUST** execute the double-gate
     - **第一步 → 通用 8 角度扫描（独立 sonnet 子agent,`effort=xhigh`,禁 haiku）**: 8 角度(行级 / 移除行为 / 跨文件调用 / 复用 / 简化 / 效率 / altitude / CLAUDE.md 约定)——擅长抓通用缺陷(反转条件/off-by-one/调用契约破坏/死代码),但**不懂本项目领域红线**。**2026-08-11 起改用独立子agent,不再用 `/code-review` skill**(skill forked 后台执行太慢、易 API 中断,本 session 连续两次异常);独立 agent 可控/可并行/可 SendMessage 追问。见 `memory/code-review-skill-too-slow-use-independent-agent.md`。
     - **第二步 → `QA_VP.md §1/§2` 领域清单**: 第一步扫完后，对照 §1.1 梯度隔离 / §1.2 优化器绑定 / §1.3 FP16 数值 / §1.4 患者泄漏 / §1.5 损失维度 / §1.6 DICOM 脱敏 / **§1.7 推理侧红线**（误报/维度契约/降级路径） / §2.1 符号极性 / §2.2 广播，逐条核对**改动触及的**项（未触及的跳过）。
     - **谁做**: 高风险改动（梯度路由/优化器绑定/损失数学/gatekeeper 降级路径）→ 派 `model="sonnet"` 及以上子 agent 审；低风险改动 → 主会话自审。**Gate2 禁用 haiku**（能力不足）。
-    - **反例（本次教训）**: 只跑 skill 跳过 QA 清单 = 漏领域红线；只走清单跳过 skill = 漏通用缺陷。
+    - **反例（本次教训）**: 只跑第一步(独立 agent 8 角度)跳过 QA 清单 = 漏领域红线；只走清单跳过第一步 = 漏通用缺陷。
     - **反例二（2026-07-30 真实违规·谎报审查）**：#87 高风险改动（`authenticity.py` 的 `EXPECTED_CKPT_SHA256` 封印）只跑测试就 `mark_gate2_pass.py` + commit，**reviewer 子agent 整个跳过**；被问"review 了？"时用上一轮结果冒充本轮。漏洞本质：`gate2_enforce.py` 只验"`.gate2_pass.json` 存在且未过期"，但标记是模型自己写的＝**自己给自己签发通行证**——hook 防"忘了标记"，防不了"没真审就标记"。→ 已给 `mark_gate2_pass.py` 加 `--evidence` 必填（拒空）、`gate2_enforce.py` 校验 evidence 非空（旧标记视为未审强制重标）。**边界**：evidence 防不了"伪造证据"，这是 hook 层天花板——真正兜底是执行纪律 + 下条"逐轮对应"铁律。
-    - **回答"review了？"的铁律（2026-07-30 新增）**：被问"代码 review 了？"时，**必须逐轮对应**——只能回答"本轮 reviewer agent 结论是 XX（task <id>）"或"本轮 `/code-review` 结论是 XX"，**禁止用上一轮的结果冒充本轮**。若本轮确实没跑，如实说"没跑，现在补"——谎报比漏审恶劣得多（漏审是疏忽，谎报是欺骗）。
+    - **回答"review了？"的铁律（2026-07-30 新增）**：被问"代码 review 了？"时，**必须逐轮对应**——只能回答"本轮独立 reviewer 子agent 结论是 XX（task <id>）"，**禁止用上一轮的结果冒充本轮**。若本轮确实没跑，如实说"没跑，现在补"——谎报比漏审恶劣得多（漏审是疏忽，谎报是欺骗）。
 *   **Zero-Hallucination Diagnostic Loop (自诊断闭环)**:
     * If `verify_model.py` fails any Gate (Exit Code != 0), the AI agent **MUST** print a structured diagnostic report (containing the failed Gate, numerical discrepancy evidence, and recovery guidance), execute patches locally in a sandbox, and verify correctness before requesting a git diff review.
 * **Rule**: Gate 1（`python scripts/verify_model.py` 全通过）**且** Gate 2（reviewer 子agent 审核通过）后，才启动正式训练。
 * **Rule (Gate2 触发时机 · 推理侧/交付侧代码)**: 上一条的触发点写的是「启动正式训练」，但**推理容器代码（`predict.py`/`video_predict.py`/`src/inference/**`/`src/gatekeeper/**`/`entrypoint.sh`）永远不会触发训练**——若照字面理解，这类改动等于没有 Gate2 触发点。**对推理侧/交付侧改动，Gate2 的触发点是「commit 之前」**，不是训练前、也不是 push 后补做。
-  - **反例（2026-07-29 真实违规）**：改完概率输出 + gatekeeper 软化后，只跑了搭配规范**第二步**（QA_VP 清单 + reviewer），**跳过第一步 `/code-review` skill** 就 commit+push；事后补跑 skill 查出 6 问题，其中一条是修 Gate2 nits 时**自己引入的回归**（`_assert_finite` 在逐帧循环里无隔离，单帧 NaN 拖垮整段视频）。教训：① **两步缺一都漏**（执行纪律问题非规则缺陷）；② **修复本身也要过 Gate2**——按审查意见改完的代码与原始改动同等风险，本次正是"补丁引入新回归"。
-  - **顺序不可颠倒**：先 `/code-review` skill（通用 8 角度）→ 再 `QA_VP.md` 领域清单。颠倒或只做一步都视为未完成 Gate2。
+  - **反例（2026-07-29 真实违规）**：改完概率输出 + gatekeeper 软化后，只跑了搭配规范**第二步**（QA_VP 清单 + reviewer），**跳过第一步**（通用 8 角度扫描，当时载体为 `/code-review` skill，2026-08-11 起已改独立子agent）就 commit+push；事后补跑第一步查出 6 问题，其中一条是修 Gate2 nits 时**自己引入的回归**（`_assert_finite` 在逐帧循环里无隔离，单帧 NaN 拖垮整段视频）。教训：① **两步缺一都漏**（执行纪律问题非规则缺陷）；② **修复本身也要过 Gate2**——按审查意见改完的代码与原始改动同等风险，本次正是"补丁引入新回归"。
+  - **顺序不可颠倒**：先独立 sonnet 子agent（通用 8 角度，禁 haiku，**不再用 `/code-review` skill**，见 §2 搭配规范第一步）→ 再 `QA_VP.md` 领域清单。颠倒或只做一步都视为未完成 Gate2。
 * **Rule (CI 只验证已 push 的 commit)**: 声称「CI 通过」前,必须跑 `gh run list --branch <branch> --limit 1`(走代理)核对其 `headSha` **正是本轮 commit** 且 `conclusion=success`——`pull_request` 事件的 run message 取自 PR 而非最新 commit,只能凭 SHA 判定。本地未 push 的改动 CI 从未覆盖,不得用本地 pytest 全绿或历史 commit 绿灯冒充;对不上则如实说明「本地绿、CI 未覆盖本轮」。
 * **OOM Preventative Rule → `src/models/AGENTS.md` §4**: See model architecture constraints for spatial attention resolution limits. **官方平台算力硬上界(答疑第4期 Q33):单卡 32G 显存、16 核 CPU、96G 内存、419 TFLOPS(FP16 稀疏)**——batch/分辨率/AMP 规划不得超此显存;本地 A800(80G)上不 OOM 不代表平台 32G 不 OOM,交付前须按 32G 复核。
 

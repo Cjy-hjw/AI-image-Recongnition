@@ -58,7 +58,7 @@
 > `test_service_runner`(12)/`test_case_discovery`(40)/`test_service_api`(20)。**本地收集总数 463
 > tests collected**(2026-08-10 实测;含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。根
 > `AGENTS.md`/`tests/AGENTS.md` 里先前的 356/580 是不同口径基线(580 含 Phase 5 前的旧计数,现
-> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`=580、`pytest --collect-only`=672、全套 **671 passed + 1 skipped**(Demo_D 主环境,三数自洽);463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准)。后续 Phase2 阶段2.1/2.2 新增 location(25)+extension(39)后,2026-08-12 口径为 `--collect-only`=711、grep `def test_`=613、全套 **710 passed + 1 skipped**;阶段2.3 新增 clinical_t(26)后,最终口径为 `--collect-only`=737、grep `def test_`=637、全套 **737 passed + 1 skipped**(三数自洽;collect 与 def 差额=参数化用例)。
+> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`=580、`pytest --collect-only`=672、全套 **671 passed + 1 skipped**(Demo_D 主环境,三数自洽);463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准)。后续 Phase2 阶段2.1/2.2 新增 location(25)+extension(39)后,2026-08-12 口径为 `--collect-only`=711、grep `def test_`=613、全套 **710 passed + 1 skipped**;阶段2.3 新增 clinical_t(26)后,最终口径为 `--collect-only`=738、grep `def test_`=638、全套 **737 passed + 1 skipped**(三数自洽;collect 与 def 差额=参数化用例)。
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

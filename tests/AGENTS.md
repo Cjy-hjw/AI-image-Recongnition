@@ -28,8 +28,8 @@
 | `test_gate8_adaptor_isolation.py` | `gate8_adaptor_isolation`(2026-07-11 新增) — TaskAlignmentAdaptor cls→seg 梯度隔离审计的正面/负面回归；正面:真实代码(`.detach()` 正确)+ 模拟前序 Gate 遗留的 `requires_grad=False` 污染状态下仍判定通过、`seg_backbone` 梯度精确 `0.0`、`gamma`/`requires_grad` 复位无副作用(2026-07-11 Gate2 review 非阻塞建议补齐:此前 finally 只复原 gamma 没复原 requires_grad,依赖"Gate8 是最后一个 Gate"这个隐性顺序假设,现改为逐参数显式记录+复原);负面:monkeypatch `torch.Tensor.detach` 为恒等函数模拟误删,断言 Gate 检测到泄漏并返回 False(踩坑记录:`TaskAlignmentAdaptor.gamma` 零初始化会让正确/错误 detach 都测出梯度 0,Gate 内部强制拨到非零才能让负面测试真正生效,详见该 Gate 源码注释) | 2 | — |
 | `test_prediction_json.py` | prediction.json schema 构造与校验(2026-08-01 新增;**2026-08-10 A3 起 v21_output 经它组装/校验,并入 V2.1 交付链路**) | 19 | Phase 5 |
 | `test_v21_output.py` | **V2.1 单病例输出写盘入口**(2026-08-10 A3 新增)——`write_case_v21` 静/动两链路:静态把 case_pipeline 结果落成 `{case_dir}/{subdir_uid}/nodule_NNN.nii.gz` + `prediction.json`(StudyUID=PatientId、MaskFile 相对路径正斜杠、原子写、阴性空数组合法、缺 orig_hw 报 V21 错误);动态逐帧 resize 回原图 + scatter 回填全帧 3D mask + 3D 连通域跨帧关联;占位维度(ETE=1/Location 均匀/T=0)结构合规 | 11 | Phase 5 |
-| `test_service_runner.py` | **runner 批量编排**(2026-08-10 A2 新增)——mock 掉 heavy 依赖只留编排逻辑:逐病例调 write_case_v21 且 case_dir={output}/{patient_id}、静/动 kind 分派、processing_ms 非负 int、gatekeeper 每病例照跑、**单病例失败隔离**(一例 diagnose 崩溃不影响其余 + 落结构合规 ERROR 占位)、loader 失败隔离、**模型只 build 一次**(跨病例 + 跨多次 build_service_runner 缓存)、空/无效/全非影像目录不崩 | 11 | Phase 5 |
-| `test_case_discovery.py` | **病例发现**(2026-08-10 A2 新增)——`discover_cases` 递归遍历 + 静/动分派(.dcm→static,.nii.gz/.nii→dynamic)、静态读 DICOM 头取 PatientID/SeriesUID、动态按组委会口径取直接父目录名(PatientId=AccessionNumber)、路径推断兜底、空/不存在目录返回 []、确定性顺序;依赖 pydicom/nibabel 缺则 skip | 39 | Phase 5 |
+| `test_service_runner.py` | **runner 批量编排**(2026-08-10 A2 新增)——mock 掉 heavy 依赖只留编排逻辑:逐病例调 write_case_v21 且 case_dir={output}/{patient_id}、静/动 kind 分派、processing_ms 非负 int、gatekeeper 每病例照跑、**单病例失败隔离**(一例 diagnose 崩溃不影响其余 + 落结构合规 ERROR 占位)、loader 失败隔离、**模型只 build 一次**(跨病例 + 跨多次 build_service_runner 缓存)、空/无效/全非影像目录不崩 | 12 | Phase 5 |
+| `test_case_discovery.py` | **病例发现**(2026-08-10 A2 新增)——`discover_cases` 递归遍历 + 静/动分派(.dcm→static,.nii.gz/.nii→dynamic)、静态读 DICOM 头取 PatientID/SeriesUID、动态按组委会口径取直接父目录名(PatientId=AccessionNumber)、路径推断兜底、空/不存在目录返回 []、**跨文件系统确定性顺序契约**(monkeypatch 反转 `os.scandir` 返回序,断言发现顺序仍为字典序 DFS——2026-08-12 CI run 31512732898 因 `os.walk` 未排子目录、Linux 走 hash 序而 flaky,`dirs.sort()` 修复后由本用例钉死);依赖 pydicom/nibabel 缺则 skip | 40 | Phase 5 |
 
 ---
 
@@ -47,14 +47,14 @@
 | `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
 | `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
 
-## `test_phase_refactor.py` — 重构不变式(全套 **619 passed + 6 skipped**(2026-08-12 torch2.8 预演环境实测,新增 `test_stage_schedule.py` 22 项;2026-08-11 R6 曾新增 test_famo_directional_correctness + test_latent_lagrangian_constraint_direction 2 例;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
+## `test_phase_refactor.py` — 重构不变式(全套 **620 passed + 6 skipped**(2026-08-12 torch2.8 预演环境实测,新增 `test_stage_schedule.py` 22 项;2026-08-11 R6 曾新增 test_famo_directional_correctness + test_latent_lagrangian_constraint_direction 2 例;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
 
 > **2026-08-10 Phase 5 加入新测试后,全套 = 357 collected → 更新**:表格其余文件外,另加
 > `test_nifti_io`(24)/`test_nodule_split`(28)/`test_prediction_json`(45)/`test_v21_output`(11)/
-> `test_service_runner`(11)/`test_case_discovery`(39)/`test_service_api`(20)。**本地收集总数 463
+> `test_service_runner`(12)/`test_case_discovery`(40)/`test_service_api`(20)。**本地收集总数 463
 > tests collected**(2026-08-10 实测;含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。根
 > `AGENTS.md`/`tests/AGENTS.md` 里先前的 356/580 是不同口径基线(580 含 Phase 5 前的旧计数,现
-> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`≈536、pytest 全套 **619 passed + 6 skipped**;463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准**)。
+> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`≈536、pytest 全套 **620 passed + 6 skipped**;463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准**)。
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

@@ -30,3 +30,14 @@ desktop.ini
 # Gate2 审查标记(运行时状态,不入库)
 /.claude/.gate2_pass.json
 /.claude/.gate2_pending.json
+
+# Gate2 验证产物(主会话 tmp_main_* / 各路审查子agent tmp_review_<lane>_*)。
+# 这些是「交产物不交自述」要求下的可重跑证据脚本(rules.md §2/§8),跑完留在工作区
+# 供主会话复核,但**不入库**——它们是一次性证据、不是项目代码。
+# 命名空间隔离的由来:2026-08-12 一路审查 agent 清理临时文件时,把主会话的
+# `tmp_verify_walk_order.py` 当自己的垃圾一并删了,导致其结论失去可核验证据。
+# 现规定每路 agent 只能删自己前缀的文件,详见 rules.md §8。
+/tmp_main_*.py
+/tmp_review_*.py
+/tmp_review_*.txt
+/tmp_verify_*.py

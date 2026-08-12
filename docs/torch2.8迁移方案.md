@@ -33,7 +33,7 @@
 
 ## 2. requirements.txt 改动清单(逐行)
 
-> ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑)**:独立 venv(py3.10.18 + **torch 2.8.0+cpu** + **numpy 2.4.4** + **timm 1.0.28** + cv2 4.14)跑全套 pytest = **619 passed / 6 skipped / 0 failed**(首验时 597,差额为其后新增的 `test_stage_schedule.py` 22 项)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
+> ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑)**:独立 venv(py3.10.18 + **torch 2.8.0+cpu** + **numpy 2.4.4** + **timm 1.0.28** + cv2 4.14)跑全套 pytest = **620 passed / 6 skipped / 0 failed**(首验时 597,差额为其后新增的 `test_stage_schedule.py` 22 项)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
 
 | 行 | 现状 | 改为 | 理由 |
 |---|---|---|---|

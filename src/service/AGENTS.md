@@ -160,7 +160,7 @@ ERROR/REJECTED 原因)。**该函数自身绝不抛**(写盘失败只记日志),
 |:--|:--|:--|
 | `tests/test_service_api.py` | 服务层 HTTP 路由/回调/容错(见 src/service/AGENTS.md 正文) | 20 |
 | `tests/test_service_runner.py` | runner 批量编排:逐病例调 write_case_v21、单病例失败隔离落 ERROR 占位、模型只 build 一次(跨病例 + 跨多次 build_service_runner 缓存)、空/无效数据集不崩 | 12 |
-| `tests/test_case_discovery.py` | `discover_cases` 静/动分派、静态 DICOM 头读取、动态按组委会口径取直接父目录名、路径推断、空目录不崩、确定性顺序 | 39 |
+| `tests/test_case_discovery.py` | `discover_cases` 静/动分派、静态 DICOM 头读取、动态按组委会口径取直接父目录名、路径推断、空目录不崩、**跨文件系统确定性顺序契约**(反转 os.scandir 序仍恒为字典序 DFS,钉死 `dirs.sort()`;2026-08-12 CI flaky 修复) | 40 |
 
 `TestPlaceholderRunner` 用例(占位 runner 明确标注输出为空)仍在 `test_service_api.py` 中,
 验证 `_runner` 未注入时占位语义存在(向后兼容,不参与生产路径)。

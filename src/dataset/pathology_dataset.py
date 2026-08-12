@@ -119,7 +119,13 @@ def build_pathology_samples(root: str) -> List[Dict]:
         if not os.path.isdir(img_dir):
             print(f"[PathologyDataset] {img_dir} 不存在,跳过", flush=True)
             continue
-        for fname in os.listdir(img_dir):
+        # ⚠️ 必须 sorted:`os.listdir` 的返回序由文件系统决定(Windows NTFS 按名、
+        # Linux ext4/overlayfs 按 hash 序),不排序则 `samples` 的初始排列跨平台/跨
+        # 重建都不同 —— **这是 seed 救不回的可复现性缺口**:`train.py` 的 seed 四件套
+        # 只固定随机源,固定不了"随机源作用于哪个排列"。同项目 `loader.py:26` 已是
+        # `sorted(os.listdir(...))`,此处对齐同一口径。
+        # (2026-08-12 由 `case_discovery` 同类顺序 bug 的 Gate2 审查连带查出。)
+        for fname in sorted(os.listdir(img_dir)):
             if not fname.lower().endswith(".jpg"):
                 continue
             pname = fname.split("_")[0]

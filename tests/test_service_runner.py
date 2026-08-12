@@ -217,8 +217,18 @@ class TestPerCaseFailureIsolation:
         def _explode_on_bad(*a, **k):
             raise RuntimeError("simulated diagnose crash")
 
-        # 让 BAD 例崩掉。discover_cases 按 os.walk + 同目录文件名排序,GOOD1/GOOD2/
-        # BAD 同挂 tmp_path 根下,目录名字典序为 BAD < GOOD1 < GOOD2,故 BAD 是第 1 例。
+        # 让 BAD 例崩掉。依据 = `discover_cases` 的**顺序契约**:路径字典序 DFS
+        # (子目录名与文件名均显式排序,见 case_discovery.py 的 `dirs.sort()`),
+        # 故 BAD < GOOD1 < GOOD2,BAD 是第 1 例。
+        # 🔴 该假设**必须显式断言**,不能只写在注释里:2026-08-12 CI
+        # (run 31512732898)曾因 `os.walk` 未排子目录、Linux 走 hash 序而首例变成
+        # GOOD1,报错是 `assert 'GOOD1' in {'BAD','GOOD2'}` —— 完全看不出是顺序
+        # 问题,排查成本极高。下面这行让契约一旦破裂就直接指名道姓。
+        from src.service.case_discovery import discover_cases
+        assert [c["patient_id"] for c in discover_cases(str(tmp_path))] == [
+            "BAD", "GOOD1", "GOOD2",
+        ], "discover_cases 顺序契约(字典序 DFS)被破坏 —— 本测试的「首例=BAD」前提失效"
+
         box_diagnose = mock_heavy["diagnose_static"]
         call_n = {"n": 0}
 
@@ -260,8 +270,14 @@ class TestPerCaseFailureIsolation:
         import src.inference.gatekeeper_runner as gatekeeper_mod
         import src.inference.io as io_mod
         # P_REJECTED 触发硬拒绝,其余仍 pass。用 img_np 的输入路径无法直接区分,
-        # 改为按调用次数+文件名:静态每例 run_gatekeeper 恰调一次,discover 排序后
-        # P_OK < P_REJECTED(P_OK 例先)。第二例即 P_REJECTED。
+        # 改为按调用次数:静态每例 run_gatekeeper 恰调一次,依 `discover_cases` 的
+        # 字典序 DFS 顺序契约 P_OK < P_REJECTED,第二例即 P_REJECTED。
+        # 🔴 同上,顺序契约显式断言(不显式断的代价见上一个测试的注释)。
+        from src.service.case_discovery import discover_cases
+        assert [c["patient_id"] for c in discover_cases(str(tmp_path))] == [
+            "P_OK", "P_REJECTED",
+        ], "discover_cases 顺序契约(字典序 DFS)被破坏 —— 本测试的「第2例=P_REJECTED」前提失效"
+
         call_n = {"n": 0}
 
         def _reject_second(img_np, *a, **k):

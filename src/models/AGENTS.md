@@ -11,9 +11,11 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor 装配, decoder, stage freeze registry)。ConvBlock/TaskAlignmentAdaptor 已外移至 `blocks.py`、mask 派生标量已外移至 `mask_features.py`（均 re-export 或直接 import 保后兼容） | ~291 lines |
 | `blocks.py` | 可复用 nn 块：`ConvBlock`（U-Net double-conv 解码块）+ `TaskAlignmentAdaptor`（分割→分类单向软注意力，`.detach()` 契约 + gamma 零初始化见 §1.1 / Gate 8） | ~67 lines |
 | `label_schema.py` | **官方类别定义的单一权威**：位置 7 类 `LOCATION_LABELS` + ETE 4 码。2026-08-12 从 `src/inference/prediction_json.py` **下沉到 models 层** —— `.importlinter` 契约2 规定 `src.models` 是最底层不得依赖 `src.inference`，而位置头必须按同一份顺序构造标签，常量留在 inference 会让 CI import-linter 直接红。`prediction_json` 现为 re-export，对外路径不变。**改类别定义改这里** | ~75 lines |
-| `mask_features.py` | 由分割 soft mask 派生的标量/局部特征（纯张量函数，无 nn 状态）：`nodule_scale_from_mask`（归一化等效直径，临床 T 头输入）。**一律返回 detach 后的张量**——三头梯度不得回流分割主干，否则破坏 Gate 8 精确零断言前提。阶段 2.2 的交界带（膨胀−腐蚀）提取也落此处 | ~48 lines |
-| `heads/` | 官方新增三维度增量诊断头子包（位置/侵犯/临床T，见 `docs/训练架构方案.md`）。**接入接口 4/4 于 2026-08-12 阶段 2.0 补全**（`stage4_spatial` / `soft_mask_detached` / `margin` / `nodule_scale_detached`，现状记于 `heads/__init__.py`）；**`location.py` 位置头已实现**（阶段 2.1），侵犯头/临床T头待阶段 2.2/2.3 | 1/3 头就绪 |
-| `heads/location.py` | 位置头：CoordConv + Stage-4 空间特征 → 侧别3×纵向3 因子分解 → 7 类。`P(k)=P(side)×P(level)`、`P(峡部)=P(side=峡)`，**和为 1 是数学恒等式非再归一化**。🔴 模块导入期断言 `LOCATION_LABELS` 顺序（顺序变了而映射没跟着改 = 左右静默错位，JSON 仍合法、和仍为 1、测试仍过）。含 `flip_location_index`（水平翻转必须联动翻标签）与 `build_level_validity`（峡部无纵向属性，level 分支必须屏蔽） | ~200 lines |
+| `mask_features.py` | 由分割 soft mask 派生的标量/局部特征（纯张量函数，无 nn 状态）：`nodule_scale_from_mask`（归一化等效直径，临床 T 头输入）+ `boundary_band_from_mask`（**2026-08-12 阶段 2.2 新增**：膨胀−腐蚀提取包膜-结节交界带，返回 detach 后的带宽 mask，供扩展头做 ROI-Mask 引导；⚠️ 实测带宽 = `kernel_size − 1`，实现取 k=5 → 4px）。**一律返回 detach 后的张量**——三头梯度不得回流分割主干，否则破坏 Gate 8 精确零断言前提 | ~137 lines |
+| `heads/` | 官方新增三维度增量诊断头子包（位置/侵犯/临床T，见 `docs/训练架构方案.md`）。**接入接口 4/4 于 2026-08-12 阶段 2.0 补全**（`stage4_spatial` / `soft_mask_detached` / `margin` / `nodule_scale_detached`，现状记于 `heads/__init__.py`）；**`location.py` 位置头**（阶段 2.1）与 **`extension.py` 侵犯头**（阶段 2.2）均已实现，临床T头待阶段 2.3 | 2/3 头就绪 |
+| `heads/location.py` | 位置头：CoordConv + Stage-4 空间特征 → 侧别3×纵向3 因子分解 → 7 类。`P(k)=P(side)×P(level)`、`P(峡部)=P(side=峡)`，**和为 1 是数学恒等式非再归一化**。🔴 模块导入期断言 `LOCATION_LABELS` 顺序（顺序变了而映射没跟着改 = 左右静默错位，JSON 仍合法、和仍为 1、测试仍过）。含 `flip_location_index`（水平翻转必须联动翻标签）与 `build_level_validity`（峡部无纵向属性，level 分支必须屏蔽） | ~190 lines |
+| `heads/extension.py` | **ETE 侵犯头**（阶段 2.2，2026-08-12）：Stage-4 空间特征 + ROI-Mask 交界带（`boundary_band_from_mask`，带宽 = kernel−1 → 4px）→ 4 类 ETE（无/甲状腺包膜/毗邻软组织/血管）。**CB-Focal Loss + Logit Adjustment 保护稀有血管类**（类别计数 3906/267/67/5）；`compute_extension_loss` 的 `class_balanced_weights` 乘性加权 β=0.99 → 血管:无 = 20.4:1。**参数量 0.063M**（与 LocationHead 0.409M 相比属轻量头）。概率输出守官方「必须输出概率分布否则计0分」约束 | ~194 lines |
+| `heads/__init__.py` | 三头 re-export 门面：`LocationHead` / `ExtensionHead` 已导出，docstring 记接入接口与使用契约 | ~74 lines |
 | `mil_pooling.py` | 门控注意力多示例学习(Gated-Attention MIL)——患者级良恶性弱标签聚合:`SpatialAttentionModule`(保留 backbone `forward_features()` 空间判别性,不用 GAP 稀释微钙化等高频特征) + `GatedAttentionPooling`。仅供 `scripts/pretrain_malignancy_mil.py` 训练管线使用,不在 `MultiTaskThyroidModel` 主推理路径。见 `memory/patient-leakage-and-probe-trap.md` | ~255 lines |
 | `losses/` | Decomposed loss function subpackage | See below |
 | `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
@@ -42,6 +44,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `components/malignancy.py` | `compute_malignancy_losses(mal_loss_fn, supcon_loss_fn, outputs, targets, mask_weight, slr_weights)` |
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |
 | `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` — 拉格朗日约束 g=loss_l2-delta_budget≤0。参数方向:grad=λ·grad(loss_l2),λ>0 恒成立故残差恒被往小推,约束满足(g≤0)只减量级不翻转方向;乘子 `λ←λ+η·g` 违反加压/满足松绑(2026-08-11 #120 核实为误报,方向正确,见文件内注释) |
+| `components/extension.py` | **ETE 侵犯头损失组件**（阶段 2.2，2026-08-12）：`compute_extension_loss`（CE + CB-Focal γ 聚焦 + Logit-Adjustment 先验补偿）+ `class_balanced_weights`（乘性加权，β=0.99→血管:无=20.4:1，默认）+ `log_class_prior`。🚫 与 `heads/extension.py` 同名不同职责——前者是头（前向），此文件是损失（训练），勿混 | — |
 
 **Rule**: 新损失函数放入 losses/ 子模块或 losses/components/ 文件，由 multitask.py 调用。`loss.py` is a shim only.
 

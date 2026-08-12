@@ -6,7 +6,7 @@
 
 本模块服务 Phase 2 三头：
   - `nodule_scale_from_mask` —— 临床 T 头的结节尺度输入（阶段 2.0 ✅）
-  - 交界带（膨胀−腐蚀）提取 —— 侵犯头的 ROI 局部特征（阶段 2.2 待补）
+  - `boundary_band_from_mask` —— 侵犯头的 ROI 交界带局部特征（阶段 2.2 ✅）
 
 ⚠️ 本模块所有函数**一律返回 detach 后的张量**：消费方是三头，而三头梯度**不得**
 回流分割主干（会破坏 `gate8_adaptor_isolation` 的精确零断言前提，并复刻 2026-08-11
@@ -14,8 +14,9 @@ Stage2 崩塌的四因之一——物理先验通路梯度由 0 到满强度）�
 """
 
 import torch
+import torch.nn.functional as F
 
-__all__ = ["nodule_scale_from_mask"]
+__all__ = ["nodule_scale_from_mask", "boundary_band_from_mask"]
 
 
 def nodule_scale_from_mask(soft_mask: torch.Tensor) -> torch.Tensor:
@@ -59,3 +60,78 @@ def nodule_scale_from_mask(soft_mask: torch.Tensor) -> torch.Tensor:
     area = soft_mask.detach().sum(dim=(2, 3), dtype=torch.float32)  # [B, 1]
     n_pixels = float(soft_mask.shape[-2] * soft_mask.shape[-1])
     return torch.sqrt(torch.clamp(area / n_pixels, min=0.0))
+
+
+def boundary_band_from_mask(
+    soft_mask: torch.Tensor, kernel_size: int = 5
+) -> torch.Tensor:
+    """由 soft mask 用「膨胀 − 腐蚀」取出结节交界带，供侵犯头（ETE）做局部加权池化。
+
+    Args:
+        soft_mask: [B, 1, H, W] sigmoid 后的概率图。
+        kernel_size: 形态学核边长，**必须是奇数且 ≥3**。
+    Returns:
+        [B, 1, H, W] 非负权重图，轮廓处最大、结节内部与远处为 0，且**已 detach**。
+
+    ## 为什么是交界带而不是整个结节
+
+    甲状腺外侵犯（ETE）的判据是**肿瘤与包膜/毗邻组织的界面**是否被突破 —— 证据全在
+    轮廓一圈，结节实心内部的纹理与 ETE 无关。用交界带加权池化等于把分类器的注意力
+    钉在解剖学上真正相关的窄环上，而不是让它自己从整图里找。
+
+    ## 带宽实测（不要按核宽推算）
+
+    `dilate(k) − erode(k)` 的带宽是 **`kernel_size − 1` 像素**，不是 `kernel_size`：
+    40×40 画布上 20×20 实心方块实测，k=3 → 每边 2px、k=5 → 4px、k=7 → 6px。
+    故 `docs/训练架构方案.md` 所称「5px 交界带」对应 **k=5（实测 4px）**或 k=7（6px），
+    这里取 k=5。
+
+    ## 三个必须知道的行为（均已实测，`tests/test_extension_head.py` 锁死）
+
+    1. **空 mask / 全 1 mask → 带恒为 0**。前者是阴性病例，后者是分割崩溃（整图判前景）；
+       两种情形都没有"界面"可言，返回 0 是正确语义。下游加权池化必须能吞下
+       `分母=0`（见 `ExtensionHead` 的 eps），否则阴性病例直接 NaN。
+    2. 🔴 **贴图像边界的结节，其贴边那一侧没有带**。`F.max_pool2d` 的 padding 语义是
+       隐式 −inf，于是 `-max_pool2d(-m)`（腐蚀）在越界方向取不到背景值、不会内缩。
+       实测：20×20 画布左上角 10×10 前景块，图像角点 (0,0) 带值 0、块的内侧边
+       (9,5) 带值 1.0。这是**有意保留的行为** —— 图像边缘外的解剖结构本就未知，
+       在那里伪造一条"界面"只会喂给 ETE 头假证据。
+       ⚠️ 该行为**只区分得出 zero-padding 的错误实现**（改用零填充会让角点冒出带）；
+       reflect 填充实测与 −inf 在所有检查点逐位相同，测试抓不到。别高估这条护栏。
+    3. **降采样到特征分辨率后带很窄**。512² 的带在 16×16 特征图上：20px 结节 → 仅
+       **4 个** cell 非零，50px → 4 个，100px → 12 个，200px → 28 个（实测）。
+       即小结节的局部特征实际只读 4/256 个 cell，方差偏高 —— 但每个 cell 的感受野
+       覆盖大片图像，并非只看 32×32 的原图块。若真实数据上 ETE 明显欠拟合，
+       **第一个该试的就是加全局池化特征**，而不是先去调采样倍率。
+
+    🔴 **band 一旦被转回低精度再求和就会溢出**（`ExtensionHead` 内 `w` 会 `.to(feat.dtype)`
+    变回 fp16，故其求和写的是 `sum(dtype=torch.float32)`）：512² 有 262144 个像素，
+    fp16 朴素求和实测直接 `inf`（同 `nodule_scale_from_mask` 的陷阱，QA_VP §1.3）。
+    本函数返回的**是 fp32**（内部 `.float()`），所以直接对返回值求和不会溢出 ——
+    风险点在下游的精度回转，不在这里。`ExtensionHead` 的做法是先
+    `adaptive_avg_pool2d` 到 16×16 再求和：pool 保均值精确（实测 0.5 → 0.5），
+    256 个 ≤1 的数相加不可能溢出。
+
+    ℹ️ 同款可微腐蚀 `-max_pool2d(-m)` 在 `physical_prior.py` 里也用了一次（算周长时
+    取单侧内边 `m − erode(m)`），**语义不同故未合并**：那里要的是单侧窄边、且**必须
+    保留梯度**（物理先验通路有意不 detach，见 `training/stages.py`），本函数则是双侧
+    带且一律 detach。合并会让 detach 语义打架，得不偿失；此处交叉引用仅供检索。
+    """
+    assert soft_mask.dim() == 4 and soft_mask.shape[1] == 1, (
+        f"boundary_band_from_mask 期望 [B,1,H,W],got {tuple(soft_mask.shape)}"
+    )
+    assert kernel_size >= 3 and kernel_size % 2 == 1, (
+        f"kernel_size 必须是 ≥3 的奇数,got {kernel_size}"
+        " —— 偶数核的 padding 不对称,带会往一侧偏移"
+    )
+    pad = kernel_size // 2
+    m = soft_mask.detach().float()
+    dilated = F.max_pool2d(m, kernel_size=kernel_size, stride=1, padding=pad)
+    # 腐蚀 = 对偶的膨胀。`clamp(min=0)` 兜的是 soft mask 下 dilate<erode 不可能发生、
+    # 但浮点误差可能产出 -1e-8 的情形 —— 负权重会让加权池化的分母与分子反号。
+    eroded = -F.max_pool2d(-m, kernel_size=kernel_size, stride=1, padding=pad)
+    # `clamp(min=0)` 在数学上**恒真**（同一窗口的 max ≥ min，浮点也不会翻转）——
+    # 实测 200 组随机 soft mask + 二值/软阈值/软边共 0 个负例。保留它纯属零成本的
+    # 结构性防御（万一将来换非 max_pool 的实现），**不要因为"它从没触发过"就当成
+    # 需要清理的死代码**；同样也别指望它兜住什么真实的数值问题。
+    return (dilated - eroded).clamp(min=0.0)

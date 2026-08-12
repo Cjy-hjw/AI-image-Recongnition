@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import timm
 from src.models.blocks import ConvBlock, TaskAlignmentAdaptor
+from src.models.mask_features import nodule_scale_from_mask
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
 from src.models.pretrained_loader import load_local_safetensors
@@ -30,6 +31,11 @@ class ModelOutputs(TypedDict):
     z_contrastive: torch.Tensor
     physical_vector: torch.Tensor
     spin_l1: torch.Tensor
+    # --- Phase 2 三头(位置/侵犯/临床T)接口 ---
+    # 命名即契约:带 `_detached` 后缀的键**已经 detach**,消费方拿到即无梯度。
+    stage4_spatial: torch.Tensor
+    soft_mask_detached: torch.Tensor
+    nodule_scale_detached: torch.Tensor
 
 
 class MultiTaskThyroidModel(nn.Module):
@@ -192,8 +198,22 @@ class MultiTaskThyroidModel(nn.Module):
         for name, param in self.named_parameters():
             param.requires_grad = self.is_param_trainable(name, stage)
 
-    def _forward_cls_backbone(self, x, seg_features):
-        """EfficientNet-B2 classification branch with task-alignment injection."""
+    def _forward_cls_backbone(
+        self, x: torch.Tensor, seg_features: list
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """EfficientNet-B2 classification branch with task-alignment injection.
+
+        Returns:
+            pooled:  [B, CLS_POOLED_DIM]  —— 全局平均池化后的向量(既有契约)
+            spatial: [B, CLS_POOLED_DIM, H/32, W/32] —— **pool 前**的空间特征图,
+                512² 输入下实测 [B, 352, 16, 16]。位置头需要空间结构(CoordConv 要
+                坐标网格),pool 后拿不到。
+
+        ⚠️ `spatial` **有意不 detach**:位置头梯度回流 `cls_backbone` 是设计意图
+        (调度阶段 B 要 LLRD 解冻 Top-2 层)。这不会污染 `seg_backbone` —— 下方
+        `adaptor_stage3/4` 两个调用点已对 `seg_features` 各自 `.detach()`,
+        `gate8_adaptor_isolation` 的精确零断言前提不受影响。
+        """
         B = x.shape[0]
         x_cls = self.cls_backbone.conv_stem(x)
         x_cls = self.cls_backbone.bn1(x_cls)
@@ -205,8 +225,10 @@ class MultiTaskThyroidModel(nn.Module):
         x_cls = self.cls_backbone.blocks[4](x_cls)
         x_cls = self.cls_backbone.blocks[5](x_cls)
         x_cls = self.adaptor_stage4(seg_features[2].detach(), x_cls)
+        # blocks[6] 把 CLS_STAGE4_CHANNELS(208,adaptor_stage4 的输出=blocks[6] 的输入)
+        # 映射到 CLS_POOLED_DIM(352)。位置头第一层 in_channels 必须取 352,不是 208。
         x_cls = self.cls_backbone.blocks[6](x_cls)
-        return self.cls_pool(x_cls).view(B, -1)
+        return self.cls_pool(x_cls).view(B, -1), x_cls
 
     def forward(self, x, gamma_prior=1.0) -> ModelOutputs:
         B, C, H, W = x.shape
@@ -231,16 +253,24 @@ class MultiTaskThyroidModel(nn.Module):
         v_phys = self.prior_extractor(soft_mask, x)
         e_prior = self.prior_mlp(v_phys) * gamma_prior
 
-        x_cls = self._forward_cls_backbone(x, seg_features)
+        x_cls, x_cls_spatial = self._forward_cls_backbone(x, seg_features)
         assert x_cls.shape[1] == self.CLS_POOLED_DIM, (
             f"cls pooled dim mismatch: expected {self.CLS_POOLED_DIM}, "
             f"got {x_cls.shape[1]} — cbm_head/vclub/supcon in_features will misalign"
+        )
+        # 不再断言 spatial 的通道数:`cls_pool` 池到 1×1 后 view,pooled.shape[1] 与
+        # spatial.shape[1] 恒等,重复断言零区分力(位置头 in_channels 取 352 这件事由
+        # `tests/test_head_interfaces.py` 的 352≠208 锚点保护)。这里断 spatial 真正
+        # 独有的性质:**保留了空间维** —— 若有人把返回值误写成两个 pooled,dim 会退化成 2。
+        assert x_cls_spatial.dim() == 4, (
+            f"stage4_spatial 必须保留空间维 [B,C,H,W],got {tuple(x_cls_spatial.shape)}"
+            " —— 位置头的 CoordConv 需要空间网格"
         )
 
         cbm = self.cbm_head(x_cls, e_prior)
         z_contrastive = self.supcon_projector(x_cls)
 
-        outputs = {
+        outputs: ModelOutputs = {
             "mask": logits_mask,
             "composition": cbm.logits_comp,
             "echogenicity": cbm.logits_echo,
@@ -254,6 +284,12 @@ class MultiTaskThyroidModel(nn.Module):
             "z_contrastive": z_contrastive,
             "physical_vector": v_phys,
             "spin_l1": self.cbm_head.get_l1_penalty(),
+            # --- Phase 2 三头接口 ---
+            # `soft_mask` 原通路(→ prior_extractor)**有意不 detach**,见 stages.py:27。
+            # 这里另发一份 detach 副本给三头,原物理先验通路不受影响。
+            "stage4_spatial": x_cls_spatial,
+            "soft_mask_detached": soft_mask.detach(),
+            "nodule_scale_detached": nodule_scale_from_mask(soft_mask),
         }
 
         return outputs

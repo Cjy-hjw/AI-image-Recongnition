@@ -4,7 +4,8 @@ import torch
 def gate8_adaptor_isolation(model, criterion, x, targets):
     """TaskAlignmentAdaptor cls→seg Gradient Isolation Audit.
 
-    审计契约(multi_task_model.py:260,263,`_forward_cls_backbone`):
+    审计契约(`multi_task_model.py` 的 `_forward_cls_backbone`,不写行号——该行号已因
+    无关改动过时两次,符号名比行号耐改):
         x_cls = self.adaptor_stage3(seg_features[1].detach(), x_cls)
         x_cls = self.adaptor_stage4(seg_features[2].detach(), x_cls)
     `seg_features` 必须先 `.detach()` 再喂给 adaptor,防止分类误差梯度污染分割主干

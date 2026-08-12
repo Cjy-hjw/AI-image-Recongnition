@@ -19,13 +19,14 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地 Windows 须用 A800/CI，GBK bug 见 memory/gate1-windows-gbk-bug.md）
+# 完整测试套件（本地可跑，实测 646 passed/1 skipped；⚠️ 测试总数跨 Python 环境不可比，
+# torch2.8 预演环境同代码为 620/6，判回归须同环境前后对拍）
 pytest tests/ -v
 
 # 单文件测试
 pytest tests/test_pathology_dataset.py -v
 
-# Gate1 模型验证（仅服务器/CI，本地 GBK 会报错）
+# Gate1 模型验证（2026-08-12 起本地可跑：runner.py 已补 encoding=utf-8，此前 GBK 崩）
 python scripts/verify_model.py
 
 # 病理预训练（A800，ImageNet迁移学习，全量8500张）

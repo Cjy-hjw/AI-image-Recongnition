@@ -36,7 +36,12 @@ def verify():
         print(f"Error: Config not found at {config_path}")
         return False
 
-    with open(config_path, "r") as f:
+    # `encoding="utf-8"` 不可省:Windows 中文环境下 `open()` 默认走 GBK,
+    # 而本 yaml 含中文注释,会崩在 `UnicodeDecodeError: 'gbk' codec can't decode
+    # byte 0x8f`。这曾让 Gate1 在本地完全跑不了、只能靠 A800/CI(见
+    # memory/gate1-windows-gbk-bug.md)。`verify_model.py` 顶部的
+    # `sys.stdout.reconfigure` 只管**输出**流,管不到这里的**读取**。
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     backbone = config["model"]["backbone"]

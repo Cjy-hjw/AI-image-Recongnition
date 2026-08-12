@@ -8,9 +8,10 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 |:---|:---|:---|
 | `physical_prior.py` | Differentiable physical feature extraction (AR, ER, Circularity) | ~160 lines |
 | `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~209 lines |
-| `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor 装配, decoder, stage freeze registry)。ConvBlock/TaskAlignmentAdaptor 已外移至 `blocks.py`（re-export 保后兼容） | ~260 lines |
+| `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor 装配, decoder, stage freeze registry)。ConvBlock/TaskAlignmentAdaptor 已外移至 `blocks.py`、mask 派生标量已外移至 `mask_features.py`（均 re-export 或直接 import 保后兼容） | ~291 lines |
 | `blocks.py` | 可复用 nn 块：`ConvBlock`（U-Net double-conv 解码块）+ `TaskAlignmentAdaptor`（分割→分类单向软注意力，`.detach()` 契约 + gamma 零初始化见 §1.1 / Gate 8） | ~67 lines |
-| `heads/` | 官方新增三维度增量诊断头子包（Plan v2 阶段2 填充：位置/侵犯/临床T，见 `docs/训练实现计划.md`）。当前为骨架，`heads/__init__.py` 记接入接口现状 + re-export 新头类 | scaffold |
+| `mask_features.py` | 由分割 soft mask 派生的标量/局部特征（纯张量函数，无 nn 状态）：`nodule_scale_from_mask`（归一化等效直径，临床 T 头输入）。**一律返回 detach 后的张量**——三头梯度不得回流分割主干，否则破坏 Gate 8 精确零断言前提。阶段 2.2 的交界带（膨胀−腐蚀）提取也落此处 | ~48 lines |
+| `heads/` | 官方新增三维度增量诊断头子包（位置/侵犯/临床T，见 `docs/训练架构方案.md`）。**接入接口 4/4 于 2026-08-12 阶段 2.0 补全**（`stage4_spatial` / `soft_mask_detached` / `margin` / `nodule_scale_detached`，现状记于 `heads/__init__.py`）；**头类实现待阶段 2.1+**，当前 `__all__` 仍为空 | 接口就绪/头未实现 |
 | `mil_pooling.py` | 门控注意力多示例学习(Gated-Attention MIL)——患者级良恶性弱标签聚合:`SpatialAttentionModule`(保留 backbone `forward_features()` 空间判别性,不用 GAP 稀释微钙化等高频特征) + `GatedAttentionPooling`。仅供 `scripts/pretrain_malignancy_mil.py` 训练管线使用,不在 `MultiTaskThyroidModel` 主推理路径。见 `memory/patient-leakage-and-probe-trap.md` | ~255 lines |
 | `losses/` | Decomposed loss function subpackage | See below |
 | `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
@@ -60,7 +61,7 @@ To eliminate representation competition between high-frequency segmentation and 
 
 ### 1.1 Task-Alignment Adaptor (Soft Attention Gating)
 Because the classification branch loses spatial priors after decoupling, segmentation features must be injected back as soft attention.
-- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2), adaptor 调用在 `multi_task_model.py:204,207`(`_forward_cls_backbone`);类定义在 `blocks.py`。
+- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2), adaptor 调用在 `_forward_cls_backbone`(`multi_task_model.py`,不写行号——已因无关改动过时两次);类定义在 `blocks.py`。
 - **Unidirectional Flow**: `f_seg` MUST be `.detach()`ed before passing to the Adaptor to prevent classification error gradients from corrupting the segmentation backbone's weights.
 - **Fusion Equation**: `f_cls_enhanced = f_cls + gamma * (f_cls * W_align)`, where `W_align` is generated via spatial interpolation, 1x1 channel projection, and 3x3 depthwise convolution + Sigmoid. `gamma` is a learnable scalar initialized to 0.
 - **Gate 8 验证(`scripts/verify/gates/gate8_adaptor_isolation.py`,2026-07-11 新增)**:上述"MUST `.detach()`"契约此前只有实现、没有 Gate 量化验证——`gate2_vclub` 走的是 vCLUB 局部图(不经过 adaptor)、`gate3_auc_margin`/`gate6_stage1_masking` 都测不到这条通路(具体原因见 `QA_VP.md` §1.1 与该 Gate 源码注释)。Gate 8 用 `loss_mal.backward()` + 断言 `seg_backbone` 梯度精确为 `0.0`(非 `<1e-7` 容差)量化验证该契约,并在 Gate 内部主动做了两处必要的前置状态复位(**这两处都是本 Gate 存在的核心原因,删了会退化成永远通过的伪 Gate**):
@@ -197,7 +198,8 @@ outputs = model(images, gamma_prior=1.0)
 
 🔴 **γ 升满的时点与 Stage2 起点紧邻,是 2026-08-11 分割崩塌的四因之一**:γ 在 **epoch 40** 恰好到 1.0,
 而 Stage2 从 **epoch 41** 起同时触发 lr 100 倍跳变 + 全模型解冻 + `enable_mal_loss` 首启。
-物理先验通路(`multi_task_model.py:229` 的 `soft_mask` **有意不 detach**)是 `loss_mal → seg_backbone`
+物理先验通路(`multi_task_model.py` 的 `forward` 内 `soft_mask = torch.sigmoid(logits_mask)` **有意不 detach**;
+⚠️ 勿与 outputs 里供三头消费的 `soft_mask_detached` 混淆,后者是另发的 detach 副本)是 `loss_mal → seg_backbone`
 的唯一非 detach 路径,γ 由 0 到 1 等于把分类损失对分割主干的回传从关到全开——四件事挤在同一个 epoch,
 分割 3 个 epoch 内从 97.71% 塌到 80.6%。详见 `src/training/stages.py` 的
 `compute_gamma_prior` docstring 与 `docs/项目现状总纲.md` §6。**三头训练另建调度时须错开这些时点。**

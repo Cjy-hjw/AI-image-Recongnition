@@ -25,7 +25,8 @@ def compute_gamma_prior(epoch: int) -> float:
 
     `multi_task_model.forward(x, gamma_prior=γ)` 用它缩放 `e_prior = prior_mlp(v_phys) * γ`。
     该通路(`soft_mask → prior_extractor → prior_mlp → e_prior → cbm_head`,
-    `multi_task_model.py:229` 的 `soft_mask` **有意不 detach**,见
+    `multi_task_model.forward` 内 `soft_mask = torch.sigmoid(logits_mask)` **有意不 detach**
+    (⚠️ 勿与 outputs 里供三头消费的 `soft_mask_detached` 混淆,后者是另发的 detach 副本),见
     `scripts/verify/gates/gate8_adaptor_isolation.py` 注释)是 `loss_mal → seg_backbone`
     的**唯一非 detach 路径**——γ 从 0 升到 1 等于把分类损失对分割主干的回传从关到全开。
 

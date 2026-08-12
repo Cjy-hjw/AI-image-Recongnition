@@ -90,8 +90,11 @@ def discover_cases(dataset_path):
             `tasks._write_task_error`;发现层不越俎代庖落盘)。
 
     Returns:
-        list[dict]:每项形如模块 docstring 描述的 case dict。**顺序**按 os.walk
-        的目录遍历序(确定性,便于复现与对拍),同目录内按文件名排序。
+        list[dict]:每项形如模块 docstring 描述的 case dict。**顺序 = 路径字典序的
+        深度优先遍历**(子目录名与同目录文件名均显式排序),因此**跨平台确定**
+        (Windows NTFS / Linux ext4 / 容器 overlayfs 结果一致)。实现见下方
+        `dirs.sort()` 处的注释:`os.scandir` 本身不保证顺序,不显式排就会随文件
+        系统漂移。顺序非业务语义,但**是可复现性契约**(日志对照/批量对拍/测试断言)。
 
     Raises:
         不抛异常 —— IO 错误(Dataset 头读失败、文件不可读)一律记为「跳过该文件」
@@ -104,10 +107,25 @@ def discover_cases(dataset_path):
         return []
 
     cases = []
-    # os.walk(topdown=True) 保证先访问目录再访问其下文件,顺序确定性。
-    for root, _dirs, files in os.walk(dataset_path, topdown=True):
-        # 同目录内文件名排序,保证跨平台(Linux 容器 vs Windows 本地测试)顺序一致,
-        # 便于对拍与回归(顺序非业务语义,但测试断言 `==` 需要稳定序)。
+    # os.walk(topdown=True) 保证先访问目录再访问其下文件。
+    for root, dirs, files in os.walk(dataset_path, topdown=True):
+        # 🔴 子目录名排序 —— **必须 in-place `.sort()`,不能 `dirs = sorted(dirs)`**:
+        # topdown=True 时 os.walk 直接复用调用方修改后的 `dirs` 列表决定递归顺序,
+        # 重新绑定局部名只会让排序结果被丢弃(已实测:反转 scandir 序下 in-place 得
+        # 字典序、重新绑定原样保留文件系统序)。
+        # ⚠️ 读 CPython 源码时别被 `os.py` 里的 `for dirname in reversed(dirs)` 迷惑
+        # (3.12 迭代实现):它是**反转后压栈**,弹栈时恰好还原为正序,净效果仍是
+        # `dirs` 的当前顺序 —— 已实测最终产出为字典序。
+        #
+        # 为什么非排不可:os.walk 的目录序取自 `os.scandir`,而 scandir **不保证任何
+        # 顺序** —— Windows NTFS 按名索引(天然字典序),Linux ext4/overlayfs 按
+        # **hash 序**返回。不排序 → 本地 Windows 恒字典序、CI/交付容器(Linux)随机。
+        # 2026-08-12 实证:CI run 31512732898 的 test job 就栽在这
+        # (`test_one_case_crash_does_not_block_others` 期望字典序首例 BAD,
+        # 实际首例是 GOOD1);更早那次 CI 绿是碰巧抽中了想要的顺序,不是真绿。
+        # 病例处理顺序影响日志对照、批量对拍与失败复现,属交付可复现性红线。
+        dirs.sort()
+        # 同目录内文件名排序,同理(sorted() 不改原列表,此处只影响本层文件遍历)。
         for name in sorted(files):
             full = os.path.join(root, name)
             case = _build_case(full)

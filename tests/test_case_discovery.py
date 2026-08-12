@@ -389,13 +389,87 @@ class TestDiscoverCases:
         assert p3[0]["subdir_uid"] == "P3"
 
     def test_deterministic_order(self, tmp_path):
-        # 同目录内按文件名排序;跨目录按 os.walk 顺序(确定性)
+        # ⚠️ 本用例只覆盖**同一目录内的文件名排序**(三个文件同挂 P/S/ 下),
+        # 覆盖不到**跨子目录的目录序** —— 后者见下面的
+        # test_order_independent_of_filesystem_scandir_order。
+        # (2026-08-12 教训:本用例长期全绿,而目录序 bug 一直活着,与 #119
+        #  「断言选在不会失败的维度上」同类。)
         for name in ("c.dcm", "a.dcm", "b.dcm"):
             _make_dcm(str(tmp_path / "P" / "S" / name), patient_id="P",
                       series_uid="1.2.3.4.0")
         cases = discover_cases(str(tmp_path))
         names = [os.path.basename(c["input_path"]) for c in cases]
         assert names == ["a.dcm", "b.dcm", "c.dcm"]
+
+    def test_order_independent_of_filesystem_scandir_order(self, tmp_path,
+                                                           monkeypatch):
+        """🔴 顺序契约:发现顺序必须是路径字典序 DFS,**与文件系统返回序无关**。
+
+        `os.walk` 的子目录递归顺序取自 `os.scandir`,而 scandir **不保证任何顺序**:
+        Windows NTFS 按名索引(天然字典序),Linux ext4/overlayfs 按 **hash 序**。
+        `discover_cases` 若不显式 `dirs.sort()`,就会「Windows 本地恒字典序、
+        Linux 容器随机」——本地测试永远绿,CI/交付容器偶发红。
+
+        **真实事故(2026-08-12,CI run 31512732898)**:
+        `test_service_runner.py::TestPerCaseFailureIsolation` 依赖「字典序首例=BAD」,
+        Linux 上首例变成 GOOD1,报错 `assert 'GOOD1' in {'BAD','GOOD2'}`,
+        完全看不出是顺序问题。更早那次 CI 绿是**碰巧抽中**想要的顺序,不是真绿。
+
+        本用例把 scandir 顺序**反转**来模拟非字典序文件系统,直接钉死契约 ——
+        谁删掉 `dirs.sort()`,这里立刻红,且失败信息直指顺序。
+        """
+        # 目录名字典序 BAD < GOOD1 < GOOD2,但文件名序 a < b < c 恰好相反,
+        # 用以确保断言的是**目录序**而非文件序(两者若同向,测试会失去区分力)。
+        _make_dcm(str(tmp_path / "GOOD1" / "S" / "a.dcm"), patient_id="GOOD1",
+                  series_uid="1.2.3.4.10")
+        _make_dcm(str(tmp_path / "BAD" / "S" / "b.dcm"), patient_id="BAD",
+                  series_uid="1.2.3.4.11")
+        _make_dcm(str(tmp_path / "GOOD2" / "S" / "c.dcm"), patient_id="GOOD2",
+                  series_uid="1.2.3.4.12")
+
+        expected = ["BAD", "GOOD1", "GOOD2"]
+        assert [c["patient_id"] for c in discover_cases(str(tmp_path))] == expected
+
+        real_scandir = os.scandir
+
+        class _ReversedScandirIt:
+            """os.walk 用 `with scandir(top) as it:`,故须支持 context manager。
+
+            另实现 `close()` —— 真实 `os.ScandirIterator` 有该方法用于释放目录
+            句柄;当前 CPython 的 os.walk 只走 `with`(不显式调 close),但若未来实现
+            或某重构路径调用它,缺失会抛 AttributeError 把测试炸成"假失败"。
+            本假迭代器已把目录项 list 化、无句柄可放,故为空操作。
+            """
+
+            def __init__(self, entries):
+                self._it = iter(entries)
+
+            def __iter__(self):
+                return self._it
+
+            def __next__(self):
+                return next(self._it)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def close(self):
+                self._it = iter(())
+
+        def _reversed_scandir(path="."):
+            with real_scandir(path) as it:
+                entries = list(it)
+            return _ReversedScandirIt(entries[::-1])
+
+        monkeypatch.setattr(os, "scandir", _reversed_scandir)
+        got = [c["patient_id"] for c in discover_cases(str(tmp_path))]
+        assert got == expected, (
+            f"文件系统返回序变化导致发现顺序改变({got} != {expected}) —— "
+            "case_discovery 的 `dirs.sort()` 被移除或失效"
+        )
 
     def test_nested_subdirs_all_discovered(self, tmp_path):
         # 深层嵌套:所有层级的影像都被发现

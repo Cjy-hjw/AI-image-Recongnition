@@ -19,8 +19,17 @@
   `logits + τ·log π`（**加**），符号反了会放大不平衡而损失照常降；推理侧**不得**
   再调一次。③ CB 加权与 LA 是同一问题的两种解法，同时开满会过校正，故 `la_tau`
   默认 0（关）。
-- **临床T头** `clin_t_stage`（二分类）——全局 Pooling + 结节等效体积标量 + ETE logits →
-  轻量 MLP；影像学上限约 0.72（淋巴结常不在视野）。
+- **临床T头** `clin_t_stage`（二分类）—— ✅ **已实现**（阶段 2.3，`clinical_t.py`）；
+  GAP 全局特征 + 结节尺度标量 `[s, log s]` + ETE 概率（**detach**）→ 轻量 MLP。
+  影像学上限约 0.72（淋巴结常不在视野），训到 0.72 附近就该转去看别的头。
+  **三个坑**：① 🔴 **别把侵犯头的 `cb_beta=0.99` 抄过来** —— 在 `[2410,1831]`
+  这种千级计数上 CB 权重比恒为 **1.0000**（`1−β^n` 已饱和），配了等于没配且不报错；
+  要加权用 `inverse_frequency_weights`（1.3162:1）。② `label_smoothing` 会把
+  `P(T=1)` 上界**精确钳死在 `1−ls/2`**（实测 ls=0.1 → 0.9500），而官方 `T_conf`
+  读的正是这个数，故默认 0。③ 头内**禁用 `BatchNorm1d`**（train 模式 batch=1 直接
+  `ValueError`，末批可能只剩 1 样本）；需要归一化用 `LayerNorm`。
+  🔴 **`T_conf` = P(T=1)**，不是"对所报 T 值的置信度" —— 与
+  `Malignancy.confidence`（`predicted = conf >= 阈值` 推出的"恶性概率"）同一语义。
 
 **接入接口现状（阶段 2.0 已补全，2026-08-12）**：
   ① Stage-4 空间特征图 —— ✅ `outputs["stage4_spatial"]`，512² 输入下实测 **[B,352,16,16]**。
@@ -60,6 +69,12 @@ from src.models.heads.extension import (  # noqa: F401  (re-export)
     ExtensionHead,
     ExtensionOutputs,
 )
+from src.models.heads.clinical_t import (  # noqa: F401  (re-export)
+    NUM_CLIN_T_CLASSES,
+    T_POSITIVE_INDEX,
+    ClinicalTHead,
+    ClinicalTOutputs,
+)
 
 __all__ = [
     "LocationHead",
@@ -71,4 +86,8 @@ __all__ = [
     "ExtensionOutputs",
     "NUM_ETE_CLASSES",
     "ETE_IDX_TO_CODE",
+    "ClinicalTHead",
+    "ClinicalTOutputs",
+    "NUM_CLIN_T_CLASSES",
+    "T_POSITIVE_INDEX",
 ]

@@ -2,16 +2,18 @@
 
 ## 为什么单独有这个脚本
 
-三头的单测（`tests/test_location_head.py` / `tests/test_extension_head.py`）跑在
-Windows + CPU + fp32 上，能覆盖数学与契约，但**结构性地测不到**四类上云才会炸的问题：
+三头的单测（`tests/test_{location,extension,clinical_t}_head.py`）跑在 Windows +
+CPU + fp32 上，能覆盖数学与契约，但**结构性地测不到**四类上云才会炸的问题：
 
-1. **fp16 autocast**：torch 在 CPU 上不支持 float16 autocast（`model_runner` 里就有
-   专门的 CPU 回退分支），而交付推理正是 `precision="fp16"`。头里的 `.float()` softmax、
-   fp32 累加器、`.to(feat.dtype)` 回转三处 dtype 处理，**只有真 CUDA 上才走到真实分支**。
+1. **fp16 autocast**：torch 在 CPU 上不支持 float16 autocast，而交付推理正是
+   `precision="fp16"`。三头里的 `.float()` softmax、fp32 累加器、`.to(feat.dtype)`
+   回转、以及临床 T 的 `log(clamp(s))`，**只有真 CUDA 上才走到真实分支**。
 2. 🔴 **`F.max_pool2d` 的隐式 −inf padding 语义**：交界带的腐蚀是 `-max_pool2d(-m)`，
    整个 ETE 局部特征都押在这个语义上。CPU 与 CUDA 是两套 kernel，一致性**必须实测**。
-3. **显存峰值**：平台每容器仅约 14~16G（`docs/项目现状总纲.md` §3），A800 的 80G
-   不 OOM 推不出平台不 OOM。带的提取会在**原分辨率**上物化 3 份 [B,1,512,512]。
+3. **显存峰值**：平台每容器仅约 14~16G（`docs/项目现状总纲.md` §3）。
+   ⚠️ 实测下来这一维**并非风险**（三头合计 **0.536M** 参数 = 2.05MB fp32、batch=16
+   峰值仅百 MB 级），本项保留的价值是"换 backbone / 提分辨率后能立刻重测"，
+   不是当前有隐患。
 4. **BatchNorm 在 batch=1 下的推理形态**：交付推理 batch 恒 1。
 
 ## 用法
@@ -26,8 +28,19 @@ Windows + CPU + fp32 上，能覆盖数学与契约，但**结构性地测不到
   - `0` = 全部通过且**没有任何 SKIP**（GPU 项真的验过了）
   - `2` = 有 SKIP（多半是没看到 CUDA）。这不是失败，但**绝不能当成"已验证"** ——
     fp16/显存/跨设备一致性三类恰恰是本脚本存在的理由，跳过它们等于没跑。
-    上云时若拿到 2，先查容器里 `torch.cuda.is_available()` 为什么是 False。
   - `1` = 有 FAIL
+
+## 📌 关于 rules.md §6 的 300 行红线：本文件是**有意保留的例外**
+
+本文件超 300 行且**不拆**，按 rules §6 的「拆分前置检查」三问逐条判定（三问全中）：
+① 拆分**降低可分发性** —— 本脚本是**上云现场跑的工具**，而云平台上传要过人工审核、
+每次限约 10 个文件（`memory/cloud-upload-review-constraint.md`），拆成 `probes/` 包会从
+1 个文件变 3 个；且现在任何工作目录下 `python scripts/probe_heads_cuda.py` 直接可跑，
+拆包后要依赖 `scripts/__init__` → `scripts/probes/__init__` 的 import 链，陌生容器里多一个
+失败点。② 切出来的两半仍是同一件事（验三头 GPU 契约），**不产生认知边界**。
+③ 为守行数压缩注释会撞 §5「细节优先」—— 上一轮真这么干过，是被规则记录在案的反例。
+
+本脚本只有一个职责，行数随头数线性增长（每加一个头约 20 行），可读性不随之下降。
 """
 
 import argparse
@@ -47,6 +60,7 @@ for _stream in (sys.stdout, sys.stderr):
 # 允许从仓库根直接 `python scripts/probe_heads_cuda.py`
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
+from src.models.heads.clinical_t import ClinicalTHead  # noqa: E402
 from src.models.heads.extension import ExtensionHead  # noqa: E402
 from src.models.heads.location import LocationHead  # noqa: E402
 from src.models.mask_features import (  # noqa: E402
@@ -121,16 +135,28 @@ def probe_fp16_autocast(device, batch):
         return
     ext = ExtensionHead(in_channels=IN_CH).to(device).eval()
     loc = LocationHead(in_channels=IN_CH).to(device).eval()
+    clt = ClinicalTHead(in_channels=IN_CH).to(device).eval()
     feat, mask, margin = _make_inputs(batch, device)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         eo = ext(feat, mask, margin)
         lo = loc(feat)
+        to = clt(feat, nodule_scale_from_mask(mask), eo["ete_logits"])
+        # 阴性病例（空 mask）→ scale 恰为 0 → `log(clamp(s,1e-4))`。fp16 下 1e-4 落在
+        # 非规格化边缘（最小正规数 6.1e-5），是 CPU 测不到的真实分支。
+        to_empty = clt(feat, nodule_scale_from_mask(torch.zeros_like(mask)),
+                       eo["ete_logits"])
     ok = (
         torch.isfinite(eo["ete_logits"]).all()
         and torch.isfinite(eo["ete_probs"]).all()
         and torch.isfinite(lo["location_probs"]).all()
+        and torch.isfinite(to["t_logits"]).all()
     )
     check("fp16 autocast 前向无 NaN/Inf", bool(ok))
+    check(
+        "fp16 下空 mask 的 log(clamp) 不产生 -inf/NaN",
+        bool(torch.isfinite(to_empty["t_logits"]).all()),
+        f"t_logits[0]={[round(float(v), 3) for v in to_empty['t_logits'][0]]}",
+    )
     check(
         "fp16 下 ETE 概率和为 1",
         torch.allclose(eo["ete_probs"].sum(-1).float(), torch.ones(batch, device=device), atol=1e-3),
@@ -141,9 +167,16 @@ def probe_fp16_autocast(device, batch):
         torch.allclose(lo["location_probs"].sum(-1).float(), torch.ones(batch, device=device), atol=1e-3),
     )
     check(
+        "fp16 下 T 概率和为 1 且 t_conf==P(T=1)",
+        torch.allclose(to["t_probs"].sum(-1).float(), torch.ones(batch, device=device), atol=1e-3)
+        and torch.equal(to["t_conf"], to["t_probs"][:, 1]),
+    )
+    check(
         "fp16 概率输出被提升到 fp32",
-        eo["ete_probs"].dtype == torch.float32 and lo["location_probs"].dtype == torch.float32,
-        f"ete={eo['ete_probs'].dtype}, loc={lo['location_probs'].dtype}",
+        eo["ete_probs"].dtype == torch.float32
+        and lo["location_probs"].dtype == torch.float32
+        and to["t_probs"].dtype == torch.float32,
+        f"ete={eo['ete_probs'].dtype}, loc={lo['location_probs'].dtype}, t={to['t_probs'].dtype}",
     )
 
 
@@ -187,6 +220,16 @@ def probe_batch_one_inference(device):
         float(out1["band_ratio"]) > float(out2["band_ratio"]) > 0.0,
         f"150px={float(out1['band_ratio']):.5f} vs 12px={float(out2['band_ratio']):.5f}",
     )
+    # 临床 T 在 **train 模式 + batch=1**：若有人把 BatchNorm1d 加回 MLP，这里当场
+    # ValueError（"Expected more than 1 value per channel"）。训练末批可能只剩 1 样本，
+    # 这不是假想。CPU 上单测已覆盖，此处确认 CUDA kernel 同样不引入 batch 依赖。
+    clt = ClinicalTHead(in_channels=IN_CH).to(device).train()
+    to = clt(feat, nodule_scale_from_mask(mask), torch.randn(1, 4, device=device))
+    check(
+        "T 头 train 模式 batch=1 不崩(BN1d 未被加回)",
+        bool(torch.isfinite(to["t_logits"]).all()),
+        f"t_conf={float(to['t_conf']):.5f}",
+    )
 
 
 # ── 4. 显存 ────────────────────────────────────────────────────────────────
@@ -201,10 +244,16 @@ def probe_memory(device, batch):
     torch.cuda.reset_peak_memory_stats()
     ext = ExtensionHead(in_channels=IN_CH).to(device)
     loc = LocationHead(in_channels=IN_CH).to(device)
+    clt = ClinicalTHead(in_channels=IN_CH).to(device)
     feat, mask, margin = _make_inputs(batch, device)
     feat.requires_grad_(True)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        out = ext(feat, mask, margin)["ete_logits"].sum() + loc(feat)["side_logits"].sum()
+        eo = ext(feat, mask, margin)
+        out = (
+            eo["ete_logits"].sum()
+            + loc(feat)["side_logits"].sum()
+            + clt(feat, nodule_scale_from_mask(mask), eo["ete_logits"])["t_logits"].sum()
+        )
     out.backward()
     peak_alloc = torch.cuda.max_memory_allocated() / 2**20
     peak_res = torch.cuda.max_memory_reserved() / 2**20
@@ -215,13 +264,14 @@ def probe_memory(device, batch):
         f"batch={batch} allocated={peak_alloc:.1f}MB reserved={peak_res:.1f}MB "
         f"/ 卡上 total={total:.0f}MB（平台容器仅约 14336MB，按 reserved 折算）",
     )
-    n_ext = sum(p.numel() for p in ext.parameters())
-    n_loc = sum(p.numel() for p in loc.parameters())
+    n = {k: sum(p.numel() for p in h.parameters())
+         for k, h in (("ext", ext), ("loc", loc), ("clin_t", clt))}
     record(
         "三头参数量",
         "PASS",
-        f"ExtensionHead={n_ext / 1e6:.3f}M, LocationHead={n_loc / 1e6:.3f}M "
-        f"（合计 {(n_ext + n_loc) * 4 / 2**20:.2f}MB fp32）",
+        f"ExtensionHead={n['ext'] / 1e6:.3f}M, LocationHead={n['loc'] / 1e6:.3f}M, "
+        f"ClinicalTHead={n['clin_t'] / 1e6:.3f}M "
+        f"（合计 {sum(n.values()) * 4 / 2**20:.2f}MB fp32）",
     )
 
 
@@ -229,7 +279,7 @@ def probe_memory(device, batch):
 
 
 def probe_gradient_isolation(device):
-    """ETE/位置头的梯度不得到达 mask 与 CBM margin —— 换设备不该改变这条契约。"""
+    """三头的梯度不得到达 mask / CBM margin / 上游头 —— 换设备不该改变这些契约。"""
     ext = ExtensionHead(in_channels=IN_CH).to(device)
     feat, mask, margin = _make_inputs(2, device)
     feat.requires_grad_(True)
@@ -241,6 +291,20 @@ def probe_gradient_isolation(device):
     check(
         "ETE 梯度确实到达 stage4_spatial(反证上两条非空转)",
         feat.grad is not None and float(feat.grad.abs().sum()) > 0,
+    )
+
+    # 临床 T：ete_logits 与 nodule_scale 都必须 detach（ETE 是官方独立计分维度，
+    # 不能被 T 的监督拽偏；scale 那条则是分割主干隔离）。
+    clt = ClinicalTHead(in_channels=IN_CH).to(device)
+    feat_t = torch.randn(2, IN_CH, FEAT_HW, FEAT_HW, device=device, requires_grad=True)
+    scale_t = torch.rand(2, 1, device=device, requires_grad=True)
+    ete_t = torch.randn(2, 4, device=device, requires_grad=True)
+    clt(feat_t, scale_t, ete_t)["t_logits"].sum().backward()
+    check("T 梯度不回流 ETE logits", ete_t.grad is None)
+    check("T 梯度不回流 nodule_scale", scale_t.grad is None)
+    check(
+        "T 梯度确实到达 stage4_spatial(反证上两条非空转)",
+        feat_t.grad is not None and float(feat_t.grad.abs().sum()) > 0,
     )
 
 

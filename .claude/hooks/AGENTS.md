@@ -15,7 +15,7 @@
 | `gate2_escalate_block.py` | PreToolUse，Edit/Write 前 | **阻断式**(exit 2) | 待审清单堆到阈值(`ESCALATE_THRESHOLD=3`)后，挡新的高风险文件 Edit/Write——只挡"堆新账"，不挡"修正清单里已在案的文件"。 |
 | `gate2_enforce.py` | PreToolUse，`git commit` 前 | **阻断式**(exit 2) | 暂存区含未过审(或标记已过期>1小时)的高风险文件 → 挡 commit，stderr 喂回模型上下文逼迫先做 Gate2。含 `CRITICAL_INFRA_EXACT_FILES` 时额外要求 `review_mode=="deep"`，`"self"` 不放行(见教训4)。**命令含 `git add` 或 `commit -a/--all` 时改用工作区全量改动作超集判定**——PreToolUse 早于 `git add` 执行，只读暂存区会被一行式 commit 绕开(见教训5)。**标记必须带非空 `evidence` 字段**(2026-07-30 新增,见教训6),空标记强制重审重标。 |
 | `mark_gate2_pass.py` | 人工/模型主动调用 | CLI 脚本 | 审查通过后执行 `python .claude/hooks/mark_gate2_pass.py [--review-mode self\|deep] [--evidence "<来源与结论>"] <files...>`，写 `.gate2_pass.json`(含 `review_mode` + `evidence`，1小时有效)+ 从 pending 清单摘除。**`--evidence` 必填**(2026-07-30 新增,见教训6)——没填或空字符串直接拒绝。 |
-| `modularity_check.py` | PostToolUse，Edit/Write 后 | 提醒式 | `src/` 下 `.py` 超 300 行提醒拆分(rules.md §6)，不阻断——行数不能机械决定该怎么拆。 |
+| `modularity_check.py` | PostToolUse，Edit/Write 后 | 提醒式 | `src/` 下 `.py` 超 300 行 → 提醒**按 rules §6 前置三问评估**（不是提醒拆分），不阻断。**仅查 `src/`**，与 §6 的豁免范围（`tests/`、`scripts/` 独立工具）一致。⚠️ **不要改成阻断式**：问题从来不是"没拦住超行"，而是"机械执行行数规则"——阻断只会把这个失误自动化（2026-08-12 真实失误：差点为守 300 行把上云现场探针拆成 3 文件、上一轮为守行数删掉了实测细节）。文案已于 2026-08-12 同步为「行数是提示信号 + 三问」。 |
 | `ci_push_reminder.py` | PostToolUse，`git push` 后 | 提醒式 | 提醒核对 `gh run list` 的 headSha 与本轮 commit 一致(rules.md §2)。 |
 | `post_edit_check.py` | PostToolUse，`.py` 改动后 | 提醒式 | `py_compile` 语法检查 + 提示对应 `tests/test_xxx.py` 精准测试命令(不自动跑全量,太慢)。 |
 | `proxy_check.py` | PreToolUse，`git push/fetch/gh` 前 | 提醒式(**曾是阻断式，已回退**) | 提醒设代理，见下方"三次教训"之外的独立踩坑记录。 |

@@ -3,7 +3,13 @@
 三头独立成模块置于本子包，使 `multi_task_model.py` 保持薄装配枢纽（rules.md §6）：
 
 - **位置头** `lesion_loc`（7 类，侧别×纵向因子分解 `P(k∈1..6)=P(Side)×P(Level)`、
-  `P(7峡部)=P(Side=峡)`）——最高优先级；接 EfficientNet Stage-4 空间特征图 + CoordConv。
+  `P(7峡部)=P(Side=峡)`）—— ✅ **已实现**（阶段 2.1，`location.py`）；接 EfficientNet
+  Stage-4 空间特征图 + CoordConv。损失在 `losses/components/location.py`（侧别/纵向
+  各自 masked CE）。**两个坑**：① 峡部无纵向属性，level 分支须用 `build_level_validity`
+  屏蔽，且其 level 标签为 -1、直接喂 `cross_entropy` 会越界；② 水平翻转必须用
+  `flip_location_index` 联动翻标签，漏了会让位置头学到反的左右而 loss 照常下降。
+  ③ CoordConv **必须先过非线性再池化**（线性卷积下坐标贡献退化为常数偏置，被 GAP
+  平均掉、左右完全不可分 —— 已用三段反证锁在 `tests/test_location_head.py`）。
 - **侵犯头** `extrathy_ext`/ETE（保 4 类，血管仅5例不并类）——ConvNeXt mask 概率图
   膨胀-腐蚀出交界带 × 局部特征 + 复用 CBM `logits_margin` 旁路。
 - **临床T头** `clin_t_stage`（二分类）——全局 Pooling + 结节等效体积标量 + ETE logits →
@@ -25,10 +31,27 @@
      用面积^1.5 会把典型结节（面积占比~1%）压到 1e-3 量级造成输入数值塌陷。
 
 **标签构造铁律（Plan M3）**：位置/ETE 标签构造与 7 维概率合成
-  MUST `import src.inference.prediction_json` 的 `LOCATION_LABELS` / `_ETE_LABEL_TO_CODE`，
+  MUST `import src.models.label_schema` 的 `LOCATION_LABELS` / `_ETE_LABEL_TO_CODE`，
   否则概率分布与官方类别系统性错位、JSON 合法但指标偏低、本地永远查不出根因。
+  ⚠️ 2026-08-12 起该常量由 `src/inference/prediction_json.py` **下沉到
+  `src/models/label_schema.py`**（`.importlinter` 契约2：models 是最底层，不得依赖
+  inference）；`prediction_json` 仍 re-export，交付侧代码无需改动。
 
 新增头类请从本 `__init__` re-export，保持向后兼容。
 """
 
-__all__ = []  # type: ignore[var-annotated]
+from src.models.heads.location import (  # noqa: F401  (re-export)
+    LocationHead,
+    LocationOutputs,
+    build_level_validity,
+    compose_location_probs,
+    flip_location_index,
+)
+
+__all__ = [
+    "LocationHead",
+    "LocationOutputs",
+    "compose_location_probs",
+    "build_level_validity",
+    "flip_location_index",
+]

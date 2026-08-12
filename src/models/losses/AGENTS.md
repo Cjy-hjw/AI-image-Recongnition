@@ -13,6 +13,12 @@
 - `malignancy.py`: `compute_malignancy_losses()` — AUCM+SupCon
 - `famo_mix.py`: `apply_famo_weighting()` — FAMO权重应用与更新
 - `regularizers.py`: `compute_regularizers()` — Latent L2+SPIN L1
+- `location.py`: `compute_location_loss()` — 位置头侧别/纵向双分支 masked CE（阶段 2.1）。
+  **不对合成的 7 维概率取 NLL**：合成概率是 `P(side)·P(level)` 乘积，两个 1e-4 相乘即
+  1e-8，log 后接近 -18 甚至下溢 -inf；分支各自 CE 走 `log_softmax` 稳定实现。
+  **峡部 level 标签是 -1**，直接喂 `cross_entropy` 报 `Target -1 is out of bounds` →
+  先 clamp 到 0 保证不崩、再由 validity 乘 0 屏蔽，**两道保险缺一不可**（只 clamp 会
+  编造监督，只屏蔽会先崩在 CE 里）。
 
 ---
 
@@ -89,4 +95,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`（全套现 646 passed(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）
+执行: `pytest tests/test_masked_loss.py -v`（全套现 671 passed(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）

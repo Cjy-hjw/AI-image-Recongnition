@@ -177,3 +177,103 @@ def make_splice(img_np, donor_np, rng_or_seed=0, patch_frac=0.22):
     bbox = [dx, dy, dx + pw, dy + ph]
 
     return out, mask, bbox
+
+
+def make_splice_poisson(img_np, donor_np, rng_or_seed=0, patch_frac=0.22):
+    """泊松/羽化拼接:donor 块用 `cv2.seamlessClone` 无缝融入本图。
+
+    与 `make_splice`(硬粘贴、留尖锐缝)互补:泊松融合**消除长直阶跃边界**,
+    几何缝检测器(`detect_splicing`)对其无能为力——专供 CAT-Net DCT/BAG 取证
+    (`tampering_catnet`)训练/验证:若 donor 与宿主块栅格相位错位,融合后 RGB
+    边界看不见,但块伪影栅格仍被破坏。
+
+    Returns:
+        (spliced_img, mask, bbox);seamlessClone 不可用则退化为高斯羽化混合。
+    """
+    rng = _as_rng(rng_or_seed)
+    h, w = img_np.shape
+    out = img_np.copy()
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    donor = cv2.resize(donor_np, (w, h), interpolation=cv2.INTER_LINEAR)
+    ph = max(24, int(h * patch_frac))
+    pw = max(24, int(w * patch_frac))
+    # 守卫:中心采样区间 randint(ph//2+1, h-ph//2-1) 须 low<high,否则 numpy 抛
+    # ValueError(不被 except cv2.error 接住)。小图/极端 patch_frac 下 ph 逼近 h 时
+    # 区间会塌缩,故要求两轴均留足边距(比单纯 ph>=h 更严)。
+    if ph >= h - 2 or pw >= w - 2:
+        return out, mask, None
+
+    sy = int(rng.randint(0, h - ph))
+    sx = int(rng.randint(0, w - pw))
+    # 目标中心需留出半块边距,避免 seamlessClone ROI 越界
+    cy = int(rng.randint(ph // 2 + 1, h - ph // 2 - 1))
+    cx = int(rng.randint(pw // 2 + 1, w - pw // 2 - 1))
+
+    src_rgb = cv2.cvtColor(donor[sy:sy + ph, sx:sx + pw], cv2.COLOR_GRAY2BGR)
+    dst_rgb = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    patch_mask = np.full((ph, pw), 255, dtype=np.uint8)
+    try:
+        blended = cv2.seamlessClone(
+            src_rgb, dst_rgb, patch_mask, (cx, cy), cv2.NORMAL_CLONE
+        )
+        out = cv2.cvtColor(blended, cv2.COLOR_BGR2GRAY)
+    except cv2.error:
+        # 退化:高斯羽化 alpha 混合(同样无硬缝),保证函数不崩
+        y0, x0 = cy - ph // 2, cx - pw // 2
+        alpha = cv2.GaussianBlur(patch_mask.astype(np.float32) / 255.0, (0, 0), 5)
+        roi = out[y0:y0 + ph, x0:x0 + pw].astype(np.float32)
+        src = donor[sy:sy + ph, sx:sx + pw].astype(np.float32)
+        out[y0:y0 + ph, x0:x0 + pw] = (
+            alpha * src + (1 - alpha) * roi
+        ).astype(np.uint8)
+
+    y0, x0 = cy - ph // 2, cx - pw // 2
+    mask[y0:y0 + ph, x0:x0 + pw] = 255
+    bbox = [x0, y0, x0 + pw, y0 + ph]
+    return out, mask, bbox
+
+
+def inject_nakagami_speckle(img_np, rng_or_seed=0, m_range=(0.6, 1.4)):
+    """注入一阶 Nakagami 散斑(乘性),模拟真实超声散斑统计。
+
+    超声包络服从 Nakagami 分布(形状参数 m:m=1 为充分发育 Rayleigh 散斑)。
+    Nakagami(m,Ω) 的平方 = Gamma(k=m, θ=Ω/m),故包络 = sqrt(Gamma 抽样)。
+    乘性叠加到图像上,使域随机化样本的散斑统计贴近真实声学过程,而非加性高斯。
+
+    Args:
+        m_range: 形状参数采样区间,默认 [0.6,1.4] 覆盖欠/充分发育散斑。
+    """
+    rng = _as_rng(rng_or_seed)
+    img = img_np.astype(np.float32)
+    m = rng.uniform(*m_range)
+    # Nakagami 包络:E[env]≈1 归一,作乘性增益(Ω=1 → Gamma(m,1/m),均值 1)
+    gamma = rng.gamma(shape=m, scale=1.0 / m, size=img.shape)
+    env = np.sqrt(gamma).astype(np.float32)
+    env /= (env.mean() + 1e-6)  # 归一到均值 1,只调散斑纹理不改整体亮度
+    out = img * env
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def domain_randomize(img_np, rng_or_seed=0):
+    """域随机化:Nakagami 散斑 → 高斯模糊 k∈{3,5,7} → JPEG 重压 Q∈[15,75]。
+
+    缩小合成训练样本与官方真实 JPG 的域差(不同探头/增益/压缩链)。三步按真实
+    采集-传输链顺序施加:先生理散斑、再光学/重建模糊、最后有损压缩伪影。
+    确定性可复现(同 seed 同输出)。
+    """
+    rng = _as_rng(rng_or_seed)
+    out = inject_nakagami_speckle(img_np, rng)
+
+    # 高斯模糊,核 ∈ {3,5,7}(奇数),sigma 由核自动推断
+    k = int(rng.choice([3, 5, 7]))
+    out = cv2.GaussianBlur(out, (k, k), 0)
+
+    # JPEG 重压缩 Q∈[15,75],植入块伪影/量化残差
+    quality = int(rng.randint(15, 76))
+    ok, enc = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if ok:
+        decoded = cv2.imdecode(enc, cv2.IMREAD_GRAYSCALE)
+        if decoded is not None:
+            return decoded
+    return out  # 编解码异常守卫:退回模糊结果,满足 uint8 类型契约

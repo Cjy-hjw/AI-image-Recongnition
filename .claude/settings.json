@@ -1,0 +1,56 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/proxy_check.py"
+          },
+          {
+            "type": "command",
+            "command": "python .claude/hooks/gate2_enforce.py"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/gate2_escalate_block.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/post_edit_check.py"
+          },
+          {
+            "type": "command",
+            "command": "python .claude/hooks/gate2_reminder.py"
+          },
+          {
+            "type": "command",
+            "command": "python .claude/hooks/modularity_check.py"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/ci_push_reminder.py"
+          }
+        ]
+      }
+    ]
+  }
+}

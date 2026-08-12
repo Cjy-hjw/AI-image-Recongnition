@@ -14,6 +14,22 @@ from src.models.losses.components import (
 )
 
 
+# 任务名 → loss_dict key 映射（多源异构标注的 task_mask 屏蔽路径参考）。
+# 说明：per-sample 真屏蔽已由本模块 forward 的 valid_mask 注入 + components 内部
+# label_validity 处理实现（无效样本不进入计算图，真正零梯度）；此表仅作为
+# 「任务名对应哪些 loss 分项」的文档性常量，供上层构建 task_mask / 调试查阅。
+# （原 masked_multitask.py 的后处理缩放 wrapper 已删除，其缩放法只改量级不屏蔽梯度。）
+TASK_TO_LOSS_KEYS = {
+    'mask': ['seg'],
+    'composition': ['comp', 'concepts_ce', 'prior'],
+    'echogenicity': ['echo', 'concepts_ce', 'prior'],
+    'shape': ['shape', 'concepts_ce', 'prior'],
+    'margin': ['margin', 'concepts_ce', 'prior'],
+    'foci': ['foci', 'concepts_ce', 'prior'],
+    'malignancy': ['malignancy', 'supcon'],
+}
+
+
 class MultiTaskLoss(nn.Module):
     """
     Combined multi-task loss function.
@@ -68,8 +84,31 @@ class MultiTaskLoss(nn.Module):
         spin_l1_weight=0.0,
         label_smoothing=0.0,
         enable_mal_loss=True,
+        task_mask=None,
     ):
-        # 1. Segmentation Loss
+        """
+        Args:
+            task_mask: dict of binary masks (B,) indicating label availability
+                {
+                    'mask': Tensor[B],       # 1 if has segmentation mask, 0 otherwise
+                    'composition': Tensor[B],
+                    'echogenicity': Tensor[B],
+                    'shape': Tensor[B],
+                    'margin': Tensor[B],
+                    'foci': Tensor[B],
+                    'malignancy': Tensor[B],
+                }
+                If None, assumes all labels available (backward compat)
+
+                Note: Segmentation already supports valid_mask via targets['valid_mask'],
+                      so we pass task_mask['mask'] -> targets['valid_mask']
+        """
+        # 注入task_mask到targets（利用现有valid_mask支持）
+        if task_mask is not None:
+            if 'mask' in task_mask and 'valid_mask' not in targets:
+                targets = {**targets, 'valid_mask': task_mask['mask'].float()}
+
+        # 1. Segmentation Loss (自动应用valid_mask)
         loss_seg = compute_segmentation_loss(
             self.bce_seg, self.dice_seg, outputs, targets
         )

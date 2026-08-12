@@ -11,14 +11,58 @@ data:
   val_path: "data/val"
   holdout_path: "data/holdout"
   batch_size: 64              # Reduced from 128 to prevent NaN accumulation
-  img_size: 512             # Resized resolution (set to 512 or 1024 for A800 80GB)
+  img_size: 512             # Resized resolution。注意:该值烘焙进 checkpoint(prior_extractor.x_coords/y_coords
+                            # 按 img_size 存的固定形状 buffer),换分辨率≠热插拔——实测 512→1024 直接 load_state_dict
+                            # size mismatch 报错(2026-07-11 A800 80G 复核验证)。当前所有已训练 checkpoint 均为
+                            # 512;若要上 1024 必须用该分辨率重新训练/生成新 checkpoint,不能只改这个数字。
+
+# Post-hoc 置信度校准(温度缩放)。param_file 缺失时全任务 T=1.0(不校准,输出不变);
+# 初赛真实数据到位后用 src/inference/calibration.fit_temperature 在独立验证集拟合 T 写入。
+calibration:
+  param_file: "checkpoints/calibration.json"
 
 gatekeeper:
+  # 审计命中后的处置模式(主开关):
+  #   soft(默认,交付值) — 命中只作 flag 写进 result.json,诊断照常输出;
+  #   hard              — 去重/篡改命中即 REJECTED,不输出任何诊断字段。
+  # 默认 soft 的依据:2026-07-28 官方赛前动员会明确赛道七豁免全部医保安全考核,
+  # 总分 = 临床诊断得分 Sclin × 100,gatekeeper 零计分贡献;且"真实病例被误判为
+  # 伪造,诊断结果仍参与目标三四五计分"(前提是必须先输出诊断)。故硬拒绝已成
+  # 纯负期望——拒对零收益,误拒一次白丢该病例全部临床得分。hard 仅供回归测试与
+  # 未来规则变化时启用(非法值一律降级 soft,见 gatekeeper_runner.resolve_enforcement_mode)。
+  #
+  # ⚠️ 本项与下方 `bag_hard_reject` 是**两把独立的锁**,只切一把不会生效:
+  #   enforcement_mode 决定"硬判据命中后是否 REJECTED";
+  #   bag_hard_reject  决定"BAG 相位命中算不算硬判据"(false 时只进 soft_flags)。
+  # 故 `enforcement_mode: hard` + `bag_hard_reject: false` 下,BAG 命中**仍不拒绝**——
+  # 想让 BAG 真正参与拒绝,两处都要切。切换时务必同时确认另一处。
+  enforcement_mode: soft
   fpr_threshold: 0.01
   precision_threshold: 0.98
   phash_threshold: 1        # Hamming distance limit
-  cosine_threshold: 0.995   # Cosine similarity limit for deep features
-  faiss_dim: 512            # ResNet18 feature dimension
+  # 余弦近重复阈值,按激活后端分别取值(单一标量无法同时服务两后端):
+  #   sscd 0.86     — SSCD 描述符对裁切/水印/色调偏移近似不变,0.86 治近重复漏检
+  #                   (官方 README 给 0.75@90%精度,取更严的 0.86 压误报);
+  #   resnet18 0.995 — 降级后端守一票否决红线「宁可漏检不可误杀真实影像」,故调严。
+  cosine_threshold:
+    sscd: 0.86
+    resnet18: 0.995
+  faiss_dim: 512            # 描述符维度(SSCD/ResNet18 均 512;实际以后端实测维度建索引)
+  # sscd_weights:           # 可选,显式指定 SSCD TorchScript 路径;缺省自动探测 checkpoints/
+  # catnet_weights:         # 可选,CAT-Net v2 TorchScript 路径;缺省探测 checkpoints/catnet_v2.torchscript.pt
+                            #   缺失则降级 dct-bag(纯 NumPy 块伪影栅格取证),detect() 仍含几何检测器并集
+  # BAG 相位取证是否作硬拒绝。默认 false(仅软 flag,进 result.json 的
+  # gatekeeper.soft_flags)——BAG 阈值仅经 8 个合成种子小样本验证,远小于
+  # copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门:官方真实干净
+  # JPG holdout 上预注册、带置信区间的 FPR 验收达标
+  # (统一软flag制度,见 docs/P2红线修复实施计划.md B3)。
+  #
+  # ⚠️ 与上方 `enforcement_mode` 是**两把独立的锁**:本项只决定"BAG 命中算不算
+  # 硬判据",即使置 true,也还要 `enforcement_mode: hard` 才会真的 REJECTED。
+  # 反之 `enforcement_mode: hard` 单独切换不会让 BAG 参与拒绝。切一处前先看另一处。
+  # 注:copy_move/splice 无对应开关——二者**恒为软判据**(真实图误报 27.3%),
+  # 无论两把锁怎么切都只进 soft_flags,不驱动 would_reject_in_hard_mode。
+  bag_hard_reject: false
   tamper_threshold: 0.5
 
 model:

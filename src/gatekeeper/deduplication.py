@@ -10,6 +10,9 @@ def compute_dhash(img_np, hash_size=8):
     Computes difference hash (dHash) for fast image similarity screening.
     Resizes image to (hash_size + 1) x hash_size, then compares horizontal gradients.
     """
+    if img_np.ndim == 3:
+        code = cv2.COLOR_BGRA2GRAY if img_np.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+        img_np = cv2.cvtColor(img_np, code)
     resized = cv2.resize(img_np, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
     # Compare left and right pixels
     diff = resized[:, 1:] > resized[:, :-1]
@@ -31,45 +34,118 @@ def hamming_distance(hash1, hash2):
     bin2 = bin(int(hash2, 16))[2:].zfill(64)
     return sum(b1 != b2 for b1, b2 in zip(bin1, bin2))
 
+# SSCD 离线 TorchScript 权重的候选路径(任一存在即启用 SSCD 后端)。
+# 来源:facebookresearch/sscd-copy-detection,Apache-2.0/MIT,95MB,512 维 GeM。
+# 比赛交付为商用离线容器,SSCD 协议合规;权重需赛前手动下载放入 checkpoints/。
+_SSCD_WEIGHT_CANDIDATES = (
+    os.path.join("checkpoints", "sscd_disc_mixup.torchscript.pt"),
+    os.path.expanduser("~/.cache/torch/hub/checkpoints/sscd_disc_mixup.torchscript.pt"),
+)
+
+
+def _find_sscd_weights(explicit_path=None):
+    """返回首个存在的 SSCD 权重路径,均不存在返回 None(触发 ResNet18 降级)。"""
+    candidates = ([explicit_path] if explicit_path else []) + list(_SSCD_WEIGHT_CANDIDATES)
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
 class FeatureExtractor:
-    """Extracts deep features from images using a pre-trained ResNet18."""
-    def __init__(self, device='cpu'):
+    """可插拔深度描述符提取器。
+
+    优先 SSCD(近重复检测 SOTA,对 ≤80% 局部裁切/水印/色调偏移近似不变);
+    SSCD TorchScript 权重缺失时**降级** torchvision ResNet18(行为与历史一致,
+    保证离线无权重环境下测试与推理不破)。两后端均输出 512 维 L2 归一向量,
+    与 FAISS `IndexFlatIP(512)` 及余弦判据完全兼容。
+    """
+
+    # 各后端推荐的余弦近重复阈值(Deduplicator cosine_threshold=None 时自适应取用)。
+    # SSCD 0.86:官方 README 给 0.75(90% 精度),本项目取更严的 0.86 以贴合医保
+    #   一票否决红线「宁可漏检不可误杀真实影像」(阈值越高→误报越少)。
+    # ResNet18 0.95:类默认;生产 config 另以 0.995 进一步调严(见 thyroid_config.yaml)。
+    _RECOMMENDED_COSINE = {"sscd": 0.86, "resnet18": 0.95}
+
+    def __init__(self, device='cpu', sscd_weights=None):
         self.device = device
-        # Use torchvision ResNet18 pre-trained on ImageNet
-        self.model = models.resnet18(pretrained=False)
-        local_weights = os.path.expanduser("~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth")
-        if os.path.exists(local_weights):
-            self.model.load_state_dict(torch.load(local_weights, map_location='cpu'))
+        sscd_path = _find_sscd_weights(sscd_weights)
+
+        if sscd_path is not None:
+            # SSCD: 自带 GeM 池化,TorchScript 直接 jit.load,零外部框架依赖
+            self.backend_name = "sscd"
+            self.model = torch.jit.load(sscd_path, map_location=device)
+            self.model.eval()
+            resize = 288  # SSCD disc 官方推荐输入边长
         else:
-            self.model = models.resnet18(pretrained=True)
-        # Remove the classification head (fc layer)
-        self.model.fc = torch.nn.Identity()
-        self.model.to(device)
-        self.model.eval()
-        
+            # 降级:torchvision ResNet18(ImageNet),去分类头取 512 维 pooled 特征
+            self.backend_name = "resnet18"
+            self.model = models.resnet18(pretrained=False)
+            local_weights = os.path.expanduser(
+                "~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth"
+            )
+            if os.path.exists(local_weights):
+                # weights_only=True:纯张量 state_dict,torch≥2.6 下安全加载(拒绝
+                # 任意代码执行)且消除 FutureWarning;旧版 torch 同样支持该参数。
+                self.model.load_state_dict(
+                    torch.load(local_weights, map_location='cpu', weights_only=True))
+            else:
+                # 2026-07-11 修复(v1→v2,v1 曾直接 raise 挡掉整个联网尝试,结果把 CI/开发
+                # 机等本身有网络的环境也一并堵死——这些环境本不需要预置本地缓存,联网下载
+                # 本来就能成功,是本项目自己的回归,已用真实 CI 跑红复现锁定,详见
+                # git log 里 v1 commit 的教训)。
+                # 真正要防的不是"这次没有本地缓存"，而是"离线交付容器场景(答疑Q26禁联网)
+                # 下联网尝试失败/挂起"——两者的正确处理不同:CI/开发机应该让 pretrained=True
+                # 照常联网下载成功;只有当联网这一步本身失败(DNS解析失败/连接被拒/超时等)
+                # 才需要转成清晰的 RuntimeError,而不是任由原始网络异常类型裸传播,或者
+                # (更糟)完全不给联网尝试的机会就一刀切拒绝。
+                try:
+                    self.model = models.resnet18(pretrained=True)
+                except Exception as e:
+                    raise RuntimeError(
+                        "[FATAL] Deduplicator resnet18 降级后端权重缺失且联网下载失败: "
+                        f"{local_weights} 不存在,尝试 torchvision pretrained=True 联网"
+                        f"下载时报错({type(e).__name__}: {e})。若在离线交付容器场景"
+                        "(答疑Q26禁联网)下触发,说明打包流程漏了预置"
+                        "resnet18-f37072fd.pth——去重是 gatekeeper 一票否决链路的一环,"
+                        "不能在权重链路完全断裂且联网也失败时继续静默运行。"
+                        "请确认打包流程已把权重放入 ~/.cache/torch/hub/checkpoints/,"
+                        "或修复 SSCD 主后端权重缺失(sscd_weights 缺失是本次降级到 "
+                        "resnet18 的根因)。"
+                    ) from e
+            self.model.fc = torch.nn.Identity()
+            self.model.to(device)
+            self.model.eval()
+            resize = 224
+
+        self.recommended_cosine_threshold = self._RECOMMENDED_COSINE[self.backend_name]
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((224, 224)),
+            transforms.Resize((resize, resize)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225]
             )
         ])
-        
+        # Fail-fast 输出维度探测(reviewer 必修2):跑一次 dummy 前向实测描述符维度。
+        # 防止误传非 512 维 SSCD 权重(如 disc_large=1024)时,FAISS 晚抛错或
+        # NumPy 回退路径静默算出错误相似度。Deduplicator 据此动态建索引,不再硬编码。
+        self.feat_dim = int(self.extract(np.zeros((64, 64), dtype=np.uint8)).shape[0])
+
     def extract(self, img_np):
-        # Convert grayscale to RGB for ResNet
+        # 灰度超声补成 RGB(两后端均吃 3 通道 ImageNet 归一化输入)
         if len(img_np.shape) == 2:
             img_rgb = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
         else:
             img_rgb = img_np
-            
+
         tensor = self.transform(img_rgb).unsqueeze(0).to(self.device)
         with torch.no_grad():
             feat = self.model(tensor)
-            feat = feat.squeeze(0).cpu().numpy()
-            
-        # L2 Normalize feature vector
+            feat = feat.squeeze(0).cpu().numpy().reshape(-1)
+
+        # L2 归一化 → 内积即余弦相似度
         norm = np.linalg.norm(feat)
         if norm > 0:
             feat = feat / norm
@@ -78,13 +154,28 @@ class FeatureExtractor:
 class Deduplicator:
     """
     Main deduplication module.
-    Performs fast dHash screening first, then verifies using cosine similarity of ResNet embeddings.
-    Supports FAISS with standard NumPy fallback.
+    Performs fast dHash screening first, then verifies using cosine similarity of deep embeddings.
+    特征后端可插拔(SSCD 优先,降级 ResNet18);均为 512 维,支持 FAISS / NumPy 双路。
     """
-    def __init__(self, device='cpu', phash_threshold=5, cosine_threshold=0.95):
+    def __init__(self, device='cpu', phash_threshold=5, cosine_threshold=None,
+                 sscd_weights=None):
         self.phash_threshold = phash_threshold
-        self.cosine_threshold = cosine_threshold
-        self.extractor = FeatureExtractor(device=device)
+        self.extractor = FeatureExtractor(device=device, sscd_weights=sscd_weights)
+        # 阈值解析(按激活后端选值,守红线):
+        #   None         → 取后端推荐(SSCD 0.86 / ResNet18 0.95);
+        #   dict         → 按 backend_name 取值(如 {sscd:0.86, resnet18:0.995}),
+        #                  缺失键回退后端推荐。单一标量无法同时服务两后端——SSCD 与
+        #                  ResNet18 相似度分布不同(SSCD 治近重复漏检需 0.86,ResNet18
+        #                  守一票否决红线「宁可漏检不可误杀」需 0.995),故支持映射;
+        #   标量(float)  → 尊重调用方,两后端同值(向后兼容旧 config 硬编码阈值)。
+        backend = self.extractor.backend_name
+        if cosine_threshold is None:
+            self.cosine_threshold = self.extractor.recommended_cosine_threshold
+        elif isinstance(cosine_threshold, dict):
+            self.cosine_threshold = float(cosine_threshold.get(
+                backend, self.extractor.recommended_cosine_threshold))
+        else:
+            self.cosine_threshold = float(cosine_threshold)
         
         # In-memory database of hashes and embeddings
         self.hashes = []      # list of dHash strings
@@ -94,8 +185,8 @@ class Deduplicator:
         try:
             import faiss
             self.use_faiss = True
-            # ResNet18 output dimension is 512
-            self.index = faiss.IndexFlatIP(512)
+            # 用后端实测描述符维度(SSCD/ResNet18 均 512;防误传 1024 维权重静默错算)
+            self.index = faiss.IndexFlatIP(self.extractor.feat_dim)
         except ImportError:
             self.use_faiss = False
             

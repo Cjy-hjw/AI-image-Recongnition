@@ -2,7 +2,9 @@
 
 from src.inference.io import load_input_image
 from src.inference.model_runner import build_model, preprocess_image, run_forward
-from src.inference.postprocess import decode_predictions, build_tirads_breakdown
+from src.inference.postprocess import (
+    decode_predictions, build_tirads_breakdown, build_probability_export)
+from src.inference.calibration import TemperatureScaler
 from src.inference.export import (
     save_prediction_artifacts,
     save_rejection_json,
@@ -16,6 +18,8 @@ __all__ = [
     "run_forward",
     "decode_predictions",
     "build_tirads_breakdown",
+    "build_probability_export",
+    "TemperatureScaler",
     "save_prediction_artifacts",
     "save_rejection_json",
     "save_gradcam_overlay",

@@ -27,6 +27,12 @@
 
 生成可打印的临床报告文本,包含患者信息、各维度预测、TI-RADS 分级及恶性概率。
 
+- **硬校验(2026-07-10 Gate2审查修复,此前该文件零测试覆盖)**：
+  1. `calculate_tirads_points` 对 comp/echo/shape/margin/foci 各 idx 越界一律 `raise ValueError`（不再 `.get(idx,("未知",0))` 静默按0分处理）。实测案例:margin_idx=5(非法,应为2分档)此前被静默记0分,总分从真值3(TR3,~4.8%风险,建议穿刺)算成1(TR2,~1.5%风险,无需处置)——静默跨越了临床处置决策边界。`FOCI_MAP.get(i)` 此前唯独缺默认值,foci_probs 若>4维会在越界处直接 `TypeError` 崩溃,现同样归入越界硬校验。
+  2. `generate_report` 对 `malignancy_prob=None/nan/inf` 一律 `raise ValueError`。此前 `nan >= 0.5` 在 Python 里恒为 `False`,会**无任何报错**地打印"良性倾向"——本该判"无效/不确定"的情形被静默判成良性,是癌症筛查场景的假阴性风险。
+  3. 两处硬校验均依赖 `predict.py`/`video_predict.py` 的外层 `except Exception` 转 `ERROR` result.json 兜底(为此同步把 `predict.py` 的 gatekeeper 审计也纳入了 try 包裹范围)。
+  4. 测试见 `tests/test_report_generator.py`(13个用例,覆盖评分表边界/越界idx/NaN/None/inf)。评分表本身(COMPOSITION/ECHOGENICITY/SHAPE/MARGIN/FOCI 映射 + TR1-5 分级区间)经核对与 ACR TI-RADS 白皮书(2017)完全一致,不是bug来源。
+
 ---
 
 ## 2. Grad-CAM (`grad_cam.py`)

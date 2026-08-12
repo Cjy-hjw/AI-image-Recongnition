@@ -2,8 +2,8 @@ from typing import TypedDict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import timm
+from src.models.blocks import ConvBlock, TaskAlignmentAdaptor
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
 from src.models.pretrained_loader import load_local_safetensors
@@ -32,62 +32,6 @@ class ModelOutputs(TypedDict):
     spin_l1: torch.Tensor
 
 
-class ConvBlock(nn.Module):
-    """Basic double convolution block for U-Net style decoder."""
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class TaskAlignmentAdaptor(nn.Module):
-    def __init__(self, seg_in_channels, cls_in_channels):
-        super().__init__()
-        self.channel_projector = nn.Sequential(
-            nn.Conv2d(seg_in_channels, cls_in_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(cls_in_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.attention_generator = nn.Sequential(
-            nn.Conv2d(
-                cls_in_channels,
-                cls_in_channels,
-                kernel_size=3,
-                padding=1,
-                groups=cls_in_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(cls_in_channels),
-            nn.Sigmoid(),
-        )
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, f_seg_detached, f_cls):
-        if f_seg_detached.shape[-2:] != f_cls.shape[-2:]:
-            f_seg_detached = F.interpolate(
-                f_seg_detached,
-                size=f_cls.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        f_seg_detached = f_seg_detached.float()
-        f_cls_float = f_cls.float()
-        projected = self.channel_projector(f_seg_detached)
-        attention_mask = self.attention_generator(projected)
-        out = f_cls_float + self.gamma * (f_cls_float * attention_mask)
-        return out.to(dtype=f_cls.dtype)
-
-
 class MultiTaskThyroidModel(nn.Module):
     """
     基于双分支特征解耦与可微物理先验注入的2D甲状腺超声多任务一体化诊断系统
@@ -110,7 +54,15 @@ class MultiTaskThyroidModel(nn.Module):
         "adaptor_stage4",
     )
 
-    def __init__(self, backbone_name="efficientnet_b2", pretrained=True, config=None):
+    def __init__(
+        self,
+        backbone_name="efficientnet_b2",
+        pretrained=True,
+        config=None,
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+    ):
         super().__init__()
 
         self.img_size = 512
@@ -156,6 +108,21 @@ class MultiTaskThyroidModel(nn.Module):
                 "checkpoints/efficientnet_b2_pretrained.safetensors",
                 stem_key="conv_stem.weight",
             )
+
+        # LoRA 注入：在预训练权重加载完成后，替换目标 1x1 Conv2d 层
+        if use_lora:
+            from src.models.lora_utils import apply_lora
+            n_cls = apply_lora(self.cls_backbone, r=lora_r, alpha=lora_alpha)
+            n_seg = apply_lora(self.seg_backbone, r=lora_r, alpha=lora_alpha)
+            print(f"--> LoRA 注入: cls_backbone {n_cls} 层, seg_backbone {n_seg} 层 (r={lora_r}, alpha={lora_alpha})")
+            # 冻结所有参数（含 LoRA A/B）：模型以"LoRA 未激活"状态构建，
+            # 训练脚本在 FT 阶段显式解冻 lora_A/lora_B（见 train_thyroidxl.py）。
+            # 若不冻结 LoRA 参数，LP 阶段它们不在 optimizer 内、梯度永不清零，
+            # 会跨 batch 累积直至数值溢出（§1.1 教训：LP/FT 参数集合必须与 requires_grad 严格对齐）。
+            for p in self.cls_backbone.parameters():
+                p.requires_grad = False
+            for p in self.seg_backbone.parameters():
+                p.requires_grad = False
 
         seg_channels = list(self.seg_backbone.feature_info.channels())
         self.seg_stage_channels = seg_channels

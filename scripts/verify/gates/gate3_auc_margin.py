@@ -44,6 +44,30 @@ def gate3_auc_margin(model, criterion, x, targets):
         ).abs().sum() > 0, (
             "Dual parameter 'alpha' was not updated by the optimizer step."
         )
+
+        # 2026-08-11 R6 sibling fix (#119): DIRECTION assertion on the minimax polarity,
+        # not just "alpha changed". The old gate only checked |Δalpha|>0, the same
+        # weak-assertion class that let FAMO's sign bug survive. Verify the dual mechanism
+        # directly with a controlled gradient: step_dual_variable("pre") MUST flip the
+        # gradient sign so AdamW (a minimizer) ends up MAXIMIZing alpha. Using a controlled
+        # probe avoids fragility from the random dummy model (whose mean_neg-mean_pos could
+        # clamp alpha back to 0 and give a false direction failure).
+        from src.models.losses.classification import AUCMLossApprox
+
+        probe = AUCMLossApprox()
+        probe.alpha.grad = torch.tensor([1.0])
+        probe.step_dual_variable("pre")
+        assert probe.alpha.grad.item() < 0, (
+            "AUCM dual polarity reversed: step_dual_variable('pre') must FLIP the alpha "
+            f"gradient sign for maximization (fed +1.0, got {probe.alpha.grad.item():+.3f})."
+        )
+        with torch.no_grad():
+            probe.alpha.fill_(-0.5)
+        probe.step_dual_variable("post")
+        assert probe.alpha.item() >= 0.0, (
+            "AUCM dual constraint violated: step_dual_variable('post') must clamp alpha "
+            f"to [0, inf) (got {probe.alpha.item():+.3f})."
+        )
         # Rule 3.3: Verify BatchNorm freezing logic for stage transition safety
         # Simulate stage 2 freeze using current train.py logic
         for name, param in model.named_parameters():

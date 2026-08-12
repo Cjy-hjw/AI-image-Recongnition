@@ -6,22 +6,100 @@ import torch
 from src.utils.report_generator import calculate_tirads_points
 
 
-def decode_predictions(outputs: dict) -> dict:
+class NonFiniteProbabilityError(ValueError):
+    """概率含 NaN/Inf 的专用异常(`ValueError` 子类)。
+
+    独立子类的理由:`video_predict.py` 逐帧循环只应把「这一帧数值异常、丢帧不丢
+    整段」的错当可跳帧信号,但 `ValueError` 这个**类型名**本身太宽——`cv2.resize`
+    对 0 尺寸/单像素畸形帧抛 `cv2.error`、numpy 在 exotic dtype 帧上也抛
+    `ValueError`,这些按 QA_VP §1.7 属「输入/解码故障」应整段 ERROR,不该被逐帧
+    兜底吞成"少几帧 PASSED"。入口层 `except NonFiniteProbabilityError` 即可精确
+    区分「概率无效(可丢帧)」与「其它 ValueError(故障,须冒泡)」。
+    """
+
+
+def decode_predictions(outputs: dict, calibrator=None) -> dict:
     """Extract all prediction fields from raw model outputs.
+
+    Args:
+        outputs: 原始模型输出(各头 logits)。
+        calibrator: 可选 `TemperatureScaler`。每个分类头在 softmax/sigmoid **之前**
+            先经 `calibrator.apply(task, logits)` 做温度缩放。为 None 或全 T=1.0 时
+            **无任何行为变化**(逐位等同无校准)。argmax 预测类别不受 T 影响。
 
     Returns dict with keys:
         pred_mask, mask_binary, comp_idx, echo_idx, shape_idx, margin_idx,
-        foci_prob, mal_prob
+        comp_prob, echo_prob, shape_prob, margin_prob, foci_prob,
+        mal_prob, mal_probs
+
+    `*_prob` 为各头**完整概率分布**(softmax 头和为 1;foci 为多标签 sigmoid,不求和),
+    `mal_probs` 为良恶性二类分布 `[p_benign, p_malignant]`。官方硬约束"所有分类/分级/
+    分型任务必须输出功率分布或置信度,否则计0分"(赛前动员会 2026-07-28),概率必须
+    随 `*_idx` 一并导出到 result.json,不得只留 argmax。
     """
-    pred_mask = torch.sigmoid(outputs["mask"].float())[0, 0].cpu().numpy()
+    def _cal(task, logits):
+        return calibrator.apply(task, logits) if calibrator is not None else logits
+
+    def _assert_finite(task, prob):
+        """概率含 NaN/Inf 即硬报错,拒绝导出"看起来正常"的无效分布。
+
+        两个后果都不可接受(2026-07-29 /code-review 实测复现):
+        ① `torch.argmax` 对全 NaN 向量**静默返回 0** —— logits=[0.2, nan, 1.5, -0.3]
+           时真实最大值在 idx=2,却报 idx=0,报告会打印一个错误的 TI-RADS 分项;
+        ② `json.dumps` 把 NaN 写成字面量 `NaN`,这是 **非标准 JSON**,严格解析器
+           (Go/Rust/Jackson 默认)会拒绝**整个** result.json —— 等于该样本零输出,
+           比预测错更严重。
+        与 `report_generator.generate_report` 对 malignancy_prob 的既定处置同范式
+        (硬拦截、交上层 except 转 ERROR),但覆盖面扩到全部分类头——generate_report
+        只校验恶性标量,管不到四个概念头。**2026-07-30 起连 mask 也罩**(sigmoid 后):
+        NaN logits 经 sigmoid 得 NaN,`(NaN > 0.5)` 恒 False 会静默产出全零分割图,
+        而 status=PASSED、报告正常——比报错更隐蔽,评测只看 JSON 察觉不到分割已废。
+
+        校验的是**激活后的概率**而非输入 logits:`-inf` 经 softmax/sigmoid 得 0,
+        分布仍有限、仍和为 1(数学含义即"该类概率为 0"),属合法输出不该拦。
+
+        抛 `NonFiniteProbabilityError`(`ValueError` 子类):视频逐帧循环靠这个**专属
+        类型**区分「概率无效可丢帧」与「其它 ValueError 是故障须冒泡」——若抛基类
+        ValueError,cv2/numpy 在畸形帧上抛的同类型异常会被误当可丢帧吞掉。
+        """
+        if not torch.isfinite(prob).all():
+            raise NonFiniteProbabilityError(
+                f"decode_predictions: {task} 概率含 NaN/Inf(logits 数值异常或权重损坏)"
+                f"——拒绝导出无效分布(argmax 会静默返回 0,NaN 还会写出非标准 JSON)"
+            )
+        return prob
+
+    def _softmax_head(task, logits):
+        """→ (完整概率向量 np.ndarray, argmax 索引 int)。
+
+        argmax 取自概率向量而非 logits:softmax 严格单调,二者等价,少一次前向。
+        """
+        prob = _assert_finite(task, torch.softmax(_cal(task, logits.float()), dim=1)[0])
+        return prob.cpu().numpy(), int(torch.argmax(prob).item())
+
+    # mask 为分割,不走温度缩放(分割校准是另一套,本期不碰)。
+    # 但 NaN 校验不能省:分类头有 `_assert_finite` 硬拦,mask 若漏拦,NaN logits
+    # 经 sigmoid 得 NaN → `(NaN > 0.5)` 恒 False → **静默产出全零分割图**,而
+    # status=PASSED、报告正常——人工/评测只看 JSON 完全察觉不到分割已废(比报错更
+    # 隐蔽)。故对激活后的 pred_mask 同样硬拦,交上层处置(单图 ERROR / 视频丢帧)。
+    pred_mask = torch.sigmoid(outputs["mask"].float())[0, 0]
+    _assert_finite("mask", pred_mask)
+    pred_mask = pred_mask.cpu().numpy()
     mask_binary = (pred_mask > 0.5).astype(np.uint8) * 255
 
-    comp_idx = torch.argmax(outputs["composition"], dim=1)[0].item()
-    echo_idx = torch.argmax(outputs["echogenicity"], dim=1)[0].item()
-    shape_idx = torch.argmax(outputs["shape"], dim=1)[0].item()
-    margin_idx = torch.argmax(outputs["margin"], dim=1)[0].item()
-    foci_prob = torch.sigmoid(outputs["foci"])[0].cpu().numpy()
-    mal_prob = torch.softmax(outputs["malignancy"].float(), dim=1)[0, 1].item()
+    # argmax 对温度缩放不变(T>0 单调),保留校准以与概率刻度一致、便于上层取置信度。
+    # 各头统一 .float():AMP fp16 下温度除法 logits/T 在半精度有舍入损失,先升 fp32 再缩放/softmax,
+    # 与 malignancy 的精度路径对齐(reviewer 建议),不改 argmax 结果。
+    comp_prob, comp_idx = _softmax_head("composition", outputs["composition"])
+    echo_prob, echo_idx = _softmax_head("echogenicity", outputs["echogenicity"])
+    shape_prob, shape_idx = _softmax_head("shape", outputs["shape"])
+    margin_prob, margin_idx = _softmax_head("margin", outputs["margin"])
+    foci_prob = _assert_finite(
+        "foci", torch.sigmoid(_cal("foci", outputs["foci"].float()))[0]).cpu().numpy()
+    mal_probs = _assert_finite(
+        "malignancy",
+        torch.softmax(_cal("malignancy", outputs["malignancy"].float()), dim=1)[0]).cpu().numpy()
+    mal_prob = float(mal_probs[1])
 
     return {
         "pred_mask": pred_mask,
@@ -30,8 +108,13 @@ def decode_predictions(outputs: dict) -> dict:
         "echo_idx": echo_idx,
         "shape_idx": shape_idx,
         "margin_idx": margin_idx,
+        "comp_prob": comp_prob,
+        "echo_prob": echo_prob,
+        "shape_prob": shape_prob,
+        "margin_prob": margin_prob,
         "foci_prob": foci_prob,
         "mal_prob": mal_prob,
+        "mal_probs": mal_probs,
     }
 
 
@@ -40,3 +123,33 @@ def build_tirads_breakdown(comp_idx, echo_idx, shape_idx, margin_idx, foci_prob)
     return calculate_tirads_points(
         comp_idx, echo_idx, shape_idx, margin_idx, foci_prob
     )
+
+
+def build_probability_export(preds: dict) -> dict:
+    """把 `decode_predictions` 的概率字段整成 JSON 可序列化的导出结构。
+
+    官方硬约束(赛前动员会 2026-07-28):"所有分类/分级/分型任务必须输出功率分布或
+    置信度,否则计0分"。静态图(`predict.py`)与动态图(`video_predict.py`)共用本函数,
+    保证两条链路的 result.json schema 完全一致——新增维度只需改这一处。
+
+    类别顺序即索引顺序,与 `src/utils/report_generator.py` 的 `COMPOSITION_MAP` /
+    `ECHOGENICITY_MAP` / `SHAPE_MAP` / `MARGIN_MAP` / `FOCI_MAP` 的键严格对应。
+    `composition`/`echogenicity`/`shape`/`margin` 为 softmax 分布(和为 1);
+    `foci` 是**多标签 sigmoid**,各元素独立、不求和。
+    """
+    return {
+        "concept_probabilities": {
+            "composition": preds["comp_prob"].tolist(),
+            "echogenicity": preds["echo_prob"].tolist(),
+            "shape": preds["shape_prob"].tolist(),
+            "margin": preds["margin_prob"].tolist(),
+            "foci": preds["foci_prob"].tolist(),
+        },
+        "concept_predicted_index": {
+            "composition": preds["comp_idx"],
+            "echogenicity": preds["echo_idx"],
+            "shape": preds["shape_idx"],
+            "margin": preds["margin_idx"],
+        },
+        "malignancy_probabilities": preds["mal_probs"].tolist(),
+    }

@@ -1,11 +1,14 @@
 import os
 import argparse
+import random
+
 import yaml
+import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from src.dataset.loader import ThyroidDataset
+from src.dataset.loader import ThyroidDataset, MultiSourceThyroidDataset
 from src.dataset.augmentation import get_train_transforms
 from src.models.multi_task_model import MultiTaskThyroidModel
 from src.models.loss import MultiTaskLoss
@@ -15,6 +18,20 @@ from src.training import (
     validate_epoch,
     train_authenticity_classifier,
 )
+
+
+def _seed_worker(worker_id):
+    """DataLoader worker 子进程的 RNG 播种(可复现四件套之③)。
+
+    主进程的 `torch.manual_seed` **管不住 worker 子进程里 numpy/random 的 RNG**,
+    而 7 个随机增强(albumentations)正是跑在 worker 里、用的正是 `random`/`numpy`
+    —— 不设这个 hook,只播主进程的种子,训练照样不可复现。
+    PyTorch 已为每个 worker 播好 torch RNG(base_seed + worker_id),
+    这里只补 numpy / random 两路。
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def main():
@@ -27,36 +44,163 @@ def main():
         action="store_true",
         help="Skip authenticity classifier training when weights exist",
     )
+    parser.add_argument(
+        "--mix-thyroidxl",
+        type=str,
+        default=None,
+        metavar="THYROIDXL_SEG_DIR",
+        help="启用 TN3K + ThyroidXL 分割混训(补 A0 证实的跨域失效,见 docs/项目现状总纲 §6)。"
+             "值 = format_thyroidxl.py 产出的 data/thyroidxl_seg 目录。"
+             "不传则维持纯 TN3K 单源(默认,不破坏现有行为)。",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="换取逐位可复现:关 cudnn.benchmark、开 cudnn.deterministic(速度下降)。"
+             "做归因消融/训练对拍时才需要;常规训练不传(seed 已保证数据顺序与增强可复现)。",
+    )
     args = parser.parse_args()
 
-    with open(args.config, "r") as f:
+    with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    # ── 可复现性四件套(2026-08-11 补)──────────────────────────────────────────
+    # 此前 `configs/thyroid_config.yaml` 的 `environment.seed: 42` **从未被任何代码
+    # 读取**:全局 RNG / 加权采样器 / 7 个随机增强 / mixup 全都无种子,同一条命令跑
+    # 两次结果不同。后果不是"不够优雅"而是**训练对拍与消融实验不可信** —— 2026-08-11
+    # Stage2 崩塌复盘时,正因单 epoch 结果不可复现、组间差异会被噪声吞掉,才放弃了
+    # 分离 lr / 物理耦合各自贡献的归因消融。
+    # 四件套缺一不可,**只设 ①② 仍然不可复现**(③ 是最容易漏的那件):
+    #   ① 全局 RNG(下方)  ② sampler generator  ③ DataLoader worker_init_fn  ④ cudnn 取舍
+    seed = int(config["environment"].get("seed", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # ② 采样与 DataLoader 各用**独立** generator,不共用一个对象。
+    #    两者消费 RNG 的用途不同:sampler 的 generator 喂 `torch.multinomial`(决定抽哪些样本),
+    #    DataLoader 的 generator 用来派生各 worker 的 base_seed。共用一个对象虽然仍然确定性,
+    #    但会把两条流交错在同一 RNG 状态上——改个 `num_workers` 就能连带改变采样序列,
+    #    是很脆的隐式耦合。分开后各自独立、互不影响。
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(seed)
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(seed + 1)
 
     device = torch.device(
         config["environment"]["device"] if torch.cuda.is_available() else "cpu"
     )
     print(f"Training on device: {device}")
-    torch.backends.cudnn.benchmark = True
+    # ④ cudnn 取舍:`benchmark`(自动选最快卷积算法)与 `deterministic` 互斥,必须二选一。
+    #    默认保持 benchmark=True —— 速度优先,且 seed 已让数据顺序/增强/权重初始化可复现,
+    #    cudnn 的非确定性只影响卷积算法层面的浮点尾数,不会改变训练走向。
+    #    需要逐位复现(归因消融、对拍实验)时传 --deterministic。
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        print(f"[可复现] seed={seed} · cudnn.deterministic=True(牺牲速度换逐位复现)")
+    else:
+        torch.backends.cudnn.benchmark = True
+        print(f"[可复现] seed={seed} · cudnn.benchmark=True(默认,速度优先)")
     torch.set_float32_matmul_precision("high")
 
-    train_dataset = ThyroidDataset(
-        data_dir=config["data"]["train_path"],
-        img_size=config["data"]["img_size"],
-        transform=get_train_transforms(),
-    )
+    # ── 训练数据源:纯 TN3K(默认) 或 TN3K+ThyroidXL 混训(--mix-thyroidxl)──────────
+    # 混训动机(A0 零训练实测):TN3K 分割主干单域过拟合,跨域 ThyroidXL 仅 18% Dice。
+    # 契约红线(sonnet 对抗审):
+    #   ① TN3K 源级 label_mask 屏蔽 5 概念+malignancy(概念是 mask 反推伪标签 split_tn3k.py),
+    #      仅留 mask:1——否则伪标签当真监督污染概念头。
+    #   ② ThyroidXL 源级补 5 概念=0 双保险(逐样本 meta 已写全,源级再兜底防漏键落 loader 默认1);
+    #      mask/malignancy 用 format_thyroidxl.py 逐样本 meta 真值(无 mask 样本 valid_mask=0 零梯度)。
+    #   ③ 采样器 num_samples=len(mds)、replacement=True——用默认 shuffle 会完全无视 ratio
+    #      (两源等概率),num_samples 取更小值则 XL 每样本抽中次数进一步跌破 0.48,配比意图落空。
+    #      注意 XL 在当前配置下本就 ≈0.48 次/epoch(见下方采样器处的完整算式),这是设计值
+    #      不是缺陷——靠 replacement 抽样让每 epoch 见到约 3760 张*不同*跨域图。
+    train_transform = get_train_transforms()
+    if args.mix_thyroidxl is not None:  # 空串/坏路径进此分支,由下方空源 raise 兜住,不静默落回纯 TN3K
+        _tn3k_src = {
+            "name": "tn3k", "path": config["data"]["train_path"],
+            "label_mask": {"malignancy": 0, "composition": 0, "echogenicity": 0,
+                           "shape": 0, "margin": 0, "foci": 0, "mask": 1},
+            "ratio": 1.0,
+        }
+        _xl_src = {
+            "name": "thyroidxl", "path": os.path.join(args.mix_thyroidxl, "train"),
+            "label_mask": {"composition": 0, "echogenicity": 0, "shape": 0,
+                           "margin": 0, "foci": 0},  # mask/malignancy 用逐样本 meta 真值
+            "ratio": 0.6,
+        }
+        train_dataset = MultiSourceThyroidDataset(
+            sources=[_tn3k_src, _xl_src],
+            img_size=config["data"]["img_size"], transform=train_transform,
+        )
+        _n_tn = len(train_dataset.datasets[0])
+        _n_xl = len(train_dataset.datasets[1])
+        # 中4(Gate2):空源静默降级红线——ThyroidDataset 对不存在/空目录只跳过(loader.py:25),
+        # MultiSource 对空源 per_sample_w=0,sampler 不崩但 XL 权重全 0 → 实际纯 TN3K,
+        # 配比意图静默落空(print 仍报 62.5:37.5)。混训必须两源都非空,否则显式拒绝。
+        if _n_tn == 0 or _n_xl == 0:
+            raise RuntimeError(
+                f"[混训] 数据源为空(TN3K={_n_tn} ThyroidXL={_n_xl}):核对 "
+                f"--mix-thyroidxl={args.mix_thyroidxl!r}(应含 train/ 子目录,先跑 "
+                f"scripts/data/format_thyroidxl.py 生成)与 config train_path。"
+                "拒绝静默降级为纯 TN3K。")
+        print(f"[混训] TN3K={_n_tn} + ThyroidXL={_n_xl} = {len(train_dataset)} "
+              f"(抽样占比≈62.5%:37.5%,补 A0 证实的跨域失效)")
+    else:
+        train_dataset = ThyroidDataset(
+            data_dir=config["data"]["train_path"],
+            img_size=config["data"]["img_size"],
+            transform=train_transform,
+        )
+    # val 严格纯 TN3K(高4 护栏):TN3K val Dice 是「混训毁没毁主域」的唯一探针,
+    # 绝不混 ThyroidXL 稀释退化信号;epoch10 熔断 + 早停据此天然守护 TN3K 98%。
     val_dataset = ThyroidDataset(
         data_dir=config["data"]["val_path"], img_size=config["data"]["img_size"]
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["data"]["batch_size"],
-        shuffle=True,
-        num_workers=config["environment"]["num_workers"],
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
+    # 混训用 WeightedRandomSampler(按源 ratio 配比),与 shuffle 互斥(同传 PyTorch 报错)。
+    if args.mix_thyroidxl is not None:  # 与上方数据集分支判据一致(空串已被空源 raise 拦截)
+        _sampler = WeightedRandomSampler(
+            train_dataset.get_sample_weights(),
+            # num_samples=len(mds):按源权重质量(TN3K 1.0 : XL 0.6)抽样。
+            # 期望抽中次数 = num_samples × w_i / Σw,其中 w_i = ratio/n、Σw = Σratio = 1.6。
+            # 生产配比(TN3K n=2742 / ThyroidXL n=9882)下:
+            #   TN3K 每样本 ≈ 2.88 次/epoch、ThyroidXL 每样本 ≈ 0.48 次/epoch(比值 6.0);
+            #   XL 每 epoch 去重可见 ≈ 9882×(1-e^-0.48) ≈ 3760 张不同跨域图。
+            # ⚠️ 原注释写的 "1.2 / 0.8 次、去重 4700 张" 是算错的(漏除 Σw=1.6),2026-08-11 修正。
+            # 别与下方 print 的 62.5%:37.5% 混为一谈——那是 *draw 总量分布*(= ratio/Σratio),
+            # 与"每样本抽中次数"不同量纲,那个数一直是对的。
+            # 用 len(mds) 而非更小值:num_samples 过小会让 XL(n≈9882)每样本抽不到 0.5 次。
+            # 数值锁定见 tests/test_stage_schedule.py::test_mixtrain_production_ratio_numbers
+            num_samples=len(train_dataset),
+            replacement=True,
+            generator=sampler_generator,  # ② 采样序列可复现(WeightedRandomSampler 内部
+                                          #    用它喂 torch.multinomial,已实测同 seed 逐 epoch 一致)
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["data"]["batch_size"],
+            sampler=_sampler,
+            num_workers=config["environment"]["num_workers"],
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+            worker_init_fn=_seed_worker,  # ③ worker 子进程的 numpy/random(增强用的就是它们)
+            generator=loader_generator,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["data"]["batch_size"],
+            shuffle=True,
+            num_workers=config["environment"]["num_workers"],
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+            worker_init_fn=_seed_worker,  # ③ 同上(shuffle 顺序由下面的 generator 定)
+            generator=loader_generator,
+        )
+    # val 不打乱、无随机增强,但 worker 里仍可能有随机源,一并播种保持一致。
     val_loader = DataLoader(
         val_dataset,
         batch_size=config["data"]["batch_size"],
@@ -65,6 +209,7 @@ def main():
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
+        worker_init_fn=_seed_worker,
     )
 
     print(
@@ -120,6 +265,15 @@ def main():
             ts = torch.load(state_path, map_location=device)
             criterion.load_state_dict(ts["criterion"])
             criterion.famo.load_state_dict(ts["famo"])
+            # 2026-08-11 R6: FAMO 方向已修复(见 src/models/famo.py),旧 checkpoint 的
+            # w_logits 是"反方向"产物(给强任务加权),语义颠倒不可继承。强制重置为均权重
+            # 从零重启调度——旧 best=0.5653 那批本就是错方向产物,不值得继承。
+            criterion.famo.w_logits = torch.zeros(criterion.famo.num_tasks)
+            criterion.famo.prev_loss = torch.zeros(criterion.famo.num_tasks)
+            print(
+                "--> [R6] FAMO w_logits/prev_loss reset to zero "
+                "(direction fix invalidates old reversed logits)."
+            )
             best_val_score = ts.get("best_val_score", best_val_score)
             print(
                 f"--> Restored training state from epoch {ts.get('epoch')} "

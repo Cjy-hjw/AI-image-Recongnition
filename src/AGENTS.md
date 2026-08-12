@@ -9,7 +9,7 @@
 | `src/gatekeeper/` | Image authenticity verification (inference-time) | `authenticity.py`, `deduplication.py`, `tampering.py` |
 | `src/utils/` | Visualization, report generation, Grad-CAM | `report_generator.py`, `grad_cam.py` |
 | `src/training/` | Training loop, stage management | `trainer.py`, `stages.py`, `loop/`, `authenticity_trainer.py` |
-| `src/models/` | Neural network architectures & losses | `multi_task_model.py`, `pretrained_loader.py`, `physical_prior.py`, `cbm_head.py`, `losses/` | See `src/models/AGENTS.md` |
+| `src/models/` | Neural network architectures & losses | `multi_task_model.py`, `blocks.py`, `heads/`, `pretrained_loader.py`, `physical_prior.py`, `cbm_head.py`, `losses/` | See `src/models/AGENTS.md` |
 
 **Rule**: New functionality MUST go into the appropriate package. Do NOT create monolithic files spanning multiple domains. Target: no file > 300 lines, no function > 3 domains.
 
@@ -23,13 +23,13 @@
 
 | File | Responsibility |
 |:---|:---|
-| `io.py` | `load_input_image()` — DICOM PHI anonymization (5 fields) + standard image loading |
-| `gatekeeper_runner.py` | `run_gatekeeper_audit()` — 4-layer gatekeeper (auth + dedup + copy-move + splicing). **predict.py only** |
+| `io.py` | `load_input_image()` — DICOM PHI anonymization (21 PHI fields, HIPAA Safe Harbor) + standard image loading |
+| `gatekeeper_runner.py` | `run_gatekeeper_audit()` — **3 阶段** gatekeeper（auth → dedup → tamper；copy-move/splice 为 CatNet `detect()` 内部子判据，非独立层），返回 `(passed, audit: dict)`；`resolve_enforcement_mode()` 读 `gatekeeper.enforcement_mode`（默认/交付 `soft`：命中只 flag、诊断照出；`hard` 才 REJECTED）。predict.py 单图 + video_predict.py 动态图 |
 | `model_runner.py` | `build_model()`, `preprocess_image()`, `run_forward()` — `torch.inference_mode()` + autocast + clamp [-15,15] |
 | `postprocess.py` | `decode_predictions()`, `build_tirads_breakdown()` |
 | `export.py` | `save_prediction_artifacts()`, `save_rejection_json()`, `save_gradcam_overlay()`, `maybe_save_gradcam()`(predict/video 共用) |
 
-**Gatekeeper scope**: Runs in `predict.py` only. `evaluate.py` MUST NOT import from `gatekeeper_runner.py`.
+**Gatekeeper scope**: Runs in `predict.py`(单图) 和 `video_predict.py`(动态图). `evaluate.py` MUST NOT import from `gatekeeper_runner.py`.
 
 ---
 

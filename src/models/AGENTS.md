@@ -7,12 +7,17 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | File / Package | Responsibility | Max Scope |
 |:---|:---|:---|
 | `physical_prior.py` | Differentiable physical feature extraction (AR, ER, Circularity) | ~160 lines |
-| `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~190 lines |
-| `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor, decoder, stage freeze registry) | ~300 lines |
+| `cbm_head.py` | Concept Embedding Model head + vCLUB estimator | ~209 lines |
+| `multi_task_model.py` | Model assembly hub (ConvNeXt-Nano + EfficientNet-B2 dual-backbone, adaptor 装配, decoder, stage freeze registry)。ConvBlock/TaskAlignmentAdaptor 已外移至 `blocks.py`（re-export 保后兼容） | ~260 lines |
+| `blocks.py` | 可复用 nn 块：`ConvBlock`（U-Net double-conv 解码块）+ `TaskAlignmentAdaptor`（分割→分类单向软注意力，`.detach()` 契约 + gamma 零初始化见 §1.1 / Gate 8） | ~67 lines |
+| `heads/` | 官方新增三维度增量诊断头子包（Plan v2 阶段2 填充：位置/侵犯/临床T，见 `docs/训练实现计划.md`）。当前为骨架，`heads/__init__.py` 记接入接口现状 + re-export 新头类 | scaffold |
+| `mil_pooling.py` | 门控注意力多示例学习(Gated-Attention MIL)——患者级良恶性弱标签聚合:`SpatialAttentionModule`(保留 backbone `forward_features()` 空间判别性,不用 GAP 稀释微钙化等高频特征) + `GatedAttentionPooling`。仅供 `scripts/pretrain_malignancy_mil.py` 训练管线使用,不在 `MultiTaskThyroidModel` 主推理路径。见 `memory/patient-leakage-and-probe-trap.md` | ~255 lines |
 | `losses/` | Decomposed loss function subpackage | See below |
-| `loss.py` | Backward-compatible re-export shim (DO NOT add new code here) | ~35 lines |
-| `famo.py` | FAMO dynamic loss weight scheduler | ~50 lines |
+| `loss.py` | loss.py 为纯 re-export shim，新损失函数统一写入 losses/ 对应子模块 | ~35 lines |
+| `famo.py` | FAMO dynamic loss weight scheduler | ~85 lines |
 | `pretrained_loader.py` | `load_local_safetensors()` — offline backbone weight loader (ConvNeXt seg + EfficientNet cls) | ~36 lines |
+| `lora_utils.py` | `LoRAConv2d`(1x1 conv 低秩包装) + `apply_lora`/`get_lora_params`/`disable_lora` — LP-FT-LoRA 微调用 | ~140 lines |
+| `physical_prior.py` 的 `x_coords`/`y_coords` buffer | **2026-07-10 修复**：`torch.meshgrid` 返回的 0-stride 广播视图直接 `register_buffer` 会导致*任何* checkpoint 的 `load_state_dict()` 崩溃（PyTorch 检测目标 tensor 内存别名），已加 `.contiguous()` 修复。此 bug 与 LoRA 无关，早于且独立于下面的 LoRA 部署问题，是 `predict.py`/`evaluate.py` 此前从未能真正加载训练权重的根因之一，详见 `memory/`（如已生成）或 `src/inference/AGENTS.md` §3。 | — |
 
 ### losses/ Subpackage Structure
 
@@ -22,7 +27,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `losses/segmentation.py` | `DiceLoss` |
 | `losses/classification.py` | `AUCMLossApprox`, `SupervisedContrastiveLoss` |
 | `losses/concepts.py` | `symmetric_label_regression_loss`, `symmetric_label_regression_loss_bce` |
-| `losses/multitask.py` | `MultiTaskLoss` orchestrator (~144 lines) |
+| `losses/multitask.py` | `MultiTaskLoss` orchestrator (~183 lines) |
 
 ### losses/components/ Subpackage (MultiTaskLoss decomposition)
 
@@ -33,15 +38,19 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `components/concepts.py` | `resolve_mix_params(outputs, mix_info)`, `compute_concept_losses(outputs, targets, lam, index, mask_weight, label_smoothing, tirads_matrix)` |
 | `components/malignancy.py` | `compute_malignancy_losses(mal_loss_fn, supcon_loss_fn, outputs, targets, mask_weight, slr_weights)` |
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |
-| `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` |
+| `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` — 拉格朗日约束 g=loss_l2-delta_budget≤0。参数方向:grad=λ·grad(loss_l2),λ>0 恒成立故残差恒被往小推,约束满足(g≤0)只减量级不翻转方向;乘子 `λ←λ+η·g` 违反加压/满足松绑(2026-08-11 #120 核实为误报,方向正确,见文件内注释) |
 
-**Rule**: New loss functions MUST go into the appropriate `losses/` submodule or `losses/components/` file, NOT into `loss.py` or `multitask.py` directly. `loss.py` is a shim only.
+**Rule**: 新损失函数放入 losses/ 子模块或 losses/components/ 文件，由 multitask.py 调用。`loss.py` is a shim only.
 
 ---
 
 ## 1. HETEROGENEOUS DUAL-BACKBONE ARCHITECTURE (Decoupled)
 
 Stage freeze registry: `MultiTaskThyroidModel.STAGE3_FROZEN_PREFIXES`, `STAGE1_FROZEN_CBM_SUBMODULES`, plus `set_training_stage(stage)` / `is_param_trainable(name, stage)`.
+
+**LoRA 微调路径（`use_lora=True`，LP-FT-LoRA 训练用，见 `scripts/train_thyroidxl.py`）**：`__init__` 里 `apply_lora` 注入后，**双主干全部参数（含 LoRA A/B）默认 `requires_grad=False`**——模型以"LoRA 未激活"状态构建。LP 阶段只训任务头；FT 阶段由训练脚本显式解冻 `lora_A`/`lora_B` 并 `add_param_group`。**关键教训**：LoRA 参数若默认可训练但不在 optimizer 内，其梯度跨 batch 永不清零、累积至溢出（`§1.1` requires_grad 必须与 optimizer 参数集合严格对齐）。`is_param_trainable`/`set_training_stage` 是 LoRA-blind 的（不识别 `lora_` 前缀），仅供 `train.py` 的非 LoRA 三阶段管道用；**不可对 `use_lora=True` 模型调用 `set_training_stage`**，否则会解冻被冻结的原始骨干权重。
+
+**LoRA 部署解耦（`disable_lora`/`merge_weights`，2026-07-10 起正式接线）**：推理侧（`src/inference/model_runner.py` 的 `build_model()`）**永远不感知 LoRA**——训练产出的 LoRA 结构 checkpoint 必须先用 `scripts/merge_lora_checkpoint.py`（内部调用 `disable_lora`）把 `lora_A`/`lora_B` 数学合并回原始 Conv2d（`merged.weight = base.weight + (lora_B @ lora_A) * scale`），产出裸 `state_dict` 才能喂给 `build_model()`。**数值稳定性教训**：合并本身在单层测试下数值等价（fp32 下 diff~1e-7），但若 backbone 存在退化 BatchNorm（`running_var` 接近 0，常见于冻结 backbone 训练时忘记调用 `set_frozen_modules_eval()` 导致 running stats 漂移，见 `src/training/AGENTS.md` GradScaler Protocol 节），LoRA 双路计算与合并单路计算之间的 fp32 舍入误差会被逐层放大，可致最终分类头输出相对误差达 70%~1000%+（本质是 checkpoint 本身数值病态，非合并逻辑错误——已用"同一合并模型 CPU vs GPU 对拍"排除法定位）。**merge 脚本本身不做数值防护**（不 clamp running_var、不改 eps），保持合并是忠实恒等变换；数值病态必须在训练阶段用 BN 冻结修复，不能在合并脚本里掩盖。
 
 Offline pretrained weights: `src/models/pretrained_loader.py` (`load_local_safetensors`) loads `checkpoints/convnext_nano_pretrained.safetensors` (seg) and `checkpoints/efficientnet_b2_pretrained.safetensors` (cls).
 
@@ -51,9 +60,14 @@ To eliminate representation competition between high-frequency segmentation and 
 
 ### 1.1 Task-Alignment Adaptor (Soft Attention Gating)
 Because the classification branch loses spatial priors after decoupling, segmentation features must be injected back as soft attention.
-- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2).
+- **Injection Nodes**: Mid-to-high level layers (Stage 3 and Stage 4 of EfficientNet-B2), adaptor 调用在 `multi_task_model.py:204,207`(`_forward_cls_backbone`);类定义在 `blocks.py`。
 - **Unidirectional Flow**: `f_seg` MUST be `.detach()`ed before passing to the Adaptor to prevent classification error gradients from corrupting the segmentation backbone's weights.
 - **Fusion Equation**: `f_cls_enhanced = f_cls + gamma * (f_cls * W_align)`, where `W_align` is generated via spatial interpolation, 1x1 channel projection, and 3x3 depthwise convolution + Sigmoid. `gamma` is a learnable scalar initialized to 0.
+- **Gate 8 验证(`scripts/verify/gates/gate8_adaptor_isolation.py`,2026-07-11 新增)**:上述"MUST `.detach()`"契约此前只有实现、没有 Gate 量化验证——`gate2_vclub` 走的是 vCLUB 局部图(不经过 adaptor)、`gate3_auc_margin`/`gate6_stage1_masking` 都测不到这条通路(具体原因见 `QA_VP.md` §1.1 与该 Gate 源码注释)。Gate 8 用 `loss_mal.backward()` + 断言 `seg_backbone` 梯度精确为 `0.0`(非 `<1e-7` 容差)量化验证该契约,并在 Gate 内部主动做了两处必要的前置状态复位(**这两处都是本 Gate 存在的核心原因,删了会退化成永远通过的伪 Gate**):
+    1. **requires_grad 复位**:`gate3_auc_margin` 的 Rule 3.3 会把 `seg_backbone.requires_grad` 显式设 False 留在共享 `model` 实例上,若不复位为 True,即使 `.detach()` 被误删,`seg_backbone` 也不会收到梯度(requires_grad=False 直接短路 autograd),会把"假冻结"误判成"detach 生效"。
+    2. **gamma 强制非零**:`gamma` 初始化为 `nn.Parameter(torch.zeros(1))`(零初始化残差门控)。全新构造的模型(`verify_model.py` 每次都新建 `pretrained=False` 的 model)gamma 恒为 0,此时注入项 `gamma*(f_cls*mask)` 数值上恒为 0,无论 `.detach()` 是否还在,雅可比都被 gamma=0 这个乘法因子清零——已用脚本对拍实测:gamma=0 时故意删掉 detach,`seg_backbone` 梯度依然精确为 0.0。因此 Gate 内部会先把 gamma 手动拨到 1.0(测完再原样恢复),让注入通路数值上真正激活,负面测试(误删 detach)才能被真正捕捉到(实测 `abs().sum()≈6094`)。
+    - 另需用 `gamma_prior=0.0` 消除 `cbm_head` 里 `e_prior`(物理先验,经 `soft_mask←seg_backbone` 非 detach 路径,是设计内的合法耦合)对 `loss_mal` 的贡献,否则会把这条无关合法通路误判为泄漏(实测 `gamma_prior=1.0` 默认值下 `seg_backbone` 梯度 `abs().sum()≈14.2`,与 detach 是否失效完全无关)。
+    - 回归测试:`tests/test_gate8_adaptor_isolation.py`(正面:真实代码通过;负面:monkeypatch `torch.Tensor.detach` 为恒等函数模拟误删,断言 Gate 能检测到并返回 False)。
 
 ---
 
@@ -63,10 +77,16 @@ To ensure that the decoupling penalty $I(z; C)$ successfully regularizes the enc
 
 - **Forward Path Contract** (`cbm_head` returns a keyed `CBMHeadOutput` dataclass, not a positional tuple):
   ```python
-  z_latent_detached = outputs["z_latent"].detach()
-  concept_vector_decouple = model.cbm_head(z_latent_detached).concept_vector.detach()
+  # 复用 model() 前向已产出的 concept_vector（勿二次跑 cbm_head）:
+  #   arg1 = outputs["z_latent"]（保梯度，退耦约束导流回 backbone）
+  #   arg2 = outputs["concept_vector"].detach()（掐断梯度，防标签泄漏）
+  concept_vector_decouple = outputs["concept_vector"].detach()
   vclub_mi_bound = model.vclub(outputs["z_latent"], concept_vector_decouple)
   ```
+  ⚠️ **禁二次 `model.cbm_head(z_latent.detach())`**(审查 S2,2026-08-10):cbm_head
+  前向在 `self.training` 下每次都推进 EMA 熵门 `ema_entropy_tau`,二次前向使其每 step
+  被推进两次(`alpha_gate` 收敛快 2×)且浪费算力。concept_vector 在 e_prior 融合前算出、
+  与 z_latent 是否 detach 无关,复用值逐位等价,再 `.detach()` 即所需退耦向量。
 
 ---
 
@@ -116,6 +136,16 @@ The Lagrangian multiplier `alpha` in `AUCMLossApprox` must be optimized in the m
 - **Stage 1 (Epoch 1-40)**: Handled by `enable_mal_loss=False`, which multiplies `loss_mal` and `loss_supcon` by `0.0` inside `MultiTaskLoss.forward()`.
 - **Stage 3 (Epoch 101-120)**: `update_famo_weights=False` is passed to disable FAMO dynamic weighting.
 
+### FAMO 权重更新方向（2026-08-11 R6 修复）
+
+**目标 =「救最差任务」**：给**改善慢（欠优化）的任务**加更高权重，给改善快（强）任务减权，防止强任务（分割）主干梯度支配共享表征、压垮分类。
+
+- **更新规则（已修复）**：`delta = avg_improvement - improvement` → 改善慢的任务获正 `delta`、权重上升；改善快的任务获负 `delta`、权重下降。
+- **旧（错，勿回退）**：`delta = improvement - avg_improvement` 方向与之相反，构成"马太效应"——给改善快的强任务加权，与"救最差任务"意图完全相反，曾致分割主干强梯度支配共享表征、分类 AUC 退化到 0.51–0.53。
+- **分母 epsilon 1e-4 → 1e-2**：Dice loss 后期衰减到 ~1e-3，旧 1e-4 分母会因 batch 噪声爆炸。
+- **`weighted_loss` 加 `weights.detach()`**：权重是手写调度规则、不参与反传。
+- **方法论定位**：当前实现是**线性启发式**（`I_k ≈ -v_k`），**非原论文**（NeurIPS 2023, Liu et al., arXiv:2306.03792）的对数空间标准 FAMO（`∑z_k·log(L_k)`，对数损失空间 + 对数改进率）。原论文方案 B（对数空间重构）已记 backlog，本次只做了方案 A（修正符号方向）。方向正确性核验与算法重构详见 `reference/FAMO 动态权重更新规则的方向正确性核验与算法重构研究报告.md`。
+
 ---
 
 ## 7b. MASKED TASK-SPECIFIC LOSS(逐样本逐任务有效性掩码)
@@ -150,7 +180,10 @@ The model itself is stateless regarding time. The annealing factor `gamma_prior`
 
 ```python
 # 训练时(train_step.py):epoch 1-20 gamma=0, 21-40 线性升到 1, 41+ gamma=1
-gamma_prior = max(0.0, min(1.0, (epoch - 20) / 20.0))
+# 公式已提取为 src/training/stages.py 的模块级函数(2026-08-11,原内联在 train_batch 里
+# 无法单测);数值锁定见 tests/test_stage_schedule.py::test_gamma_prior_annealing。
+from src.training.stages import compute_gamma_prior
+gamma_prior = compute_gamma_prior(epoch)      # = max(0.0, min(1.0, (epoch - 20) / 20.0))
 outputs = model(images, gamma_prior=gamma_prior)
 
 # 验证时(validate_step.py, Phase B 固定):gamma_prior = 1.0(不再随 epoch 漂移)
@@ -161,6 +194,13 @@ outputs = model(images, gamma_prior=1.0)
 - **训练 Epoch 21-40**: `gamma_prior` linearly increases from 0 to 1
 - **训练 Epoch 41+**: `gamma_prior = 1.0` (full physical prior active)
 - **验证全阶段**: `gamma_prior = 1.0`(Phase B 固定,避免 val 指标随 epoch 漂移)
+
+🔴 **γ 升满的时点与 Stage2 起点紧邻,是 2026-08-11 分割崩塌的四因之一**:γ 在 **epoch 40** 恰好到 1.0,
+而 Stage2 从 **epoch 41** 起同时触发 lr 100 倍跳变 + 全模型解冻 + `enable_mal_loss` 首启。
+物理先验通路(`multi_task_model.py:229` 的 `soft_mask` **有意不 detach**)是 `loss_mal → seg_backbone`
+的唯一非 detach 路径,γ 由 0 到 1 等于把分类损失对分割主干的回传从关到全开——四件事挤在同一个 epoch,
+分割 3 个 epoch 内从 97.71% 塌到 80.6%。详见 `src/training/stages.py` 的
+`compute_gamma_prior` docstring 与 `docs/项目现状总纲.md` §6。**三头训练另建调度时须错开这些时点。**
 
 ---
 

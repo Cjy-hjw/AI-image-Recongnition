@@ -4,8 +4,12 @@ name: CI
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
 
 # 同一分支新 push 取消旧的在跑任务,省额度。
 concurrency:
@@ -26,7 +30,7 @@ jobs:
       - name: Check architecture contracts
         run: lint-imports
 
-  # 铁律 2:Gate 1(verify_model.py 七门)+ 全套 pytest 回归。
+  # 铁律 2:Gate 1(verify_model.py 八门)+ 全套 pytest 回归。
   # 直接跑在交付基镜像内 —— torch 2.1.0 / Python 3.10 / weights_only 默认 False,
   # 与离线推理容器完全一致。避免 GitHub runner 临时拼装的 torch 版本漂移
   # (如 torch≥2.6 翻转 weights_only 默认值)导致测出非交付环境的假故障。
@@ -35,13 +39,312 @@ jobs:
     container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
     steps:
       - uses: actions/checkout@v4
+      - name: Install system deps (file — entrypoint.sh 内容嗅探依赖,与 Dockerfile 保持一致)
+        run: apt-get update && apt-get install -y --no-install-recommends file && rm -rf /var/lib/apt/lists/*
       - name: Install runtime + test deps
         run: |
           # 镜像已自带 torch/torchvision 2.1.0,requirements 里的 torch>=2.1.0 已满足
           # (无 --upgrade,pip 跳过不重装)。faiss-cpu 在 py3.10 有 wheel,正常安装。
           pip install -r requirements.txt
-          pip install pytest
-      - name: Gate 1 - verify_model (7 gates)
+          # pandas/openpyxl 仅 official_loader(训练侧数据加载器,src/dataset)单测需要:
+          # **不进 requirements.txt**——离线推理容器从不 import 该模块(它只被训练脚本用),
+          # 加进容器只会白白变肥,同 paramiko 的处置逻辑(见 requirements.txt 尾注)。
+          # 缺它们时 tests/test_official_loader.py 顶部的 importorskip 会静默 skip 掉 8 个
+          # 用例,CI 从未真验过本会话新增的 official_loader;在此补上让它们真跑。
+          # pandas 封顶 <2.3:2.2.x 有 cp310 manylinux wheel 且兼容 numpy 1.x(requirements
+          # 已锁 numpy<2,torch 2.1.0 C-ABI 要求);不封顶恐被未来 pandas 拖 numpy>=2 上来冲突。
+          pip install pytest "pandas>=2.0,<2.3" "openpyxl>=3.1"
+      - name: Gate 1 - verify_model (8 gates)
         run: python scripts/verify_model.py
       - name: Full pytest regression
         run: pytest -q
+
+  # 铁律 3(2026-08-10 V2.1 改写):真实 `docker build` + 常驻 HTTP 服务冒烟。
+  # 背景:V2.1 容器入口从离线 CLI(entrypoint.sh)切为常驻 HTTP 推理服务
+  # `python -m src.service.app`(uvicorn 监听 8000,/call 收批量目录任务,
+  # /health 供平台探针;见 Dockerfile ENTRYPOINT)。平台探针打 `GET /health`
+  # (30s×3 失败=容器重启),本 job 验证「镜像能 build 出来 + 服务能起 +
+  # /health 返回 200」。跑在 host runner(非容器内 job,ubuntu-latest 自带 docker)。
+  #
+  # 无真实权重(checkpoints/ 未打进镜像,交付走官方平台人工上传通道,见
+  # docs/比赛对齐与风险.md),但服务启动是**惰性**的 —— app.py::main() 调
+  # set_runner(build_service_runner(...)) 只解析路径(见 runner.py
+  # _resolve_runtime_params,不校验文件存在),模型真正构建推迟到首次 /call 的
+  # runner 调用(_ensure_built),故权重缺失时 /health 仍返回 200,**无需挂载
+  # dummy 权重**。预测数值正确性由 test job 的 Gate1-8 + pytest 覆盖。
+  docker-build-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t thyroid-infer:ci-test .
+      - name: Start service container (detached, host 8000 → container 8000)
+        run: |
+          docker run -d --name thyroid-smoke -p 8000:8000 thyroid-infer:ci-test
+          # 马上起探针可能会撞上后台容器尚未 bind 端口,下面轮询已覆盖
+      - name: Poll /health until 200 (timeout 60s)
+        # 平台探针 30s×3 失败即重启容器,故 /health 必须在秒级就绪且极轻。
+        # 这里轮询最多 60s,一旦 200 立即通过;超时则 dump 容器日志定位。
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/health_body.json -w '%{http_code}' http://localhost:8000/health || true)
+            if [ "$code" = "200" ]; then
+              echo "OK: /health 返回 200 (第 ${i}s)"
+              cat /tmp/health_body.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "FAIL: /health 60s 内未返回 200,最后一次 body:"
+          cat /tmp/health_body.json 2>/dev/null || true
+          echo "--- 容器日志 tail ---"
+          docker logs thyroid-smoke 2>&1 | tail -n 50
+          exit 1
+      - name: Assert /health body
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/health_body.json'))
+          assert d.get('status') == 'ok', f'预期 /health status=ok,实际:{d}'
+          print('OK: /health body 校验通过:', d)
+          "
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f thyroid-smoke || true
+
+  # 铁律 3b(entrypoint.sh 分发冒烟,保留为调试旁路):entrypoint.sh 已从生产入口
+  # 降级为本地/CI 单文件调试旁路(见 Dockerfile 注释),其 30 个 dispatch 测试 /
+  # 封印 / 信号转发 / 崩溃兜底仍是已验证资产、有独立价值,故保留整组单文件分发
+  # + 落盘冒烟(容器能按扩展名分发到 predict.py/video_predict.py、异常兜底不崩)。
+  # 本 job 与 docker-build-smoke 各自独立 build 镜像(避免 job 间共享 runner 状态)。
+  #
+  # 2026-08-10 关键修复(此前该 job 从诞生起从未绿过、必挂起):A2 把镜像 ENTRYPOINT
+  # 从 entrypoint.sh(离线 CLI)切成了常驻 HTTP 服务 `python -m src.service.app`。
+  # 若照旧 `docker run image <input>` 直接喂位置参数,该参数会被 uvicorn 忽略 →
+  # 容器起成不退出的 HTTP 服务 → step 挂起 ~23min 被 cancelled(0% 通过率)。
+  # 故每个冒烟步骤都加 `--entrypoint /workspace/scripts/entrypoint.sh` 显式覆盖回
+  # CLI 分发入口,只测 bash 分发/兜底逻辑,不触发生产 HTTP 形态。
+  entrypoint-dispatch-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t thyroid-infer:ci-test .
+      - name: Install host fixture deps (numpy/opencv/pydicom — 供所有合成 fixture 生成)
+        # host runner 不预装 opencv/pydicom;下面各步骤生成的都是喂给容器的输入
+        # fixture(PNG/JPG/DICOM),与容器内推理环境无关。必须在**第一个用 cv2 的
+        # 生成步骤之前**装好,否则 Generate synthetic static image 的 import cv2 会
+        # ModuleNotFoundError(2026-08-11 修复:此前 opencv 装在 DICOM 步骤前、静态
+        # PNG 步骤后,PNG 从 1x1 base64 改用 cv2 生成 64x64 后就撞上了这个顺序坑)。
+        run: pip install numpy opencv-python-headless pydicom
+      - name: Generate synthetic static image (64x64 random noise, real decodable PNG)
+        # 2026-08-10 修复:此前用"1x1 极简 PNG"——cv2.imread 能解码,但 libpng 对
+        # 1x1 报 `IDAT: Extra compressed data`/`Not enough image data`,真实超声图
+        # 不可能 1x1,改用 numpy 生成 64x64 真实随机噪声图(与 JPG 用例同生成逻辑),
+        # 让 predict.py 走到真正的推理而非在图像加载就失败。
+        run: |
+          python3 -c "
+          import numpy as np, cv2
+          arr = (np.random.rand(64, 64) * 255).astype('uint8')
+          cv2.imwrite('/tmp/smoke_input.png', arr)
+          "
+      - name: Smoke test — static image path (predict.py via entrypoint 分发)
+        # R3(2026-08-10)后:authenticity 权重缺失在 build_auth_module 降级 skipped,
+        # 不再硬 ERROR。故预期 status=PASSED(soft 模式、诊断照出),这本身证明
+        # 「容器构建+启动+分发+gatekeeper 降级」全链路走通。
+        run: |
+          mkdir -p /tmp/smoke_out_static
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/smoke_input.png:/workspace/smoke_input.png:ro \
+            -v /tmp/smoke_out_static:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/smoke_input.png
+          echo "--- result.json ---"; cat /tmp/smoke_out_static/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_static/result.json'))
+          # 2026-08-10 R3 起:authenticity 权重缺失在 build_auth_module 降级 skipped,
+          # **不再硬 ERROR**。故静态图预期 status=PASSED(soft,诊断照出)而非旧 ERROR。
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(R3后auth缺失降级,诊断照出),实际:{d}'
+          print('OK: 静态图路径冒烟测试通过')
+          "
+      - name: Generate synthetic cine video (ffmpeg lavfi testsrc,无需外部输入文件)
+        # ubuntu-latest runner 不保证预装 ffmpeg,显式装,勿依赖镜像隐式行为
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -f lavfi -i testsrc=duration=1:size=64x64:rate=5 -y /tmp/smoke_input.mp4
+      - name: Smoke test — dynamic video path (video_predict.py via entrypoint 分发)
+        # --skip_gatekeeper 跳过审计(video_predict.py 独有该flag,predict.py没有);
+        # checkpoints/thyroidxl_merged_v2.pth 缺失时 build_model 降级随机初始化(非硬报错,
+        # 见 src/inference/AGENTS.md),故完整推理链路应能跑完产出 status=PASSED
+        # (预测数值本身无意义,只验证容器机制:分发+完整推理链路+落盘)。
+        run: |
+          mkdir -p /tmp/smoke_out_video
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/smoke_input.mp4:/workspace/smoke_input.mp4:ro \
+            -v /tmp/smoke_out_video:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/smoke_input.mp4 --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_video/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_video/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(random-init模型仍应完整跑完),实际:{d}'
+          print('OK: 动态图路径冒烟测试通过')
+          "
+
+      # ── P1(2026-07-11): 输入覆盖扩容 ────────────────────────────────────
+      # 上面 2 步只测了「标准 PNG + 标准 MP4」，8-1 官方数据格式未知(见
+      # docs/比赛对齐与风险.md「动态图交付格式未知风险」)，此前完全没有真实容器
+      # 验证过 DICOM/边界分辨率/损坏文件这几类同样可能出现的输入。以下 4 步用
+      # scripts/verify/gen_synthetic_dicom.py(同一份生成逻辑被
+      # tests/test_smoke_entrypoints.py::TestDicomInputPaths 本地单测复用)在
+      # host runner 生成真实可被 pydicom.dcmread() 解析的合成 DICOM，经真实容器
+      # 验证不崩溃 —— 与上面 2 步一样，只验证容器机制，不验证预测数值。
+      # (pydicom/numpy/opencv 已在 job 开头 "Install host fixture deps" 统一装好,
+      #  此处不再重复安装;--compressed 分支用 cv2.imencode 生成 JPEG 压缩帧。)
+      - name: Generate synthetic DICOM fixtures (single-frame + multi-frame cine + compressed x2)
+        run: |
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/single.dcm --frames 1 --rows 64 --cols 64
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/cine.dcm --frames 4 --rows 64 --cols 64
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/compressed.dcm --frames 1 --rows 64 --cols 64 --compressed
+          python3 scripts/verify/gen_synthetic_dicom.py --out /tmp/compressed_cine.dcm --frames 4 --rows 64 --cols 64 --compressed
+      - name: Smoke test — DICOM single-frame (entrypoint 按内容嗅探路由到 video_predict.py)
+        # entrypoint.sh 把 .dcm 无条件路由到 video_predict.py(单帧也不例外,
+        # _load_dicom_cine 把 2D pixel_array 包装成 (1,H,W) 当单帧 cine 处理,
+        # 是设计意图非 bug,见 src/inference/video_io.py::_load_dicom_cine)。
+        run: |
+          mkdir -p /tmp/smoke_out_dcm1
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/single.dcm:/workspace/single.dcm:ro \
+            -v /tmp/smoke_out_dcm1:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/single.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm1/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm1/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(单帧DICOM应完整跑完),实际:{d}'
+          print('OK: DICOM 单帧冒烟测试通过')
+          "
+      - name: Smoke test — DICOM multi-frame cine
+        run: |
+          mkdir -p /tmp/smoke_out_dcm4
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/cine.dcm:/workspace/cine.dcm:ro \
+            -v /tmp/smoke_out_dcm4:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/cine.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm4/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm4/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(多帧DICOM cine应完整跑完),实际:{d}'
+          print('OK: DICOM 多帧cine冒烟测试通过')
+          "
+      - name: Smoke test — compressed DICOM (JPEG baseline,容器需 pylibjpeg 解码插件)
+        # 2026-07-11 Opus 战略审查发现的致命缺口:真实超声 DICOM 绝大多数是
+        # JPEG/JPEG2000/RLE 压缩,上面两步的 fixture 都是未压缩 ExplicitVRLittleEndian,
+        # 从未验证过压缩像素数据这条路径——若压缩解码插件缺失,ds.pixel_array 会抛
+        # NotImplementedError(被 _load_dicom_cine 兜成 ERROR 不崩溃,但等于该动态图
+        # 样本 100% 丢失预测)。requirements.txt 已补 pylibjpeg/pylibjpeg-libjpeg,
+        # 这里验证容器内真实解码成功、产出 PASSED(而非降级 ERROR)。
+        run: |
+          mkdir -p /tmp/smoke_out_dcm_compressed
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/compressed.dcm:/workspace/compressed.dcm:ro \
+            -v /tmp/smoke_out_dcm_compressed:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/compressed.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm_compressed/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm_compressed/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(压缩DICOM解码插件应正确解码,若为ERROR说明解压插件缺失或失效),实际:{d}'
+          print('OK: 压缩DICOM冒烟测试通过')
+          "
+      - name: Smoke test — compressed DICOM multi-frame cine (Gate2 review 非阻塞建议补齐:压缩+多帧组合此前未覆盖)
+        run: |
+          mkdir -p /tmp/smoke_out_dcm_compressed_cine
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/compressed_cine.dcm:/workspace/compressed_cine.dcm:ro \
+            -v /tmp/smoke_out_dcm_compressed_cine:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/compressed_cine.dcm --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_dcm_compressed_cine/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_dcm_compressed_cine/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(压缩多帧cine应完整解码跑完),实际:{d}'
+          print('OK: 压缩DICOM多帧cine冒烟测试通过')
+          "
+      - name: Generate synthetic JPG static image (官方确认静态图交付格式是 JPG,此前只测过 PNG)
+        # 2026-07-12 修复：此前用 `run: python3 -c "..."` 单值写法(非 `run: |`
+        # 块标量)，YAML 按 plain scalar 规则把内嵌的多行字符串折叠成一行空格
+        # 分隔，Python 代码整个粘一起变成 IndentationError——与文件里其它
+        # python3 -c 步骤统一用 `run: |` 块标量的写法不一致，这里补齐。
+        run: |
+          python3 -c "
+          import numpy as np, cv2
+          arr = (np.random.rand(64, 64) * 255).astype('uint8')
+          cv2.imwrite('/tmp/smoke_input.jpg', arr)
+          "
+      - name: Smoke test — JPG static image path (predict.py via entrypoint 分发)
+        run: |
+          mkdir -p /tmp/smoke_out_jpg
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/smoke_input.jpg:/workspace/smoke_input.jpg:ro \
+            -v /tmp/smoke_out_jpg:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/smoke_input.jpg
+          echo "--- result.json ---"; cat /tmp/smoke_out_jpg/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_jpg/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(R3后auth缺失降级,同静态PNG用例),实际:{d}'
+          print('OK: JPG 静态图冒烟测试通过')
+          "
+      - name: Smoke test — corrupted non-empty file (predict.py 必须 ERROR 不崩溃)
+        # 与上面标准 PNG 用例区分:这里带合法 PNG 魔数 + IHDR chunk 头(与
+        # tests/test_entrypoint_dispatch.py::_write_png 同款构造 —— `file
+        # --mime-type` 的 magic 库需要看到 IHDR 才会判定 image/png,只有 8 字节
+        # 纯魔数不够,2026-07-11 首次提交只写了纯魔数,entrypoint.sh 内容嗅探判成
+        # unknown、在入口层就被"完全无法识别"分支拦下 exit 1,根本到不了
+        # predict.py,测的是入口层而非本步骤想测的 cv2.imread 失败路径,踩了这个
+        # 坑),IHDR 之后紧跟垃圾字节使其不构成合法 PNG 结构,验证 cv2.imread 解码
+        # 失败路径同样被正确兜住,不裸崩溃、不零输出。"完全无法识别"分支已由
+        # tests/test_entrypoint_dispatch.py::TestContentSniffFallback 覆盖,不重复测。
+        run: |
+          { printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR'; head -c 2048 /dev/urandom; } > /tmp/corrupted.png
+          mkdir -p /tmp/smoke_out_corrupted
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/corrupted.png:/workspace/corrupted.png:ro \
+            -v /tmp/smoke_out_corrupted:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/corrupted.png
+          echo "--- result.json ---"; cat /tmp/smoke_out_corrupted/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_corrupted/result.json'))
+          assert d.get('status') == 'ERROR', f'预期status=ERROR(损坏文件不应被误判成功),实际:{d}'
+          assert d.get('reason'), f'reason不应为空: {d}'
+          print('OK: 损坏文件冒烟测试通过')
+          "
+      - name: Smoke test — extreme low resolution video (4x4)
+        # 验证 resize+模型前向不因极端分辨率崩溃(TaskAlignmentAdaptor 等模块对
+        # 极小特征图维度可能有隐含假设,真实容器实测比读代码猜测更可靠)。
+        run: |
+          ffmpeg -f lavfi -i testsrc=duration=1:size=4x4:rate=5 -y /tmp/tiny.mp4
+          mkdir -p /tmp/smoke_out_tiny
+          docker run --rm \
+            --entrypoint /workspace/scripts/entrypoint.sh \
+            -v /tmp/tiny.mp4:/workspace/tiny.mp4:ro \
+            -v /tmp/smoke_out_tiny:/workspace/data/output \
+            thyroid-infer:ci-test /workspace/tiny.mp4 --skip_gatekeeper
+          echo "--- result.json ---"; cat /tmp/smoke_out_tiny/result.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/smoke_out_tiny/result.json'))
+          assert d.get('status') == 'PASSED', f'预期status=PASSED(极小分辨率仍应完整跑完),实际:{d}'
+          print('OK: 极端低分辨率冒烟测试通过')
+          "

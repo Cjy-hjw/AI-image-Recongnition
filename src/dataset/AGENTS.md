@@ -4,7 +4,7 @@
 
 ### Normalization (current implementation)
 - **实际现状**: `loader.py` 与 `inference/model_runner.py` 均只做 `img / 255.0`,**未应用 mean/std 标准化**。训练与推理预处理一致(都仅 /255),无训练-推理偏移。
-- 若未来引入 mean/std,MUST 静态基于训练集计算(禁止 per-batch 动态归一化,防未来数据泄漏),并同步训练与推理两条路径。
+- 若未来引入 mean/std，归一化统计量（mean/std）静态基于训练集预计算，写入 config 后在 loader 与 model_runner 两处一致读取。
 
 ### Patient ID(每张图独立身份 + 来源前缀,Phase D 已实施)
 - **实际现状**: TN3K 原始数据无患者级元数据。Phase D 已废弃 `PAT_{img_id//2}` 伪分组,改为**纯随机图像级划分**(`_split_samples`),`patient_id = {source}_{image_id}`(tv 前缀=trainval, ho 前缀=holdout,防跨集编号碰撞),train/val 图像级互斥、固定 seed 可复现。holdout 来自 TN3K 独立 `test-image/` 目录,与 train/val 物理隔离,**无泄漏**。
@@ -26,6 +26,18 @@
 - **职责**: 把多个异构数据源(各自 path + 源级 `label_mask` + 采样 `ratio`)拼成单个 `Dataset`,供训练 `DataLoader` 直接消费。
 - **构造**: `MultiSourceThyroidDataset(sources, img_size=256, transform=None)`,`sources` 为 `[{name, path, label_mask, ratio}, ...]`。逐源建 `ThyroidDataset(source_label_mask=label_mask)`,内部 `index_map`(全局 idx → (源序号, 源内 idx))做透明拼接。
 - **按源采样配额**: `get_sample_weights()` 返回逐样本权重 `ratio / n_source`(源内均分该源的目标占比),喂给 `WeightedRandomSampler` 即可让小源不被大源淹没。空源安全(不贡献样本、不崩)。
+
+### 官方数据加载器 `official_loader.py`(Phase 1,2026-08-10)
+
+把官方标注(xlsx + `.dcm`/`.nii.gz` + NIfTI mask)转成与 `ThyroidDataset` **同构**样本 `(img[1,H,W]/255, mask, labels+valid_*)`,无改动接入 `train_step` masked-loss。三件套照 `pathology_dataset.py`:`parse_annotation_xlsx`(pandas 读 `ROI级别` sheet)→ `build_official_samples`(静动分派 + RoiName 对 mask)→ `OfficialThyroidDataset` → `build_official_datasets`(复用 `patient_grouped_split` 防泄漏)。
+
+- **按字段名解析、禁硬编码列号**(各轮列号不一致,`docs/训练数据定稿.md §4.2`);列名候选在 `_FIELD_ALIASES`,**部分列名待真实 xlsx 复核**(数据禁本地,云端/A800 验;字段名式解析→只改 `_FIELD_ALIASES` 即适配)。
+- **masked-loss 判据 = 该临床列是否为空**(空→`valid_{task}=0`、有值→1),逐列逐行,**非**"是否 M 行"(定稿 §2.2:非 M 行 ~13% 也有标注)。
+- **标签常量硬依赖 `prediction_json`**(禁重定义,Plan M3):`location_label_to_index`(数字前缀优先)、`_ETE_LABEL_TO_CODE`(权威 ETE 标签表)。⚠️ **ETE 混写坑 + 未知/阴性串红线(S3,含 /code-review 补强)**:`ete_label_to_code` 只做纯中文精确匹配、不认 `2甲状腺包膜` 数字前缀,且对**任何未知串**都返 1(无)——那是**输出侧**占位策略,训练侧套用会把真侵犯样本当"无侵犯"学。且 `_ETE_LABEL_TO_CODE` 本身含输出侧归并项 `NA/UNK`/`无病灶（阴性）`→码1,**训练侧不能吃全表**。`official_loader._parse_ete_code` 解析优先级:① `阴性`/`无病灶` 显式排除(**优先于数字前缀**,与 S4 阴性→valid=0 一致)→None;② 数字前缀 1..4 即官方码;③ `NA/UNK`→None;④ 规范短标签精确命中 `_ETE_LABEL_TO_CODE` 才返码;⑤ 其余→**None→`valid_extrathy_ext=0`**(masked-loss 跳过)。**@云TODO**:非规范措辞(`无侵犯`/`毗邻软组织侵犯`)当前 safe-drop 到 valid=0(欠采不误标),真实 xlsx 到位须重锁——**禁激进子串匹配**(否定陷阱 `无血管侵犯` 含"血管");digit-prefix 路径覆盖定稿混写常态,是可靠主路。
+- **静动分派**:静态 `{pid}/{SeriesUid}/*.dcm`、动态 `{pid}/{pid}/{pid}.nii.gz`(定稿 §1.11);动态主病灶无 SliceIndex → **从 mask 非零帧定位**,每非零帧一样本(@云TODO:是否覆盖全部非零帧待复核)。
+- 三新维度键(`lesion_loc`/`extrathy_ext`/`clin_t_stage`)**只产出、暂不消费**,消费待 Phase 2 三头 + 损失接线(当前 `train_step` 忽略额外键,无害)。
+- 复用:`io._to_gray`(读 .dcm,不整段调 `load_input_image` 避免 PHI 匿名化写盘)、`nifti_io.load_nifti_frames`(含 (X,Y,Z)↔(H,W) 转置约定,mask 读取也复用勿另抄)。
+- 单测 `tests/test_official_loader.py`(合成 .dcm/.nii.gz/xlsx,8 用例:混写解析/静动分派/清晰帧跳过/输出契约静+动/患者无泄漏/ETE越界+纯中文/阴性位置valid=0/动态无mask跳过;本地 UTF-8 全绿)。
 
 ---
 
@@ -59,3 +71,72 @@
 ### MixUp Target Interpolation Protection
 - AUCM dual variables (`a`, `b`, `alpha`) MUST use **un-interpolated** target arrays.
 - Enforced in `multitask.py` (see `src/models/AGENTS.md` §3).
+
+---
+
+## 3. PHASE 4 新增组件（官方数据前预备）
+
+### JPEG压缩增强 (`augmentation/jpeg_augment.py`) — 抵抗JPG域偏移
+- **背景**: 官方数据采用有损JPG压缩,公开数据多为PNG。调研报告实证PNG→JPG迁移导致25-26%性能崩塌。
+- **实现**:
+  - `JPEGCompressionAugment(prob=0.7, quality_range=(30,95))`: 训练时动态JPEG重压缩,Q~U(30,95),强制网络学习鲁棒特征
+  - `AdaptiveJPEGAugment(stage='early'/'mid'/'late')`: 阶段感知版,early温和(60-95),mid全范围(30-95),late聚焦官方可能区间(40-80)
+  - 集成: `get_train_transforms_with_jpeg(stage, jpeg_prob)`在几何变换后、归一化前插入
+- **使用**: 仅对PNG/DICOM源应用,原生JPG数据（如ThyUS2Path）跳过避免二次退化
+
+### 多源适配器 (`multiset_adapter.py`) — 统一异构标注格式
+- **抽象基类** `ThyroidDatasetAdapter`:
+  - 运行时动态适配原始格式→项目统一接口(image, mask, labels, task_mask)
+  - 子类: `ThyroidXLAdapter`(HF格式,**真实映射已实现**), `ThyUS2PathAdapter`(Figshare JPG,骨架), `StandardAdapter`(项目标准)
+  - 自动生成`task_mask`指示标注可用性
+- **PyTorch包装** `AdaptedThyroidDataset`:
+  - 接受任意Adapter,返回torch Dataset
+  - 与现有`ThyroidDataset`接口兼容,可直接替换
+- **零拷贝**: 保持原始数据不变,仅运行时转换
+- **`ThyroidXLAdapter` 真实 schema(2026-07-10 实测确认,不再是空壳)**:
+  - **train/test 两个 split 标注来源完全不同**,不可混用同一份反查表:
+    - `test/test_annotations.json`(唯一文件,`{"info": {patient_id: {nodule_1: {Conclusion, TIRADS, ...}, images:[...]}}}`)覆盖 test split 全部 2094 张图,739 患者。
+    - `train/labels_orig/{stem}.json` 是**每图独立标注**(`{"label": "actinh"(恶性)/"lanhtinh"(良性), bbox, polygon}`,越南语),覆盖 train split 9538 张图,3353 患者。**patient_id 从文件名首段提取**(`stem.split('_')[0]`)。
+  - 实测 train/test 患者 id 编号体系互斥(0 重叠),`build_dataloaders` 的 GroupKFold 泄漏自检(`assert len(train_pids & val_pids) == 0`)是防线关键位置。
+  - `_load_train_labels` 对未知 label 值(非 actinh/lanhtinh)显式 `continue` 跳过,不产出空 Conclusion 污染样本。
+  - 细粒度概念(composition/echogenicity/shape/margin/foci)ThyroidXL 无此标注,`task_mask` 对应位置固定为 0(声明无效),仅 `malignancy`/`mask` 两任务有效。
+  - **全量 LP-FT-LoRA 训练已跑通管道**(`scripts/train_thyroidxl.py`,9305 train / 2327 val,患者级 GroupKFold fold0)。**⚠️首版 checkpoint(`thyroidxl_best.pth`,训练循环内部报告 patient-AUC≈0.8362)已判定报废**——诊断出 `train_one_epoch` 遗漏 BatchNorm 冻结(`set_frozen_modules_eval`,详见 `src/training/AGENTS.md`),50 epoch 内冻结 backbone 的 BN running stats 持续漂移致数值病态(CPU/GPU 与 LoRA/合并两种等价前向相对误差炸到 70%~1240%),训练循环自报的 AUC 不可复现、不可信。**永久弃用,不再使用 `thyroidxl_best.pth`/`thyroidxl_merged.pth`(首版产物)。**
+  - **✅ 2026-07-10 v2 重训 + 验收通过,当前权威权重**:修复 BN 冻结根因后在 A800 重训,产出 `checkpoints/thyroidxl_best_v2.pth`(LoRA结构,训练循环自报 best patient-AUC=0.8518 @ epoch39)。验收协议全通过:① `merge_lora_checkpoint.py` 合并出 `thyroidxl_merged_v2.pth`;② CPU/GPU 一致性 rel_err_max=4.49e-3(相比首版 70%~1240% 病态,量级级改善,深度 CNN 正常硬件浮点误差范围);③ LoRA-vs-合并一致性 rel_err_max=5.09e-7(机器精度级,合并数学正确);④ 用**真实 `predict.py` 推理链路**(`build_model`+`run_forward`,生产默认 fp16 精度)在同一 val fold0(819 患者,249 阳/570 阴,与 train 患者 0 重叠)重测,**patient-AUC=0.8514**,与训练内部自报值(0.8518)几乎一致,证实该数字可信、可复现。**下游可放心使用 `thyroidxl_merged_v2.pth` 部署。**
+- **拆分待办**: 文件超 `rules.md §6` 上限,ThyroidXLAdapter 已转正式实现,拆分优先级提升(拆为
+  `adapters/{base,thyroidxl,thyus2path}.py` + `adapted_dataset.py`),暂未执行。
+
+### 动态采样器 (`stage_sampler.py`) — 防止小样本遗忘
+- **背景**: 多源样本规模悬殊(99例 vs 17,412帧),均匀采样导致小样本每epoch仅访问1-2次
+- **实现**:
+  - `StageAwareSampler`: Epoch 1-50采样70%大样本+30%小样本(稳定编码器),51+调整为50%-50%(防遗忘)
+  - `ProportionalStageSampler`: 按源配置ratio直接加权采样
+  - 支持过采样(小样本重复)和欠采样(大样本随机子集)
+- **使用**: 配合`MultiSourceThyroidDataset`的`get_sample_weights()`
+
+### PathologyDataset (`pathology_dataset.py`) — 病理良恶性预训练数据集
+
+- **用途**: 官方数据(2026-08-01)到位前,用 ThyUS2Path(figshare 27021604)8500张原生JPG预训 malignancy 分支。
+- **数据形态**: A800 `/home/cjy/AI_image_Recognition/data/27021604_extract/`，batch1(6005 Jpg, 601患者) + batch2(2503 Jpg, 241患者)，患者级 histo_label(0良/1恶)。
+- **关键设计**:
+  - `build_pathology_samples(root)`: **扫目录**而非依赖 image.csv 枚举(batch1 CSV序号跳空约43%，扫目录可用全部磁盘文件)；从文件名首段提取 patient_id；患者级标签广播到图像级。
+  - `patient_grouped_split(samples, val_frac, seed)`: 按 `patient_key` 分组 + 分层(按label)划分 train/val，**同一患者所有图像必须在同侧**，防超声连续帧泄漏。seed 固定可复现。
+  - batch1/batch2 患者编号数值完全重叠(各自从0独立编号)，用 `b1_`/`b2_` 前缀隔离，防误并。
+- **输出接口**: 与 `ThyroidDataset` 完全同构 `(img[1,H,W]f32∈[0,1], mask[1,H,W]全零, labels)`；仅 `valid_malignancy=1`，其余 `valid_*=0`，`valid_mask=0`——下游 masked loss 对无标签任务自动零梯度，可无缝接现有训练循环。
+- **预训练脚本**: `scripts/pretrain_malignancy.py`，单任务CE+AdamW+bf16 AMP(无GradScaler)；按患者分组train/val；默认走ImageNet迁移学习(加载`checkpoints/{efficientnet_b2,convnext_nano}_pretrained.safetensors`，无权重时`--no-pretrained`退回随机初始化)。
+  - **⚠️当前状态(2026-07-07)：预训练未成功，无泄漏 val AUC ≈ 0.50，等于没学到可泛化判别力。** 方案调研中(见 `docs/提示词_malignancy预训练调研.md`)，勿据此 checkpoint 下游微调。
+  - **血泪教训(详见 `memory/patient-leakage-and-probe-trap.md`)**: 曾用随机 KFold 做 linear-probe 得 AUC=0.705，误判"backbone特征好、是CBM头损耗0.18"，遂在分类头上一路瞎改(绕CBM→临时linear_head→BatchNorm→冻结backbone)全是错方向。**对拍实验证实 0.705 是 patient 泄漏虚高**(同患者帧被随机分进train+val)；按患者分组的无泄漏真值仅 **0.5012**。头没问题，是 backbone 没学到东西。对拍脚本 `scripts/data/duipai_probe_vs_head.py`。
+  - **评估铁律**: 患者级标签，所有评估**必须** `patient_grouped_split`/`GroupKFold(patient_id)`，**禁随机KFold**。
+  - **脚本现有开关**: `--freeze-backbone`(LP模式,冻结cls_backbone只训头)；linear_head=`BatchNorm1d(352)+Linear(352,2)`(绕CBM,产物只保backbone)；分层LR(early=lr/8,late=lr*3/8,head=lr*2,默认lr=8e-5)；weight_decay=0.05；早停val_loss patience=7。**注：这些开关已验证无法突破0.50上界——根因在数据/任务(患者级弱标签,单帧未必反映结节良恶性)，非超参。下一步方向:全量FT/自监督/MIL,待调研结论。**
+- **测试覆盖**: `tests/test_pathology_dataset.py`，20个测试(标签广播、列顺序容错、无泄漏、分层、可复现、输出形状/dtype/valid键)，全部 PASS。
+- **MIL 组件** (`src/dataset/pathology_mil_dataset.py`):
+  - `build_patient_bags(samples)` — 把 flat 单帧 samples 按 `patient_key` 聚合成 bag 列表 `[{patient_key, label, img_paths}]`。
+  - `PathologyMILDataset(bags, img_size, transform, max_frames_per_bag=32, random_frames=True)` — `__getitem__` 返回 `(bag[N,1,H,W]f32, label:int, patient_key:str)`；train 随机采样帧、val 固定前 N 帧（可复现）；`patient_class_counts()` 返回患者级计数。
+  - **评估铁律**：MIL 天然患者级——一个 bag 一个预测，AUC 在患者上算，不退回帧级。
+- **MIL 测试覆盖** (`tests/test_pathology_mil_dataset.py`)：13 个测试（bag 聚合/label/顺序/形状/截断/患者级计数/无泄漏/门控注意力/模型前向+冻结）全部 PASS。
+- **MIL 训练进展（截至 2026-07-07）**：
+  - Phase 1（冻结 backbone）：best_patient_val_auc = **0.5653**（epoch 15 早停），当前最优，checkpoint: `checkpoints/malignancy_mil_best.pth`。
+  - Phase 2（LLRD 解冻 backbone）：不稳定，AUC 在 0.46–0.56 震荡，未突破 Phase 1；根因：GAP 预池化 + 弱监督梯度稀疏，解冻后 backbone 灾难性遗忘。
+  - 空间注意力版（SpatialAttentionModule 替代 GAP）：best_auc = **0.5000**（epoch 8 早停），双注意力模块冷启动失败——从零初始化产生噪声权重，弱监督信号无法同时收敛两模块。
+  - **结论（2026-07-10 已用对拍实验证实，不再是猜测）**：`scripts/train_thyus2path_lora.py`（复用 ThyroidXL 上验证过 patient-AUC=0.8514 的同架构 LP-FT-LoRA 管道，改喂 27021604 单帧数据+`patient_grouped_split`，绕开 MIL bag 框架）跑满 50 epoch，best patient-AUC=**0.5531**（FT-LoRA 阶段 train loss 从 0.50 崩到 0.02 严重过拟合，val AUC 全程在 0.45~0.55 震荡，收官 epoch50=0.4998），与 MIL 0.5653、随机猜 0.50 均在噪声范围内。**换了完全不同的训练范式结果仍卡住 → 瓶颈是 27021604 数据本身（患者级标签广播到大量非靶区背景帧），不是 MIL 弱监督框架的问题**。空间注意力/解冻联合训练等架构改造在这份数据上大概率仍无效，无需再投入；等官方精确帧级标注数据（2026-08-01）到位后才值得重新尝试架构层面优化。
+
+**注意**: 以上组件等ThyroidXL/ThyUS2Path数据到位后激活,当前为框架预备。

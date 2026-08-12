@@ -16,13 +16,18 @@ def vclub_learning_step(model, vclub_optimizer, prev_z_latent, prev_concept_vect
 def compute_vclub_mi_bound(model, outputs):
     """
     vCLUB 互信息极小化约束：全程启用，软正交隔离隐表征与属性概念。
-    
-    对输入 cbm_head 的 z_latent 分支进行 detach 计算条件概念向量，并 detach 该向量防止其梯度回传。
-    计算互信息上界时，第一个 z_latent 参数必须保留计算图和梯度，以将退耦约束导流回 encoder (backbone)。
-    """
-    z_latent_detached = outputs["z_latent"].detach()
-    concept_vector_decouple = model.cbm_head(z_latent_detached).concept_vector.detach()
 
-    # 计算互信息上界时，第一个 z_latent 参数必须保留计算图和梯度
+    第一个 z_latent 参数（`outputs["z_latent"]`，保留计算图与梯度）把退耦约束导流回
+    encoder (backbone)；第二个概念向量必须 detach 掐断梯度回传。
+
+    ⚠️ 复用 `model()` 前向已算出的 `outputs["concept_vector"]`，**不再二次跑
+    `model.cbm_head(...)`**（审查 S2）——二次前向会让 cbm_head 内的 EMA 熵门
+    (`ema_entropy_tau`) 每 step 被推进两次（`alpha_gate` 收敛快 2×）且浪费算力。
+    数值等价:concept_vector 在 e_prior 融合之前算出，与 z_latent 是否 detach、
+    e_prior 是否 None 均无关，故复用值与 `cbm_head(z_latent.detach()).concept_vector`
+    逐位相同；再 `.detach()` 即得所需的无梯度退耦向量。
+    """
+    concept_vector_decouple = outputs["concept_vector"].detach()
+
     vclub_mi_bound = model.vclub(outputs["z_latent"], concept_vector_decouple)
     return vclub_mi_bound

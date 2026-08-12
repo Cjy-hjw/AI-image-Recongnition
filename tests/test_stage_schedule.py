@@ -245,10 +245,16 @@ def test_stage_frozen_sets(model_and_criterion):
 
     Stage1:只冻 CBM 直连头(`classifier_direct`/`latent_mlp`),**主干可训**
             —— 勿把"Stage1 = 头 warmup"误读为冻主干。
-    Stage2:全解冻(零冻结)—— 这正是崩塌根因之二。
+    Stage2:除官方三头外全解冻 —— 全解冻这件事正是崩塌根因之二。
     Stage3:冻 `STAGE3_FROZEN_PREFIXES` 全部前缀,只留 CBM 头 + vclub。
+
+    🔴 **官方三头(位置/ETE/临床T)在所有 legacy stage 恒冻结**:它们由
+    `schedule_official.py` 的 A/B/C 调度训练,不搭 stages.py 这条线——后者
+    Stage1→2 边界 lr 100 倍跳变已实测崩分割(见 stages.py docstring)。
+    故下面各 stage 的冻结集合断言都要放行 `OFFICIAL_HEAD_PREFIXES`。
     """
     model, criterion = model_and_criterion
+    head_pfx = MultiTaskThyroidModel.OFFICIAL_HEAD_PREFIXES
 
     # ── Stage 1 ──
     configure_stage_parameters(
@@ -259,20 +265,26 @@ def test_stage_frozen_sets(model_and_criterion):
     assert frozen, "Stage1 至少应冻结 CBM 直连头"
     assert all(
         any(sub in n for sub in MultiTaskThyroidModel.STAGE1_FROZEN_CBM_SUBMODULES)
+        or n.startswith(head_pfx)
         for n in frozen
-    ), f"Stage1 只应冻 {MultiTaskThyroidModel.STAGE1_FROZEN_CBM_SUBMODULES},实冻 {sorted(frozen)[:5]}"
+    ), (
+        f"Stage1 只应冻 {MultiTaskThyroidModel.STAGE1_FROZEN_CBM_SUBMODULES}"
+        f" + 官方三头 {head_pfx},实冻 {sorted(frozen)[:5]}"
+    )
     assert any(n.startswith("seg_backbone") for n in trainable), "Stage1 主干必须可训"
     assert any("vclub" in n for n in trainable), "vclub 在所有阶段恒可训(独立优化器)"
 
-    # ── Stage 2:全解冻 ──
+    # ── Stage 2:除三头外全解冻 ──
     configure_stage_parameters(
         model, criterion, epoch=41, lr_base=LR_BASE, weight_decay=WEIGHT_DECAY
     )
     frozen = {n for n, p in model.named_parameters() if not p.requires_grad}
-    assert not frozen, (
-        f"Stage2 设计上全模型解冻(崩塌根因之二),实有冻结 {sorted(frozen)[:5]}。"
+    assert all(n.startswith(head_pfx) for n in frozen), (
+        f"Stage2 设计上除官方三头外全模型解冻(崩塌根因之二),"
+        f"实有非三头冻结 {sorted(n for n in frozen if not n.startswith(head_pfx))[:5]}。"
         "若你已把它改成 LLRD/部分解冻,请同步 stages.py docstring 与本测试。"
     )
+    assert frozen, "官方三头必须在 legacy Stage2 保持冻结(只由 schedule_official 训)"
 
     # ── Stage 3 ──
     configure_stage_parameters(
@@ -281,7 +293,8 @@ def test_stage_frozen_sets(model_and_criterion):
     frozen = {n for n, p in model.named_parameters() if not p.requires_grad}
     trainable = {n for n, p in model.named_parameters() if p.requires_grad}
     prefixes = MultiTaskThyroidModel.STAGE3_FROZEN_PREFIXES
-    assert all(any(n.startswith(p) for p in prefixes) for n in frozen)
+    assert all(any(n.startswith(p) for p in prefixes) or n.startswith(head_pfx)
+               for n in frozen)
     # 反向:被列进前缀表的参数(vclub 除外)必须真的冻上,防前缀拼写错导致静默不生效
     should_freeze = {
         n

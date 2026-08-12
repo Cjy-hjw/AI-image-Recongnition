@@ -5,6 +5,87 @@ from src.training.loop.slr import compute_slr_weights
 from src.training.loop.vclub import vclub_learning_step, compute_vclub_mi_bound
 from src.training.stages import compute_gamma_prior
 
+# 三头任务名。与 `validate_step._OFFICIAL_HEAD_TASKS` 同一份语义,两侧都只是
+# 遍历顺序,不构成跨模块契约,故各自持有(避免 loop 子模块间横向依赖)。
+_OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage")
+
+
+def build_official_head_targets(labels, mix_info, batch_size, device):
+    """组装官方三头(位置/ETE/临床T)的 targets 片段。三头键缺席 → 返回空 dict。
+
+    提成模块级函数(而非内联在 `train_batch`)是为了可单测:这里的每条规则错了都
+    **不会报错**,只会让指标系统性偏低 —— 正是 `compute_gamma_prior` 当年被提取的
+    同一理由(崩塌复盘时公式内联、无法单测)。测试见
+    `tests/test_train_step_head_targets.py`。
+
+    Args:
+        labels: loader 给的 labels dict(collate 后)。
+        mix_info: `apply_mixup_or_cutmix` 的返回,None 表示本批未混合。
+        batch_size / device: 用于缺键时造默认张量。
+
+    ## 三条规则
+
+    **① 必须在 mixup/cutmix 之后调用**。`apply_mixup_or_cutmix` 原样返回 labels,
+    既有概念任务靠 `lam` 做**软标签混合**(concepts.py),而三头是硬标签 masked CE,
+    没有对应的软化路径。若在 mixup 前组装,图像被混了而位置/ETE/T 标签仍是
+    recipient 的 → 静默错监督、loss 照常降。
+
+    混合后的标签归属按 DR-CutMix 已算好的 `lam` 判定(mixup.py:50-68),不另发明规则:
+      - `lam==0` → 100% 继承 donor(`index` 指向的样本)标签,须 gather;
+      - `lam==1` → 100% 保留 recipient 标签;
+      - 其余(含标准 MixUp 的软 lam)→ 归属不明确,validity 置 0 屏蔽掉。
+    再乘 `mask_weight`(DR-CutMix 判定归属不明或无结节时已置 0)。
+
+    **② validity 走顶层直传键**,不进 `label_validity` —— 后者只被 malignancy.py /
+    concepts.py 消费,三头损失各自接 [B] validity 参数、根本不读它。塞错地方
+    不报错,但 invalid 样本的垃圾标签会当真监督(审查 F2,钉在
+    `tests/test_official_head_losses.py::test_validity_must_be_toplevel_key...`)。
+
+    **③ 🔴 三头只训主病灶**。评审规则原文:「甲状腺外侵犯、主病灶位置、T临床显著性
+    仅对主病灶标注,评估时仅针对匹配成功的主病灶」;总纲 §1 已把"损失加权与验证
+    指标都只按主病灶统计"定为 2.4 接线的显式要求。`official_loader` 对 `病灶N`
+    次病灶也建样本(约 13% 带临床标注),它们的分割/概念监督仍有价值,但三头标签
+    **在官方口径里根本不存在** —— 放进损失等于拿非评分对象训评分头。
+    `is_main` 键缺席(legacy 数据集)时全当主病灶,与接线前行为一致。
+    """
+    out = {}
+    if not any(t in labels for t in _OFFICIAL_HEAD_TASKS):
+        return out
+
+    is_main = labels.get("is_main")
+    if isinstance(is_main, torch.Tensor):
+        main_w = is_main.float().to(device)
+    else:
+        main_w = torch.ones(batch_size, dtype=torch.float32, device=device)
+
+    donor = hard = idx = None
+    if mix_info is not None:
+        lam = mix_info["lam"].to(device)
+        idx = mix_info["index"].to(device)
+        donor = lam == 0.0                      # 继承 donor 标签
+        hard = donor | (lam == 1.0)             # 归属明确(硬继承)才留监督
+        # is_main 跟着标签走:donor 位继承 donor 的主病灶属性,否则会把次病灶
+        # 的标签当主病灶训(标签换了、屏蔽没换)
+        main_w = torch.where(donor, main_w[idx], main_w)
+
+    for task in _OFFICIAL_HEAD_TASKS:
+        if task not in labels:
+            continue
+        y = labels[task].to(device).long()
+        v = labels.get(f"valid_{task}")
+        v = (
+            v.float().to(device)
+            if isinstance(v, torch.Tensor)
+            else torch.ones(batch_size, dtype=torch.float32, device=device)
+        )
+        if mix_info is not None:
+            v = torch.where(donor, v[idx], v)   # donor 样本的 validity 也要跟着换
+            y = torch.where(donor, y[idx], y)
+            v = v * hard.float() * mix_info["mask_weight"].to(device)
+        out[task] = y
+        out[f"valid_{task}"] = v * main_w
+    return out
+
 
 def train_batch(
     model,
@@ -80,6 +161,13 @@ def train_batch(
     # label_validity is NOT mixed — validity flags are batch-level metadata,
     # not feature-space signals. We keep the original batch's validity unchanged.
     # (A mixed sample still has the same label availability as its primary sample.)
+
+    # 官方三头 targets —— **必须在 mixup 之后**,规则与理由见
+    # `build_official_head_targets` docstring(硬标签无软化路径 / validity 顶层直传 /
+    # 只训主病灶)。三头键缺席时返回空 dict → legacy train.py 路径零回归。
+    targets.update(
+        build_official_head_targets(labels, mix_info, images.shape[0], device)
+    )
 
     # vCLUB 独立优化：使用前一批次的 detached 输出，在 autocast 外执行独立 backward
     vclub_learning_step(model, vclub_optimizer, prev_z_latent, prev_concept_vector)

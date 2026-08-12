@@ -76,7 +76,16 @@ def train_epoch(
     return avg_loss, seg_loss / len(loader), mal_loss / len(loader)
 
 
-def validate_epoch(model, loader, criterion, device, epoch=1):
+def validate_epoch(model, loader, criterion, device, epoch=1, official_metrics_out=None):
+    """验证一个 epoch。
+
+    Args:
+        official_metrics_out: 可选 dict。传入时,官方口径指标(病灶级聚合 + 官方筛选)
+            会**原地写入**该 dict,键见 `metrics_official.compute_official_metrics`。
+            为什么用出参而不是加返回值:`train.py:337` 按 5 元组解包本函数,加宽
+            返回值会直接破坏 legacy 训练入口(lane2b 实测该处是唯一调用点)。
+            三头键缺席的数据集(legacy)→ 写入全 None 的指标 dict。
+    """
     model.eval()
     criterion.eval()
     val_loss = 0.0
@@ -86,6 +95,7 @@ def validate_epoch(model, loader, criterion, device, epoch=1):
     total_samples = 0
     all_mal_probs: list[float] = []
     all_mal_targets: list[int] = []
+    official_records: list[dict] = []
 
     from src.training.stages import get_stage_number
 
@@ -101,6 +111,7 @@ def validate_epoch(model, loader, criterion, device, epoch=1):
                 batch_size,
                 mal_probs,
                 mal_targets,
+                batch_records,
             ) = validate_batch(
                 model, images, masks, labels, criterion, device, stage, batch_idx, epoch
             )
@@ -112,6 +123,13 @@ def validate_epoch(model, loader, criterion, device, epoch=1):
             mal_correct += mal_correct_batch
             all_mal_probs.extend(mal_probs.tolist())
             all_mal_targets.extend(mal_targets.tolist())
+            if official_metrics_out is not None:
+                official_records.extend(batch_records)
+
+    if official_metrics_out is not None:
+        from src.training.metrics_official import compute_official_metrics
+
+        official_metrics_out.update(compute_official_metrics(official_records))
 
     avg_loss = val_loss / len(loader)
     avg_loss_l2 = val_loss_l2 / len(loader)

@@ -26,6 +26,7 @@
 import os
 import glob
 import re
+import random
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +34,9 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
+
+# 水平翻转时位置标签的左右置换(单一权威,禁自定义映射)
+from src.models.heads import flip_location_index
 
 # 复用:患者分组切分(防同患者跨集泄漏,rules.md §5 铁律)
 from src.dataset.pathology_dataset import patient_grouped_split
@@ -250,13 +254,20 @@ def _mask_path_for_roi(img_dir: str, roi_name: str) -> Optional[str]:
     return hits[0] if hits else None
 
 
-def _build_labels(rec: Dict, patient_id: str) -> Dict:
+def _build_labels(rec: Dict, patient_id: str, lesion_id: str = "") -> Dict:
     """从一条 ROI record 构造 labels dict(同 ThyroidDataset 键 + 三新维度 + valid_*)。
 
     masked-loss 判据:每个任务的 `valid_{task}` = 该临床列**非空**才 1。空 → 0 + 占位值,
     下游 masked-loss 零梯度(定稿 §2.2:判据是列是否为空,不是是否 M 行)。
+
+    `is_main`/`lesion_id` 供验证侧复现官方评分口径(评审规则:三新维度"仅针对匹配成功的
+    主病灶"评估;动态数据分类指标按**病灶级**汇总、每病灶只贡献一个样本)——只有 labels
+    dict 会随 `__getitem__` 进 batch,加在 sample base 里到不了训练循环。
     """
     labels: Dict = {"patient_id": patient_id}
+    roi = _cell_str(rec.get("roi_name"))
+    labels["is_main"] = int(roi == MAIN_LESION_ROI)
+    labels["lesion_id"] = lesion_id or f"{patient_id}::{roi}"
 
     # 良恶性
     # ⚠️ 审查 S4:"阴性"→良性(0)+valid=1(有效负样本),与位置/ETE 对阴性置 valid=0
@@ -347,7 +358,11 @@ def build_official_samples(
                 continue  # 无对应影像,跳过(定稿:部分检查目录在 ROI 表无对应影像)
 
             mask_path = _mask_path_for_roi(img_dir, roi)
-            labels = _build_labels(rec, pid)
+            # 病灶唯一键:同一病灶的多帧(动态)必须归为一个评测样本。用 mask 路径最稳
+            # (同目录同 roi 唯一);无 mask 时退回 影像目录+roi —— 同患者多序列(静态)
+            # 各有自己的 img_dir,不会互相撞。
+            lesion_id = mask_path or f"{img_dir}::{roi}"
+            labels = _build_labels(rec, pid, lesion_id=lesion_id)
             labels["valid_mask"] = int(mask_path is not None)
             base = {
                 "img_path": img_path,
@@ -425,10 +440,14 @@ class OfficialThyroidDataset(Dataset):
        Phase 4 训练前若成瓶颈再做帧缓存/预抽取。
     """
 
-    def __init__(self, samples: List[Dict], img_size: int = 512, transform=None):
+    def __init__(self, samples: List[Dict], img_size: int = 512, transform=None,
+                 hflip_prob: float = 0.0, seed: Optional[int] = None):
         self.samples = samples
         self.img_size = img_size
         self.transform = transform
+        self.hflip_prob = float(hflip_prob)
+        # 独立 RNG:worker 子进程各自持有,由 train_official.py 的 worker_init_fn 播种。
+        self._rng = random.Random(seed)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -462,13 +481,27 @@ class OfficialThyroidDataset(Dataset):
         if self.transform is not None:
             img, mask = self.transform(img, mask)
 
-        img_t = torch.tensor(img, dtype=torch.float32).unsqueeze(0) / 255.0
-        mask_t = torch.tensor((mask > 0).astype(np.float32), dtype=torch.float32).unsqueeze(0)
         # labels 浅拷贝 + foci 单独 clone:foci 是 _build_labels 建的**共享**零 tensor,
         # 浅拷贝会让多样本/多帧共享同一对象,下游(Phase 2 消费 foci)若原地改会跨样本
         # 污染,故克隆隔离。其余值均为不可变标量,浅拷贝安全。
         labels = dict(s["labels"])
         labels["foci"] = labels["foci"].clone()
+
+        # 水平翻转:必须与位置标签联动。漏了会让位置头学到左右相反的监督,而 loss 照常
+        # 下降(location.py:97-98 的警告)。**在 transform 之后、归一化之前**做,故本类
+        # 的 transform 不得自带 HorizontalFlip(否则翻两次且标签只翻一次)。
+        if self.hflip_prob > 0.0 and self._rng.random() < self.hflip_prob:
+            img = np.ascontiguousarray(img[:, ::-1])
+            mask = np.ascontiguousarray(mask[:, ::-1])
+            if labels.get("valid_lesion_loc", 0) == 1:
+                # flip_location_index 内部 `perm[idx]` 取 idx.device —— python int 直传
+                # 报 AttributeError,必须包成 tensor(0-d 进 0-d 出,取值正确)。
+                labels["lesion_loc"] = int(
+                    flip_location_index(torch.tensor(int(labels["lesion_loc"])))
+                )
+
+        img_t = torch.tensor(img, dtype=torch.float32).unsqueeze(0) / 255.0
+        mask_t = torch.tensor((mask > 0).astype(np.float32), dtype=torch.float32).unsqueeze(0)
         return img_t, mask_t, labels
 
     def _static_mask(self, mask_path: Optional[str]) -> np.ndarray:
@@ -494,16 +527,19 @@ def build_official_datasets(
     seed: int = 42,
     train_transform=None,
     sheet_name: str = "ROI级别",
+    hflip_prob: float = 0.0,
 ) -> Tuple["OfficialThyroidDataset", "OfficialThyroidDataset"]:
     """便捷入口:构样本 → 患者分组切分 → 建 train/val Dataset。返回 (train_ds, val_ds)。
 
     分组切分复用 `patient_grouped_split`(按 patient_key 分组、label 分层),防同患者
-    跨集泄漏(rules.md §5)。val 集不加增强。DataLoader/Sampler 由调用方按训练脚本组装。
+    跨集泄漏(rules.md §5)。val 集不加增强(含 hflip=0:翻转会改位置标签,验证侧必须
+    用原始朝向)。DataLoader/Sampler 由调用方按训练脚本组装。
     """
     samples = build_official_samples(root, xlsx_path, sheet_name)
     if not samples:
         raise RuntimeError(f"未在 {root} + {xlsx_path} 构造出任何样本,检查路径/表头")
     train_s, val_s = patient_grouped_split(samples, val_frac=val_frac, seed=seed)
-    train_ds = OfficialThyroidDataset(train_s, img_size=img_size, transform=train_transform)
+    train_ds = OfficialThyroidDataset(train_s, img_size=img_size, transform=train_transform,
+                                      hflip_prob=hflip_prob, seed=seed)
     val_ds = OfficialThyroidDataset(val_s, img_size=img_size, transform=None)
     return train_ds, val_ds

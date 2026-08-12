@@ -35,9 +35,10 @@
 - **masked-loss 判据 = 该临床列是否为空**(空→`valid_{task}=0`、有值→1),逐列逐行,**非**"是否 M 行"(定稿 §2.2:非 M 行 ~13% 也有标注)。
 - **标签常量硬依赖 `prediction_json`**(禁重定义,Plan M3):`location_label_to_index`(数字前缀优先)、`_ETE_LABEL_TO_CODE`(权威 ETE 标签表)。⚠️ **ETE 混写坑 + 未知/阴性串红线(S3,含 /code-review 补强)**:`ete_label_to_code` 只做纯中文精确匹配、不认 `2甲状腺包膜` 数字前缀,且对**任何未知串**都返 1(无)——那是**输出侧**占位策略,训练侧套用会把真侵犯样本当"无侵犯"学。且 `_ETE_LABEL_TO_CODE` 本身含输出侧归并项 `NA/UNK`/`无病灶（阴性）`→码1,**训练侧不能吃全表**。`official_loader._parse_ete_code` 解析优先级:① `阴性`/`无病灶` 显式排除(**优先于数字前缀**,与 S4 阴性→valid=0 一致)→None;② 数字前缀 1..4 即官方码;③ `NA/UNK`→None;④ 规范短标签精确命中 `_ETE_LABEL_TO_CODE` 才返码;⑤ 其余→**None→`valid_extrathy_ext=0`**(masked-loss 跳过)。**@云TODO**:非规范措辞(`无侵犯`/`毗邻软组织侵犯`)当前 safe-drop 到 valid=0(欠采不误标),真实 xlsx 到位须重锁——**禁激进子串匹配**(否定陷阱 `无血管侵犯` 含"血管");digit-prefix 路径覆盖定稿混写常态,是可靠主路。
 - **静动分派**:静态 `{pid}/{SeriesUid}/*.dcm`、动态 `{pid}/{pid}/{pid}.nii.gz`(定稿 §1.11);动态主病灶无 SliceIndex → **从 mask 非零帧定位**,每非零帧一样本(@云TODO:是否覆盖全部非零帧待复核)。
-- 三新维度键(`lesion_loc`/`extrathy_ext`/`clin_t_stage`)**只产出、暂不消费**,消费待 Phase 2 三头 + 损失接线(当前 `train_step` 忽略额外键,无害)。
+- 三新维度键(`lesion_loc`/`extrathy_ext`/`clin_t_stage`)**已消费(阶段 2.4 接线完成)**:`train_step.build_official_head_targets()` 组装三头 targets(`is_main` 筛主病灶、mixup 后调、validity 顶层直传)、`validate_step` 组装 + `collect_official_records` 收集官方记录、`MultiTaskLoss` 固定 λ 外挂消费。labels 新增 `is_main`(主病灶标志,`roi==MAIN_LESION_ROI`→1,供损失与指标按官方口径筛)+ `lesion_id`(病灶级聚合键,`f"{patient_key}::{mask 或 roi 唯一标识}"`,str 经 default_collate 保持 list[str])。
+- `OfficialThyroidDataset` 新增 `hflip_prob`/`seed` 参数(默认 0):掷中时 `torch.flip(img/mask, dims=[-1])` 且 **`lesion_loc` 过 `flip_location_index`** 联动翻标签(调用形态 `int(flip_location_index(torch.tensor(loc)))`——内部 `perm[idx]` 依赖 idx.device, python int 直传 AttributeError);仅当 `valid_lesion_loc==1` 时翻标签。`build_official_datasets(hflip_prob=)` 透传,**val 恒无 hflip**(翻转会改位置标签)。RNG 受 train_official.py 的 seed 四件套管控。
 - 复用:`io._to_gray`(读 .dcm,不整段调 `load_input_image` 避免 PHI 匿名化写盘)、`nifti_io.load_nifti_frames`(含 (X,Y,Z)↔(H,W) 转置约定,mask 读取也复用勿另抄)。
-- 单测 `tests/test_official_loader.py`(合成 .dcm/.nii.gz/xlsx,8 用例:混写解析/静动分派/清晰帧跳过/输出契约静+动/患者无泄漏/ETE越界+纯中文/阴性位置valid=0/动态无mask跳过;本地 UTF-8 全绿)。
+- 单测 `tests/test_official_loader.py`(合成 .dcm/.nii.gz/xlsx,12 用例:混写解析/静动分派/清晰帧跳过/输出契约静+动/患者无泄漏/ETE越界+纯中文/阴性位置valid=0/动态无mask跳过/**labels 携带 is_main+lesion_id**/**hflip 联动翻位置标签**/**hflip 跳过 invalid 位置**/**val 数据集无 hflip**;本地 UTF-8 全绿)。
 
 ---
 

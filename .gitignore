@@ -41,3 +41,7 @@ desktop.ini
 /tmp_review_*.py
 /tmp_review_*.txt
 /tmp_verify_*.py
+# 兜底:上面按扩展名逐条列会漏(2026-08-12 实证 —— pytest 输出的 `tmp_main_*.log`
+# 就没被上面任何一条盖住,以 untracked 身份出现在 git status 里);按前缀逐条列同样会漏
+# (新起一个 `tmp_qavp_*` 前缀就又漏了)。改用单条通配收口:凡 `tmp_` 开头一律不入库。
+/tmp_*

@@ -89,4 +89,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`（全套现 620 passed，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准）
+执行: `pytest tests/test_masked_loss.py -v`（全套现 646 passed(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）

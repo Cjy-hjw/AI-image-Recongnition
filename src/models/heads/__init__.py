@@ -32,6 +32,7 @@
   `Malignancy.confidence`（`predicted = conf >= 阈值` 推出的"恶性概率"）同一语义。
 
 **接入接口现状（阶段 2.0 已补全，2026-08-12）**：
+  🔴 **三头已接线（阶段 2.4 完成，2026-08-12）**：`multi_task_model.py` 实例化三头（in_channels 一律 `CLS_POOLED_DIM`=352）、`forward` 串接调用并把输出写入 `ModelOutputs`（`location_side_logits`/`location_level_logits`/`location_probs`/`ete_logits`/`ete_probs`/`ete_band_ratio`/`t_logits`/`t_probs`/`t_conf`）；`train_step`/`validate_step` 组装 targets、`MultiTaskLoss` 固定 λ 外挂消费。**仅推理侧接线仍在 2.5**（`v21_output` 三头字段仍是占位，勿当已能交付）。
   ① Stage-4 空间特征图 —— ✅ `outputs["stage4_spatial"]`，512² 输入下实测 **[B,352,16,16]**。
      ⚠️ 通道数是 `CLS_POOLED_DIM`(352) 而非 `CLS_STAGE4_CHANNELS`(208)——后者是
      `adaptor_stage4` 的**输入**通道，`blocks[6]` 再把 208→352。位置头 `in_channels` 取 352。

@@ -7,6 +7,7 @@ from src.models.blocks import ConvBlock, TaskAlignmentAdaptor
 from src.models.mask_features import nodule_scale_from_mask
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
+from src.models.heads import ClinicalTHead, ExtensionHead, LocationHead
 from src.models.pretrained_loader import load_local_safetensors
 
 
@@ -36,6 +37,17 @@ class ModelOutputs(TypedDict):
     stage4_spatial: torch.Tensor
     soft_mask_detached: torch.Tensor
     nodule_scale_detached: torch.Tensor
+    # --- Phase 2.4 三头输出 ---
+    # 训练走 `*_logits`(原始未校正),交付/评估走 `*_probs`(fp32 softmax,和为 1)。
+    location_side_logits: torch.Tensor
+    location_level_logits: torch.Tensor
+    location_probs: torch.Tensor
+    ete_logits: torch.Tensor
+    ete_probs: torch.Tensor
+    ete_band_ratio: torch.Tensor
+    t_logits: torch.Tensor
+    t_probs: torch.Tensor
+    t_conf: torch.Tensor
 
 
 class MultiTaskThyroidModel(nn.Module):
@@ -47,6 +59,9 @@ class MultiTaskThyroidModel(nn.Module):
     CLS_STAGE4_CHANNELS = 208
 
     STAGE1_FROZEN_CBM_SUBMODULES = ("classifier_direct", "latent_mlp")
+    # 官方三头前缀:legacy 三阶段调度(stages.py)一律不训,由 schedule_official.py 接管。
+    # 加载旧 checkpoint 时 missing_keys 的合法白名单也是这个集合。
+    OFFICIAL_HEAD_PREFIXES = ("location_head", "extension_head", "clinical_t_head")
     STAGE3_FROZEN_PREFIXES = (
         "seg_backbone",
         "cls_backbone",
@@ -185,9 +200,21 @@ class MultiTaskThyroidModel(nn.Module):
             nn.Linear(128, 128),
         )
 
+        # ── 官方新增三维度头(位置/ETE/临床T)────────────────────────────────
+        # in_channels 一律取 CLS_POOLED_DIM(352):三头都吃 blocks[6] 之后的
+        # stage4 空间图,208 是 adaptor_stage4 的**输入**通道,写错要到真训练才崩。
+        self.location_head = LocationHead(in_channels=self.CLS_POOLED_DIM)
+        self.extension_head = ExtensionHead(in_channels=self.CLS_POOLED_DIM)
+        self.clinical_t_head = ClinicalTHead(in_channels=self.CLS_POOLED_DIM)
+
     def is_param_trainable(self, name: str, stage: int) -> bool:
         if "vclub" in name:
             return True
+        # 三头只由 `schedule_official.py` 的 A/B/C 调度训练,legacy 三阶段
+        # (stages.py 的 1-40/41-100/101-120)一律冻结——那套调度的 Stage2 起点
+        # 有 lr 100 倍跳变的已知崩塌缺陷,不得让三头搭上这条线。
+        if any(name.startswith(pfx) for pfx in self.OFFICIAL_HEAD_PREFIXES):
+            return False
         if stage == 1:
             return not any(sub in name for sub in self.STAGE1_FROZEN_CBM_SUBMODULES)
         if stage == 2:
@@ -270,6 +297,19 @@ class MultiTaskThyroidModel(nn.Module):
         cbm = self.cbm_head(x_cls, e_prior)
         z_contrastive = self.supcon_projector(x_cls)
 
+        # ── 三头串接 ────────────────────────────────────────────────────────
+        # 依赖顺序:ETE 的 logits 是 T 头的输入之一(T 头内部 detach + softmax,
+        # T 的监督不得回流重塑 ETE 表征——ETE 是官方独立计分维度)。
+        soft_mask_detached = soft_mask.detach()
+        loc_out = self.location_head(x_cls_spatial)
+        ete_out = self.extension_head(
+            x_cls_spatial, soft_mask_detached, cbm.logits_margin
+        )
+        nodule_scale_detached = nodule_scale_from_mask(soft_mask)
+        t_out = self.clinical_t_head(
+            x_cls_spatial, nodule_scale_detached, ete_out["ete_logits"]
+        )
+
         outputs: ModelOutputs = {
             "mask": logits_mask,
             "composition": cbm.logits_comp,
@@ -288,8 +328,18 @@ class MultiTaskThyroidModel(nn.Module):
             # `soft_mask` 原通路(→ prior_extractor)**有意不 detach**,见 stages.py:27。
             # 这里另发一份 detach 副本给三头,原物理先验通路不受影响。
             "stage4_spatial": x_cls_spatial,
-            "soft_mask_detached": soft_mask.detach(),
-            "nodule_scale_detached": nodule_scale_from_mask(soft_mask),
+            "soft_mask_detached": soft_mask_detached,
+            "nodule_scale_detached": nodule_scale_detached,
+            # --- Phase 2.4 三头输出 ---
+            "location_side_logits": loc_out["side_logits"],
+            "location_level_logits": loc_out["level_logits"],
+            "location_probs": loc_out["location_probs"],
+            "ete_logits": ete_out["ete_logits"],
+            "ete_probs": ete_out["ete_probs"],
+            "ete_band_ratio": ete_out["band_ratio"],
+            "t_logits": t_out["t_logits"],
+            "t_probs": t_out["t_probs"],
+            "t_conf": t_out["t_conf"],
         }
 
         return outputs

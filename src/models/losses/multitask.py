@@ -11,6 +11,7 @@ from src.models.losses.components import (
     compute_malignancy_losses,
     apply_famo_weighting,
     compute_regularizers,
+    compute_official_head_losses,
 )
 
 
@@ -37,7 +38,8 @@ class MultiTaskLoss(nn.Module):
     using Homoscedastic Uncertainty Weighting and ACR TI-RADS prior regularization.
     """
 
-    def __init__(self, num_tasks=5, alpha_prior=0.1, fn_weight=1.5):
+    def __init__(self, num_tasks=5, alpha_prior=0.1, fn_weight=1.5,
+                 official_head_config=None):
         super().__init__()
         self.alpha_prior = alpha_prior  # Clinical prior regularization factor
         self.mal_loss_fn = AUCMLossApprox(margin=1.0, imratio=0.33)
@@ -73,6 +75,22 @@ class MultiTaskLoss(nn.Module):
         )
         self.register_buffer("lambda_latent", torch.tensor(0.01))
         self.delta_budget = 0.1
+
+        # ── 官方三头(位置/ETE/临床T)的固定 λ 外挂配置 ─────────────────────────
+        # 由 `scripts/train_official.py` 从 config 组装后传入;为 None 时用默认值,
+        # 且只要 targets 里没有三头键就整体跳过(legacy train.py 路径零回归)。
+        # ETE 的 class_weights / log_prior 是 [C] 张量,须随模型 .to(device) 迁移,
+        # 故走 register_buffer 而非普通属性(普通属性留在 CPU 会在损失里报设备不匹配)。
+        cfg = dict(official_head_config or {})
+        self.lambda_loc = float(cfg.get("loc_loss_weight", 1.0))
+        self.lambda_ete = float(cfg.get("ete_loss_weight", 1.0))
+        self.lambda_clin_t = float(cfg.get("clin_t_loss_weight", 1.0))
+        self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
+        self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
+        self.clin_t_label_smoothing = float(cfg.get("clin_t_label_smoothing", 0.0))
+        self.register_buffer("ete_class_weights", cfg.get("ete_class_weights"))
+        self.register_buffer("ete_log_prior", cfg.get("ete_log_prior"))
+        self.register_buffer("clin_t_class_weights", cfg.get("clin_t_class_weights"))
 
     def forward(
         self,
@@ -155,6 +173,25 @@ class MultiTaskLoss(nn.Module):
             self.training,
         )
 
+        # 4.5 官方三头(位置/ETE/临床T)固定 λ 外挂 —— **不进 FAMO**,理由见
+        # `components/official_heads.py` docstring(checkpoint 兼容 + masked 0 值
+        # 会被 FAMO 误读为"已收敛")。插在 FAMO 之后、正则之前:λ 项是任务损失,
+        # 不该被 L2/spin-L1 的正则语义裹挟。targets 无三头键 → 整体跳过。
+        head_total, head_detail = compute_official_head_losses(
+            outputs,
+            targets,
+            lambda_loc=self.lambda_loc,
+            lambda_ete=self.lambda_ete,
+            lambda_clin_t=self.lambda_clin_t,
+            ete_class_weights=self.ete_class_weights,
+            ete_log_prior=self.ete_log_prior,
+            ete_focal_gamma=self.ete_focal_gamma,
+            ete_la_tau=self.ete_la_tau,
+            clin_t_class_weights=self.clin_t_class_weights,
+            clin_t_label_smoothing=self.clin_t_label_smoothing,
+        )
+        total_loss = total_loss + head_total
+
         # 5. Regularization
         total_loss, loss_l2 = compute_regularizers(
             total_loss,
@@ -179,5 +216,8 @@ class MultiTaskLoss(nn.Module):
             "latent_l2": loss_l2,
             "spin_l1": outputs["spin_l1"],
         }
+        # 三头监控项(未乘 λ 的原始量级)。targets 无三头键时 head_detail 为空,
+        # loss_dict 与 legacy 完全一致。
+        loss_dict.update(head_detail)
 
         return total_loss, loss_dict

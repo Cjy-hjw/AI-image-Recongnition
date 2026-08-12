@@ -37,7 +37,7 @@
 
 ---
 
-## `test_official_loader.py` — 官方数据加载器契约(8 用例,2026-08-10)
+## `test_official_loader.py` — 官方数据加载器契约(12 用例,2026-08-10 + 2026-08-12 阶段2.4 扩)
 
 合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
 
@@ -50,12 +50,26 @@
 | `test_ete_parse_edge_cases` | ETE 纯中文回退、越界数字(如 `0无`)不产生负类索引 |
 | `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
 | `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
+| `test_labels_carry_is_main_and_lesion_id` | **labels 携带 `is_main`(M→1,病灶N→0)+ `lesion_id`(病灶级聚合键)**,供三头只训主病灶/指标按病灶聚合 |
+| `test_hflip_syncs_location_label` | **hflip 联动翻位置标签**(左中叶→右中叶 1→4,经 `flip_location_index`),防学到反的左右 |
+| `test_hflip_skips_invalid_location` | 位置标签 invalid 时 hflip **不翻**(不编造监督) |
+| `test_val_dataset_has_no_hflip` | val 数据集恒无 hflip(翻转会改位置标签,val 必须原样) |
+
+## `test_train_step_head_targets.py` — 三头 targets 口径(12 用例,2026-08-12 阶段 2.4)
+
+`train_step.build_official_head_targets` 的三条"错了不报错、只让指标系统性偏低"红线:① **三头只训主病灶**(`is_main==0` → validity=0,评审规则点评口径);② **mixup 后标签归属**(DR-CutMix lam==0 继承 donor 标签,含 is_main/validity 一起 gather);③ **软 MixUp 整批屏蔽**(硬标签无软化路径)。另含:is_main 缺席(legacy)全当主病灶零回归、is_main×原 validity 相乘、cutmix mask_weight=0 屏蔽、legacy 无三头键返回空 dict、部分键只出 present 任务、缺 valid_* 默认全有效、validity 必须 [B] 一维 float([B,1] 隐式广播成 [B,B])。
+
+🔴 **`import sklearn` 必须在 torch / src.training 之前**(文件顶部先 `import sklearn.metrics` + docstring 记录):Windows + Demo_D 下先 import torch 再走 src.training → OpenMP DLL 冲突段错误(EXIT=-1073741819,pytest 报 exit 5),最小复现两行 import;**Linux 云端不复现**。新测试若 import `src.training` 链需注意导入顺序。
+
+## `test_official_head_losses.py` — 三头损失外挂(10 用例,2026-08-12 阶段 2.4)
+
+`compute_official_head_losses` + `MultiTaskLoss` 的固定 λ 外挂:legacy 三头全缺席零回归(返回 0.0+空 dict)、λ 精确线性、全 invalid 精确 0.0 无 NaN、validity 必须 targets 顶层直传键(塞 label_validity 静默失效)、[B,1] validity 拒绝、**梯度隔离**(cbm_head/seg_head/dec_stages 梯度精确 0、cls_backbone>0)、`register_buffer(..., None)` 不进 state_dict(legacy 零影响)、buffer 随 model 走 device。
 
 ## 测试总数(单一权威,2026-08-12 `Demo_D` 主环境实测,三数自洽)
 
-**`pytest --collect-only`=738 / grep `def test_`=638 / 全套 737 passed + 1 skipped**(collect 与 def 差额=参数化用例)。
+**`pytest --collect-only`=777 / grep `def test_`=677 / 全套 776 passed + 1 skipped**(collect 与 def 差额=参数化用例)。
 
-- **三头单测合计 105**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27),Demo_D 与 A800(torch2.6)两环境均实测通过。
+- **三头相关单测合计 127**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12),Demo_D 与 A800(torch2.6)两环境均实测通过。
 - ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 620 passed + 6 skipped,skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。
 - **下方分模块明细数字为历史演进累积、可能有偏差**——精确值一律以 `pytest --collect-only tests/` 实跑为准,不逐一核对旧数。
 - Phase5(2026-08-10)交付四模块:`test_nifti_io`(24) + `test_nodule_split`(28) + `test_prediction_json`(45) + `test_v21_output`(11) + `test_service_runner`(12) + `test_case_discovery`(40) + `test_service_api`(20)(含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。

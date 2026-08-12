@@ -55,6 +55,7 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 - **Stage 2–3 best**: `checkpoint_w_dice * val_dice + checkpoint_w_auc * val_auc` (defaults 0.30 / 0.70).
 - **Stage 3 ES**: `stage3_early_stopping_patience=0` disables early stopping; tracker resets at epoch 101.
 - **`validate_epoch` return**: 5-tuple `(avg_loss, avg_dice, avg_acc, avg_loss_l2, val_auc)`; `val_auc` is `None` in Stage 1 or single-class val sets.
+- 阶段 2.4 新增可选出参 `official_metrics_out`(dict):传入时 `validate_epoch` 收集每批 `validate_batch` 返回的 `official_records`,epoch 末调 `metrics_official.compute_official_metrics` **原地写入**官方口径指标,返回值**不加宽**(`train.py:337` 按 5 元组解包,唯一调用点)。三头键缺席的数据集 → 写入全 None。选模判据与 Dice 护栏在 `schedule_official.py`(Phase E 未写)。
 
 ---
 
@@ -64,11 +65,20 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 
 | File | Responsibility |
 |:---|:---|
-| `train_step.py` | `train_batch()` — single batch forward/backward with MixUp, vCLUB, SLR, AMP |
-| `validate_step.py` | `validate_batch()` — single batch validation with Val Diag print |
+| `train_step.py` | `train_batch()` — single batch forward/backward with MixUp, vCLUB, SLR, AMP;模块级 `build_official_head_targets()` 组装三头 targets(见下) |
+| `validate_step.py` | `validate_batch()` — single batch validation with Val Diag print;返回 **8 元组**(新增 `official_records`);`collect_official_records()`/`_official_head_targets()` |
+| `metrics_official.py` | **官方口径验证指标(阶段 2.4 新增)**:病灶级聚合(同 `lesion_id` 多帧概率取均值)+ 官方筛选(见下) |
 | `slr.py` | `compute_slr_weights()` — Supervised Label Rectification (1000-sample history, mean+2σ anomaly) |
 | `vclub.py` | `vclub_learning_step()`, `compute_vclub_mi_bound()` — mutual information decoupling |
 | `bn_freeze.py` | `set_frozen_modules_eval()` — automatic BatchNorm eval for frozen modules |
+
+### `build_official_head_targets()`(train_step.py,阶段 2.4 提取为可单测模块级函数)
+
+**必须在 mixup/cutmix 之后调用**——三头是硬标签 masked CE、无软标签路径,图像混了而标签不跟着换 = 静默错监督。混合后归属按 DR-CutMix 已算好的 `lam` 判定:`lam==0` 继承 donor(`index`)标签须 gather、`lam==1` 保留 recipient、其余(软 MixUp)整批屏蔽。validity 走 **targets 顶层直传键**(`valid_lesion_loc` 等,float [B]),**不进 `label_validity`**——后者只被 `malignancy.py:25`/`concepts.py:155` 消费,三头损失各自显式断言 [B] 一维 validity、根本不读它。🔴 **三头只训主病灶**:`is_main==0` 的次病灶(约 13% 带标注)validity 置 0(评审规则:三新维度仅对主病灶标注/评估);`is_main` 键缺席(legacy)全当主病灶,零回归。测试见 `tests/test_train_step_head_targets.py`(12 条)。
+
+### `metrics_official.py`(官方口径验证指标,阶段 2.4)
+
+病灶级聚合(同 `lesion_id` 多帧概率取均值、标签取首)+ 官方筛选(金标准侧,非预测侧):**全部指标只取 `is_main==1 且 valid_*==1`**;ETE/T 再加金标准 `malignancy==1`;位置/良恶性/TI-RADS 不限恶性。指标:良恶意 `average_precision_score`(AUC-PR)、位置 `roc_auc_score(multi_class='ovr', average='weighted')`(剔除缺席类+重归一化,**2 类时走二分类分支**——sklearn 对 2 类拒收 [N,2] 矩阵)、ETE `cohen_kappa_score(weights='quadratic')`(官方只说加权 Kappa 未指线性/二次,取 quadratic 并标注假设)、T `roc_auc_score`(t_conf 当 score)。单类/空集返回 None 不抛异常。**训练侧代理性质**:无 IoU 匈牙利匹配(训练用 GT mask 等价"匹配必成功"),数字与官方线上分不可直接对齐,只用于相对比较与选模。sklearn 2 类分支与加权方向均由 `tests/test_metrics_official.py`(13 条)钉死。
 
 ### `trainer.py` (Thin Orchestrator)
 

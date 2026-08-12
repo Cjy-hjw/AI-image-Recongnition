@@ -6,6 +6,7 @@
 - `MultiTaskLoss`: 组合分割BCE+Dice、TI-RADS概念SLR、良恶性AUCM+SupCon
 - 使用Homoscedastic Uncertainty Weighting自动平衡任务权重
 - 支持FAMO动态权重调度
+- ✅ **三头固定 λ 外挂(阶段 2.4 接线)**:`__init__(official_head_config=...)` 读取 `lambda_loc/lambda_ete/lambda_clin_t`(默认各 1.0)与 ETE/T 的类加权/平滑超参;三个 `register_buffer("ete_class_weights", ...)` 等缓存——**传 None 时不进 state_dict(legacy 零影响)**。`forward` 在 `apply_famo_weighting` 之后、`compute_regularizers` 之前调用 `compute_official_head_losses` 并把 `detail` 数入 `loss_dict`(location/location_side/location_level/ete/ete_ce/clin_t/clin_t_ce)。🔴 **三头不进 FAMO 5 通道**(扩通道破坏 checkpoint 兼容 + masked 0 值被 FAMO 误读为"已收敛",见 `components/official_heads.py`)。三头键缺席 → 跳过,legacy `train.py` 路径零回归。
 
 ### 组件化设计 (`components/`)
 - `segmentation.py`: `compute_segmentation_loss()` — BCE+Dice,支持`valid_mask`
@@ -131,4 +132,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`（全套现 738 collected / 737 passed+1 skipped(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）
+执行: `pytest tests/test_masked_loss.py -v`(全套现 777 collected / 776 passed+1 skipped(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620)

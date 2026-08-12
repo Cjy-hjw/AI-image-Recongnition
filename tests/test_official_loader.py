@@ -220,6 +220,70 @@ def test_location_pure_chinese_and_negative():
     assert unk["valid_lesion_loc"] == 0
 
 
+def test_labels_carry_is_main_and_lesion_id(mini_root):
+    """`is_main`/`lesion_id` 随 labels 产出:验证侧按官方口径筛主病灶 + 按病灶聚合。"""
+    root, xlsx = mini_root
+    samples = O.build_official_samples(root, xlsx)
+    for s in samples:
+        lab = s["labels"]
+        assert lab["is_main"] == 1                      # 合成集只有 M 主病灶行
+        assert isinstance(lab["lesion_id"], str) and lab["lesion_id"]
+    # 同一动态病灶的多帧共享同一 lesion_id(病灶级聚合的前提:帧维度不得各成一样本)
+    dyn = [s for s in samples if s["is_dynamic"]]
+    assert len({s["labels"]["lesion_id"] for s in dyn}) == 1
+    # 不同患者的静态病灶 lesion_id 必须互异(否则跨患者被误并成一个病灶)
+    static = [s for s in samples if not s["is_dynamic"]]
+    assert len({s["labels"]["lesion_id"] for s in static}) == len(static)
+    # 次要病灶(RoiName=M1)标 is_main=0
+    assert O._build_labels({"roi_name": "M1"}, "P")["is_main"] == 0
+
+
+def test_hflip_syncs_location_label(mini_root):
+    """hflip_prob=1.0 时图像/mask 镜像**且**位置标签同步置换(左右反了 loss 照常降)。"""
+    root, xlsx = mini_root
+    samples = O.build_official_samples(root, xlsx)
+    idx = next(i for i, s in enumerate(samples)
+               if not s["is_dynamic"] and s["labels"]["lesion_loc"] == 1)
+
+    plain = O.OfficialThyroidDataset(samples, img_size=64)
+    flipped = O.OfficialThyroidDataset(samples, img_size=64, hflip_prob=1.0, seed=0)
+    img0, mask0, lab0 = plain[idx]
+    img1, mask1, lab1 = flipped[idx]
+
+    assert lab0["lesion_loc"] == 1 and lab1["lesion_loc"] == 4      # 左中叶→右中叶
+    assert np.allclose(img1.numpy(), img0.numpy()[:, :, ::-1])
+    assert np.allclose(mask1.numpy(), mask0.numpy()[:, :, ::-1])
+    # 原样本 labels 不被就地改写(dict(s["labels"]) 浅拷贝隔离),重复取样不累积翻转
+    assert samples[idx]["labels"]["lesion_loc"] == 1
+    assert flipped[idx][2]["lesion_loc"] == 4
+
+
+def test_hflip_skips_invalid_location(mini_root):
+    """valid_lesion_loc=0 时不得置换位置标签(无监督样本的占位值置换毫无意义且掩盖 bug)。"""
+    root, xlsx = mini_root
+    samples = O.build_official_samples(root, xlsx)
+    idx = next(i for i, s in enumerate(samples) if not s["is_dynamic"])
+    samples[idx]["labels"] = dict(samples[idx]["labels"])
+    samples[idx]["labels"]["valid_lesion_loc"] = 0
+    orig = samples[idx]["labels"]["lesion_loc"]
+
+    ds = O.OfficialThyroidDataset(samples, img_size=64, hflip_prob=1.0, seed=0)
+    img, _, lab = ds[idx]
+    assert lab["lesion_loc"] == orig                    # 标签不动
+    plain = O.OfficialThyroidDataset(samples, img_size=64)
+    assert np.allclose(img.numpy(), plain[idx][0].numpy()[:, :, ::-1])   # 图像仍翻
+
+
+def test_val_dataset_has_no_hflip(mini_root):
+    """build_official_datasets:train 吃 hflip,val 必须原始朝向(翻转会改位置标签)。"""
+    root, xlsx = mini_root
+    train_ds, val_ds = O.build_official_datasets(
+        root, xlsx, img_size=64, val_frac=0.34, seed=0, hflip_prob=0.5
+    )
+    assert train_ds.hflip_prob == 0.5
+    assert val_ds.hflip_prob == 0.0 and val_ds.transform is None
+
+
 def test_dynamic_no_mask_skipped(mini_root):
     """动态病灶无 mask → 无法定位标注帧,整例跳过(不产出坏样本;sonnet 审查覆盖缺口)。"""
     root, xlsx = mini_root

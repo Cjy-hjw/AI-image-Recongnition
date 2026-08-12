@@ -36,6 +36,25 @@
   **`focal_gamma` 只接受 0 或 ≥1**：γ∈(0,1) 在 `p_t=1.0` 处梯度为 NaN 而 loss 值
   看不出异常（实跑 γ=0.5 → loss=0.0、grad=[nan,nan]），且 `p_t==1.0` 在 fp32 下
   真的可达（logit gap≥50 即精确 1.0）。
+- `clinical_t.py`: `compute_clinical_t_loss()` + `inverse_frequency_weights()` —
+  临床 T 显著性 2 类的 masked 加权 CE（阶段 2.3）。**无 Focal 无 CB**。计数
+  `0无2410 / 1有1831`（`docs/训练数据定稿.md:87`），阳性率 35.7% 已相当均衡。
+  **三条硬知识（均实测）**：
+  1. 🔴 **不能把侵犯头的 `cb_beta=0.99` 抄过来**：CB 的 `1−β^n` 在千级计数上已
+     饱和，`class_balanced_weights([2410,1831], 0.99)` 权重比恒为 **1.0000**——
+     配了等于没配，且**不报错不告警**。β=0.999→1.0838、β=0.9999→1.2800，仍不及
+     逆频率 1.3162。CB 是给长尾的（ETE 血管 n=5 那里 β=0.99 才给出 20.4:1）。
+     要加权用 `inverse_frequency_weights`。
+  2. 🔴 **`label_smoothing` 默认 0**：LS 的最优解是 `1−ls+ls/C`，二分类即
+     `1−ls/2`——实测 ls=0.05→阳性样本 P(T=1)=**0.9750**、ls=0.1→**0.9500**。
+     官方 `T_ClinSig.T_conf` 读的正是 `P(T=1)`，开 LS = 系统性压缩交付置信度。
+     这是拿概率校准换分类精度，不是白捡的正则。
+  3. **刻意不加 Focal**：阳性率 35.7% 已相当均衡，Focal 只会平白引入
+     `γ∈(0,1) → NaN 梯度` 那类风险而无收益（见上方 extension.py 的
+     `focal_gamma` 禁值说明）。
+  超参在 `configs/thyroid_config.yaml: train.clin_t_*`（`clin_t_class_counts:
+  [2410,1831]` / `clin_t_use_class_weights: false` / `clin_t_label_smoothing:
+  0.0`）。
 
 ---
 
@@ -112,4 +131,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`（全套现 711 collected / 710 passed+1 skipped(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）
+执行: `pytest tests/test_masked_loss.py -v`（全套现 738 collected / 737 passed+1 skipped(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）

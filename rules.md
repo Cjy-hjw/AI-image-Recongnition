@@ -62,7 +62,16 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
   仅访问外网(push/fetch/clone/gh)时加;本地 commit/diff/log 无需代理。
 
 ## 6. Code Modularity & Maintainability
-* **Rule (Functional Decomposition)**: Every Python module must maintain a clear single responsibility. When a file exceeds 300 lines or contains more than 3 distinct functional domains (e.g., model architecture + physical priors + classification heads), it **MUST** be decomposed into separate modules.
+* **Rule (Functional Decomposition)**: Every Python module must maintain a clear single responsibility. 拆分的**判据是职责**（>3 个 distinct functional domains，如 model architecture + physical priors + classification heads），**不是行数**。文件超 **300 行是提示信号**：它要求你**停下来评估**，不要求你拆。
+* 🔴 **Rule (拆分前置检查 · 2026-08-12 新增,由真实失误反推)**: 执行任何拆分**之前**必须先答这三问,**任一为"是"则不拆**,并在被豁免文件的模块 docstring 里**显式记录例外与理由**(让后人知道是判断而非疏忽):
+  1. **拆分会降低可分发性/可执行性吗?** 例:上云现场跑的工具从 1 个文件变 3 个,撞云平台"人工审核 + 每次约 10 文件"限额;从"任何工作目录 `python x.py` 直接可跑"变成依赖 `pkg/__init__` 链,陌生容器里多一个失败点。
+  2. **拆出来的部分有独立的认知边界吗?** 没有 = 只是把同一件事切成两半,**零收益**。
+  3. **需要为满足行数而压缩/删除注释与实测细节吗?** —— 这直接违反 §5「细节优先」,**绝对禁止**。
+  - **豁免范围**:`tests/`(一个测试文件对应一个被测模块本就是正确组织)、`scripts/` 下的独立可执行工具。
+  - **冲突优先级**:**§5(细节优先) > §6(行数)**。删掉的实测数字找不回来,多出来的几十行没有代价。
+  - **反例(2026-08-12 真实失误,两次同源)**:① 差点把 `scripts/probe_heads_cuda.py`(369 行,单一职责=验三头 GPU 契约)拆成 `scripts/probes/` 包 —— 上面三条代价全中,而它们是被用户一提醒就立刻列得出来的,**信息一直都在,只是没先想**;② 上一轮为把该文件压回 300 行,**删掉了 docstring 里的实测细节**,直接撞 §5。
+  - **补充事实(说明这条 MUST 从未被真正执行)**:全仓 `src/`+`scripts/` 115 个 .py 有 **12 个**超 300 行(最大 `official_loader.py` 509),`tests/` 34 个有 **18 个**超(最大 `test_gatekeeper.py` 928)。
+  - **执行机制**:`.claude/hooks/modularity_check.py`(PostToolUse,**仅查 `src/`**,与上面的豁免范围一致)已是**提醒式而非阻断式**,其 docstring 早就写明「阻断式检查容易产生**为了不超行数而硬拆**的反效果」——比本规则原文更清醒。2026-08-12 已把它的提示文案同步为「行数只是提示信号 + 前置三问」。**不要把它改成阻断式**:问题从来不是"没拦住超行",而是"机械执行行数规则",阻断只会把这个失误自动化。
 * **Implementation Standard**: 
   - Use `__init__.py` re-export shims to maintain backward compatibility
   - Group related classes/functions by domain (e.g., `losses/segmentation.py`, `losses/classification.py`)

@@ -19,7 +19,7 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 711 collected / 710 passed+1 skipped，`def test_` 口径 613；
+# 完整测试套件（本地可跑，实测 738 collected / 737 passed+1 skipped，`def test_` 口径 638；
 # ⚠️ 测试总数跨 Python 环境不可比，
 # torch2.8 预演环境同代码为 620/6，判回归须同环境前后对拍）
 pytest tests/ -v

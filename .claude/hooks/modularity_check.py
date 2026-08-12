@@ -38,8 +38,12 @@ except OSError:
 if n_lines > LINE_LIMIT:
     print(
         f"[MODULARITY] {os.path.basename(file_path)} 已达 {n_lines} 行"
-        f"（rules.md §6 上限 {LINE_LIMIT} 行 / 单一职责）。\n"
-        "若确实承担 3+ 个功能域，考虑按 losses/components 已有拆分模式再拆一层；"
-        "若只是临时超出（如正在过渡重构），可先记录待办。",
+        f"（rules.md §6 提示阈值 {LINE_LIMIT} 行）。\n"
+        "🔴 行数只是**提示信号**，不是拆分判据 —— 判据是**职责**（是否承担 3+ 个功能域）。\n"
+        "拆之前先过 §6 前置三问，任一为「是」则**不拆**、在模块 docstring 里记录例外与理由：\n"
+        "  ① 拆分会降低可分发性/可执行性吗？（多文件撞云上传限额、多一层 import 失败点）\n"
+        "  ② 拆出来的部分有独立的认知边界吗？没有 = 把同一件事切两半，零收益。\n"
+        "  ③ 需要为守行数压缩/删除注释与实测细节吗？—— 违反 §5，绝对禁止。\n"
+        "确实是 3+ 功能域且三问全否，才按 losses/components 已有模式再拆一层。",
         flush=True,
     )

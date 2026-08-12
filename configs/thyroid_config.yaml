@@ -121,3 +121,19 @@ train:
                             # CE(logits + τ·log π, y)（是**加**不是减；符号反了会放大
                             # 不平衡且损失照常下降）。推理侧不得再调一次。
                             # 待官方验证集到手后再调——官方数据只在云端，本地无从验证。
+
+  # ── 临床 T 头（Phase2 阶段 2.3）超参 ────────────────────────────────────
+  # 实现见 src/models/heads/clinical_t.py + losses/components/clinical_t.py。
+  clin_t_class_counts: [2410, 1831]  # 0无 / 1有，阳性率 35.7%（docs/训练数据定稿.md:87）
+  clin_t_use_class_weights: false    # 三头里唯一**不存在极端不平衡**的任务，默认不加权。
+                                     # 开启时用 inverse_frequency_weights（1.3162:1）。
+                                     # 🔴 **不要用 ete_cb_beta 那套 CB**：CB 的 1−β^n 在
+                                     # 千级计数上已饱和，β=0.99 给出的权重比是 **1.0000**
+                                     # ——配了等于没配，且不报错不告警（实测钉在
+                                     # tests/test_clinical_t_head.py）。CB 是给长尾的
+                                     # （ETE 血管 n=5 那里 β=0.99 才有 20.4:1）。
+  clin_t_label_smoothing: 0.0        # 🔴 保持 0。LS 把 P(T=1) 上界精确钳死在 1−ls/2
+                                     # （实测 ls=0.05→0.9750、ls=0.1→0.9500），而官方
+                                     # T_ClinSig.T_conf 读的正是这个数 —— 开了等于系统性
+                                     # 压缩交付置信度。要开之前先想清楚这个代价：
+                                     # 是拿概率校准换分类精度，不是白捡的正则。

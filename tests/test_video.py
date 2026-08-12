@@ -275,7 +275,6 @@ class TestGatekeeperSoftFlagPolicy:
     背景:authenticity_trainer 的 phantom/synthetic 训练标签 100% 来自
     synthesis.py 程序化合成代理,真实域零 FPR 验证,argmax 无置信度门槛。
     统一软flag制度要求:任何硬拒绝分支在真实 holdout FPR 验收达标前默认软化。
-    见 docs/P2红线修复实施计划.md B1、docs/P2启动定论_Opus复核.md。
     """
 
     @staticmethod

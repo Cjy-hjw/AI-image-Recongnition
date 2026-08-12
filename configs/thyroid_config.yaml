@@ -54,8 +54,7 @@ gatekeeper:
   # BAG 相位取证是否作硬拒绝。默认 false(仅软 flag,进 result.json 的
   # gatekeeper.soft_flags)——BAG 阈值仅经 8 个合成种子小样本验证,远小于
   # copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门:官方真实干净
-  # JPG holdout 上预注册、带置信区间的 FPR 验收达标
-  # (统一软flag制度,见 docs/P2红线修复实施计划.md B3)。
+  # JPG holdout 上预注册、带置信区间的 FPR 验收达标(统一软flag制度)。
   #
   # ⚠️ 与上方 `enforcement_mode` 是**两把独立的锁**:本项只决定"BAG 命中算不算
   # 硬判据",即使置 true,也还要 `enforcement_mode: hard` 才会真的 REJECTED。
@@ -109,7 +108,7 @@ train:
   #
   # ⚠️ 二者是同一问题的两种解法（Menon 原文把 Logit Adjustment 作为重加权的*替代*
   # 提出），**同时开满会过校正**。故当前只开 CB-Focal，la_tau 留 0。
-  ete_class_counts: [3906, 267, 67, 5]   # 官方全量实测（docs/训练数据定稿.md:85）
+  ete_class_counts: [3906, 267, 67, 5]   # 官方全量实测（docs/训练与架构/训练数据定稿.md:85）
                                          # 换数据集/换划分后必须重算，否则先验与实际不符、
                                          # 校正方向对但幅度错（不会报错）。
   ete_cb_beta: 0.99         # 🔴 不要抄论文的 0.9999。实跑 class_balanced_weights 的权重比
@@ -124,7 +123,7 @@ train:
 
   # ── 临床 T 头（Phase2 阶段 2.3）超参 ────────────────────────────────────
   # 实现见 src/models/heads/clinical_t.py + losses/components/clinical_t.py。
-  clin_t_class_counts: [2410, 1831]  # 0无 / 1有，阳性率 35.7%（docs/训练数据定稿.md:87）
+  clin_t_class_counts: [2410, 1831]  # 0无 / 1有，阳性率 35.7%（docs/训练与架构/训练数据定稿.md:87）
   clin_t_use_class_weights: false    # 三头里唯一**不存在极端不平衡**的任务，默认不加权。
                                      # 开启时用 inverse_frequency_weights（1.3162:1）。
                                      # 🔴 **不要用 ete_cb_beta 那套 CB**：CB 的 1−β^n 在

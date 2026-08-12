@@ -5,7 +5,7 @@
 `(img[1,H,W]f32∈[0,1], mask[1,H,W]f32, labels)`,可无改动接入
 `train_step.train_batch` 的 masked-loss。
 
-数据格式见 `docs/训练数据定稿.md`。**代码本地写、取数运行在云端/A800**(官方数据禁本地),
+数据格式见 `docs/训练与架构/训练数据定稿.md`。**代码本地写、取数运行在云端/A800**(官方数据禁本地),
 本地用合成 fixture 单测(`tests/test_official_loader.py`)。
 
 三件套(照 `pathology_dataset.py`):

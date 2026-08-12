@@ -31,7 +31,7 @@
 
 把官方标注(xlsx + `.dcm`/`.nii.gz` + NIfTI mask)转成与 `ThyroidDataset` **同构**样本 `(img[1,H,W]/255, mask, labels+valid_*)`,无改动接入 `train_step` masked-loss。三件套照 `pathology_dataset.py`:`parse_annotation_xlsx`(pandas 读 `ROI级别` sheet)→ `build_official_samples`(静动分派 + RoiName 对 mask)→ `OfficialThyroidDataset` → `build_official_datasets`(复用 `patient_grouped_split` 防泄漏)。
 
-- **按字段名解析、禁硬编码列号**(各轮列号不一致,`docs/训练数据定稿.md §4.2`);列名候选在 `_FIELD_ALIASES`,**部分列名待真实 xlsx 复核**(数据禁本地,云端/A800 验;字段名式解析→只改 `_FIELD_ALIASES` 即适配)。
+- **按字段名解析、禁硬编码列号**(各轮列号不一致,`docs/训练与架构/训练数据定稿.md §4.2`);列名候选在 `_FIELD_ALIASES`,**部分列名待真实 xlsx 复核**(数据禁本地,云端/A800 验;字段名式解析→只改 `_FIELD_ALIASES` 即适配)。
 - **masked-loss 判据 = 该临床列是否为空**(空→`valid_{task}=0`、有值→1),逐列逐行,**非**"是否 M 行"(定稿 §2.2:非 M 行 ~13% 也有标注)。
 - **标签常量硬依赖 `prediction_json`**(禁重定义,Plan M3):`location_label_to_index`(数字前缀优先)、`_ETE_LABEL_TO_CODE`(权威 ETE 标签表)。⚠️ **ETE 混写坑 + 未知/阴性串红线(S3,含 /code-review 补强)**:`ete_label_to_code` 只做纯中文精确匹配、不认 `2甲状腺包膜` 数字前缀,且对**任何未知串**都返 1(无)——那是**输出侧**占位策略,训练侧套用会把真侵犯样本当"无侵犯"学。且 `_ETE_LABEL_TO_CODE` 本身含输出侧归并项 `NA/UNK`/`无病灶（阴性）`→码1,**训练侧不能吃全表**。`official_loader._parse_ete_code` 解析优先级:① `阴性`/`无病灶` 显式排除(**优先于数字前缀**,与 S4 阴性→valid=0 一致)→None;② 数字前缀 1..4 即官方码;③ `NA/UNK`→None;④ 规范短标签精确命中 `_ETE_LABEL_TO_CODE` 才返码;⑤ 其余→**None→`valid_extrathy_ext=0`**(masked-loss 跳过)。**@云TODO**:非规范措辞(`无侵犯`/`毗邻软组织侵犯`)当前 safe-drop 到 valid=0(欠采不误标),真实 xlsx 到位须重锁——**禁激进子串匹配**(否定陷阱 `无血管侵犯` 含"血管");digit-prefix 路径覆盖定稿混写常态,是可靠主路。
 - **静动分派**:静态 `{pid}/{SeriesUid}/*.dcm`、动态 `{pid}/{pid}/{pid}.nii.gz`(定稿 §1.11);动态主病灶无 SliceIndex → **从 mask 非零帧定位**,每非零帧一样本(@云TODO:是否覆盖全部非零帧待复核)。

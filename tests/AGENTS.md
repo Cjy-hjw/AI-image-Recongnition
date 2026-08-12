@@ -51,14 +51,19 @@
 | `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
 | `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
 
-## `test_phase_refactor.py` — 重构不变式(全套 **738 collected / 638 `def test_` / 737 passed + 1 skipped**(2026-08-12 `Demo_D` 主环境实测,含 Phase2 阶段2.0 新增 `test_head_interfaces.py` 14 项、阶段2.1 新增 `test_location_head.py` 25 项、阶段2.2 新增 `test_extension_head.py` 39 项、**阶段2.3 新增 `test_clinical_t_head.py` 27 项**;三头单测合计 **104** passed,在 A800(torch2.6)与本地 torch2.8 两处均实测通过;**⚠️ 同日 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)实测为 620 passed + 6 skipped —— 两组数字不可互比**:skip 数差异源于该环境的依赖集与 `os.name` 平台门,判「有无回归」必须**同环境前后对拍**,跨环境比总数会得出假结论;新增 `test_stage_schedule.py` 22 项;2026-08-11 R6 曾新增 test_famo_directional_correctness + test_latent_lagrangian_constraint_direction 2 例;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
+## 测试总数(单一权威,2026-08-12 `Demo_D` 主环境实测,三数自洽)
 
-> **2026-08-10 Phase 5 加入新测试后,全套 = 357 collected → 更新**:表格其余文件外,另加
-> `test_nifti_io`(24)/`test_nodule_split`(28)/`test_prediction_json`(45)/`test_v21_output`(11)/
-> `test_service_runner`(12)/`test_case_discovery`(40)/`test_service_api`(20)。**本地收集总数 463
-> tests collected**(2026-08-10 实测;含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。根
-> `AGENTS.md`/`tests/AGENTS.md` 里先前的 356/580 是不同口径基线(580 含 Phase 5 前的旧计数,现
-> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`=580、`pytest --collect-only`=672、全套 **671 passed + 1 skipped**(Demo_D 主环境,三数自洽);463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准)。后续 Phase2 阶段2.1/2.2 新增 location(25)+extension(39)后,2026-08-12 口径为 `--collect-only`=711、grep `def test_`=613、全套 **710 passed + 1 skipped**;阶段2.3 新增 clinical_t(26)后,最终口径为 `--collect-only`=738、grep `def test_`=638、全套 **737 passed + 1 skipped**(三数自洽;collect 与 def 差额=参数化用例)。
+**`pytest --collect-only`=738 / grep `def test_`=638 / 全套 737 passed + 1 skipped**(collect 与 def 差额=参数化用例)。
+
+- **三头单测合计 105**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27),Demo_D 与 A800(torch2.6)两环境均实测通过。
+- ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 620 passed + 6 skipped,skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。
+- **下方分模块明细数字为历史演进累积、可能有偏差**——精确值一律以 `pytest --collect-only tests/` 实跑为准,不逐一核对旧数。
+- Phase5(2026-08-10)交付四模块:`test_nifti_io`(24) + `test_nodule_split`(28) + `test_prediction_json`(45) + `test_v21_output`(11) + `test_service_runner`(12) + `test_case_discovery`(40) + `test_service_api`(20)(含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。
+
+## `test_phase_refactor.py` — 重构不变式(22 项)
+
+2026-08-11 R6 新增 `test_famo_directional_correctness` + `test_latent_lagrangian_constraint_direction` 2 例;CI 已核实绿(run 31365316179/dc4b827)。
+
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

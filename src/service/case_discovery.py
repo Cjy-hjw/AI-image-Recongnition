@@ -4,7 +4,7 @@
 
 V2.1 交付形态是常驻 HTTP 服务(`src/service/app.py` 的 `/call`)。平台下发一个
 **目录**(`dataset_path`,内含批量测评病例),服务须遍历该目录逐病例推理,每病例
-落 `{PatientId}/prediction.json`(见 `docs/训练数据定稿.md` §1.2)。runner 契约是
+落 `{PatientId}/prediction.json`(见 `docs/训练与架构/训练数据定稿.md` §1.2)。runner 契约是
 `runner(dataset_path, output_dir) -> None`,其中第一步就是「这个目录里有哪些病例、
 每个病例的输入文件是什么、按静/动怎么分派」—— 即本模块。
 

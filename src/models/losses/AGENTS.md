@@ -38,7 +38,7 @@
   真的可达（logit gap≥50 即精确 1.0）。
 - `clinical_t.py`: `compute_clinical_t_loss()` + `inverse_frequency_weights()` —
   临床 T 显著性 2 类的 masked 加权 CE（阶段 2.3）。**无 Focal 无 CB**。计数
-  `0无2410 / 1有1831`（`docs/训练数据定稿.md:87`），阳性率 35.7% 已相当均衡。
+  `0无2410 / 1有1831`（`docs/训练与架构/训练数据定稿.md:87`），阳性率 35.7% 已相当均衡。
   **三条硬知识（均实测）**：
   1. 🔴 **不能把侵犯头的 `cb_beta=0.99` 抄过来**：CB 的 `1−β^n` 在千级计数上已
      饱和，`class_balanced_weights([2410,1831], 0.99)` 权重比恒为 **1.0000**——

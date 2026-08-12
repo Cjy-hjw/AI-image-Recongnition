@@ -3,7 +3,7 @@
 动机(见 memory/patient-leakage-and-probe-trap.md + reference/…MIL深度方案.md):
     ThyUS2Path 是**患者级弱标签**。MIL 把全部帧作为 bag,门控注意力自动挑病灶帧。
 
-架构演进(见 reference/甲状腺超声图像弱监督多实例学习良恶性分类研究与骨干网络微调瓶颈分析报告.md):
+架构演进(见 reference/2026-07月调研/甲状腺超声图像弱监督多实例学习良恶性分类研究与骨干网络微调瓶颈分析报告.md):
     原始版:backbone(num_classes=0) → GAP → [N,1408] → GatedAttentionPooling。
     GAP 将 16×16 空间图均值化,微钙化等高频特征被稀释 256 倍,是 Phase1 AUC 卡
     在 0.5653(vs 官方基准 0.735-0.754)的根本原因。

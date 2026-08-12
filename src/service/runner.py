@@ -207,7 +207,7 @@ def _process_case(case, output_dir, state, precision, max_frames):
     kind = case["kind"]
     # case_dir 必须是**一级** `{output}/{PatientId}`——`write_case_v21` 内部负责建
     # `{case_dir}/{subdir_uid}/nodule.nii.gz` 子目录,且官方 V2.1 契约要求
-    # `prediction.json` 落在顶层 `{PatientId}/prediction.json`(docs/训练数据定稿.md §1.2)。
+    # `prediction.json` 落在顶层 `{PatientId}/prediction.json`(docs/训练与架构/训练数据定稿.md §1.2)。
     # ⚠️ 2026-08-11 #122 曾把这里改成两级 `{pid}/{subdir_uid}` 想防同 PatientId 多序列
     # 覆盖,但那会叠成 `{pid}/{subdir}/{subdir}/mask` + prediction.json 掉出顶层→整例零分
     # (Gate2 对抗审计实测坐实)。已回退。**同 PatientId 多序列的 prediction.json 互相覆盖

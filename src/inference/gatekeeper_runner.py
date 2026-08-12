@@ -283,8 +283,7 @@ def run_gatekeeper_audit(img_np, config, device, weights_path, output_dir,
     # 非真实物理结论"(authenticity.py 的 extract_nakagami_features docstring);
     # 且 argmax 无任何置信度门槛。全仓零真实图像 FPR 实测(对比 tampering 有 359
     # 张真实图 0%/27.3% 的明确数字)。故不再作一票否决,仅记录审计,不驱动 REJECT。
-    # 恢复硬拒绝的唯一闸门:官方真实干净 holdout 上预注册、带置信区间的 FPR 验收
-    # 达标(见 docs/P2红线修复实施计划.md B1、docs/P2启动定论_Opus复核.md §五.5)。
+    # 恢复硬拒绝的唯一闸门:官方真实干净 holdout 上预注册、带置信区间的 FPR 验收达标。
     if is_phantom == 1:
         print("--> [Gatekeeper 软 flag] authenticity: Physical Phantom 疑似(不拒绝,仅记录)", flush=True)
     elif is_phantom == 2:

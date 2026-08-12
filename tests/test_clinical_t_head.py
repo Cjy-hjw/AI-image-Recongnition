@@ -27,7 +27,7 @@ from src.models.losses.components.extension import class_balanced_weights
 
 IN_CH = 352
 FEAT_HW = 16
-CLIN_T_COUNTS = [2410, 1831]  # docs/训练数据定稿.md:87，阳性率 35.7%
+CLIN_T_COUNTS = [2410, 1831]  # docs/训练与架构/训练数据定稿.md:87，阳性率 35.7%
 
 
 def _head(**kw):

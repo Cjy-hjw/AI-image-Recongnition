@@ -481,7 +481,7 @@ class TestDicomInputPaths:
 
 class TestJpegInputPath:
     def test_jpeg_static_image_reject_path_runs(self, tmp_path):
-        """2026-07-11 P1 收尾补测：docs/比赛对齐与风险.md 确认官方静态图交付格式
+        """2026-07-11 P1 收尾补测：docs/历史存档/比赛对齐与风险.md 确认官方静态图交付格式
         是 JPG，但此前所有冒烟/单测全部用 PNG 构造输入，JPG 路径从未被真实验证
         过——cv2.imread 本身对两种格式一视同仁，但零成本的事该补，直接对齐交付
         格式。"""

@@ -149,8 +149,7 @@ class CatNetTamperingDetector:
         # BAG 相位不一致是否作硬拒绝。默认 False(仅软 flag)——BAG 阈值仅经
         # 8 个合成种子小样本验证(tests/test_gatekeeper.py::TestCatNetDetector),
         # 远小于 copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门:
-        # 官方真实干净 JPG holdout 上预注册、带置信区间的 FPR 验收达标(统一软flag制度,
-        # 见 docs/P2红线修复实施计划.md B3)。
+        # 官方真实干净 JPG holdout 上预注册、带置信区间的 FPR 验收达标(统一软flag制度)。
         self.bag_hard_reject = bool(bag_hard_reject)
         self._model = None
         self.backend_name = "dct-bag"

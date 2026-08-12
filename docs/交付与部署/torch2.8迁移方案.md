@@ -2,7 +2,8 @@
 
 > **状态(2026-08-11 更新,方向已变)**:
 > - ❌ **§4 Dockerfile 自建镜像 / sshd 那套不执行**——用户已定**直接用官方基础镜像**(平台内网 registry 4 选 1,见下),权重走平台上传,不做本地→云的镜像迁移。该章仅存档。
-> - ✅ **§2 requirements + §3 代码 API 兼容仍然要做**——不管镜像谁提供,我们的代码都要在 torch2.8+numpy2 下不崩。已在 A800 建独立 venv `/home/cjy/envs/torch28` 做兼容性预演(不动 `thyroid_env`),静态扫描结论见 §3.1,实测验证见 §2。
+> - ✅ **§2 requirements + §3 代码 API 兼容仍然要做**——不管镜像谁提供,我们的代码都要在 torch2.8+numpy2 下不崩。预演 venv 在**本地 Windows** `C:\Users\cjy\envs\torch28`,**其唯一职责 = 模拟云端目标环境**(官方镜像 torch2.8.0+cuda12.8),提前抓出上云才会炸的崩溃/静默行为变更 —— 模型只提交一次、禁联网,上云才发现即整场零分。
+> - ⚠️ **A800 与本地 torch28 职责严格分工,勿混淆**:**A800 只负责训练 + Linux/真 CUDA 契约验证,不模拟云环境**(它是 Ubuntu16.04/glibc2.23,物理装不了 torch2.7+,曾建到一半已止损清理,**别再试**);**模拟云环境只在本地 torch28 venv 做**。二者互补:本地有目标版本但没 CUDA、A800 有真 CUDA 但版本上不去,故 fp16/CUDA 相关契约走 A800(`probe_heads_cuda.py`),版本兼容性走本地。静态扫描结论见 §3.1,实测验证见 §2。 `/home/cjy/envs/torch28` 做兼容性预演(不动 `thyroid_env`),静态扫描结论见 §3.1,实测验证见 §2。
 > - ⚠️ **不可拆开单独改 requirements**:版本锁是围绕 base 配平的联动约束,只改一半必崩 CI。
 
 ## 0. 官方环境实况(2026-08-11 用户从平台控制台实读,权威)
@@ -33,7 +34,9 @@
 
 ## 2. requirements.txt 改动清单(逐行)
 
-> ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑)**:独立 venv(py3.10.18 + **torch 2.8.0+cpu** + **numpy 2.4.4** + **timm 1.0.28** + cv2 4.14)跑全套 pytest = **620 passed / 6 skipped / 0 failed**(首验时 597,差额为其后新增的 `test_stage_schedule.py` 22 项)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
+> ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑)**:独立 venv `C:\Users\cjy\envs\torch28`(**py3.12.13** + **torch 2.8.0+cpu** + **numpy 2.4.4** + timm 1.0.28 + cv2 4.14,2026-08-12 主会话实跑 `python -c "import sys,torch,numpy"` 核实)跑全套 pytest = **620 passed / 6 skipped / 0 failed**(首验时 597,差额为其后新增的 `test_stage_schedule.py` 22 项)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
+> ⚠️ **此处 620 是 2026-08-12 当时该环境的快照,且与 `Demo_D` 主环境的 737 不可互比**(依赖集与平台门不同,见根 `AGENTS.md`);判回归须**同环境**前后对拍,勿拿两环境数字相减。
+> ⚠️ 曾误记为"py3.10.18 + venv 建在 A800",两处均已实测纠正(A800 glibc 2.23 装不了 torch2.7+,那个 venv 从未建成)。
 
 | 行 | 现状 | 改为 | 理由 |
 |---|---|---|---|
@@ -117,10 +120,11 @@
 
 </details>
 
-## 5. CI 同步(关键,别漏)
+## 5. CI 同步(关键,别漏) —— 🔴 **未完成的有效待办**
 
-- `.github/workflows/ci.yml` 的 test job `container: pytorch/pytorch:2.1.0...` **必须同步换** torch2.8 base(否则 CI 测的不是交付环境,违反铁律2)。
-- **docker-build-smoke / entrypoint-dispatch-smoke**:换 base 后重验;若加了 sshd/权重 COPY,冒烟步骤要相应调整。
+- `.github/workflows/ci.yml` 的 test job **现仍是 `container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime`**(2026-08-12 主会话实读 `ci.yml:39` 核实),**必须同步换** torch2.8 base,否则 CI 测的不是交付环境(违反铁律2)。**本条是本文档唯一未落地的实质待办,勿因 §4 作废就以为整篇存档。**
+- **docker-build-smoke / entrypoint-dispatch-smoke**:换 base 后重验。
+- 🔴 **权重 COPY(#111)是必做项,不是"若加了"**:交付 backlog #111 明确要求 Dockerfile 补权重 COPY(见 `docs/项目现状总纲.md` §7),换 base 后冒烟步骤须相应调整。此处与 §4 存档中的 sshd 不同 —— **sshd 已随自建镜像方案一起作废,权重 COPY 没有**。
 - push 后 `gh run list`(走代理)核 headSha + success。
 
 ## 6. 验证顺序(换云时执行)

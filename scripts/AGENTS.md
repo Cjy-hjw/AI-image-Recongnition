@@ -87,7 +87,7 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 > `docker run --rm --entrypoint /workspace/scripts/entrypoint.sh <image> <input>`
 > (`.github/workflows/ci.yml` 的 `entrypoint-dispatch-smoke` job 即按此法,9 个 docker run 全部带 `--entrypoint`;R3 起静态 PNG/JPG 用例断言 status=PASSED——authenticity 权重缺失已降级 skipped 不再硬 ERROR;corrupted 用例仍断言 ERROR,来自 cv2.imread 解码失败分支。)
 
-**背景**:官方"动态图"具体交付格式从未在答疑中明确过(见 `docs/比赛对齐与风险.md`「动态图交付格式未知风险」)。纯扩展名白名单(`mp4|avi|mov|mkv|dcm|dicom` → `video_predict.py`,其余 → `predict.py`)是工程假设,格式超出预期时会静默误判成静态图,导致该样本 100% 丢失预测。
+**背景**:官方"动态图"具体交付格式从未在答疑中明确过(见 `docs/历史存档/比赛对齐与风险.md`「动态图交付格式未知风险」)。纯扩展名白名单(`mp4|avi|mov|mkv|dcm|dicom` → `video_predict.py`,其余 → `predict.py`)是工程假设,格式超出预期时会静默误判成静态图,导致该样本 100% 丢失预测。
 
 **分发逻辑(`entrypoint.sh` 第 5 节)**:
 1. **扩展名判断**(`ext_kind`,与此前行为一致,是路由默认值)。

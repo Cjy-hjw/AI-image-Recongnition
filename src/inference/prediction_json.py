@@ -50,52 +50,22 @@ import math
 import re
 from typing import Optional
 
-# 甲状腺外侵犯:输出编码(规范 §五.4)。
-ETE_NONE = 1
-ETE_CAPSULE = 2
-ETE_SOFT_TISSUE = 3
-ETE_VESSEL = 4
-ETE_CODES = (ETE_NONE, ETE_CAPSULE, ETE_SOFT_TISSUE, ETE_VESSEL)
-
-# xlsx `extrathy_ext` 原始标签 → 输出编码。
-# "无病灶(阴性)" 与 "NA/UNK" 在输出侧无对应值,统一归并到 1(无侵犯):阴性病例本就
-# 不该有结节条目,未知则按最保守("无侵犯")处置——把未知报成有侵犯会虚增分期。
-_ETE_LABEL_TO_CODE = {
-    "甲状腺包膜": ETE_CAPSULE,
-    "毗邻软组织": ETE_SOFT_TISSUE,
-    "血管": ETE_VESSEL,
-    "无": ETE_NONE,
-    "无病灶（阴性）": ETE_NONE,
-    "无病灶(阴性)": ETE_NONE,
-    "NA/UNK": ETE_NONE,
-}
-
-# 主病灶位置:输出 `Location` 1..7 与 `LocationProbs[7]` 的**固定顺序**。
-#
-# ⚠️ **顺序取自官方 xlsx 的实际单元格值,不是《数据格式说明》的文字列举次序** ——
-# 二者不一致,照文档写会错 4/7 类。2026-08-01 实测官方标注表 `主病灶位置` 列的
-# 单元格形如 `1左上叶` / `2左中叶` / `5右中叶`(编码与标签写在同一格),据此:
-#     1=左上叶  2=左中叶  5=右中叶
-# 而《数据格式说明》的列举次序是「左上叶、左下叶、左中叶、右上叶、右下叶、右中叶、
-# 峡部」,按它推则 2=左下叶、5=右下叶,与实测**直接冲突**。唯一自洽的解释是真实编码
-# 按解剖习惯「上→中→下」排列(文档只是在列举有哪些类别,并非在定义编码)。
-#
-# 该错位不会引发任何报错:概率分布与类别标签系统性错位,JSON 完全合法,指标只是
-# "偏低",本地永远查不出根因。故此处是**单一权威定义**,训练侧构造标签必须
-# `import` 本常量,不得另抄一份,更不得照抄文档列举顺序。
-LOCATION_LABELS = (
-    "左上叶",   # 1
-    "左中叶",   # 2  ← 实测证据:xlsx 单元格 `2左中叶`
-    "左下叶",   # 3
-    "右上叶",   # 4
-    "右中叶",   # 5  ← 实测证据:xlsx 单元格 `5右中叶`
-    "右下叶",   # 6
-    "峡部",     # 7
+# 类别定义的**单一权威已下沉到 `src/models/label_schema.py`**（2026-08-12）。
+# 原因：`.importlinter` 契约 2 规定 `src.models` 是最底层、不得依赖 `src.inference`，
+# 而位置头 `models/heads/location.py` 必须按同一份顺序构造标签 —— 常量留在本文件
+# 会让 CI 的 import-linter job 直接红。此处 re-export 保持对外 import 路径不变。
+# **改类别定义请改 `label_schema.py`，不要在这里另抄一份。**
+from src.models.label_schema import (  # noqa: F401  (re-export，保向后兼容)
+    ETE_CAPSULE,
+    ETE_CODES,
+    ETE_NONE,
+    ETE_SOFT_TISSUE,
+    ETE_VESSEL,
+    LOCATION_LABELS,
+    LOCATION_NULL_LABELS,
+    NUM_LOCATIONS,
+    _ETE_LABEL_TO_CODE,
 )
-NUM_LOCATIONS = len(LOCATION_LABELS)
-
-# xlsx 里超出上述 7 类的两个值。它们不进概率分布,遇到时该样本不参与位置训练。
-LOCATION_NULL_LABELS = ("无（阴性）", "无(阴性)", "NA/UNK")
 
 # 无结节时 Location 的合法特例(规范:"1~7,仅无结节时可为 0")。
 LOCATION_NONE = 0

@@ -31,6 +31,7 @@
 | `test_service_runner.py` | **runner 批量编排**(2026-08-10 A2 新增)——mock 掉 heavy 依赖只留编排逻辑:逐病例调 write_case_v21 且 case_dir={output}/{patient_id}、静/动 kind 分派、processing_ms 非负 int、gatekeeper 每病例照跑、**单病例失败隔离**(一例 diagnose 崩溃不影响其余 + 落结构合规 ERROR 占位)、loader 失败隔离、**模型只 build 一次**(跨病例 + 跨多次 build_service_runner 缓存)、空/无效/全非影像目录不崩 | 12 | Phase 5 |
 | `test_head_interfaces.py` | **三头接入接口契约**(2026-08-12 Phase2 阶段2.0 新增)——守四条「删掉就静默出错」的契约:① `stage4_spatial` 通道数是 `CLS_POOLED_DIM`(352) 而非 `CLS_STAGE4_CHANNELS`(208)，且自带 352≠208 反向锚点防断言失去区分力;② 命名即契约(`stage4_spatial` 有梯度、两个 `*_detached` 无梯度);③ 🔴 从 `stage4_spatial` 反传 `seg_backbone` 梯度**精确 0**(用 `!=0.0` 而非容差,对 NaN 敏感,同 Gate 8 论证)——保住 Gate 8 前提、防三头重开 Stage2 崩塌的物理先验回流;④ fp16 求和溢出反证(自带「反证失效」保护:先断言朴素 `.sum()==inf`,否则说明该测试已对 fp32 累加器失去区分力) | 14 | Phase 2 |
 | `test_location_head.py` | **位置头契约**(2026-08-12 Phase2 阶段2.1 新增)——守「错了不崩、只静默学错」那几条:① 因子分解**拼接顺序**必须对齐 `LOCATION_LABELS`(用非对称确定性输入逐格核对——顺序错了概率和仍为 1、JSON 仍合法,只是左叶预测填进右叶槽);② 7 维**严格**和为 1(数学恒等式非再归一化);③ 峡部 level 标签是 `-1`,须 clamp+validity 双保险(附反证:直接喂 `cross_entropy` 确实越界);④ 标签越界**正负不对称**(`idx=7` IndexError 而 `idx=-1` 走负索引静默取末元素)双向拦截;⑤ `[B,1]` validity 隐式广播成 `[B,B]` 静默放大 loss(附反证坐实该坑真实存在);⑥ 🔴 **CoordConv 必须先过非线性再池化**——三段反证(普通卷积不可分 → **裸 CoordConv 仍不可分** → 加 ReLU 才可分),卷积线性可拆使坐标贡献退化为常数偏置被 GAP 平均掉;⑦ 水平翻转联动翻标签 | 25 | Phase 2 |
+| `test_extension_head.py` | **ETE 侵犯头契约**(2026-08-12 Phase2 阶段2.2 新增)——守「稀有类静默学错 + CB 保护失效」那几条:① 4 类 ETE 概率**严格**和为 1、argmax 与分布自洽;② 类别顺序对齐 `ET4 码`（无/甲状腺包膜/毗邻软组织/血管，计数 3906/267/67/5）；③ `class_balanced_weights` 乘性加权数值（β=0.99 默认 → 血管:无=20.4:1，β=0.9→2.4:1 / 0.999→196.4:1 / 0.9999→646.9:1 全表锁定）；④ CB-Focal γ 聚焦 + Logit-Adjustment 先验补偿存在且不翻转方向；⑤ `boundary_band_from_mask` 带宽 = `kernel_size−1`（k=3→2px / 5→4px / 7→6px 实测，实现取 k=5 → 4px）；⑥ 头/损失同名不同职责（`heads/extension.py` vs `losses/components/extension.py`）不致误导；⑦ 参数量 0.063M | 39 | Phase 2 |
 | `test_case_discovery.py` | **病例发现**(2026-08-10 A2 新增)——`discover_cases` 递归遍历 + 静/动分派(.dcm→static,.nii.gz/.nii→dynamic)、静态读 DICOM 头取 PatientID/SeriesUID、动态按组委会口径取直接父目录名(PatientId=AccessionNumber)、路径推断兜底、空/不存在目录返回 []、**跨文件系统确定性顺序契约**(monkeypatch 反转 `os.scandir` 返回序,断言发现顺序仍为字典序 DFS——2026-08-12 CI run 31512732898 因 `os.walk` 未排子目录、Linux 走 hash 序而 flaky,`dirs.sort()` 修复后由本用例钉死);依赖 pydicom/nibabel 缺则 skip | 40 | Phase 5 |
 
 ---
@@ -49,14 +50,14 @@
 | `test_location_pure_chinese_and_negative` | 位置纯中文回退、阴性/未知→valid=0(绝不默认 0=左上叶) |
 | `test_dynamic_no_mask_skipped` | 动态病灶无 mask→无法定位帧→整例跳过 |
 
-## `test_phase_refactor.py` — 重构不变式(全套 **671 passed + 1 skipped**(2026-08-12 `Demo_D` 主环境实测,含 Phase2 阶段2.0 新增 `test_head_interfaces.py` 14 项;**⚠️ 同日 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)实测为 620 passed + 6 skipped —— 两组数字不可互比**:skip 数差异源于该环境的依赖集与 `os.name` 平台门,判「有无回归」必须**同环境前后对拍**,跨环境比总数会得出假结论;新增 `test_stage_schedule.py` 22 项;2026-08-11 R6 曾新增 test_famo_directional_correctness + test_latent_lagrangian_constraint_direction 2 例;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
+## `test_phase_refactor.py` — 重构不变式(全套 **711 collected / 613 `def test_` / 710 passed + 1 skipped**(2026-08-12 `Demo_D` 主环境实测,含 Phase2 阶段2.0 新增 `test_head_interfaces.py` 14 项、阶段2.1 新增 `test_location_head.py` 25 项、**阶段2.2 新增 `test_extension_head.py` 39 项**;三头单测合计 78 passed,在 A800(torch2.6)与本地 torch2.8 两处均实测通过;**⚠️ 同日 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)实测为 620 passed + 6 skipped —— 两组数字不可互比**:skip 数差异源于该环境的依赖集与 `os.name` 平台门,判「有无回归」必须**同环境前后对拍**,跨环境比总数会得出假结论;新增 `test_stage_schedule.py` 22 项;2026-08-11 R6 曾新增 test_famo_directional_correctness + test_latent_lagrangian_constraint_direction 2 例;此前基线 357 collected +8 official_loader 2026-08-10、本地 UTF-8 通过;CI 已补 pandas/openpyxl 纳入回归,已核实绿 run 31365316179/dc4b827),此文件 22)
 
 > **2026-08-10 Phase 5 加入新测试后,全套 = 357 collected → 更新**:表格其余文件外,另加
 > `test_nifti_io`(24)/`test_nodule_split`(28)/`test_prediction_json`(45)/`test_v21_output`(11)/
 > `test_service_runner`(12)/`test_case_discovery`(40)/`test_service_api`(20)。**本地收集总数 463
 > tests collected**(2026-08-10 实测;含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。根
 > `AGENTS.md`/`tests/AGENTS.md` 里先前的 356/580 是不同口径基线(580 含 Phase 5 前的旧计数,现
-> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`=580、`pytest --collect-only`=672、全套 **671 passed + 1 skipped**(Demo_D 主环境,三数自洽);463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准**)。
+> 按 grep `def test_` 校准为 **463**(⚠️ 2026-08-12 复核:grep `def test_`=580、`pytest --collect-only`=672、全套 **671 passed + 1 skipped**(Demo_D 主环境,三数自洽);463 为旧口径,下方分模块明细数字有历史偏差,**精确值一律以 `pytest --collect-only tests/` 实跑为准)。后续 Phase2 阶段2.1/2.2 新增 location(25)+extension(39)后,2026-08-12 最终口径为 `--collect-only`=711、grep `def test_`=613、全套 **710 passed + 1 skipped**(三数自洽;collect 与 def 差额=参数化用例)。
 
 ### Phase A: 解耦 + 死代码清理
 | Test | 验证内容 |

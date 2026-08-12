@@ -74,6 +74,13 @@ model:
   num_classes_margin: 4       # smooth, ill-defined, lobulated/irregular, extrathyroidal extension
   num_classes_foci: 4         # none/comet-tail, large coarse, peripheral/rim, punctate echogenic
   num_classes_malignancy: 2   # benign, malignant
+  # ── 官方新增三维度（Phase2 三头）──────────────────────────────────────────
+  num_classes_location: 7     # 1左上 2左中 3左下 4右上 5右中 6右下 7峡部（顺序权威见 src/models/label_schema.py）
+  num_classes_ete: 4          # 1无 2甲状腺包膜 3毗邻软组织 4血管
+                              # 🔴 保 4 类不并类：血管仅 5 例，若官方指标是 Macro-AUC，
+                              # 并类会让该类 AUC 无从计算（= 直接丢该项分）。要翻此决定
+                              # 必须先拿到官方评测口径，不是配置偏好。
+  num_classes_clin_t: 2       # 0 非临床显著 / 1 临床显著
 
 train:
   epochs: 120                # 120 Epochs for full convergence on server
@@ -93,3 +100,24 @@ train:
   slr_alpha: 0.1
   prior_mlp_dim: 16
   physical_kappa: 100.0
+
+  # ── 侵犯头（ETE）不平衡校正超参（Phase2 阶段 2.2）────────────────────────────
+  # ETE 是全项目最极端的不平衡任务：3906/267/67/5（无/包膜/软组织/血管），
+  # 最稀有类占 0.12%。裸 CE 下恒输出"无侵犯"即可拿 92% 准确率，三个有临床意义的
+  # 类全部学不到。下面两项是两种校正手段，实现见
+  # src/models/losses/components/extension.py。
+  #
+  # ⚠️ 二者是同一问题的两种解法（Menon 原文把 Logit Adjustment 作为重加权的*替代*
+  # 提出），**同时开满会过校正**。故当前只开 CB-Focal，la_tau 留 0。
+  ete_class_counts: [3906, 267, 67, 5]   # 官方全量实测（docs/训练数据定稿.md:85）
+                                         # 换数据集/换划分后必须重算，否则先验与实际不符、
+                                         # 校正方向对但幅度错（不会报错）。
+  ete_cb_beta: 0.99         # 🔴 不要抄论文的 0.9999。实跑 class_balanced_weights 的权重比
+                            # （血管:无）：β=0.9→2.4:1  β=0.99→20.4:1  β=0.999→196.4:1
+                            # β=0.9999→646.9:1。n=5 时 0.9999 退化成近似逆频率加权，
+                            # 等于让 5 张图吃掉整个损失、必然过拟合。0.0 = 关闭加权。
+  ete_focal_gamma: 2.0      # Focal 的 γ；0 = 退化为普通加权 CE
+  ete_la_tau: 0.0           # Logit Adjustment 的 τ，**0 = 关闭**。>0 时训练损失用
+                            # CE(logits + τ·log π, y)（是**加**不是减；符号反了会放大
+                            # 不平衡且损失照常下降）。推理侧不得再调一次。
+                            # 待官方验证集到手后再调——官方数据只在云端，本地无从验证。

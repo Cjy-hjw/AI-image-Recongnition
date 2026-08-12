@@ -106,6 +106,11 @@ for root, dirs, files in os.walk(local_base):
             or f.endswith(".pyc")
             or f.endswith(".tmp")
             or f.endswith(".md")
+            # 本地临时/调试产物(审查证据脚本、探针日志)。`.gitignore` 已有 `/tmp_*`,
+            # 但 deploy 不读 gitignore —— 本轮 Gate2 的 16 个 tmp_ 脚本因此被整批传上
+            # 服务器。它们对服务器毫无用处,还会污染目录、干扰后续 agent 判断哪些是
+            # 正式代码。
+            or f.startswith("tmp_")
         ):
             continue
         local_file = os.path.join(root, f)

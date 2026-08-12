@@ -10,8 +10,15 @@
   `flip_location_index` 联动翻标签，漏了会让位置头学到反的左右而 loss 照常下降。
   ③ CoordConv **必须先过非线性再池化**（线性卷积下坐标贡献退化为常数偏置，被 GAP
   平均掉、左右完全不可分 —— 已用三段反证锁在 `tests/test_location_head.py`）。
-- **侵犯头** `extrathy_ext`/ETE（保 4 类，血管仅5例不并类）——ConvNeXt mask 概率图
-  膨胀-腐蚀出交界带 × 局部特征 + 复用 CBM `logits_margin` 旁路。
+- **侵犯头** `extrathy_ext`/ETE（**保 4 类，血管仅 5 例不并类**）—— ✅ **已实现**
+  （阶段 2.2，`extension.py`）；`soft_mask_detached` 膨胀−腐蚀出交界带 × Stage-4 局部
+  加权池化 + CBM `margin` 旁路（**detach**，不让 ETE 梯度重塑「边缘」概念、毁掉 CBM
+  报告可信度）。损失在 `losses/components/extension.py`（CB-Focal + 可选 Logit
+  Adjustment，masked）。**三个坑**：① CB 的 β **不能抄论文 0.9999** —— n=5 时权重比
+  达 646.9:1，5 张图吃掉整个损失；默认 0.99（20.4:1）。② Logit Adjustment 训练时是
+  `logits + τ·log π`（**加**），符号反了会放大不平衡而损失照常降；推理侧**不得**
+  再调一次。③ CB 加权与 LA 是同一问题的两种解法，同时开满会过校正，故 `la_tau`
+  默认 0（关）。
 - **临床T头** `clin_t_stage`（二分类）——全局 Pooling + 结节等效体积标量 + ETE logits →
   轻量 MLP；影像学上限约 0.72（淋巴结常不在视野）。
 
@@ -47,6 +54,12 @@ from src.models.heads.location import (  # noqa: F401  (re-export)
     compose_location_probs,
     flip_location_index,
 )
+from src.models.heads.extension import (  # noqa: F401  (re-export)
+    ETE_IDX_TO_CODE,
+    NUM_ETE_CLASSES,
+    ExtensionHead,
+    ExtensionOutputs,
+)
 
 __all__ = [
     "LocationHead",
@@ -54,4 +67,8 @@ __all__ = [
     "compose_location_probs",
     "build_level_validity",
     "flip_location_index",
+    "ExtensionHead",
+    "ExtensionOutputs",
+    "NUM_ETE_CLASSES",
+    "ETE_IDX_TO_CODE",
 ]

@@ -53,6 +53,7 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 |:---|:---|:---|:---|
 | `deploy.py` | 通过 SSH/SFTP 将本地代码增量同步到 A800 服务器（按文件大小差异跳过未改动文件） | 凭证:环境变量优先,未设则 fallback 读 `账号密码/deploy.env`(该目录已被 `ignore_dirs` 整目录级排除,不会同步上去);跳过 `data/` `.git/` `__pycache__` `.md` `账号密码/` 等 | **已知局限**:按文件大小diff会漏掉"内容变但大小不变"的编辑(2026-07-13 实测复现:改 `predict.py`/`evaluate.py` 一行权重路径默认值,大小未变导致漏传,靠额外 SHA256 全量核对才发现)——涉及权重路径类的小改动后,建议額外核实关键文件内容,不能只信 deploy.py 的 SUCCESS。凭证文件后缀不属于 `.md` 时会绕过旧的后缀级过滤,新增敏感文件前先确认是否已被 `ignore_dirs` 目录级覆盖(2026-07-13 曾因此把 `deploy.env` 传到 A800,已删除+补目录级排除) |
 | `seal_container.py` | 计算 `predict.py`、`video_predict.py`、`src/` 全树、`checkpoints/thyroidxl_merged_v2.pth` 的 SHA-256 并注入 `entrypoint.sh`,构成防篡改签名链 | `--dry-run` 只打印不写入;产出:`entrypoint.sh` 中 `EXPECTED_*` 四个占位符被真实指纹替换 | **只在最终交付前跑一次**;提前封印会导致后续任何代码改动使容器启动校验失败;权重缺失时注入零值占位会使生产容器必然失败;**误跑了怎么办**:`git checkout scripts/entrypoint.sh` 回退占位哈希 |
+| `probe_heads_cuda.py` | **上云前置 GPU 契约探针**(2026-08-12 Phase2 阶段2.2 新增)——三头(位置/侵犯/临床T接入)在真实 CUDA 上的前向反向契约探针,查维度失配/显存/非零梯度,防"本地 CPU 过、上云 GPU 崩" | 实测(2026-08-12 A800 torch2.6):batch=16 显存峰值 allocated 124.9MB / reserved 140.0MB | 上云训练/交付前跑,确认三头在 GPU 上无维度/显存问题;更新三头维度或新增头后必跑 |
 
 ---
 

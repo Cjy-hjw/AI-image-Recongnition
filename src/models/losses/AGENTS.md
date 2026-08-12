@@ -19,6 +19,23 @@
   **峡部 level 标签是 -1**，直接喂 `cross_entropy` 报 `Target -1 is out of bounds` →
   先 clamp 到 0 保证不崩、再由 validity 乘 0 屏蔽，**两道保险缺一不可**（只 clamp 会
   编造监督，只屏蔽会先崩在 CE 里）。
+- `extension.py`: `compute_extension_loss()` + `class_balanced_weights()` +
+  `log_class_prior()` — ETE（甲状腺外侵犯 4 类）的 masked CB-Focal + 可选 Logit
+  Adjustment（阶段 2.2）。全项目最极端的不平衡任务：`3906/267/67/5`，最稀有类 0.12%。
+  **三条必须记住**：
+  1. 🔴 **CB 的 β 不能抄论文的 0.9999**。实跑权重比（血管:无）：β=0.9→2.4:1、
+     0.99→**20.4:1（默认）**、0.999→196.4:1、0.9999→**646.9:1**。n=5 时 0.9999 退化成
+     近似逆频率加权，等于让 5 张图吃掉整个损失、必然过拟合。
+  2. 🔴 **Logit Adjustment 训练时是 `logits + τ·log π`（加，不是减）**。符号反了会
+     **放大**不平衡，而损失照常下降（实跑：反号时 loss 仍从 2.90 降到 0.19）——
+     与 #113 FAMO、#120 拉格朗日符号同类。推理侧**不得再调一次**：训练完的原始
+     logits 本身已逼近平衡后验。方向由 `tests/test_extension_head.py` 的收敛实验
+     锁死（纯 CE gap≈3.0 / LA≈0 / 反号≈5.9，三者两两可分）。
+  3. CB 加权与 LA 是同一问题的两种解法，**同时开满会过校正**，故 `la_tau` 默认 0。
+     两个超参都在 `configs/thyroid_config.yaml: train.ete_*`。
+  **`focal_gamma` 只接受 0 或 ≥1**：γ∈(0,1) 在 `p_t=1.0` 处梯度为 NaN 而 loss 值
+  看不出异常（实跑 γ=0.5 → loss=0.0、grad=[nan,nan]），且 `p_t==1.0` 在 fp32 下
+  真的可达（logit gap≥50 即精确 1.0）。
 
 ---
 
@@ -95,4 +112,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`（全套现 671 passed(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）
+执行: `pytest tests/test_masked_loss.py -v`（全套现 711 collected / 710 passed+1 skipped(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境同日为 620）

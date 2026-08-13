@@ -104,7 +104,16 @@ def build_official_head_config(config: dict) -> dict:
 def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     """加载分割底座 checkpoint。三头键缺失属预期(底座无三头);缺任何**非头**键即
     fail-loud —— 那意味着底座与当前架构不匹配,静默半载会训出垃圾。"""
-    state = torch.load(ckpt_path, map_location=device)
+    # weights_only=False 是**防御性**声明,不是在修已存在的崩溃:torch 2.6 起该参数
+    # 默认翻转为 True,会拒绝纯 tensor 之外的对象。A800(torch2.6)实测全部 17 个
+    # checkpoint:本项目的分割底座(best_model_mixtrain_xl_e40.pth 等)是纯
+    # OrderedDict,默认参数下加载正常;唯一在默认参数下 UnpicklingError 的是
+    # authenticity_model.pth(含 numpy 的 feat_mean/feat_std),而它由
+    # gatekeeper/authenticity.py:229 自己以 weights_only=False 加载,不走这里。
+    # 此处显式关掉,是因为 --resume-from 允许指向 thyroidxl_best.pth 那类
+    # {"epoch","stage","state_dict",...} 包装格式,未来格式再变也不会在云上翻车。
+    # 加载的是我方自产的可信文件(非外部输入),关掉该校验无安全代价。
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     # best_model.pth 是纯 state_dict;若是 {"model": ...} 包装则取出。
     if isinstance(state, dict) and "model" in state and "location_head.0.weight" not in state:
         state = state["model"]
@@ -121,8 +130,6 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     n_head_missing = len(result.missing_keys)
     print(f"--> [warm-start] 加载 {ckpt_path};三头 {n_head_missing} 键随机初始化(预期)")
 
-
-import torch.nn as nn  # noqa: E402  (放在 load_warm_start 之后仅为可读性,不影响)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,6 +344,30 @@ def main():
     print(f"[train_official] device={device} bs={batch_size} img={img_size} "
           f"lr_base={lr_base} epochs={epochs} mock={args.mock_labels} freeze_legacy={args.freeze_legacy}")
 
+    # ── --out 可写性预检(fail-fast,必须在任何耗时操作之前)──────────────────
+    # 为什么要有:`torch.save` 失败会抛异常直接中断训练,而保存只发生在每轮 val
+    # 之后 —— 35 epoch 跑到第 30 轮才发现写不进去,前面全部白跑。
+    # 为什么位置这么靠前:再往后就是建数据集 → 建模型 → warm-start 加载 121MB
+    # 底座 → 跑一轮 baseline validate,云上合计好几分钟;路径不可写这件事在
+    # 第 0 秒就能知道,没有任何理由让它等到那之后。
+    # 为什么不能只靠 makedirs:2026-08-13 A800 实测复现过一个 makedirs 完全测
+    # 不出的场景 —— `checkpoints/` 目录 owner 是当前用户、可写(makedirs 通过),
+    # 但目标文件 official_heads_best.pth 的 owner 是 root、模式 644,torch.save
+    # 走 open(w) 覆盖时 Permission denied。**目录可写 ≠ 目标文件可写**。
+    # 为什么用 "ab" 而不是 "wb":append 模式不截断,已存在的权重文件零风险;
+    # 只有探针自己新建的 0 字节文件才删除(size==0 判据),绝不误删已有权重。
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    try:
+        with open(args.out, "ab"):
+            pass
+        if os.path.getsize(args.out) == 0:
+            os.remove(args.out)
+    except OSError as e:
+        raise SystemExit(
+            f"[FATAL] --out 不可写:{args.out}({type(e).__name__}: {e})。"
+            f"训练前置检查失败,拒绝空跑 —— 若等到训练结束才发现,整轮算力全废。"
+        )
+
     # ── 数据 ──────────────────────────────────────────────────────────────
     if args.mock_labels:
         n_train = 16 if args.smoke else 64
@@ -370,7 +401,16 @@ def main():
     ).to(device)
     criterion = MultiTaskLoss(official_head_config=build_official_head_config(config)).to(device)
     vclub_optimizer = torch.optim.Adam(model.vclub.parameters(), lr=1e-4)
-    scaler = torch.cuda.amp.GradScaler(enabled=config["train"].get("amp", True))
+    # torch.amp.GradScaler(新 API):`torch.cuda.amp.GradScaler` 在 2.8 已 deprecated
+    # (docs/交付与部署/torch2.8迁移方案.md:80 登记的待迁移项;cbm_head.py:37/52 是样板)。
+    # 云端就是 torch2.8,新入口直接用新 API,少留一处债。传 device.type 而非硬编码
+    # 'cuda':本地 CPU 冒烟时不会刷"CUDA 不可用"的无谓警告。
+    # `# type: ignore`:torch 上游没把 GradScaler 放进 torch.amp.__all__(2.5.1/2.8.0
+    # 实测均为 False),Pyright 会报 reportPrivateImportUsage —— 但两版**运行时都可用**
+    # (已实测构造成功)。压法沿用 cbm_head.py:37/52 的既有样板。
+    scaler = torch.amp.GradScaler(  # type: ignore[attr-defined]
+        device.type, enabled=config["train"].get("amp", True)
+    )
 
     if args.resume_from:
         load_warm_start(model, args.resume_from, device)
@@ -388,7 +428,6 @@ def main():
         )
         print(f"--> [护栏] warm-start val Dice 基线 = {dice_baseline:.4f}")
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     logger = JsonlLogger(log_dir=args.log_dir, data_source="official/train_v1")
     log_every = 1 if args.smoke else 20
     running_losses_history: list = []

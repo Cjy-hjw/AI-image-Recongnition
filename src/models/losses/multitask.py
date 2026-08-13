@@ -76,21 +76,27 @@ class MultiTaskLoss(nn.Module):
         self.register_buffer("lambda_latent", torch.tensor(0.01))
         self.delta_budget = 0.1
 
-        # ── 官方三头(位置/ETE/临床T)的固定 λ 外挂配置 ─────────────────────────
+        # ── 官方新增维度头(位置/ETE/临床T/TI-RADS)的固定 λ 外挂配置 ─────────────
         # 由 `scripts/train_official.py` 从 config 组装后传入;为 None 时用默认值,
-        # 且只要 targets 里没有三头键就整体跳过(legacy train.py 路径零回归)。
+        # 且只要 targets 里没有对应头的键就整体跳过(legacy train.py 路径零回归)。
         # ETE 的 class_weights / log_prior 是 [C] 张量,须随模型 .to(device) 迁移,
         # 故走 register_buffer 而非普通属性(普通属性留在 CPU 会在损失里报设备不匹配)。
         cfg = dict(official_head_config or {})
         self.lambda_loc = float(cfg.get("loc_loss_weight", 1.0))
         self.lambda_ete = float(cfg.get("ete_loss_weight", 1.0))
         self.lambda_clin_t = float(cfg.get("clin_t_loss_weight", 1.0))
+        self.lambda_tirads = float(cfg.get("tirads_loss_weight", 1.0))
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
         self.clin_t_label_smoothing = float(cfg.get("clin_t_label_smoothing", 0.0))
+        self.tirads_label_smoothing = float(cfg.get("tirads_label_smoothing", 0.0))
+        # 默认 0(关闭):见 `losses/components/tirads.py` docstring —— 没有真实数据
+        # 无法调参,先证后改;权重为 0 时对 loss 精确无贡献。
+        self.tirads_ordinal_weight = float(cfg.get("tirads_ordinal_weight", 0.0))
         self.register_buffer("ete_class_weights", cfg.get("ete_class_weights"))
         self.register_buffer("ete_log_prior", cfg.get("ete_log_prior"))
         self.register_buffer("clin_t_class_weights", cfg.get("clin_t_class_weights"))
+        self.register_buffer("tirads_class_weights", cfg.get("tirads_class_weights"))
 
     def forward(
         self,
@@ -183,12 +189,16 @@ class MultiTaskLoss(nn.Module):
             lambda_loc=self.lambda_loc,
             lambda_ete=self.lambda_ete,
             lambda_clin_t=self.lambda_clin_t,
+            lambda_tirads=self.lambda_tirads,
             ete_class_weights=self.ete_class_weights,
             ete_log_prior=self.ete_log_prior,
             ete_focal_gamma=self.ete_focal_gamma,
             ete_la_tau=self.ete_la_tau,
             clin_t_class_weights=self.clin_t_class_weights,
             clin_t_label_smoothing=self.clin_t_label_smoothing,
+            tirads_class_weights=self.tirads_class_weights,
+            tirads_label_smoothing=self.tirads_label_smoothing,
+            tirads_ordinal_weight=self.tirads_ordinal_weight,
         )
         total_loss = total_loss + head_total
 

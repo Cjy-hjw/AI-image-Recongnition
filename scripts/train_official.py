@@ -1,23 +1,23 @@
-"""官方数据三头训练入口 —— **不动 `train.py`**(legacy 交付路径,已验证)。
+"""官方数据四头训练入口 —— **不动 `train.py`**(legacy 交付路径,已验证)。
 
 与 `train.py` 的分工:`train.py` 跑 legacy 三阶段(分割+概念+良恶性,stages.py 调度);
-本脚本跑**官方三头**(位置/ETE/临床T)的 A/B/C 调度(schedule_official.py),从分割底座
+本脚本跑**官方四头**(位置/ETE/临床T/TI-RADS)的 A/B/C 调度(schedule_official.py),从分割底座
 warm-start,官方数据只在云端 —— 本地只能 `--mock-labels --smoke` 验管道数值健康。
 
 ## 训练循环复用与损失政策
 
 复用 `train_batch`(loop/train_step.py):它已内建 mixup 后的 `build_official_head_targets`
-(三头 targets 组装,只训主病灶 + validity 顶层直传),AMP/scaler/grad-clip/vCLUB/AUCM
-对偶步进都在里面,不重造。三头损失由 `MultiTaskLoss` 的固定 λ 外挂算(不进 FAMO)。
+(四头 targets 组装,只训主病灶 + validity 顶层直传),AMP/scaler/grad-clip/vCLUB/AUCM
+对偶步进都在里面,不重造。四头损失由 `MultiTaskLoss` 的固定 λ 外挂算(不进 FAMO)。
 
 **legacy 损失默认保持开启**(`--freeze-legacy` 关):头微调期间继续回传分割+概念+良恶性
 损失,守护旧任务不退化(Stage B 解冻 cls Top-2 时尤其重要 —— 让 top-2 同时服务新旧任务,
-而非被三头单独拉走导致良恶性 AUC 退化)。传 `--freeze-legacy` 则关 malignancy AUCM
+而非被四头单独拉走导致良恶性 AUC 退化)。传 `--freeze-legacy` 则关 malignancy AUCM
 (对偶变量冻结),纯头训练。
 
 ## Gate / 护栏
 
-- warm-start:`--resume-from` strict=False,断言 missing_keys ⊆ 三头前缀(多缺一个
+- warm-start:`--resume-from` strict=False,断言 missing_keys ⊆ 四头前缀(多缺一个
   非头键即 fail-loud,杜绝静默半载,Phase B.4)。
 - Dice 护栏:warm-start 后在官方 val 上测一次基线,训练中 val Dice 相对基线跌 >1 点
   警告、>3 点 abort(防重演 Stage2 崩塌)。基线与训练 val 同口径(validate_step 逐样本平均)。
@@ -67,22 +67,27 @@ from src.training.trainer import validate_epoch
 # official_head_config 组装(从 config.train 的类计数造 λ / 权重张量)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_official_head_config(config: dict) -> dict:
-    """把 config.train 的三头超参组装成 `MultiTaskLoss(official_head_config=...)`。
+    """把 config.train 的官方头超参组装成 `MultiTaskLoss(official_head_config=...)`。
 
-    ETE 的 class_weights / log_prior、T 的 class_weights 是 [C] 张量,由类计数构造;
-    随模型 `.to(device)` 迁移(MultiTaskLoss 用 register_buffer 存,故这里给 CPU 张量即可)。
+    ETE 的 class_weights / log_prior、T/TI-RADS 的 class_weights 是 [C] 张量,由类
+    计数构造;随模型 `.to(device)` 迁移(MultiTaskLoss 用 register_buffer 存,故这里
+    给 CPU 张量即可)。
     """
     tr = config["train"]
     ete_counts = tr["ete_class_counts"]
     ete_beta = float(tr.get("ete_cb_beta", 0.99))
     ete_la_tau = float(tr.get("ete_la_tau", 0.0))
+    tirads_counts = tr.get("tirads_class_counts")
     cfg = {
         "loc_loss_weight": float(tr.get("loc_loss_weight", 1.0)),
         "ete_loss_weight": float(tr.get("ete_loss_weight", 1.0)),
         "clin_t_loss_weight": float(tr.get("clin_t_loss_weight", 1.0)),
+        "tirads_loss_weight": float(tr.get("tirads_loss_weight", 1.0)),
         "ete_focal_gamma": float(tr.get("ete_focal_gamma", 2.0)),
         "ete_la_tau": ete_la_tau,
         "clin_t_label_smoothing": float(tr.get("clin_t_label_smoothing", 0.0)),
+        "tirads_label_smoothing": float(tr.get("tirads_label_smoothing", 0.0)),
+        "tirads_ordinal_weight": float(tr.get("tirads_ordinal_weight", 0.0)),
         # β=0 → 不加权(None);>0 → CB 权重。
         "ete_class_weights": (
             class_balanced_weights(ete_counts, ete_beta) if ete_beta > 0 else None
@@ -94,15 +99,22 @@ def build_official_head_config(config: dict) -> dict:
             if tr.get("clin_t_use_class_weights", False)
             else None
         ),
+        # TI-RADS 真实计数未知(禁本地),config 默认 null + 开关 false → 不加权;
+        # 上云拿到真实分布、且判定属中度不平衡(非长尾)后再置 true + 填计数。
+        "tirads_class_weights": (
+            inverse_frequency_weights(tirads_counts)
+            if tr.get("tirads_use_class_weights", False) and tirads_counts
+            else None
+        ),
     }
     return cfg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# warm-start:strict=False + missing_keys ⊆ 三头前缀断言(Phase B.4)
+# warm-start:strict=False + missing_keys ⊆ 四头前缀断言(Phase B.4)
 # ─────────────────────────────────────────────────────────────────────────────
 def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
-    """加载分割底座 checkpoint。三头键缺失属预期(底座无三头);缺任何**非头**键即
+    """加载分割底座 checkpoint。四头键缺失属预期(底座无四头);缺任何**非头**键即
     fail-loud —— 那意味着底座与当前架构不匹配,静默半载会训出垃圾。"""
     # weights_only=False 是**防御性**声明,不是在修已存在的崩溃:torch 2.6 起该参数
     # 默认翻转为 True,会拒绝纯 tensor 之外的对象。A800(torch2.6)实测全部 17 个
@@ -122,27 +134,28 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     bad_missing = [k for k in result.missing_keys if not k.startswith(head_pfx)]
     if bad_missing:
         raise RuntimeError(
-            f"warm-start 底座缺失**非三头**键 {bad_missing[:8]}(共 {len(bad_missing)})"
+            f"warm-start 底座缺失**非四头**键 {bad_missing[:8]}(共 {len(bad_missing)})"
             f" —— checkpoint {ckpt_path} 与当前架构不匹配,拒绝静默半载。"
         )
     if result.unexpected_keys:
         print(f"--> [warm-start] 忽略 {len(result.unexpected_keys)} 个多余键(底座含已弃用字段)")
     n_head_missing = len(result.missing_keys)
-    print(f"--> [warm-start] 加载 {ckpt_path};三头 {n_head_missing} 键随机初始化(预期)")
+    print(f"--> [warm-start] 加载 {ckpt_path};四头 {n_head_missing} 键随机初始化(预期)")
 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mock 数据集(--mock-labels):合成图像 + 三头标签,验管道数值健康
+# Mock 数据集(--mock-labels):合成图像 + 四头标签,验管道数值健康
 # ─────────────────────────────────────────────────────────────────────────────
 class MockOfficialDataset(Dataset):
-    """纯合成数据集:随机图像 + 随机 mask + 三头标签(含边界情形)。
+    """纯合成数据集:随机图像 + 随机 mask + 官方新增维度头标签(含边界情形)。
 
     **不依赖磁盘/公开集** —— 冒烟只验 forward/backward/masked-loss 数值健康,合成即可
     (比"公开集图像"更可移植:CI/陌生容器都能跑,无路径依赖)。刻意覆盖:
       - 全 invalid 样本(所有 valid_*=0,验 masked loss 精确 0、不炸);
       - 峡部(lesion_loc=6,无纵向属性,位置头 clamp 分支);
-      - ETE 血管(extrathy_ext=3,最稀有类)。
+      - ETE 血管(extrathy_ext=3,最稀有类);
+      - TI-RADS 两端类别(I 级=0、V 级=4,验有序项/类权重不偏废边界类)。
     """
 
     def __init__(self, n: int = 32, img_size: int = 512, seed: int = 0):
@@ -152,19 +165,26 @@ class MockOfficialDataset(Dataset):
         # 预生成每样本的确定性属性(种子固定 → 可复现)
         self._specs = []
         for i in range(n):
-            # 每 8 个里留 1 个全 invalid;每 8 个里 1 个峡部;1 个 ETE 血管。
+            # 每 8 个里留 1 个全 invalid;每 8 个里 1 个峡部;1 个 ETE 血管;
+            # 1 个 TI-RADS I 级;1 个 TI-RADS V 级。
             all_invalid = (i % 8 == 0)
             loc = 6 if (i % 8 == 1) else int(self.rng.randint(0, 7))     # 0..6
             ete = 3 if (i % 8 == 2) else int(self.rng.randint(0, 4))     # 0..3
             t = int(self.rng.randint(0, 2))
-            self._specs.append((all_invalid, loc, ete, t, i % 5 != 4))   # is_main: 4/5
+            if i % 8 == 3:
+                tirads = 0       # I 级
+            elif i % 8 == 4:
+                tirads = 4       # V 级
+            else:
+                tirads = int(self.rng.randint(0, 5))                    # 0..4
+            self._specs.append((all_invalid, loc, ete, t, tirads, i % 5 != 4))  # is_main: 4/5
 
     def __len__(self):
         return self.n
 
     def __getitem__(self, idx):
         s = self.img_size
-        all_invalid, loc, ete, t, is_main = self._specs[idx]
+        all_invalid, loc, ete, t, tirads, is_main = self._specs[idx]
         img = torch.rand(1, s, s, dtype=torch.float32)
         mask = (torch.rand(1, s, s) > 0.7).float()
         v = 0.0 if all_invalid else 1.0
@@ -176,10 +196,11 @@ class MockOfficialDataset(Dataset):
             "foci": torch.zeros(4, dtype=torch.float32), "valid_foci": 0,
             "malignancy": int(t), "valid_malignancy": int(v),
             "valid_mask": 1,
-            # 三头
+            # 官方新增维度头
             "lesion_loc": loc, "valid_lesion_loc": int(v),
             "extrathy_ext": ete, "valid_extrathy_ext": int(v),
             "clin_t_stage": t, "valid_clin_t_stage": int(v),
+            "tirads": tirads, "valid_tirads": int(v),
             "is_main": int(is_main),
             "lesion_id": f"mock::{idx}",
             "patient_id": f"mockpid::{idx % 7}",
@@ -188,10 +209,10 @@ class MockOfficialDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 冒烟:三头梯度健康(独立于训练循环,可确定性断言)
+# 冒烟:官方头梯度健康(独立于训练循环,可确定性断言)
 # ─────────────────────────────────────────────────────────────────────────────
 def smoke_grad_health(model: nn.Module, criterion: nn.Module, device):
-    """手动一次 forward+backward,断言三头梯度非零非 NaN;再验全 invalid batch 不炸。
+    """手动一次 forward+backward,断言各官方头梯度非零非 NaN;再验全 invalid batch 不炸。
 
     独立于 `train_batch`(它内部 zero_grad→step→zero,拿不到中间梯度),故这里自造
     最小批直接查 `.grad`。是本地能做的最强管道验证。
@@ -203,6 +224,7 @@ def smoke_grad_health(model: nn.Module, criterion: nn.Module, device):
         "location_head": model.location_head,
         "extension_head": model.extension_head,
         "clinical_t_head": model.clinical_t_head,
+        "tirads_head": model.tirads_head,
     }
 
     def _run(valid: float):
@@ -222,13 +244,15 @@ def smoke_grad_health(model: nn.Module, criterion: nn.Module, device):
                 k: torch.full((B,), valid, device=device)
                 for k in ("composition", "echogenicity", "shape", "margin", "foci", "malignancy")
             },
-            # 三头顶层直传 validity
+            # 官方新增维度头顶层直传 validity
             "lesion_loc": torch.tensor([6, 0], device=device),          # 含峡部
             "valid_lesion_loc": torch.full((B,), valid, device=device),
             "extrathy_ext": torch.tensor([3, 0], device=device),        # 含血管
             "valid_extrathy_ext": torch.full((B,), valid, device=device),
             "clin_t_stage": torch.tensor([1, 0], device=device),
             "valid_clin_t_stage": torch.full((B,), valid, device=device),
+            "tirads": torch.tensor([4, 0], device=device),              # 含 V 级
+            "valid_tirads": torch.full((B,), valid, device=device),
         }
         outputs = model(img)
         loss, loss_dict = criterion(outputs, targets, enable_mal_loss=True)
@@ -244,7 +268,7 @@ def smoke_grad_health(model: nn.Module, criterion: nn.Module, device):
         assert all(torch.isfinite(g).all() for g in grads), f"{hname} 梯度含 NaN/Inf"
         assert any(g.abs().sum().item() > 0 for g in grads), f"{hname} 梯度全零(监督未生效?)"
 
-    # ② 全 invalid 批:masked loss 精确屏蔽三头,loss 仍有限、三头梯度全零、无 NaN
+    # ② 全 invalid 批:masked loss 精确屏蔽四头,loss 仍有限、四头梯度全零、无 NaN
     loss_invalid = _run(0.0)
     assert np.isfinite(loss_invalid), f"全 invalid 批 loss 非有限: {loss_invalid}"
     for hname, head in heads.items():
@@ -305,7 +329,7 @@ def run_official_epoch(
 # main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="官方三头 A/B/C 调度训练")
+    parser = argparse.ArgumentParser(description="官方四头 A/B/C 调度训练")
     parser.add_argument("--config", default="configs/thyroid_config.yaml")
     parser.add_argument("--data-root", default=None, help="官方 annotation 根目录")
     parser.add_argument("--xlsx", default=None, help="官方标注 xlsx 路径")
@@ -458,7 +482,7 @@ def main():
                 device, config, running_losses_history, epoch, args.freeze_legacy,
                 logger, log_every, head_lr,
             )
-            saw_head_grad = True  # run_official_epoch 跑通即三头参与了 backward
+            saw_head_grad = True  # run_official_epoch 跑通即四头参与了 backward
 
             metrics: dict = {}
             val_loss, val_dice, val_acc, _, val_auc = validate_epoch(
@@ -470,7 +494,8 @@ def main():
                 f"Epoch {epoch:02d}/{epochs} [{stage_name}] train_loss={avg_loss:.4f} "
                 f"val_dice={val_dice:.4f} composite={composite} "
                 f"loc_auc={metrics.get('location_weighted_auc')} "
-                f"ete_kappa={metrics.get('ete_weighted_kappa')} t_auc={metrics.get('clinical_t_auc')}"
+                f"ete_kappa={metrics.get('ete_weighted_kappa')} t_auc={metrics.get('clinical_t_auc')} "
+                f"tirads_kappa={metrics.get('tirads_weighted_kappa')}"
             )
 
             # Dice 护栏(仅真数据有基线):相对 warm-start 基线跌 >3 点 abort、>1 点 warn。
@@ -503,8 +528,8 @@ def main():
         logger.close()
 
     if args.smoke:
-        assert saw_head_grad, "冒烟未跑到任何三头 backward"
-        print(f"[SMOKE OK] {epochs} epoch 完成,三头管道数值健康,日志 → {logger.path}")
+        assert saw_head_grad, "冒烟未跑到任何四头 backward"
+        print(f"[SMOKE OK] {epochs} epoch 完成,四头管道数值健康,日志 → {logger.path}")
 
 
 if __name__ == "__main__":

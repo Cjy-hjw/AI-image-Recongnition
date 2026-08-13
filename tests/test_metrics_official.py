@@ -20,8 +20,8 @@ from src.training.metrics_official import (
 
 
 def _rec(lesion_id, *, mal=1, mal_p=0.5, loc=0, loc_probs=None, ete=0,
-         ete_probs=None, t=0, t_conf=0.5, is_main=1,
-         v_mal=1, v_loc=1, v_ete=1, v_t=1, patient="P"):
+         ete_probs=None, t=0, t_conf=0.5, tirads=0, tirads_probs=None, is_main=1,
+         v_mal=1, v_loc=1, v_ete=1, v_t=1, v_tirads=1, patient="P"):
     """造一条 `collect_official_records` 形状的记录。默认全 valid、主病灶、恶性。"""
     if loc_probs is None:
         loc_probs = [0.0] * 7
@@ -29,6 +29,9 @@ def _rec(lesion_id, *, mal=1, mal_p=0.5, loc=0, loc_probs=None, ete=0,
     if ete_probs is None:
         ete_probs = [0.0] * 4
         ete_probs[ete] = 1.0
+    if tirads_probs is None:
+        tirads_probs = [0.0] * 5
+        tirads_probs[tirads] = 1.0
     return {
         "lesion_id": lesion_id,
         "patient_id": patient,
@@ -45,6 +48,9 @@ def _rec(lesion_id, *, mal=1, mal_p=0.5, loc=0, loc_probs=None, ete=0,
         "t_conf": t_conf,
         "gt_clin_t_stage": t,
         "valid_clin_t_stage": v_t,
+        "tirads_probs": list(tirads_probs),
+        "gt_tirads": tirads,
+        "valid_tirads": v_tirads,
     }
 
 
@@ -52,7 +58,7 @@ def test_empty_records_returns_all_none():
     m = compute_official_metrics([])
     assert m["n_lesions"] == 0 and m["composite"] is None
     for k in ("malignancy_auc_pr", "location_weighted_auc",
-              "ete_weighted_kappa", "clinical_t_auc"):
+              "ete_weighted_kappa", "clinical_t_auc", "tirads_weighted_kappa"):
         assert m[k] is None
 
 
@@ -134,6 +140,47 @@ def test_ete_and_t_exclude_benign_but_location_does_not():
     assert m["location_weighted_auc"] is not None, "位置不该被'仅恶性'过滤"
     assert m["ete_weighted_kappa"] is None, "ETE 必须排除良性 → 剩余单类不可算"
     assert m["clinical_t_auc"] is None, "T 必须排除良性 → 剩余单类不可算"
+
+
+def test_tirads_includes_benign_unlike_ete_and_t():
+    """🔴 TI-RADS 与位置同属"不限恶性",与 ETE/T **不同**(评审规则原文核对过,
+    「TI-RADS加权Kappa,仅匹配成功的主病灶」不带"且为恶性"限定)。
+
+    构造 2 恶性(TI-RADS 标注互不相同)+ 2 良性(TI-RADS 标注也互不相同)—— 若实现
+    误加了"仅恶性",良性会被过滤、只剩 2 恶性各自单类 → None;正确实现应保留
+    全部 4 样本、可算出具体值。
+    """
+    recs = [
+        _rec("M1", mal=1, tirads=0),
+        _rec("M2", mal=1, tirads=1),
+        _rec("B1", mal=0, tirads=3),
+        _rec("B2", mal=0, tirads=4),
+    ]
+    m = compute_official_metrics(recs)
+    assert m["tirads_weighted_kappa"] is not None, "TI-RADS 不该被'仅恶性'过滤"
+
+
+def test_tirads_uses_quadratic_weighted_kappa_on_argmax():
+    """TI-RADS = 加权(quadratic)Kappa,吃 argmax 硬预测。与 sklearn 手算对拍,
+    同时反证"不是线性 Kappa"(同 ETE 的钉法)。"""
+    def tp(cls):
+        v = [0.0] * 5
+        v[cls] = 1.0
+        return v
+
+    pairs = [(0, 0), (1, 4), (2, 2), (4, 1), (0, 1), (4, 4), (3, 0)]
+    recs = [
+        _rec(f"L{i}", mal=(i % 2), tirads=gt, tirads_probs=tp(pred))
+        for i, (gt, pred) in enumerate(pairs)
+    ]
+    got = compute_official_metrics(recs)["tirads_weighted_kappa"]
+
+    y_true = [gt for gt, _ in pairs]
+    y_pred = [pred for _, pred in pairs]
+    quad = cohen_kappa_score(y_true, y_pred, labels=list(range(5)), weights="quadratic")
+    lin = cohen_kappa_score(y_true, y_pred, labels=list(range(5)), weights="linear")
+    assert got == pytest.approx(float(quad))
+    assert not np.isclose(quad, lin), "反例失效:本组数据的线性/二次 Kappa 恰好相同"
 
 
 def test_invalid_samples_excluded_not_defaulted():

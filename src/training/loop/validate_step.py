@@ -7,13 +7,14 @@ import torch
 _placeholder_counter = itertools.count()
 
 
-# 三头 targets 与既有概念任务的组装规则不同(无 mixup、validity 顶层直传),
-# 见 `train_step.py` 同名注释。验证期无 mixup,故这里直接组装。
-_OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage")
+# 官方新增维度头(位置/ETE/临床T/TI-RADS)的 targets 组装规则与既有概念任务不同
+# (无 mixup、validity 顶层直传),见 `train_step.py` 同名注释。验证期无 mixup,
+# 故这里直接组装。
+_OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage", "tirads")
 
 
 def _official_head_targets(labels, batch_size, device):
-    """把 loader 给的三头标签/validity 转成 targets 片段。键缺席 → 返回空 dict。"""
+    """把 loader 给的官方头标签/validity 转成 targets 片段。键缺席 → 返回空 dict。"""
     out = {}
     for task in _OFFICIAL_HEAD_TASKS:
         if task not in labels:
@@ -58,6 +59,7 @@ def collect_official_records(outputs, labels, targets):
     loc_probs = cpu_list(outputs["location_probs"])
     ete_probs = cpu_list(outputs["ete_probs"])
     t_conf = cpu_list(outputs["t_conf"])
+    tirads_probs = cpu_list(outputs["tirads_probs"])
     mal_p = cpu_list(mal_probs)
 
     # lesion_id / patient_id 经 default_collate 是 list[str];缺失时退化为逐样本
@@ -68,10 +70,12 @@ def collect_official_records(outputs, labels, targets):
     gt_loc = cpu_list(targets["lesion_loc"])
     gt_ete = cpu_list(targets["extrathy_ext"]) if "extrathy_ext" in targets else [0] * B
     gt_t = cpu_list(targets["clin_t_stage"]) if "clin_t_stage" in targets else [0] * B
+    gt_tirads = cpu_list(targets["tirads"]) if "tirads" in targets else [0] * B
     gt_mal = cpu_list(targets["malignancy"])
     v_loc = cpu_list(targets["valid_lesion_loc"])
     v_ete = cpu_list(targets.get("valid_extrathy_ext", torch.zeros(B)))
     v_t = cpu_list(targets.get("valid_clin_t_stage", torch.zeros(B)))
+    v_tirads = cpu_list(targets.get("valid_tirads", torch.zeros(B)))
     v_mal = label_list("valid_malignancy", 1)
 
     records = []
@@ -99,6 +103,9 @@ def collect_official_records(outputs, labels, targets):
             "t_conf": t_conf[i],
             "gt_clin_t_stage": int(gt_t[i]),
             "valid_clin_t_stage": int(v_t[i]),
+            "tirads_probs": tirads_probs[i],
+            "gt_tirads": int(gt_tirads[i]),
+            "valid_tirads": int(v_tirads[i]),
         })
     return records
 

@@ -83,11 +83,15 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结主干 BN 置
 
 `compute_official_head_losses` + `MultiTaskLoss` 的固定 λ 外挂:legacy 三头全缺席零回归(返回 0.0+空 dict)、λ 精确线性、全 invalid 精确 0.0 无 NaN、validity 必须 targets 顶层直传键(塞 label_validity 静默失效)、[B,1] validity 拒绝、**梯度隔离**(cbm_head/seg_head/dec_stages 梯度精确 0、cls_backbone>0)、`register_buffer(..., None)` 不进 state_dict(legacy 零影响)、buffer 随 model 走 device。
 
-## 测试总数(单一权威,2026-08-12 `Demo_D` 主环境实测,三数自洽)
+## `test_tirads_head.py` — TI-RADS 头(backlog #124,15 用例,2026-08-13)
 
-**`pytest --collect-only`=795 / grep `def test_`=693 / 全套 794 passed + 1 skipped**（collect 与 def 差额=参数化用例）。
+目标三(60%权重)四子任务里此前唯一无训练信号的任务补齐后的单测。判据强度参照 extension/clinical_t 头:① 输出契约(形状/`tirads_probs`和为1/fp32);② **梯度隔离**(五个 CBM 概念 logits 全部 `.detach()`,`test_head_does_not_backprop_into_cbm_concepts` 去掉任一 detach 即失败;`test_head_concepts_actually_feed_output` 反证非空转);③ **罗马数字精确查表**(`test_roman_numeral_exact_match_not_substring`,IV/III 不被子串判成 I/II,loader 侧 `official_loader._parse_tirads`);④ **masked loss**(全 invalid 精确 0 且无 NaN、λ 线性缩放、类权重按标签而非预测索引、validity 必须 [B] 一维、标签越界拒绝);⑤ **可选二次有序项**(默认 `ordinal_weight=0` 对 total 精确无贡献,权重>0 时才建图——2026-08-13 Gate2 审查后从"无条件计算"改为门控,`test_ordinal_term_zero_weight_has_no_effect`/`test_ordinal_term_penalizes_far_predictions_more` 双向锁定语义);⑥ `inverse_frequency_weights` re-export 校验(与 `clinical_t.py` 同一函数对象,非复制)。
 
-- **三头相关单测合计 127**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12),Demo_D 与 A800(torch2.6)两环境均实测通过。
+## 测试总数(单一权威,2026-08-13 `Demo_D` 主环境实测,backlog #124 Gate2 审查+F1回归测试后重新对拍)
+
+**`pytest --collect-only`=814 / 全套 813 passed + 1 skipped**(2026-08-12 快照 795 collected / 794 passed+1 skipped 已过时,+19 = 本轮 `test_tirads_head.py` 新增15 + `test_official_loader.py`/`test_metrics_official.py` 补充断言各 +1/+2 + Gate2 审查后补的 `test_tirads_parse_known_gaps_pinned_by_regression` +1)。
+
+- **四头(位置/侵犯/临床T/TI-RADS)相关单测合计 142**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12 + backlog #124 `test_tirads_head.py` 15),Demo_D 实测通过;A800(torch2.6)/torch2.8 预演环境覆盖 TI-RADS 头待下次云端对拍确认(本轮仅 Windows+CPU 与真 CUDA `probe_heads_cuda.py` 双路验证)。
 - ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 **789 passed + 6 skipped**(2026-08-13 实测,**collected 795 与主环境一致**);旧记的 620 是 08-12 快照、已失效,且 08-13 补装 pandas+openpyxl 之前该环境只能收集 782 —— `tests/test_official_loader.py` 整模块被 `pytest.importorskip("pandas")` 跳过,预演对 `official_loader` 覆盖率为 0。skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。
 - **下方分模块明细数字为历史演进累积、可能有偏差**——精确值一律以 `pytest --collect-only tests/` 实跑为准,不逐一核对旧数。
 - Phase5(2026-08-10)交付四模块:`test_nifti_io`(24) + `test_nodule_split`(28) + `test_prediction_json`(45) + `test_v21_output`(11) + `test_service_runner`(12) + `test_case_discovery`(40) + `test_service_api`(20)(含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。

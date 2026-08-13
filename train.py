@@ -49,7 +49,7 @@ def main():
         type=str,
         default=None,
         metavar="THYROIDXL_SEG_DIR",
-        help="启用 TN3K + ThyroidXL 分割混训(补 A0 证实的跨域失效,见 docs/项目现状总纲 §6)。"
+        help="启用 TN3K + ThyroidXL 分割混训(补 A0 证实的跨域失效,见 docs/训练与架构/三头实现记录.md §6)。"
              "值 = format_thyroidxl.py 产出的 data/thyroidxl_seg 目录。"
              "不传则维持纯 TN3K 单源(默认,不破坏现有行为)。",
     )

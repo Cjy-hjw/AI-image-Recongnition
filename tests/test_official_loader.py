@@ -90,18 +90,21 @@ def mini_root(tmp_path):
 
     # mock xlsx(ROI级别 sheet),列名对齐 _FIELD_ALIASES;含 1 个应被跳过的清晰帧行
     rows = [
-        # PatientId, SeriesUid, 图像性质, RoiName, 主病灶位置, 甲状腺外侵犯, 临床T分期, ROI良恶性, ANNOTATION->SliceIndex
-        ["P1", "S1", "1", "M", "2左中叶", "2甲状腺包膜", "1有", "恶", ""],
-        ["P2", "S2", "1", "M", "5右中叶", "", "0无", "良", ""],
-        ["P3", "", "2", "M", "7峡部", "1无", "1有", "恶", ""],
-        ["P3", "", "2", "清晰帧1", "", "", "", "", "2"],   # 应被跳过(非病灶行)
+        # PatientId, SeriesUid, 图像性质, RoiName, 主病灶位置, 甲状腺外侵犯, 临床T分期, ROI良恶性, ANNOTATION->SliceIndex, ROI-TIRADS
+        ["P1", "S1", "1", "M", "2左中叶", "2甲状腺包膜", "1有", "恶", "", "V类"],
+        ["P2", "S2", "1", "M", "5右中叶", "", "0无", "良", "", "IV类"],
+        ["P3", "", "2", "M", "7峡部", "1无", "1有", "恶", "", ""],
+        ["P3", "", "2", "清晰帧1", "", "", "", "", "2", ""],   # 应被跳过(非病灶行)
     ]
     df = pd.DataFrame(rows, columns=[
         "PatientId", "SeriesUid", "图像性质", "RoiName", "主病灶位置",
-        "甲状腺外侵犯", "临床T分期", "ROI良恶性", "ANNOTATION->SliceIndex",
+        "甲状腺外侵犯", "临床T分期", "ROI良恶性", "ANNOTATION->SliceIndex", "ROI-TIRADS",
     ])
     xlsx = tmp_path / "labels.xlsx"
-    df.to_excel(xlsx, sheet_name="ROI级别", index=False)
+    # startrow=1:真实官方 xlsx 是合并单元格表头,列名在第2行(0-based row=1)、
+    # 第1行是分组标题——parse_annotation_xlsx 现在按 header=1 读(2026-08-13 云端
+    # 真实数据实测确认),mock 必须复刻同一双行结构,否则测的是已不存在的单行表头格式。
+    df.to_excel(xlsx, sheet_name="ROI级别", index=False, startrow=1)
     return str(root), str(xlsx)
 
 
@@ -118,11 +121,17 @@ def test_parse_xlsx_mixed_cells(mini_root):
     assert lab["lesion_loc"] == 1 and lab["valid_lesion_loc"] == 1        # 2左中叶→idx1
     assert lab["extrathy_ext"] == 1 and lab["valid_extrathy_ext"] == 1    # 码2-1=1
     assert lab["clin_t_stage"] == 1 and lab["malignancy"] == 1
+    assert lab["tirads"] == 4 and lab["valid_tirads"] == 1                # V类→码5-1=4
 
     p2 = records[1]
     lab2 = O._build_labels(p2, "P2")
     assert lab2["valid_extrathy_ext"] == 0                                # ETE 列空
     assert lab2["lesion_loc"] == 4 and lab2["malignancy"] == 0            # 5右中叶→idx4, 良
+    assert lab2["tirads"] == 3 and lab2["valid_tirads"] == 1              # IV类→码4-1=3
+
+    p3 = records[2]
+    lab3 = O._build_labels(p3, "P3")
+    assert lab3["valid_tirads"] == 0                                      # TI-RADS 列空
 
 
 def test_build_samples_dispatch_and_skip(mini_root):
@@ -208,6 +217,60 @@ def test_ete_parse_edge_cases():
     assert lab["valid_extrathy_ext"] == 0
     lab2 = O._build_labels({"extrathy_ext": "NA/UNK"}, "P")
     assert lab2["valid_extrathy_ext"] == 0
+
+
+def test_tirads_parse_edge_cases():
+    """TI-RADS:罗马数字精确查表(禁子串误判 IV/III→I)、混写数字前缀、
+    Unicode 罗马数字字符、越界/空/未知→None。"""
+    assert O._parse_tirads("V类") == 5
+    assert O._parse_tirads("5 V类") == 5          # 混写:数字前缀优先
+    assert O._parse_tirads("IV类") == 4           # 🔴 不得被子串匹配误判成 I(=1)
+    assert O._parse_tirads("III类") == 3          # 🔴 不得被子串匹配误判成 I 或 II
+    assert O._parse_tirads("II类") == 2
+    assert O._parse_tirads("I类") == 1
+    assert O._parse_tirads("Ⅳ类") == 4            # Unicode 罗马数字字符(U+2163)
+    assert O._parse_tirads("Ⅴ类") == 5            # Unicode 罗马数字字符(U+2164)
+    assert O._parse_tirads("") is None
+    assert O._parse_tirads(None) is None
+    assert O._parse_tirads("NA/UNK") is None
+    assert O._parse_tirads("未评估") is None       # 未知措辞 → None(不静默当某一级)
+    # 🔴 越界数字前缀分叉(branch-2 + branch-3 不对称):`脱前缀再罗马查表` 只处理
+    # 归一化后的串,"6类"/"0类" 不含罗马字符 → get(None);detach 了整个数字。
+    # 分支1: `6类` → `6 V 类` 混写(`6 V...`)会返回 6 → valid=0(None over clamps)。
+    assert O._parse_tirads("6类") is None          # 越界数字前缀
+    assert O._parse_tirads("0类") is None          # 越界数字前缀(0 非法码)
+    # 两段数字前缀 + 无空格混写(真实边界值):`4IV类` → 前缀 4 → 码 4,与 `5 V类`
+    # 混写分叉到分支3(空格版剥前缀→罗马查表)不同——空格才是进入分支3的开关。
+    assert O._parse_tirads("4IV类") == 4
+    # 上游 _build_labels:TI-RADS 码 → 0-based(码-1);未知 → valid=0
+    lab = O._build_labels({"tirads": "V类"}, "P")
+    assert lab["tirads"] == 4 and lab["valid_tirads"] == 1
+    lab2 = O._build_labels({"tirads": ""}, "P")
+    assert lab2["tirads"] == 0 and lab2["valid_tirads"] == 0
+
+
+def test_tirads_parse_known_gaps_pinned_by_regression():
+    """TI-RADS:数字前缀分支不校验后缀、罗马数字表不含越界形态 —— 当前设计行为,钉住防漂移。
+
+    Gate2 审查(2026-08-13,角度1-2)发现的两个边界:
+    ① 数字前缀 1..5 命中即返回,不校验后缀内容(`"5 NA"`→5)——**当前对真实数据无害**:
+       `_FIELD_ALIASES["tirads"]` 只映射到总分类列,该列全表实测(第12轮云端核实)永远是
+       纯罗马数字、从不带数字前缀,此分支目前无真实种子会触发;若未来候选列名改指向带
+       数字前缀的编号列,需重新评估是否要加后缀校验。
+    ② `"VI"`(6)/`"Vi"`(大小写混排空格)不在 `_TIRADS_ROMAN_TO_CODE` 精确表内 → None,
+       与"越界数字前缀→None"同一保守策略,不静默出错。
+    这条测试只钉当前行为,不代表这是理想行为——若后缀校验/罗马数字表扩容,预期一起改本测试。
+    """
+    # ① 数字前缀命中即返回,不看后缀(已知设计缺口,当前列映射下无真实数据会触发)
+    assert O._parse_tirads("5 NA") == 5
+    assert O._parse_tirads("5 UNK") == 5
+    # ② 罗马数字越界/非常规空格形态 → None(未知措辞的保守兜底,不臆测成某一级)
+    assert O._parse_tirads("VI类") is None
+    assert O._parse_tirads("Vi级") is None
+    # ③ 真实官方数据 value_counts 首见 `IV类`/`V类`/`III类`/`I类` 全部是纯罗马
+    #    无前缀,打印观察(不 assert,只做确认性输出)
+    for v in ("IV类", "V类", "III类", "II类", "I类"):
+        assert O._parse_tirads(v) is not None, f"官方 value_counts 值 {v} 解析失败"
 
 
 def test_location_pure_chinese_and_negative():

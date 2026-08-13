@@ -135,7 +135,7 @@ def test_stage2_entry_lr_jumps_100x(model_and_criterion):
     assert ratio == pytest.approx(99.94, rel=1e-3), (
         f"Stage2 入口 lr 跳变倍数 = {ratio:.2f}(历史值 99.94)。"
         "若这个数字变小了,说明有人修了调度 —— 请同步更新 stages.py 的 Stage2 "
-        "docstring、docs/项目现状总纲.md §6,并确认三头训练的 A/B/C 调度不受影响。"
+        "docstring、docs/训练与架构/三头实现记录.md §6,并确认三头训练的 A/B/C 调度不受影响。"
     )
     assert ratio > 10, "跳变倍数应远大于 1;若已降到个位数说明缺陷已被修复,请改写本测试"
 

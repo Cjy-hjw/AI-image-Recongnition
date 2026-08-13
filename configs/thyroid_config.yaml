@@ -137,12 +137,26 @@ train:
                                      # 压缩交付置信度。要开之前先想清楚这个代价：
                                      # 是拿概率校准换分类精度，不是白捡的正则。
 
-  # ── 官方三头固定 λ 外挂权重（Phase2 阶段 2.4/E）────────────────────────────
-  # 三头损失**不进 FAMO**（理由见 src/models/losses/components/official_heads.py），
-  # 按固定 λ 外挂到总损失：total = famo_weighted + λ_loc·L_loc + λ_ete·L_ete + λ_t·L_t。
+  # ── 官方新增维度头固定 λ 外挂权重(位置/ETE/临床T/TI-RADS,Phase2 阶段 2.4/E)────
+  # 这些损失**不进 FAMO**(理由见 src/models/losses/components/official_heads.py),
+  # 按固定 λ 外挂到总损失:total = famo_weighted + λ_loc·L_loc + λ_ete·L_ete
+  # + λ_t·L_t + λ_tirads·L_tirads。
   # 由 scripts/train_official.py 组装进 MultiTaskLoss(official_head_config=...)。
-  # 默认各 1.0；上云观察三头相对收敛速率后再调（ETE 长尾若主导总损失可调低 λ_ete）。
-  # legacy train.py 路径永不读这三键（它的 targets 无三头键，外挂整体跳过）。
+  # 默认各 1.0;上云观察各头相对收敛速率后再调(ETE 长尾若主导总损失可调低 λ_ete)。
+  # legacy train.py 路径永不读这些键(它的 targets 无这些键,外挂整体跳过)。
   loc_loss_weight: 1.0
   ete_loss_weight: 1.0
   clin_t_loss_weight: 1.0
+  tirads_loss_weight: 1.0
+
+  # ── TI-RADS 头(backlog #124)超参 ────────────────────────────────────────
+  # 实现见 src/models/heads/tirads.py + losses/components/tirads.py。
+  # 真实 5 类计数未知(禁本地、待上云实测),`tirads_class_counts` 留空;
+  # `tirads_use_class_weights` 开关按上云拿到的真实分布再定(是否长尾决定用
+  # inverse_frequency_weights 还是 class_balanced_weights,见 tirads.py docstring)。
+  tirads_class_counts: null
+  tirads_use_class_weights: false
+  tirads_label_smoothing: 0.0
+  # 🔴 默认 0(关闭):二次有序项对齐官方"加权 Kappa"(quadratic)语义,但没有真实
+  # 数据无法调参(rules.md §5「先证后改」)。权重=0 时对 loss 精确无贡献。
+  tirads_ordinal_weight: 0.0

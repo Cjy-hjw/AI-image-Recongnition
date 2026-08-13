@@ -61,6 +61,25 @@ NUM_LOCATIONS = len(LOCATION_LABELS)
 # xlsx 里超出上述 7 类的两个值。它们不进概率分布,遇到时该样本不参与位置训练。
 LOCATION_NULL_LABELS = ("无（阴性）", "无(阴性)", "NA/UNK")
 
+# ── TI-RADS 总分类:输出 `TI_RADS_Class` 1..5 ──────────────────────────────
+#
+# xlsx `ROI-TIRADS` 列的真实字面是**罗马数字+"类"**(`V类`),不带数字前缀
+# (`docs/训练与架构/训练数据定稿.md` §1.7 实测);但同表另有列用"数字+空格+罗马"
+# 混写(如 `5 V类`),故解析器必须两条路都走:先取数字前缀,无前缀再回退罗马数字匹配。
+TIRADS_LABELS = ("I类", "II类", "III类", "IV类", "V类")
+NUM_TIRADS_CLASSES = len(TIRADS_LABELS)
+TIRADS_CODES = tuple(range(1, NUM_TIRADS_CLASSES + 1))  # (1, 2, 3, 4, 5)
+
+# 罗马数字 token(已去除"类"/"级"尾缀、已归一化)→ 官方码 1..5。
+# 🔴 必须精确查表(dict 精确命中),严禁子串 `in` 匹配:"IV" 含 "I"、"III" 含 "II"
+# 和 "I",用 `in` 会把 IV/III 误判成 I。
+# 同时收 ASCII(I/II/III/IV/V)与 Unicode 罗马数字字符(Ⅰ-Ⅴ,U+2160..U+2164)两套,
+# 真实数据用哪种未定,两套都要能命中。
+_TIRADS_ROMAN_TO_CODE = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,          # ASCII
+    "Ⅰ": 1, "Ⅱ": 2, "Ⅲ": 3, "Ⅳ": 4, "Ⅴ": 5,  # Ⅰ Ⅱ Ⅲ Ⅳ Ⅴ
+}
+
 __all__ = [
     "ETE_NONE",
     "ETE_CAPSULE",
@@ -71,4 +90,8 @@ __all__ = [
     "LOCATION_LABELS",
     "NUM_LOCATIONS",
     "LOCATION_NULL_LABELS",
+    "TIRADS_LABELS",
+    "NUM_TIRADS_CLASSES",
+    "TIRADS_CODES",
+    "_TIRADS_ROMAN_TO_CODE",
 ]

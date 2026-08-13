@@ -24,9 +24,9 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 794 collected / 793 passed+1 skipped，`def test_` 口径 692；
+# 完整测试套件（本地可跑，实测 795 collected / 794 passed+1 skipped，`def test_` 口径 693；
 # ⚠️ 测试总数跨 Python 环境不可比，
-# torch2.8 预演环境同代码为 788/6（2026-08-13 实测，collected 794 与主环境一致），判回归须同环境前后对拍）
+# torch2.8 预演环境同代码为 789/6（2026-08-13 实测，collected 795 与主环境一致），判回归须同环境前后对拍）
 pytest tests/ -v
 
 # 单文件测试

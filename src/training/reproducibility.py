@@ -53,6 +53,17 @@ def configure_reproducibility(
         sampler 的 generator 喂 `torch.multinomial`(决定抽哪些样本),loader 的
         generator 派生各 worker 的 base_seed;共用会把两条流交错在同一 RNG 状态上,
         改 `num_workers` 就能连带改变采样序列(脆的隐式耦合),故分开。
+
+        ⚠️ **`sampler_generator` 当前全仓无消费者**(2026-08-13 Gate2 核实):唯一调用方
+        `scripts/train_official.py:334` 写的是 `_, loader_gen = configure_reproducibility(...)`,
+        因为官方三头训练走 `shuffle=True` 而非 `WeightedRandomSampler`,没有 sampler
+        需要显式喂 generator。保留它而不删,是为了将来接 `WeightedRandomSampler`
+        (类不平衡重采样)时不必改签名、也不必再想一遍"两条流为什么要分开"这件事;
+        上面那段耦合分析届时才真正生效。**别因为"看着没人用"就删** —— 但也别以为
+        它现在正在起作用。
+        另注:`loader_gen` 传给 `DataLoader(shuffle=True, generator=...)` 是**真的生效**的
+        (实测同种子两次批序逐位相同、异种子不同),PyTorch 在 shuffle=True 时用该
+        generator 构造内部 RandomSampler。
     """
     random.seed(seed)
     np.random.seed(seed)

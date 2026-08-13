@@ -37,7 +37,7 @@
 
 ---
 
-## `test_official_loader.py` — 官方数据加载器契约(13 用例,2026-08-10 + 2026-08-12 阶段2.4 扩 + 2026-08-13 Phase E hflip RNG 防回归)
+## `test_official_loader.py` — 官方数据加载器契约(14 用例,2026-08-10 + 2026-08-12 阶段2.4 扩 + 2026-08-13 Phase E hflip RNG 防回归 + Gate2 mask 命名 glob 防回归)
 
 合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
 
@@ -85,10 +85,10 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结主干 BN 置
 
 ## 测试总数(单一权威,2026-08-12 `Demo_D` 主环境实测,三数自洽)
 
-**`pytest --collect-only`=794 / grep `def test_`=692 / 全套 793 passed + 1 skipped**（collect 与 def 差额=参数化用例）。
+**`pytest --collect-only`=795 / grep `def test_`=693 / 全套 794 passed + 1 skipped**（collect 与 def 差额=参数化用例）。
 
 - **三头相关单测合计 127**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12),Demo_D 与 A800(torch2.6)两环境均实测通过。
-- ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 **788 passed + 6 skipped**(2026-08-13 实测,**collected 794 与主环境一致**);旧记的 620 是 08-12 快照、已失效,且 08-13 补装 pandas+openpyxl 之前该环境只能收集 782 —— `tests/test_official_loader.py` 整模块被 `pytest.importorskip("pandas")` 跳过,预演对 `official_loader` 覆盖率为 0。skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。
+- ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 **789 passed + 6 skipped**(2026-08-13 实测,**collected 795 与主环境一致**);旧记的 620 是 08-12 快照、已失效,且 08-13 补装 pandas+openpyxl 之前该环境只能收集 782 —— `tests/test_official_loader.py` 整模块被 `pytest.importorskip("pandas")` 跳过,预演对 `official_loader` 覆盖率为 0。skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。
 - **下方分模块明细数字为历史演进累积、可能有偏差**——精确值一律以 `pytest --collect-only tests/` 实跑为准,不逐一核对旧数。
 - Phase5(2026-08-10)交付四模块:`test_nifti_io`(24) + `test_nodule_split`(28) + `test_prediction_json`(45) + `test_v21_output`(11) + `test_service_runner`(12) + `test_case_discovery`(40) + `test_service_api`(20)(含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。
 

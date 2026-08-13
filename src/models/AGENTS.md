@@ -56,7 +56,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 
 Stage freeze registry: `MultiTaskThyroidModel.STAGE3_FROZEN_PREFIXES`, `STAGE1_FROZEN_CBM_SUBMODULES`, plus `set_training_stage(stage)` / `is_param_trainable(name, stage)`.
 
-**`OFFICIAL_HEAD_PREFIXES` = `("location_head", "extension_head", "clinical_t_head")`(2026-08-12 阶段 2.4 新增)**:三头在 legacy 三阶段(1-40/41-100/101-120)**恒冻结**——`is_param_trainable` 对三头前缀恒返 False,只由 `schedule_official.py` 的 A/B/C 调度训练(还在 Phase E 未写)。同理 `test_stage_schedule.py` 的冻结断言已改为"冻结集合 ⊆ 三头前缀"。
+**`OFFICIAL_HEAD_PREFIXES` = `("location_head", "extension_head", "clinical_t_head")`(2026-08-12 阶段 2.4 新增)**:三头在 legacy 三阶段(1-40/41-100/101-120)**恒冻结**——`is_param_trainable` 对三头前缀恒返 False,只由 `schedule_official.py` 的 A/B/C 调度训练(Phase E 已实现,2026-08-13)。同理 `test_stage_schedule.py` 的冻结断言已改为"冻结集合 ⊆ 三头前缀"。
 
 **LoRA 微调路径（`use_lora=True`，LP-FT-LoRA 训练用，见 `scripts/train_thyroidxl.py`）**：`__init__` 里 `apply_lora` 注入后，**双主干全部参数（含 LoRA A/B）默认 `requires_grad=False`**——模型以"LoRA 未激活"状态构建。LP 阶段只训任务头；FT 阶段由训练脚本显式解冻 `lora_A`/`lora_B` 并 `add_param_group`。**关键教训**：LoRA 参数若默认可训练但不在 optimizer 内，其梯度跨 batch 永不清零、累积至溢出（`§1.1` requires_grad 必须与 optimizer 参数集合严格对齐）。`is_param_trainable`/`set_training_stage` 是 LoRA-blind 的（不识别 `lora_` 前缀），仅供 `train.py` 的非 LoRA 三阶段管道用；**不可对 `use_lora=True` 模型调用 `set_training_stage`**，否则会解冻被冻结的原始骨干权重。
 

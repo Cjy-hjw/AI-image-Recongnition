@@ -37,9 +37,27 @@
 
 ---
 
-## `test_official_loader.py` — 官方数据加载器契约(12 用例,2026-08-10 + 2026-08-12 阶段2.4 扩)
+## `test_official_loader.py` — 官方数据加载器契约(13 用例,2026-08-10 + 2026-08-12 阶段2.4 扩 + 2026-08-13 Phase E hflip RNG 防回归)
 
 合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
+
+🔴 `test_build_datasets_does_not_freeze_hflip_rng`(Phase E 新增):断言 `build_official_datasets`
+返回的 dataset **`_rng is None`** —— 该 `seed` 只能喂 `patient_grouped_split`,传给 Dataset 会让
+持久 `random.Random(seed)` 实例被 pickle 复制进每个 worker(状态相同)、且每 epoch 重建 worker 使
+序列重置,**实测三个 epoch 翻转序列逐位相同**(增强白做,不报错、loss 照常降)。生产必须走全局
+`random`(由 `worker_init_fn` 按 `torch.initial_seed()` 播种,torch 每 epoch 重抽 base_seed)。
+
+## `test_official_schedule.py` — 官方三头 A/B/C 调度 + JSONL 日志(16 用例,2026-08-13 Phase E)
+
+`schedule_official.py` 的数值/契约锁定,与 `test_stage_schedule.py`(legacy 三阶段)**语义互补不重叠**:
+后者钉的是"已知缺陷 100 倍跳变确实存在",本文件钉的是"新调度**不许**出现这种跳变"。
+锁定内容:**相邻 epoch lr 比值 ≤5**(逐点扫 1..35,`MAX_LR_JUMP_RATIO`)+ A/B/C 边界与端点值
+(A 段 e1=lr_base×0.1 线性升至 e10=lr_base、B 段 e11 回到 lr_base 余弦退至 e30=×0.1、C 段固定 ×0.05)
++ A 段严格上升 / B 段严格下降 + **各 stage 冻结集合**(A/C 只训三头+vclub;B 额外解冻且**仅**解冻
+`cls_backbone.blocks[5]/[6]`,seg 主干恒冻)+ **optimizer 全覆盖**(vclub 除外,双向:漏进=永不更新、
+误进=双重更新)+ AUCM 对偶随 `freeze_legacy` 的绑定/冻结双态 + **LLRD 方向**(blocks[6]=头 lr×0.1 >
+blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结主干 BN 置 eval、三头保持 train)
++ JSONL 必填字段/ISO8601 带毫秒 Z/逐行可解析/非法 phase·mode 拒绝。纯 CPU、`pretrained=False`。
 
 | Test | 验证内容 |
 |:---|:---|
@@ -67,7 +85,7 @@
 
 ## 测试总数(单一权威,2026-08-12 `Demo_D` 主环境实测,三数自洽)
 
-**`pytest --collect-only`=777 / grep `def test_`=677 / 全套 776 passed + 1 skipped**(collect 与 def 差额=参数化用例)。
+**`pytest --collect-only`=794 / grep `def test_`=692 / 全套 793 passed + 1 skipped**（collect 与 def 差额=参数化用例）。
 
 - **三头相关单测合计 127**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12),Demo_D 与 A800(torch2.6)两环境均实测通过。
 - ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 620 passed + 6 skipped,skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。

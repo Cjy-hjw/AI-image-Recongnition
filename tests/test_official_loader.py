@@ -284,6 +284,30 @@ def test_val_dataset_has_no_hflip(mini_root):
     assert val_ds.hflip_prob == 0.0 and val_ds.transform is None
 
 
+def test_build_datasets_does_not_freeze_hflip_rng(mini_root):
+    """🔴 `build_official_datasets` 的 `seed` **只喂切分**,不得传给 Dataset 的翻转 RNG。
+
+    曾经传了(`OfficialThyroidDataset(..., seed=seed)`),后果是**多样性塌缩**:持久
+    `random.Random(seed)` 实例被 pickle 复制进每个 worker(状态相同),且
+    persistent_workers=False 时每 epoch 重建 worker 使序列重置 —— 实测三个 epoch 的
+    翻转序列**逐位相同**,增强等于白做。不报错、loss 照常降,只有靠这条断言能发现。
+
+    生产必须 `_rng is None` → 走全局 `random`(由 DataLoader 的 worker_init_fn 按
+    `torch.initial_seed()` 播种,torch 每 epoch 重抽 base_seed → 每 worker/每 epoch 都不同)。
+    """
+    root, xlsx = mini_root
+    train_ds, val_ds = O.build_official_datasets(
+        root, xlsx, img_size=64, val_frac=0.34, seed=0, hflip_prob=0.5
+    )
+    assert train_ds._rng is None, (
+        "train_ds 持有固定种子的 RNG 实例 —— 翻转序列会跨 worker/跨 epoch 完全相同。"
+        "seed 只能喂 patient_grouped_split,不能传给 Dataset。"
+    )
+    assert val_ds._rng is None
+    # 显式传 seed 仍走独立 RNG(测试确定性路径不受影响)
+    assert O.OfficialThyroidDataset([], seed=0)._rng is not None
+
+
 def test_dynamic_no_mask_skipped(mini_root):
     """动态病灶无 mask → 无法定位标注帧,整例跳过(不产出坏样本;sonnet 审查覆盖缺口)。"""
     root, xlsx = mini_root

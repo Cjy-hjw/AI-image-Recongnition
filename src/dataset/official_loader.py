@@ -446,8 +446,16 @@ class OfficialThyroidDataset(Dataset):
         self.img_size = img_size
         self.transform = transform
         self.hflip_prob = float(hflip_prob)
-        # 独立 RNG:worker 子进程各自持有,由 train_official.py 的 worker_init_fn 播种。
-        self._rng = random.Random(seed)
+        # 🔴 **生产路径必须 seed=None**(走全局 `random`,与 augmentation/transforms.py
+        # 里所有增强同源):全局 RNG 由 DataLoader 的 `worker_init_fn`(seed_worker)按
+        # `torch.initial_seed()` 播种,而 torch **每 epoch 创建 iterator 时重抽 base_seed**
+        # → 各 worker、各 epoch 的翻转序列都不同,可复现性由主种子统一保证。
+        #
+        # 传固定 seed 只用于**测试确定性**。持久 `random.Random(seed)` 实例在生产会
+        # 多样性塌缩:dataset 对象被 pickle 复制到每个 worker(状态相同),且
+        # persistent_workers=False 时每 epoch 重建 worker 使序列重置 —— 实测三个 epoch
+        # 的翻转序列**逐位相同**(不报错、loss 照常降,只是增强白做)。
+        self._rng = random.Random(seed) if seed is not None else None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -490,7 +498,10 @@ class OfficialThyroidDataset(Dataset):
         # 水平翻转:必须与位置标签联动。漏了会让位置头学到左右相反的监督,而 loss 照常
         # 下降(location.py:97-98 的警告)。**在 transform 之后、归一化之前**做,故本类
         # 的 transform 不得自带 HorizontalFlip(否则翻两次且标签只翻一次)。
-        if self.hflip_prob > 0.0 and self._rng.random() < self.hflip_prob:
+        # RNG 取用见 `__init__`:生产走全局 random(每 worker/每 epoch 不同),
+        # 仅测试传 seed 走独立实例(确定性)。
+        rng = self._rng if self._rng is not None else random
+        if self.hflip_prob > 0.0 and rng.random() < self.hflip_prob:
             img = np.ascontiguousarray(img[:, ::-1])
             mask = np.ascontiguousarray(mask[:, ::-1])
             if labels.get("valid_lesion_loc", 0) == 1:
@@ -534,12 +545,16 @@ def build_official_datasets(
     分组切分复用 `patient_grouped_split`(按 patient_key 分组、label 分层),防同患者
     跨集泄漏(rules.md §5)。val 集不加增强(含 hflip=0:翻转会改位置标签,验证侧必须
     用原始朝向)。DataLoader/Sampler 由调用方按训练脚本组装。
+
+    ⚠️ `seed` **只喂给切分**,不传给 Dataset —— Dataset 的翻转 RNG 必须留 None 走全局
+    random(由 DataLoader 的 worker_init_fn 每 worker/每 epoch 播种)。曾把这个 seed
+    一并传下去,实测导致翻转序列跨 epoch 逐位相同,见 `OfficialThyroidDataset.__init__`。
     """
     samples = build_official_samples(root, xlsx_path, sheet_name)
     if not samples:
         raise RuntimeError(f"未在 {root} + {xlsx_path} 构造出任何样本,检查路径/表头")
     train_s, val_s = patient_grouped_split(samples, val_frac=val_frac, seed=seed)
     train_ds = OfficialThyroidDataset(train_s, img_size=img_size, transform=train_transform,
-                                      hflip_prob=hflip_prob, seed=seed)
+                                      hflip_prob=hflip_prob)
     val_ds = OfficialThyroidDataset(val_s, img_size=img_size, transform=None)
     return train_ds, val_ds

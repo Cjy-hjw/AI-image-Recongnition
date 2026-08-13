@@ -31,6 +31,11 @@ desktop.ini
 /.claude/.gate2_pass.json
 /.claude/.gate2_pending.json
 
+# JSONL 训练日志(V2.1 硬约束产物)。云端正式训练落
+# `/2026aicompetition/workspace/logs`(容器内绝对路径,不在仓库);本地冒烟用
+# `--log-dir logs` 落这里,是一次性运行产物、不入库。
+/logs/
+
 # Gate2 验证产物(主会话 tmp_main_* / 各路审查子agent tmp_review_<lane>_*)。
 # 这些是「交产物不交自述」要求下的可重跑证据脚本(rules.md §2/§8),跑完留在工作区
 # 供主会话复核,但**不入库**——它们是一次性证据、不是项目代码。

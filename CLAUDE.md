@@ -23,7 +23,7 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 777 collected / 776 passed+1 skipped，`def test_` 口径 677；
+# 完整测试套件（本地可跑，实测 794 collected / 793 passed+1 skipped，`def test_` 口径 692；
 # ⚠️ 测试总数跨 Python 环境不可比，
 # torch2.8 预演环境同代码为 620/6，判回归须同环境前后对拍）
 pytest tests/ -v
@@ -71,6 +71,17 @@ python scripts/merge_lora_checkpoint.py --in checkpoints/thyroidxl_best_v2.pth -
 # 27021604(ThyUS2Path) LP-FT-LoRA 训练——MIL vs LoRA 对拍实验（已完成）
 # 结果 best patient-AUC=0.5531，与MIL基线0.5653、随机猜0.50同噪声区间：瓶颈是数据本身非MIL框架，详见 src/dataset/AGENTS.md
 python scripts/train_thyus2path_lora.py --data-root data/27021604_extract --lp-epochs 10 --ft-epochs 40 --batch-size 16
+
+# 官方三头（位置/ETE/临床T）A/B/C 调度训练（Phase E，2026-08-13）
+# 本地冒烟：合成标签验管道数值健康（无官方数据也能跑，含全 invalid 批 / 峡部 / ETE 血管边界）
+python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-size 4
+
+# 云端真数据正式训练（官方数据禁本地；A=1-10 冻主干温升三头 / B=11-30 LLRD / C=31-35 校准）
+# JSONL 日志默认落 V2.1 强制路径 /2026aicompetition/workspace/logs（不传 --log-dir）
+# 默认保留 legacy 多任务损失守护旧任务不退化；纯头训练传 --freeze-legacy
+python scripts/train_official.py --data-root /2026aicompetition/datasets/training/annotation \
+    --xlsx <标注.xlsx> --resume-from checkpoints/best_model_mixtrain_xl_e40.pth \
+    --out checkpoints/official_heads_best.pth
 ```
 
 ## Git 规范（AI 无法从 git log 推断格式约定）

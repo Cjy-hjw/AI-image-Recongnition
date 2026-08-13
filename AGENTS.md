@@ -16,7 +16,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 | **Gatekeeper Pipeline** | `/src/gatekeeper/AGENTS.md` | Authenticity classification, deduplication, tampering detection. |
 | **Scripts & Splits** | `/scripts/AGENTS.md` | 8-Gate verify_model.py tests, data splitting (纯随机图像级划分). |
 | **CI / 架构铁律** | `/.github/workflows/ci.yml` + `/.importlinter` | PR/push 到 main 自动跑三 job:① import-linter 4 契约(inference⊄training、models 无反向依赖、gatekeeper⊄上层、utils 叶子层)② `test` job 跑 Gate 1 八门(2026-07-11 补 Gate 8 cls→seg 梯度隔离审计)+ 全套 pytest ③ `docker-build-smoke`(2026-07-11 新增,host runner 上真实 `docker build` + 起容器冒烟——此前 CI 只在裸机镜像内 pip install「模拟」容器环境,从未真 build 过 Dockerfile,`entrypoint.sh` 缺 `_src_tree_hash.sh` 那次 bug 就是因此潜伏未被发现;同日首次真跑就抓到 CPU+fp16/fp32 autocast 假降级真 bug,详见 `src/inference/AGENTS.md`)。**输入覆盖(2026-07-11 P1 扩容,两轮)**:标准 PNG 静态图 + 标准 MP4 动态图 + DICOM 单帧 + DICOM 多帧 cine + **压缩 DICOM(JPEG baseline)** + **JPG 静态图**(官方确认交付格式)+ 非空损坏文件(必须 ERROR 不崩溃)+ 极端低分辨率(4x4)视频,共 8 类场景,均用真实容器验证机制层(能否构建/分发/落盘),不验证预测数值(该职责在 Gate1-8+pytest)。压缩 DICOM 一项是 Opus 战略审查发现的致命缺口补测——真实超声 DICOM 绝大多数是 JPEG/JPEG2000/RLE 压缩,`requirements.txt` 已补 `pylibjpeg`/`pylibjpeg-libjpeg`/`pylibjpeg-openjpeg`(RLE 由 pydicom 内置 `rle_handler` 覆盖,无需额外包),版本锁 `numpy<2` 兼容区间(见 `requirements.txt` 注释)。任一红则挡合并。 |
-| **Tests** | `/tests/AGENTS.md` | 🔴 **测试计数的单一权威在 `tests/AGENTS.md`,本表不再重复罗列明细**(此前三处堆砌同一份明细且都自带"与实际有偏差"免责,维护成本高于价值)。当前口径:**777 collected / 776 passed + 1 skipped**(2026-08-12 `Demo_D` 主环境实测;含三头相关单测 127 项 = head_interfaces 14 + location 25 + extension 39 + clinical_t 27 + official_head_losses 10 + train_step_head_targets 12)。⚠️ **跨环境不可比**:同代码 torch2.8 预演环境为 620 passed / 6 skipped,skip 数随依赖集与平台门浮动,**判回归必须同环境前后对拍**。精确值一律以 `pytest --collect-only tests/` 实跑为准。 |
+| **Tests** | `/tests/AGENTS.md` | 🔴 **测试计数的单一权威在 `tests/AGENTS.md`,本表不再重复罗列明细**(此前三处堆砌同一份明细且都自带"与实际有偏差"免责,维护成本高于价值)。当前口径:**794 collected / 793 passed + 1 skipped**(2026-08-13 `Demo_D` 主环境实测;含三头相关单测 144 项 = head_interfaces 14 + location 25 + extension 39 + clinical_t 27 + official_head_losses 10 + train_step_head_targets 12 + **official_schedule 16**(Phase E A/B/C 调度 + JSONL) + official_loader 的 hflip RNG 防回归 1)。⚠️ **跨环境不可比**:同代码 torch2.8 预演环境为 620 passed / 6 skipped,skip 数随依赖集与平台门浮动,**判回归必须同环境前后对拍**。精确值一律以 `pytest --collect-only tests/` 实跑为准。 |
 | **Source Packages** | `/src/AGENTS.md` | Package structure overview, TI-RADS score guidelines. |
 | **Claude Code Hooks** | `/.claude/hooks/AGENTS.md` | 非交付物,会话自动化护栏:Gate2 审查强制执行状态机(reminder→escalate_block→enforce→mark_pass) + 若干提醒式 hook。三次真实教训(高风险清单不全/绝对路径vs相对路径不一致/`.py`扩展名无差别放行非代码文件)记录在案,改动前必读。
 
@@ -27,7 +27,7 @@ This document serves as the master coordinator for the thyroid multi-task diagno
 模块文件结构与职责详见各子目录 AGENTS.md；此处仅列顶层导航。
 
 - **`src/models/`** — 双主干模型 + CBM 头 + 物理先验 + 损失：见 `src/models/AGENTS.md`
-- **`src/training/`** — 三阶段渐进训练 + GradScaler 协议 + vCLUB 隔离：见 `src/training/AGENTS.md`
+- **`src/training/`** — 三阶段渐进训练 + GradScaler 协议 + vCLUB 隔离 + **官方三头 A/B/C 调度(`schedule_official.py`,禁复用 stages.py)**：见 `src/training/AGENTS.md`
 - **`src/inference/`** — 推理管线(io / model_runner / postprocess / calibration / export / video / case_pipeline / v21_output / prediction_json / nifti_io / nodule_split):见 `src/inference/AGENTS.md`
 - **`src/dataset/`** — 数据加载 + 增强 + PathologyDataset 病理预训练：见 `src/dataset/AGENTS.md`
 - **`src/gatekeeper/`** — 真实性 / 去重 / 篡改四层门控：见 `src/gatekeeper/AGENTS.md`

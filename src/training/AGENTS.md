@@ -55,7 +55,7 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 - **Stage 2–3 best**: `checkpoint_w_dice * val_dice + checkpoint_w_auc * val_auc` (defaults 0.30 / 0.70).
 - **Stage 3 ES**: `stage3_early_stopping_patience=0` disables early stopping; tracker resets at epoch 101.
 - **`validate_epoch` return**: 5-tuple `(avg_loss, avg_dice, avg_acc, avg_loss_l2, val_auc)`; `val_auc` is `None` in Stage 1 or single-class val sets.
-- 阶段 2.4 新增可选出参 `official_metrics_out`(dict):传入时 `validate_epoch` 收集每批 `validate_batch` 返回的 `official_records`,epoch 末调 `metrics_official.compute_official_metrics` **原地写入**官方口径指标,返回值**不加宽**(`train.py:337` 按 5 元组解包,唯一调用点)。三头键缺席的数据集 → 写入全 None。选模判据与 Dice 护栏在 `schedule_official.py`(Phase E 未写)。
+- 阶段 2.4 新增可选出参 `official_metrics_out`(dict):传入时 `validate_epoch` 收集每批 `validate_batch` 返回的 `official_records`,epoch 末调 `metrics_official.compute_official_metrics` **原地写入**官方口径指标,返回值**不加宽**(`train.py:337` 按 5 元组解包,唯一调用点)。三头键缺席的数据集 → 写入全 None。选模判据与 Dice 护栏在 `scripts/train_official.py`(Phase E 已实现,2026-08-13:composite = 可算官方指标均值;Dice 相对 warm-start 基线跌 >1 点警、>3 点 abort)。
 
 ---
 
@@ -71,6 +71,21 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 | `slr.py` | `compute_slr_weights()` — Supervised Label Rectification (1000-sample history, mean+2σ anomaly) |
 | `vclub.py` | `vclub_learning_step()`, `compute_vclub_mi_bound()` — mutual information decoupling |
 | `bn_freeze.py` | `set_frozen_modules_eval()` — automatic BatchNorm eval for frozen modules |
+
+### 官方三头训练模块(Phase E,2026-08-13 新增,均在 `src/training/` 顶层)
+
+| File | Responsibility | 硬约束 |
+|:---|:---|:---|
+| `schedule_official.py` | 官方三头 A/B/C 阶段调度:`get_official_stage()`/`official_head_lr()`/`configure_official_stage()` | 🔴 **相邻 epoch lr 比值 ≤5**(`MAX_LR_JUMP_RATIO`),把 `stages.py` 的 100 倍跳变事故钉成不可能;返回契约与 `configure_stage_parameters` 同型 `(param_groups, lr, stage_name)`;**绝不复用/修改 `stages.py`** |
+| `jsonl_logger.py` | V2.1 强制 JSONL 训练日志(`JsonlLogger`) | 云端路径写死 `/2026aicompetition/workspace/logs`(`OFFICIAL_LOG_DIR`,Windows 本地不可写,冒烟须 `--log-dir logs`);**逐行 flush**(审查随时读,缓冲区里的行读不到 = 判罚口径下自曝) |
+| `reproducibility.py` | seed 四件套共享助手:`seed_worker()`/`configure_reproducibility()` | sampler / loader **两个独立 generator**(共用会让改 `num_workers` 连带改变采样序列);`train.py` 内那份是 legacy 已验证路径,**不动**,两份漂移各自的测试会红 |
+
+**阶段划分与 lr**(`lr_base` 取 `config.train.lr`):A=epoch 1-10(冻 backbone/分割/CBM,只训三头,线性 warmup 至 lr_base)、
+B=11-30(解冻 `cls_backbone.blocks[5]/[6]`,LLRD:blocks[6]=头 lr×0.1、blocks[5] 再乘 η=0.75,余弦退火至 ×0.1)、
+C=31-35(重新全冻,头部固定 lr_base×0.05;温度标定在推理侧 `calibration.py` 不在此)。
+三头在**所有** legacy stage 恒冻结(`OFFICIAL_HEAD_PREFIXES`),两条调度线互不干扰。
+入口是 `scripts/train_official.py`(**不动 `train.py`**),数值锁定见 `tests/test_official_schedule.py`(16 项)。
+
 
 ### `build_official_head_targets()`(train_step.py,阶段 2.4 提取为可单测模块级函数)
 

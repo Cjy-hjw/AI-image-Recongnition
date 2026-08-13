@@ -34,8 +34,9 @@
 
 ## 2. requirements.txt 改动清单(逐行)
 
-> ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑)**:独立 venv `C:\Users\cjy\envs\torch28`(**py3.12.13** + **torch 2.8.0+cpu** + **numpy 2.4.4** + timm 1.0.28 + cv2 4.14,2026-08-12 主会话实跑 `python -c "import sys,torch,numpy"` 核实)跑全套 pytest = **620 passed / 6 skipped / 0 failed**(首验时 597,差额为其后新增的 `test_stage_schedule.py` 22 项)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
-> ⚠️ **此处 620 是 2026-08-12 当时该环境的快照,且与 `Demo_D` 主环境的 737 不可互比**(依赖集与平台门不同,见根 `AGENTS.md`);判回归须**同环境**前后对拍,勿拿两环境数字相减。
+> ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑 / 2026-08-13 三跑)**:独立 venv `C:\Users\cjy\envs\torch28`(**py3.12.13** + **torch 2.8.0+cpu** + **numpy 2.4.4** + timm 1.0.28 + cv2 4.14 + **pandas 2.3.3 + openpyxl 3.1.5**(2026-08-13 补装))跑全套 pytest = **788 passed / 6 skipped / 0 failed**(2026-08-13;历史:首验 597 → 08-12 **620** → 08-13 补装前 775/7 → 补装后 788/6)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
+> 🔴 **补装 pandas/openpyxl 的原因(2026-08-13,别再让它退回去)**:此前该 venv 按 `requirements.txt` 装,而那是**推理交付容器**的清单(不含 pandas 是正确设计,推理不读 xlsx),于是 `tests/test_official_loader.py` **整模块**被 `pytest.importorskip("pandas")` 跳过 —— **"云环境预演"对 `official_loader`(三头标签的唯一来源)覆盖率为 0**,一直在空转最关键的模块。补装后 collected 从 782 升到 **794,与 `Demo_D` 主环境完全一致**。
+> ⚠️ **仍不可跨环境比 passed 数**:两环境 collected 现已同为 794,但 skip 数不同(torch28 = 6 / Demo_D = 1,依赖集差异);判回归须**同环境**前后对拍,勿拿两环境数字相减。`Demo_D` 主环境当前口径 = **794 collected / 793 passed + 1 skipped**(本行旧写的 737 已过时)。
 > ⚠️ 曾误记为"py3.10.18 + venv 建在 A800",两处均已实测纠正(A800 glibc 2.23 装不了 torch2.7+,那个 venv 从未建成)。
 
 | 行 | 现状 | 改为 | 理由 |
@@ -77,9 +78,12 @@
 **崩溃级:无**(A800 torch2.6 已跑通,2.6→2.8 无破坏性 API)。
 
 **行为/warning 级(可选改,消 FutureWarning)**:
-- `train.py:173` `torch.cuda.amp.GradScaler(...)` → `torch.amp.GradScaler('cuda', ...)`(2.8 仅 deprecated 不崩;`cbm_head.py:37/52` 已是正确样板)。
+- `train.py:246` `torch.cuda.amp.GradScaler(...)` → `torch.amp.GradScaler('cuda', ...)`(2.8 仅 deprecated 不崩;`cbm_head.py:37/52` 已是正确样板)。**行号已从 173 校正为 246**(2026-08-13 实核)。⚠️ 上游未把 `GradScaler` 放进 `torch.amp.__all__`(2.5.1/2.6.0/2.8.0 三版实测 `'GradScaler' in __all__` 均为 **False**),Pyright 会报 `reportPrivateImportUsage`,但三版**运行时均实测可构造** —— 迁移时按 `cbm_head.py` 样板加 `# type: ignore` 即可,别因为 IDE 报红就回退。
+  - ✅ **`scripts/train_official.py` 已迁(2026-08-13)**,写法 `torch.amp.GradScaler(device.type, enabled=...)` —— 传 `device.type` 而非硬编码 `'cuda'`,CPU 环境不刷"CUDA 不可用"警告(torch28 CPU 环境实测:传 `'cuda'` 会 warn 并 disable)。`train.py` 是 legacy 交付路径,**本次刻意不动**,仍待迁。
 - 多处 `from torch.cuda.amp import autocast` → `torch.amp.autocast('cuda', ...)`。
 - `torch.load` 所有调用点:**当前均安全**(auth 存 numpy 的已显式 `weights_only=False`,其余纯 tensor 白名单覆盖)。建议显式化 + 注释,非必须。
+  - 🔬 **2026-08-13 A800(torch 2.6.0,即 `weights_only` 默认翻转的首个版本)逐文件实测,把上面的推断升级为证据**:`checkpoints/` 下 17 个 `.pth` 用**默认参数**加载 —— **16 个 OK**(分割底座 `best_model*.pth`/`thyroidxl_merged*.pth`/`official_heads_best.pth` 均为纯 `OrderedDict`;`thyroidxl_best*.pth`/`thyus2path_lora_best.pth` 的 `{"epoch","stage","state_dict",...}` 包装、`malignancy_mil_*.pth`、`training_state.pth` 的 `{"epoch","criterion","famo"}` 也都通过 —— **python 基本类型在 weights_only 白名单内**,包装 dict 本身不是问题);**唯一失败 = `authenticity_model.pth`**(`UnpicklingError`,因含 numpy 的 `feat_mean`/`feat_std`),而它由 `gatekeeper/authenticity.py:229` 自己以 `weights_only=False` 加载,**生产路径不受影响**。
+  - `scripts/train_official.py:113` 已显式 `weights_only=False` —— 属**防御性**(允许 `--resume-from` 指向包装格式、未来格式再变也不翻车),**不是在修已存在的崩溃**。
 - `deduplication.py:103` `models.resnet18(pretrained=True)` → `weights=` 写法(仅 deprecated)。
 
 ### 3.1 静态兼容性扫描结论（并入自 `torch28兼容性扫描.md`，源文件已删）

@@ -55,6 +55,13 @@ ignore_dirs = {
     "__pycache__",
     ".omp",
     ".ipynb_checkpoints",
+    # 2026-08-13 新增:`checkpoints` 此前不在排除列表(只有形近的
+    # `.ipynb_checkpoints`),导致本地权重会被推上 A800 —— 实测一次 smoke 跑完
+    # 改写了本地 official_heads_best.pth,大小一变就触发 121MB 上传,而当时
+    # A800 磁盘已用到 99%(仅剩 97G)。本脚本的职责是**同步代码**(见 CLAUDE.md
+    # "一键同步本地代码到A800服务器");权重方向相反 —— A800 训练产出后由
+    # MCP download 拉回本地,从不需要本地→A800 上传。
+    "checkpoints",
     ".pytest_cache",
     ".ruff_cache",
     "runs",

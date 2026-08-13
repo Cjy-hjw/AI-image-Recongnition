@@ -44,8 +44,9 @@ CALLBACK_PATH = "/api/competition/inference/callback/"
 CALLBACK_MAX_RETRIES = int(os.environ.get("AICOMP_CALLBACK_RETRIES", "3"))
 CALLBACK_TIMEOUT_S = float(os.environ.get("AICOMP_CALLBACK_TIMEOUT", "10"))
 
-# 推理工作线程数。**必须为 1**:单卡 14~16G 显存(平台实际约 16G/容器、当前分配 14G,2026-08-11 修正口径)下并发推理会 OOM,
-# 且模型本身非线程安全。串行执行、队列排队是唯一安全选择。
+# 推理工作线程数。**必须为 1**:显存虽为官方实测 32G（2026-08-12 nvidia-smi；控制台"14"
+# 是 vCPU 数），"单 GPU/容器 + 模型非线程安全"下并发推理仍有 OOM/争用风险。
+# 串行执行、队列排队是唯一安全选择。
 INFERENCE_WORKERS = int(os.environ.get("AICOMP_INFERENCE_WORKERS", "1"))
 
 

@@ -10,7 +10,8 @@ CPU + fp32 上，能覆盖数学与契约，但**结构性地测不到**四类�
    回转、以及临床 T 的 `log(clamp(s))`，**只有真 CUDA 上才走到真实分支**。
 2. 🔴 **`F.max_pool2d` 的隐式 −inf padding 语义**：交界带的腐蚀是 `-max_pool2d(-m)`，
    整个 ETE 局部特征都押在这个语义上。CPU 与 CUDA 是两套 kernel，一致性**必须实测**。
-3. **显存峰值**：平台每容器仅约 14~16G（`docs/项目现状总纲.md` §3）。
+3. **显存峰值**：平台每容器实测 **32G**（2026-08-12 官方容器内 `nvidia-smi`，
+   `docs/项目现状总纲.md` §3；控制台"14"是 vCPU 数）。
    ⚠️ 实测下来这一维**并非风险**（三头合计 **0.536M** 参数 = 2.05MB fp32、batch=16
    峰值仅百 MB 级），本项保留的价值是"换 backbone / 提分辨率后能立刻重测"，
    不是当前有隐患。
@@ -236,7 +237,7 @@ def probe_batch_one_inference(device):
 
 
 def probe_memory(device, batch):
-    """三头前向+反传的显存峰值。平台每容器仅约 14G，A800 的 80G 不 OOM 说明不了什么。"""
+    """三头前向+反传的显存峰值。平台每容器实测 32G（2026-08-12 nvidia-smi），A800 的 80G 不 OOM 说明不了什么。"""
     if device.type != "cuda":
         record("显存峰值实测", "SKIP", "无 CUDA")
         return
@@ -262,7 +263,7 @@ def probe_memory(device, batch):
         "显存峰值实测",
         "PASS",
         f"batch={batch} allocated={peak_alloc:.1f}MB reserved={peak_res:.1f}MB "
-        f"/ 卡上 total={total:.0f}MB（平台容器仅约 14336MB，按 reserved 折算）",
+        f"/ 卡上 total={total:.0f}MB（平台容器总显存 32G≈32768MB，按 reserved 折算）",
     )
     n = {k: sum(p.numel() for p in h.parameters())
          for k, h in (("ext", ext), ("loc", loc), ("clin_t", clt))}

@@ -113,7 +113,7 @@ def diagnose_dynamic_case(model, frames, frame_indices, config, calibrator,
     `RuntimeError`(CUDA OOM/权重维度不符)、`cv2.error` 等真故障**冒泡**由调用方转 ERROR。
 
     关键帧张量防错位(与原实现一致):`img_tensor`(GPU 张量)只保留**当前最恶性帧**
-    那一个(边扫边留 argmax 帧,显存从 N 帧降到 1 帧,防官方 14G 上界 OOM);判据用
+    那一个(边扫边留 argmax 帧,显存从 N 帧降到 1 帧,防长视频显存/耗时 OOM);判据用
     严格 `>`,与 `aggregate_frame_predictions` 的 `max`(相等取首个)严格同序。
 
     Args:

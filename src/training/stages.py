@@ -35,7 +35,7 @@ def compute_gamma_prior(epoch: int) -> float:
     ⚠️ **与 Stage2 边界的耦合(2026-08-11 崩塌事故根因之一)**:γ 在 epoch 40 恰好升满,
     而 Stage2 从 epoch 41 起同时触发 lr 100 倍跳变 + 全模型解冻 + `enable_mal_loss`
     首次开启——四件事挤在同一个 epoch,分割 3 个 epoch 内从 97.71% 塌到 80.6%。
-    详见 `docs/项目现状总纲.md` §6。三头训练**另建调度**,勿复用本函数与
+    详见 `docs/训练与架构/三头实现记录.md` §6。三头训练**另建调度**,勿复用本函数与
     `configure_stage_parameters` 的 epoch 划分。
 
     数值锁定见 `tests/test_stage_schedule.py::test_gamma_prior_annealing`。
@@ -95,7 +95,7 @@ def configure_stage_parameters(
     (Ep1-10 冻主干温升新头 / Ep11-30 LLRD 解冻 Top-2 / Ep31-35 概率校准),
     不得复用本函数的 1-40/41-100/101-120 划分**;模型只能提交一次,踩在官方数据上无法补救。
     边界跳变的数值锁定见 `tests/test_stage_schedule.py`,事故全记录见
-    `docs/项目现状总纲.md` §6。
+    `docs/训练与架构/三头实现记录.md` §6。
 
     Stage 3 (Epoch 101-120): 分类器微调
     - 冻结双主干、分割解码器、物理先验网络

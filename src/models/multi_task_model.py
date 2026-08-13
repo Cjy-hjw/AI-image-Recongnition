@@ -7,7 +7,7 @@ from src.models.blocks import ConvBlock, TaskAlignmentAdaptor
 from src.models.mask_features import nodule_scale_from_mask
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
-from src.models.heads import ClinicalTHead, ExtensionHead, LocationHead
+from src.models.heads import ClinicalTHead, ExtensionHead, LocationHead, TiradsHead
 from src.models.pretrained_loader import load_local_safetensors
 
 
@@ -48,6 +48,9 @@ class ModelOutputs(TypedDict):
     t_logits: torch.Tensor
     t_probs: torch.Tensor
     t_conf: torch.Tensor
+    # --- backlog #124:TI-RADS 总分类头输出 ---
+    tirads_logits: torch.Tensor
+    tirads_probs: torch.Tensor
 
 
 class MultiTaskThyroidModel(nn.Module):
@@ -59,9 +62,13 @@ class MultiTaskThyroidModel(nn.Module):
     CLS_STAGE4_CHANNELS = 208
 
     STAGE1_FROZEN_CBM_SUBMODULES = ("classifier_direct", "latent_mlp")
-    # 官方三头前缀:legacy 三阶段调度(stages.py)一律不训,由 schedule_official.py 接管。
-    # 加载旧 checkpoint 时 missing_keys 的合法白名单也是这个集合。
-    OFFICIAL_HEAD_PREFIXES = ("location_head", "extension_head", "clinical_t_head")
+    # 官方头前缀(位置/ETE/临床T/TI-RADS,四头):legacy 三阶段调度(stages.py)一律
+    # 不训,由 schedule_official.py 接管。加载旧 checkpoint 时 missing_keys 的
+    # 合法白名单也是这个集合(新头名一旦加进这里,warm-start/冻结/可训集自动生效,
+    # 无需再改 `load_warm_start`/`schedule_official.py` —— 两处都动态读本元组)。
+    OFFICIAL_HEAD_PREFIXES = (
+        "location_head", "extension_head", "clinical_t_head", "tirads_head",
+    )
     STAGE3_FROZEN_PREFIXES = (
         "seg_backbone",
         "cls_backbone",
@@ -200,12 +207,13 @@ class MultiTaskThyroidModel(nn.Module):
             nn.Linear(128, 128),
         )
 
-        # ── 官方新增三维度头(位置/ETE/临床T)────────────────────────────────
-        # in_channels 一律取 CLS_POOLED_DIM(352):三头都吃 blocks[6] 之后的
+        # ── 官方新增维度头(位置/ETE/临床T/TI-RADS)────────────────────────────
+        # in_channels 一律取 CLS_POOLED_DIM(352):四头都吃 blocks[6] 之后的
         # stage4 空间图,208 是 adaptor_stage4 的**输入**通道,写错要到真训练才崩。
         self.location_head = LocationHead(in_channels=self.CLS_POOLED_DIM)
         self.extension_head = ExtensionHead(in_channels=self.CLS_POOLED_DIM)
         self.clinical_t_head = ClinicalTHead(in_channels=self.CLS_POOLED_DIM)
+        self.tirads_head = TiradsHead(in_channels=self.CLS_POOLED_DIM)
 
     def is_param_trainable(self, name: str, stage: int) -> bool:
         if "vclub" in name:
@@ -309,6 +317,11 @@ class MultiTaskThyroidModel(nn.Module):
         t_out = self.clinical_t_head(
             x_cls_spatial, nodule_scale_detached, ete_out["ete_logits"]
         )
+        tirads_out = self.tirads_head(
+            x_cls_spatial,
+            cbm.logits_comp, cbm.logits_echo, cbm.logits_shape,
+            cbm.logits_margin, cbm.logits_foci,
+        )
 
         outputs: ModelOutputs = {
             "mask": logits_mask,
@@ -340,6 +353,9 @@ class MultiTaskThyroidModel(nn.Module):
             "t_logits": t_out["t_logits"],
             "t_probs": t_out["t_probs"],
             "t_conf": t_out["t_conf"],
+            # --- backlog #124:TI-RADS 头输出 ---
+            "tirads_logits": tirads_out["tirads_logits"],
+            "tirads_probs": tirads_out["tirads_probs"],
         }
 
         return outputs

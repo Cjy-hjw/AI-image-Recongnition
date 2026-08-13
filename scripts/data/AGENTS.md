@@ -48,7 +48,7 @@ Phase D 已废弃伪分组,改为**纯随机图像级划分**:
 
 ## 3. ThyroidXL 分割混训转换 (`format_thyroidxl.py`)
 
-**动机(A0 零训练诊断,2026-08-11)**:TN3K 训练的分割主干**单域过拟合**,A800 实测跨域 ThyroidXL 仅 17.80% Dice(廉价归一化反更差,确认深层域偏移)。ThyroidXL 自带 7162 张真实像素 mask,混入 TN3K 主训练补域不变特征。详见 `docs/项目现状总纲.md §6` A0 条目、`plans/sparkling-snuggling-journal.md` 步骤 B。
+**动机(A0 零训练诊断,2026-08-11)**:TN3K 训练的分割主干**单域过拟合**,A800 实测跨域 ThyroidXL 仅 17.80% Dice(廉价归一化反更差,确认深层域偏移)。ThyroidXL 自带 7162 张真实像素 mask,混入 TN3K 主训练补域不变特征。详见 `docs/训练与架构/三头实现记录.md` §6 A0 条目。
 
 `convert(data_root, dest, val_ratio)`:`ThyroidXLAdapter` → 逐样本产 `{dest}/{train,val}/sample_{id}/`(image.png + mask.png + meta.json)。
 

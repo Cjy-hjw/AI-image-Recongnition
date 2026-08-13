@@ -27,6 +27,7 @@ import os
 import glob
 import re
 import random
+import unicodedata
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -49,6 +50,7 @@ from src.inference.nifti_io import load_nifti_frames
 from src.inference.prediction_json import (
     location_label_to_index,
     _ETE_LABEL_TO_CODE,
+    _TIRADS_ROMAN_TO_CODE,
 )
 
 # 可选依赖探测:不在模块层 import(避免 Pyright possibly-unbound + 缺失即整模块崩),
@@ -56,6 +58,10 @@ from src.inference.prediction_json import (
 import importlib.util as _ilu
 HAS_PYDICOM = _ilu.find_spec("pydicom") is not None
 HAS_PANDAS = _ilu.find_spec("pandas") is not None
+# pandas.read_excel(.xlsx) 的真实解析后端是 openpyxl(pandas 本身不含 xlsx 解析器)。
+# 装了 pandas 但没装 openpyxl 时,pd.read_excel 抛的是 pandas 内部的晦涩
+# ImportError,不会指名道姓说"装 openpyxl"——这里单独探测给出直白报错。
+HAS_OPENPYXL = _ilu.find_spec("openpyxl") is not None
 
 
 # ── xlsx 字段名映射(按字段名解析,禁硬编码列号) ─────────────────────────────
@@ -71,10 +77,14 @@ _FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "roi_name":       ("RoiName", "ROI名称", "roi_name"),
     "slice_index":    ("ANNOTATION->SliceIndex", "SliceIndex"),        # 1-based 帧号
     # 临床标签列
-    "malignancy":     ("ROI良恶性", "良恶性"),                          # 恶/良
+    "malignancy":     ("ROI良恶性", "ROI->CLINICAL->良恶性", "良恶性"),  # 恶/良
     "lesion_loc":     ("主病灶位置", "病灶位置", "lesion_loc"),          # 混写 2左中叶
     "extrathy_ext":   ("甲状腺外侵犯", "ETE", "extrathy_ext"),           # 混写 2甲状腺包膜
     "clin_t_stage":   ("临床T分期", "T分期", "clin_t_stage"),           # 混写 1有 / 0无
+    # TI-RADS 总分类(非"详细评分子项",两者是不同粒度的列,定稿 §2.2)。
+    # `ROI-TIRADS` 放第一位:定稿 §1.7 全量复核确认的真实列名,值字面 `V类`(无数字前缀)。
+    "tirads":         ("ROI-TIRADS", "ROI->CLINICAL->TI-RADS", "TI-RADS",
+                        "TIRADS", "TI_RADS", "TI-RADS分类", "TI-RADS总分类"),
     # CBM 概念子标签(列名/编码映射待真实表复核;命中则按数字前缀解析,缺失→valid=0)
     "composition":    ("成分", "composition"),
     "echogenicity":   ("回声", "echogenicity"),
@@ -179,6 +189,34 @@ def _parse_ete_code(v) -> Optional[int]:
     return _ETE_LABEL_TO_CODE.get(s)            # 规范标签精确命中才认;未知措辞→None(valid=0)
 
 
+def _parse_tirads(v) -> Optional[int]:
+    """TI-RADS 总分类 → 输出码 1..5;空/未知/越界→None。
+
+    定稿 §1.7:真实字面是**罗马数字+"类"**(`V类`,无数字前缀),但同表另有列用
+    "数字+空格+罗马"混写(`5 V类`);两条路都要走。
+
+    解析优先级:① 空→None;② 数字前缀 1..5(混写路径,前缀即官方码);③ 剥前缀后
+    归一化(去空白/全角转半角/大写/去尾缀"类"|"级")在 `_TIRADS_ROMAN_TO_CODE`
+    **精确查表**才返码;④ 其余(NA/UNK/未评估/越界数字)→None→valid=0。
+
+    🔴 **禁子串 `in` 匹配**:"IV" 含 "I"、"III" 含 "II"/"I",子串匹配会把 IV/III
+    误判成 I/II。精确 dict 查表天然避免这个坑(与 `_parse_ete_code` 同一教训)。
+    """
+    if _is_empty(v):
+        return None
+    s_full = _cell_str(v)
+    d = _digit_prefix(v)
+    if d is not None and 1 <= d <= 5:
+        return d                                 # 混写:数字前缀即官方输出码 1..5
+    # 剥数字前缀,归一化后在罗马数字表精确查找(不做子串匹配)。
+    s = re.sub(r"^\s*\d+\s*", "", s_full).strip()
+    s = unicodedata.normalize("NFKC", s)          # 全角→半角、兼容字符归一
+    s = re.sub(r"(类|级)\s*$", "", s).strip().upper()
+    if not s:
+        return None
+    return _TIRADS_ROMAN_TO_CODE.get(s)           # 精确命中才认;未知措辞→None(valid=0)
+
+
 def _parse_concept(v) -> Optional[int]:
     """CBM 概念(成分/回声/形状/边缘)→ 0-based 类索引 = 数字前缀-1。无前缀→None。
 
@@ -210,15 +248,24 @@ def parse_annotation_xlsx(
         colmap  — 逻辑字段 → 命中的真实列名(None 表示该列在表中缺失)。
 
     Raises:
-        RuntimeError: pandas 未安装。
+        RuntimeError: pandas 或 openpyxl 未安装。
         KeyError:     关键列(patient_id / image_property / roi_name)全候选名皆缺失
                       —— 宁可显式报错,不静默产出空样本集。
     """
     if not HAS_PANDAS:
         raise RuntimeError("pandas 未安装,无法读 .xlsx 官方标注表")
+    if not HAS_OPENPYXL:
+        raise RuntimeError(
+            "openpyxl 未安装,无法读 .xlsx 官方标注表(pandas.read_excel 的实际"
+            "解析后端)。训练环境请先 `pip install -r requirements-train.txt`。"
+        )
     import pandas as pd
     # dtype=str 保留 `2左中叶` 原样,避免 pandas 把纯数字列转成 float 引入 `2.0`。
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, dtype=str)
+    # header=1:官方 xlsx 用合并单元格表头,真实列名(PatientId/ROI->CLINICAL->良恶性等)
+    # 在第2行(0-based row=1),第1行是合并单元格的分组标题。云端 2026-08-13 用真实官方数据
+    # 实测确认——header=0(默认)会把分组标题当列名,导致 _FIELD_ALIASES 全部候选名零命中、
+    # 四头全程静默 valid=0(不报错,是最隐蔽的失败模式)。header=1 后列名匹配率 100%(5/5)。
+    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=1, dtype=str)
     colmap = _resolve_columns(df.columns)
 
     for key in ("patient_id", "image_property", "roi_name"):
@@ -308,6 +355,12 @@ def _build_labels(rec: Dict, patient_id: str, lesion_id: str = "") -> Dict:
     labels["clin_t_stage"] = 0 if t is None else t
     labels["valid_clin_t_stage"] = int(t is not None)
 
+    # TI-RADS 总分类:输出码 1..5 → 训练 0-based 类索引(码-1)。指标"仅匹配成功的主
+    # 病灶"、**不带**恶性限定(与 ETE/T 不同,评审规则原文无"且为恶性")。空列→valid=0。
+    tirads_code = _parse_tirads(rec.get("tirads"))
+    labels["tirads"] = 0 if tirads_code is None else int(tirads_code - 1)
+    labels["valid_tirads"] = int(tirads_code is not None)
+
     # CBM 概念(成分/回声/形状/边缘):列名/编码未锁前,命中列则按数字前缀-1,否则 valid=0
     for task in _CONCEPT_TASKS:
         val = _parse_concept(rec.get(task))
@@ -318,6 +371,31 @@ def _build_labels(rec: Dict, patient_id: str, lesion_id: str = "") -> Dict:
     labels["valid_foci"] = 0
 
     return labels
+
+
+# 三头 + TI-RADS 训练监督的实际来源列;命中列名候选表(_FIELD_ALIASES)全数缺失
+# 就等于该任务零监督——`_resolve_columns` 是精确字符串匹配、缺列不报错、只让
+# valid_*=0 全程静默。上云后第一时间用这个诊断确认列名候选是否命中真实表头。
+_CLINICAL_LOGICAL_FIELDS = (
+    "malignancy", "lesion_loc", "extrathy_ext", "clin_t_stage", "tirads",
+)
+
+
+def _warn_missing_clinical_columns(colmap: Dict[str, Optional[str]]) -> None:
+    """`build_official_samples` 启动时打印临床列命中摘要,未命中项显式 warning。
+
+    不 raise(真实表可能确实缺某列,不该阻塞训练启动),但必须在训练日志第一屏
+    可见——否则某个逻辑字段的候选列名全部未命中真实表头,会零监督且全程无提示,
+    直到指标离奇偏低才被发现(`_resolve_columns` 本身对此完全沉默)。
+    """
+    missing = [f for f in _CLINICAL_LOGICAL_FIELDS if colmap.get(f) is None]
+    hit = {f: colmap[f] for f in _CLINICAL_LOGICAL_FIELDS if colmap.get(f) is not None}
+    print(f"--> [official_loader] 临床列命中:{hit}")
+    if missing:
+        print(
+            f"--> [official_loader] ⚠️ 以下逻辑字段未命中任何候选列名(该任务将零监督,"
+            f"valid_*=0 全程静默):{missing}。核对 _FIELD_ALIASES 候选名与真实表头是否一致。"
+        )
 
 
 def build_official_samples(
@@ -335,7 +413,8 @@ def build_official_samples(
           is_dynamic(bool), patient_key(=pid,供 patient_grouped_split), label(=malignancy,
           供分层), labels(完整 labels dict)。
     """
-    records, _ = parse_annotation_xlsx(xlsx_path, sheet_name)
+    records, colmap = parse_annotation_xlsx(xlsx_path, sheet_name)
+    _warn_missing_clinical_columns(colmap)
 
     by_patient: Dict[str, List[Dict]] = defaultdict(list)
     for rec in records:

@@ -64,7 +64,11 @@ from src.models.label_schema import (  # noqa: F401  (re-export，保向后兼�
     LOCATION_LABELS,
     LOCATION_NULL_LABELS,
     NUM_LOCATIONS,
+    NUM_TIRADS_CLASSES,
+    TIRADS_CODES,
+    TIRADS_LABELS,
     _ETE_LABEL_TO_CODE,
+    _TIRADS_ROMAN_TO_CODE,
 )
 
 # 无结节时 Location 的合法特例(规范:"1~7,仅无结节时可为 0")。
@@ -285,8 +289,8 @@ def build_nodule_entry(
             f"ExtrathyroidalExtension 必须为 {ETE_CODES} 之一,收到 {ete_code}")
 
     tirads_class = int(tirads_class)
-    if not (1 <= tirads_class <= 5):
-        raise PredictionSchemaError(f"TI_RADS_Class 必须为 1..5,收到 {tirads_class}")
+    if tirads_class not in TIRADS_CODES:
+        raise PredictionSchemaError(f"TI_RADS_Class 必须为 {TIRADS_CODES} 之一,收到 {tirads_class}")
 
     t_clin_sig = int(t_clin_sig)
     if t_clin_sig not in (0, 1):
@@ -404,7 +408,7 @@ def validate_prediction_json(payload: dict) -> None:
             if key not in n:
                 raise PredictionSchemaError(f"{path} 缺必填字段: {key}")
 
-        if not (1 <= n["TI_RADS_Class"] <= 5):
+        if n["TI_RADS_Class"] not in TIRADS_CODES:
             raise PredictionSchemaError(f"{path}.TI_RADS_Class 越界: {n['TI_RADS_Class']}")
         if n["ExtrathyroidalExtension"] not in ETE_CODES:
             raise PredictionSchemaError(

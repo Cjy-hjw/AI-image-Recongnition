@@ -76,6 +76,13 @@ from src.models.heads.clinical_t import (  # noqa: F401  (re-export)
     ClinicalTHead,
     ClinicalTOutputs,
 )
+from src.models.heads.tirads import (  # noqa: F401  (re-export)
+    CONCEPT_DIM,
+    NUM_TIRADS_CLASSES,
+    TIRADS_IDX_TO_CODE,
+    TiradsHead,
+    TiradsOutputs,
+)
 
 __all__ = [
     "LocationHead",
@@ -91,4 +98,9 @@ __all__ = [
     "ClinicalTOutputs",
     "NUM_CLIN_T_CLASSES",
     "T_POSITIVE_INDEX",
+    "TiradsHead",
+    "TiradsOutputs",
+    "NUM_TIRADS_CLASSES",
+    "TIRADS_IDX_TO_CODE",
+    "CONCEPT_DIM",
 ]

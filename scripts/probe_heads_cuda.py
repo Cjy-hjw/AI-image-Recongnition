@@ -1,21 +1,22 @@
-"""Phase2 三头的 **GPU / 跨平台契约探针** —— 本地 Windows+CPU 测不到的那几条。
+"""Phase2 官方头(位置/ETE/临床T/TI-RADS)的 **GPU / 跨平台契约探针** —— 本地
+Windows+CPU 测不到的那几条。
 
 ## 为什么单独有这个脚本
 
-三头的单测（`tests/test_{location,extension,clinical_t}_head.py`）跑在 Windows +
-CPU + fp32 上，能覆盖数学与契约，但**结构性地测不到**四类上云才会炸的问题：
+四头的单测(`tests/test_{location,extension,clinical_t,tirads}_head.py`)跑在
+Windows + CPU + fp32 上,能覆盖数学与契约,但**结构性地测不到**四类上云才会炸的问题:
 
-1. **fp16 autocast**：torch 在 CPU 上不支持 float16 autocast，而交付推理正是
-   `precision="fp16"`。三头里的 `.float()` softmax、fp32 累加器、`.to(feat.dtype)`
-   回转、以及临床 T 的 `log(clamp(s))`，**只有真 CUDA 上才走到真实分支**。
-2. 🔴 **`F.max_pool2d` 的隐式 −inf padding 语义**：交界带的腐蚀是 `-max_pool2d(-m)`，
-   整个 ETE 局部特征都押在这个语义上。CPU 与 CUDA 是两套 kernel，一致性**必须实测**。
-3. **显存峰值**：平台每容器实测 **32G**（2026-08-12 官方容器内 `nvidia-smi`，
-   `docs/项目现状总纲.md` §3；控制台"14"是 vCPU 数）。
-   ⚠️ 实测下来这一维**并非风险**（三头合计 **0.536M** 参数 = 2.05MB fp32、batch=16
-   峰值仅百 MB 级），本项保留的价值是"换 backbone / 提分辨率后能立刻重测"，
+1. **fp16 autocast**:torch 在 CPU 上不支持 float16 autocast,而交付推理正是
+   `precision="fp16"`。四头里的 `.float()` softmax、fp32 累加器、`.to(feat.dtype)`
+   回转、以及临床 T 的 `log(clamp(s))`,**只有真 CUDA 上才走到真实分支**。
+2. 🔴 **`F.max_pool2d` 的隐式 −inf padding 语义**:交界带的腐蚀是 `-max_pool2d(-m)`,
+   整个 ETE 局部特征都押在这个语义上。CPU 与 CUDA 是两套 kernel,一致性**必须实测**。
+3. **显存峰值**:平台每容器实测 **32G**(2026-08-12 官方容器内 `nvidia-smi`,
+   `docs/项目现状总纲.md` §3;控制台"14"是 vCPU 数)。
+   ⚠️ 实测下来这一维**并非风险**(四头合计参数量仍是百 KB~MB 级、batch=16
+   峰值仅百 MB 级),本项保留的价值是"换 backbone / 提分辨率后能立刻重测",
    不是当前有隐患。
-4. **BatchNorm 在 batch=1 下的推理形态**：交付推理 batch 恒 1。
+4. **BatchNorm 在 batch=1 下的推理形态**:交付推理 batch 恒 1。
 
 ## 用法
 
@@ -38,7 +39,7 @@ CPU + fp32 上，能覆盖数学与契约，但**结构性地测不到**四类�
 每次限约 10 个文件（`memory/cloud-upload-review-constraint.md`），拆成 `probes/` 包会从
 1 个文件变 3 个；且现在任何工作目录下 `python scripts/probe_heads_cuda.py` 直接可跑，
 拆包后要依赖 `scripts/__init__` → `scripts/probes/__init__` 的 import 链，陌生容器里多一个
-失败点。② 切出来的两半仍是同一件事（验三头 GPU 契约），**不产生认知边界**。
+失败点。② 切出来的两半仍是同一件事（验四头 GPU 契约），**不产生认知边界**。
 ③ 为守行数压缩注释会撞 §5「细节优先」—— 上一轮真这么干过，是被规则记录在案的反例。
 
 本脚本只有一个职责，行数随头数线性增长（每加一个头约 20 行），可读性不随之下降。
@@ -64,6 +65,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 from src.models.heads.clinical_t import ClinicalTHead  # noqa: E402
 from src.models.heads.extension import ExtensionHead  # noqa: E402
 from src.models.heads.location import LocationHead  # noqa: E402
+from src.models.heads.tirads import TiradsHead  # noqa: E402
 from src.models.mask_features import (  # noqa: E402
     boundary_band_from_mask,
     nodule_scale_from_mask,
@@ -72,6 +74,8 @@ from src.models.mask_features import (  # noqa: E402
 IN_CH = 352  # MultiTaskThyroidModel.CLS_POOLED_DIM
 IMG = 512
 FEAT_HW = IMG // 32
+# CBM 五概念 logits 拼接宽度(comp4+echo4+shape2+margin4+foci4=18),TiradsHead 消费。
+_CONCEPT_DIMS = (("comp", 4), ("echo", 4), ("shape", 2), ("margin", 4), ("foci", 4))
 
 _results = []
 
@@ -94,6 +98,15 @@ def _make_inputs(batch, device, dtype=torch.float32):
     mask[:, :, 180:330, 180:330] = 1.0  # 150px 结节
     margin = torch.randn(batch, 4, device=device, dtype=dtype)
     return feat, mask, margin
+
+
+def _make_concept_logits(batch, device, dtype=torch.float32, requires_grad=False):
+    """造 TiradsHead 需要的 CBM 五概念 logits(comp/echo/shape/margin/foci)。"""
+    torch.manual_seed(1)
+    return [
+        torch.randn(batch, dim, device=device, dtype=dtype, requires_grad=requires_grad)
+        for _, dim in _CONCEPT_DIMS
+    ]
 
 
 # ── 1. 形态学 kernel 的跨设备一致性 ────────────────────────────────────────
@@ -137,11 +150,14 @@ def probe_fp16_autocast(device, batch):
     ext = ExtensionHead(in_channels=IN_CH).to(device).eval()
     loc = LocationHead(in_channels=IN_CH).to(device).eval()
     clt = ClinicalTHead(in_channels=IN_CH).to(device).eval()
+    tir = TiradsHead(in_channels=IN_CH).to(device).eval()
     feat, mask, margin = _make_inputs(batch, device)
+    concepts = _make_concept_logits(batch, device)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         eo = ext(feat, mask, margin)
         lo = loc(feat)
         to = clt(feat, nodule_scale_from_mask(mask), eo["ete_logits"])
+        tro = tir(feat, *concepts)
         # 阴性病例（空 mask）→ scale 恰为 0 → `log(clamp(s,1e-4))`。fp16 下 1e-4 落在
         # 非规格化边缘（最小正规数 6.1e-5），是 CPU 测不到的真实分支。
         to_empty = clt(feat, nodule_scale_from_mask(torch.zeros_like(mask)),
@@ -151,6 +167,8 @@ def probe_fp16_autocast(device, batch):
         and torch.isfinite(eo["ete_probs"]).all()
         and torch.isfinite(lo["location_probs"]).all()
         and torch.isfinite(to["t_logits"]).all()
+        and torch.isfinite(tro["tirads_logits"]).all()
+        and torch.isfinite(tro["tirads_probs"]).all()
     )
     check("fp16 autocast 前向无 NaN/Inf", bool(ok))
     check(
@@ -173,11 +191,18 @@ def probe_fp16_autocast(device, batch):
         and torch.equal(to["t_conf"], to["t_probs"][:, 1]),
     )
     check(
+        "fp16 下 TI-RADS 概率和为 1",
+        torch.allclose(tro["tirads_probs"].sum(-1).float(), torch.ones(batch, device=device), atol=1e-3),
+        f"和={[round(float(v), 5) for v in tro['tirads_probs'].sum(-1)[:2]]}",
+    )
+    check(
         "fp16 概率输出被提升到 fp32",
         eo["ete_probs"].dtype == torch.float32
         and lo["location_probs"].dtype == torch.float32
-        and to["t_probs"].dtype == torch.float32,
-        f"ete={eo['ete_probs'].dtype}, loc={lo['location_probs'].dtype}, t={to['t_probs'].dtype}",
+        and to["t_probs"].dtype == torch.float32
+        and tro["tirads_probs"].dtype == torch.float32,
+        f"ete={eo['ete_probs'].dtype}, loc={lo['location_probs'].dtype}, "
+        f"t={to['t_probs'].dtype}, tirads={tro['tirads_probs'].dtype}",
     )
 
 
@@ -237,7 +262,7 @@ def probe_batch_one_inference(device):
 
 
 def probe_memory(device, batch):
-    """三头前向+反传的显存峰值。平台每容器实测 32G（2026-08-12 nvidia-smi），A800 的 80G 不 OOM 说明不了什么。"""
+    """四头前向+反传的显存峰值。平台每容器实测 32G（2026-08-12 nvidia-smi），A800 的 80G 不 OOM 说明不了什么。"""
     if device.type != "cuda":
         record("显存峰值实测", "SKIP", "无 CUDA")
         return
@@ -246,14 +271,17 @@ def probe_memory(device, batch):
     ext = ExtensionHead(in_channels=IN_CH).to(device)
     loc = LocationHead(in_channels=IN_CH).to(device)
     clt = ClinicalTHead(in_channels=IN_CH).to(device)
+    tir = TiradsHead(in_channels=IN_CH).to(device)
     feat, mask, margin = _make_inputs(batch, device)
     feat.requires_grad_(True)
+    concepts = _make_concept_logits(batch, device)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         eo = ext(feat, mask, margin)
         out = (
             eo["ete_logits"].sum()
             + loc(feat)["side_logits"].sum()
             + clt(feat, nodule_scale_from_mask(mask), eo["ete_logits"])["t_logits"].sum()
+            + tir(feat, *concepts)["tirads_logits"].sum()
         )
     out.backward()
     peak_alloc = torch.cuda.max_memory_allocated() / 2**20
@@ -266,12 +294,12 @@ def probe_memory(device, batch):
         f"/ 卡上 total={total:.0f}MB（平台容器总显存 32G≈32768MB，按 reserved 折算）",
     )
     n = {k: sum(p.numel() for p in h.parameters())
-         for k, h in (("ext", ext), ("loc", loc), ("clin_t", clt))}
+         for k, h in (("ext", ext), ("loc", loc), ("clin_t", clt), ("tirads", tir))}
     record(
-        "三头参数量",
+        "四头参数量",
         "PASS",
         f"ExtensionHead={n['ext'] / 1e6:.3f}M, LocationHead={n['loc'] / 1e6:.3f}M, "
-        f"ClinicalTHead={n['clin_t'] / 1e6:.3f}M "
+        f"ClinicalTHead={n['clin_t'] / 1e6:.3f}M, TiradsHead={n['tirads'] / 1e6:.3f}M "
         f"（合计 {sum(n.values()) * 4 / 2**20:.2f}MB fp32）",
     )
 
@@ -280,7 +308,7 @@ def probe_memory(device, batch):
 
 
 def probe_gradient_isolation(device):
-    """三头的梯度不得到达 mask / CBM margin / 上游头 —— 换设备不该改变这些契约。"""
+    """四头的梯度不得到达 mask / CBM margin / 上游头 —— 换设备不该改变这些契约。"""
     ext = ExtensionHead(in_channels=IN_CH).to(device)
     feat, mask, margin = _make_inputs(2, device)
     feat.requires_grad_(True)
@@ -306,6 +334,21 @@ def probe_gradient_isolation(device):
     check(
         "T 梯度确实到达 stage4_spatial(反证上两条非空转)",
         feat_t.grad is not None and float(feat_t.grad.abs().sum()) > 0,
+    )
+
+    # TI-RADS：CBM 五概念 logits 必须 detach（不让 TI-RADS 梯度反向重塑概念，
+    # 见 `heads/tirads.py` 模块 docstring）。
+    tir = TiradsHead(in_channels=IN_CH).to(device)
+    feat_tr = torch.randn(2, IN_CH, FEAT_HW, FEAT_HW, device=device, requires_grad=True)
+    concepts_tr = _make_concept_logits(2, device, requires_grad=True)
+    tir(feat_tr, *concepts_tr)["tirads_logits"].sum().backward()
+    check(
+        "TI-RADS 梯度不回流 CBM 五概念 logits",
+        all(c.grad is None for c in concepts_tr),
+    )
+    check(
+        "TI-RADS 梯度确实到达 stage4_spatial(反证上一条非空转)",
+        feat_tr.grad is not None and float(feat_tr.grad.abs().sum()) > 0,
     )
 
 

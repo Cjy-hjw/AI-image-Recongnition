@@ -9,15 +9,16 @@
 | 病灶位置 | 加权宏平均 AUC(`roc_auc_score` ovr/weighted) | 仅匹配成功的主病灶(**不限恶性**) |
 | ETE 侵犯 | 加权 Kappa(`cohen_kappa_score`) | 仅匹配成功且**为恶性**的主病灶 |
 | 临床 T | AUC(`roc_auc_score`) | 仅匹配成功且**为恶性**的主病灶 |
+| TI-RADS | 加权 Kappa(`cohen_kappa_score`) | 仅匹配成功的主病灶(**不限恶性**,与位置同、与 ETE/T 不同) |
 
 🔴 **与线上分的三处已知偏差,选模时必须记住**:
   ① **无 IoU 匈牙利匹配**。官方先按 IoU 把预测结节与金标准配对,未配上的不计入
      分类指标;训练/验证用的是 GT mask,等价于"匹配恒成功"。故这里的数只在
      epoch 之间**相对可比**,不能与官方线上分对齐。
-  ② **加权 Kappa 的线性/二次官方未指明**。取 `weights="quadratic"`(ETE 4 级是
-     有序等级,二次权重对"差 3 级"的惩罚远重于"差 1 级",更贴合临床代价)。
-     若官方实为线性,这里的数会系统性偏低/偏高但方向一致,不影响选模排序。
-     已入 `docs/待官方答复清单.md`。
+  ② **加权 Kappa 的线性/二次官方未指明**。取 `weights="quadratic"`(ETE 4 级/
+     TI-RADS 5 级均为有序等级,二次权重对"差 3 级"的惩罚远重于"差 1 级",更贴合
+     临床代价)。若官方实为线性,这里的数会系统性偏低/偏高但方向一致,不影响
+     选模排序。已入 `docs/待官方答复清单.md`。
   ③ **位置的"加权宏平均"权重方案官方未定义**。取 `average="weighted"`(按各类
      真实样本占比加权)。若官方实为等权 macro,峡部等稀有类的影响会被低估。
      同样入待答复清单。
@@ -35,7 +36,7 @@ from sklearn.metrics import average_precision_score, cohen_kappa_score, roc_auc_
 # 类别数一律 import 权威定义,**不得手写字面量**(CLAUDE.md 标签构造铁律):
 # 手抄一份后若官方类别数变动,概率分布与标签会系统性错位——JSON 合法、和为 1、
 # 测试仍过,只是指标莫名偏低,本地永远查不出根因。
-from src.models.heads import NUM_ETE_CLASSES
+from src.models.heads import NUM_ETE_CLASSES, NUM_TIRADS_CLASSES
 from src.models.label_schema import NUM_LOCATIONS
 
 
@@ -67,6 +68,9 @@ def aggregate_by_lesion(records: List[Dict]) -> List[Dict]:
             [g["location_probs"] for g in group], axis=0
         ).tolist()
         head["ete_probs"] = np.mean([g["ete_probs"] for g in group], axis=0).tolist()
+        head["tirads_probs"] = np.mean(
+            [g["tirads_probs"] for g in group], axis=0
+        ).tolist()
         out.append(head)
     return out
 
@@ -151,6 +155,24 @@ def _clinical_t_auc(rows: List[Dict]) -> Optional[float]:
     return _safe_auc([r["gt_clin_t_stage"] for r in sel], [r["t_conf"] for r in sel])
 
 
+def _tirads_weighted_kappa(rows: List[Dict]) -> Optional[float]:
+    """TI-RADS = 加权 Kappa,**不限恶性**(评审规则原文无"且为恶性"限定,与位置
+    同、与 ETE/T 不同——`docs/8.1赛事公开资料/初赛评审规则简要说明.md` 逐条核对
+    过,良性主病灶必须参与该项统计)。Kappa 吃硬预测,故对概率取 argmax。"""
+    sel = [r for r in rows if r["is_main"] == 1 and r["valid_tirads"] == 1]
+    if len(sel) < 2:
+        return None
+    y_true = [r["gt_tirads"] for r in sel]
+    y_pred = [int(np.argmax(r["tirads_probs"])) for r in sel]
+    # 全体一致(真值与预测都只有一个类)时 Kappa 未定义,sklearn 返回 nan
+    if len(set(y_true)) < 2 and len(set(y_pred)) < 2:
+        return None
+    k = cohen_kappa_score(
+        y_true, y_pred, labels=list(range(NUM_TIRADS_CLASSES)), weights="quadratic"
+    )
+    return None if np.isnan(k) else float(k)
+
+
 def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
     """从 `collect_official_records` 的逐样本记录算全部官方口径指标。
 
@@ -158,8 +180,9 @@ def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
         records: `validate_step.collect_official_records` 的输出(可跨批 extend)。
     Returns:
         dict:`malignancy_auc_pr` / `location_weighted_auc` / `ete_weighted_kappa`
-        / `clinical_t_auc` / `n_lesions`。任一指标不可算(样本不足/单类)→ None,
-        **不抛异常**(早期 epoch 的 val 子集常只剩一类,抛异常会中断整个训练)。
+        / `clinical_t_auc` / `tirads_weighted_kappa` / `n_lesions`。任一指标不可算
+        (样本不足/单类)→ None,**不抛异常**(早期 epoch 的 val 子集常只剩一类,
+        抛异常会中断整个训练)。
 
     `composite` 是**我方自定义的选模标量**,不是官方分:取全部可算指标的算术均值。
     官方 60%/40% 的内部子权重未公布,故不做加权;这只是"哪个 checkpoint 更好"的
@@ -171,6 +194,7 @@ def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
             "location_weighted_auc": None,
             "ete_weighted_kappa": None,
             "clinical_t_auc": None,
+            "tirads_weighted_kappa": None,
             "composite": None,
             "n_lesions": 0,
         }
@@ -181,6 +205,7 @@ def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
         "location_weighted_auc": _location_weighted_auc(rows),
         "ete_weighted_kappa": _ete_weighted_kappa(rows),
         "clinical_t_auc": _clinical_t_auc(rows),
+        "tirads_weighted_kappa": _tirads_weighted_kappa(rows),
     }
     usable = [v for v in metrics.values() if v is not None]
     metrics["composite"] = float(np.mean(usable)) if usable else None

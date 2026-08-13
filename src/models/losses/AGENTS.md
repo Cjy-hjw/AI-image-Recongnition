@@ -132,4 +132,4 @@ total_loss, loss_dict = loss_fn(outputs, targets, task_mask=task_mask)
   - `test_partial_valid_excludes_invalid_samples`: 部分有效样本正确屏蔽
   - `test_all_valid_legacy_compat`: 向后兼容性
 
-执行: `pytest tests/test_masked_loss.py -v`(全套现 795 collected / 794 passed+1 skipped(Demo_D 主环境)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境为 789 passed / 6 skipped（2026-08-13 实测，collected 795 与主环境一致；旧记的 620 已失效）)
+执行: `pytest tests/test_masked_loss.py -v`(全套现 814 collected / 813 passed+1 skipped(Demo_D 主环境,2026-08-13 backlog #124 TI-RADS头补齐 + Gate2审查后补回归测试对拍)，计数以根 `AGENTS.md`/`tests/AGENTS.md` 实跑口径为准；**跨环境不可比**，torch2.8 预演环境待下次云端对拍重新确认（TI-RADS 加入前为 789 passed / 6 skipped，collected 795 与主环境一致；旧记的 620 已失效）)

@@ -5,13 +5,13 @@ from src.training.loop.slr import compute_slr_weights
 from src.training.loop.vclub import vclub_learning_step, compute_vclub_mi_bound
 from src.training.stages import compute_gamma_prior
 
-# 三头任务名。与 `validate_step._OFFICIAL_HEAD_TASKS` 同一份语义,两侧都只是
-# 遍历顺序,不构成跨模块契约,故各自持有(避免 loop 子模块间横向依赖)。
-_OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage")
+# 官方新增维度头任务名(位置/ETE/临床T/TI-RADS)。与 `validate_step._OFFICIAL_HEAD_TASKS`
+# 同一份语义,两侧都只是遍历顺序,不构成跨模块契约,故各自持有(避免 loop 子模块间横向依赖)。
+_OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage", "tirads")
 
 
 def build_official_head_targets(labels, mix_info, batch_size, device):
-    """组装官方三头(位置/ETE/临床T)的 targets 片段。三头键缺席 → 返回空 dict。
+    """组装官方新增维度头(位置/ETE/临床T/TI-RADS)的 targets 片段。键缺席 → 返回空 dict。
 
     提成模块级函数(而非内联在 `train_batch`)是为了可单测:这里的每条规则错了都
     **不会报错**,只会让指标系统性偏低 —— 正是 `compute_gamma_prior` 当年被提取的

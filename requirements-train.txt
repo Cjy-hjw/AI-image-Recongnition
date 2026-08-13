@@ -1,0 +1,23 @@
+# === 训练侧专属依赖 ===
+#
+# 分工:`requirements.txt` 是**推理容器**清单(Dockerfile 只 COPY 它,交付镜像
+# 只装它)。本文件补训练侧需要、但推理容器不需要因而未在 requirements.txt 里
+# 声明的三个包。sklearn/timm/nibabel/scipy/pyyaml/opencv 等训练侧也用到的包
+# **已经在** requirements.txt 里(训练容器基于同一批 pip 包),不重复声明。
+#
+# 云端安装(阿里源):
+#   pip install -r requirements.txt -r requirements-train.txt \
+#       -i https://mirrors.aliyun.com/pypi/simple/
+#
+# 一律封顶 major(memory/deps-must-pin-major-opencv5-trap.md 教训:>=无上限
+# 在禁联网+仅提交一次的场景下,构建那一刻装错版本零补救余地)。
+
+# official_loader.py 读官方 xlsx 标注表(pd.read_excel),函数内 lazy import,
+# 缺失不会在模块导入时崩,会崩在训练启动读标注表那一刻(最坏时机)。
+pandas>=2.0,<3
+# pandas.read_excel(.xlsx) 的真实解析后端,pandas 本身不含 xlsx 解析器。
+# 装了 pandas 不会自动带上它(是可选依赖),必须显式声明。
+openpyxl>=3.1,<4
+
+# scripts/deploy.py 用于本地↔A800 的 SSH 文件同步,推理容器不需要。
+paramiko>=3.0,<4

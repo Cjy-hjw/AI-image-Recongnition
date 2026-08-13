@@ -35,8 +35,8 @@
 ## 2. requirements.txt 改动清单(逐行)
 
 > ✅ **已本地实测验证(2026-08-11 首验 / 2026-08-12 复跑 / 2026-08-13 三跑)**:独立 venv `C:\Users\cjy\envs\torch28`(**py3.12.13** + **torch 2.8.0+cpu** + **numpy 2.4.4** + timm 1.0.28 + cv2 4.14 + **pandas 2.3.3 + openpyxl 3.1.5**(2026-08-13 补装))跑全套 pytest = **789 passed / 6 skipped / 0 failed**(2026-08-13;历史:首验 597 → 08-12 **620** → 08-13 补装 pandas 前 775/7 → 补装后 788/6 → mask glob 加固后 789/6)。torch2.8 + numpy2 + timm1.x 三者**零崩溃**,迁移风险已证实很低。
-> 🔴 **补装 pandas/openpyxl 的原因(2026-08-13,别再让它退回去)**:此前该 venv 按 `requirements.txt` 装,而那是**推理交付容器**的清单(不含 pandas 是正确设计,推理不读 xlsx),于是 `tests/test_official_loader.py` **整模块**被 `pytest.importorskip("pandas")` 跳过 —— **"云环境预演"对 `official_loader`(三头标签的唯一来源)覆盖率为 0**,一直在空转最关键的模块。补装后 collected 从 782 升到 **794,与 `Demo_D` 主环境完全一致**。
-> ⚠️ **仍不可跨环境比 passed 数**:两环境 collected 现已同为 795,但 skip 数不同(torch28 = 6 / Demo_D = 1,依赖集差异);判回归须**同环境**前后对拍,勿拿两环境数字相减。`Demo_D` 主环境当前口径 = **795 collected / 794 passed + 1 skipped**(本行旧写的 737 已过时)。
+> 🔴 **补装 pandas/openpyxl 的原因(2026-08-13,别再让它退回去)**:此前该 venv 按 `requirements.txt` 装,而那是**推理交付容器**的清单(不含 pandas 是正确设计,推理不读 xlsx),于是 `tests/test_official_loader.py` **整模块**被 `pytest.importorskip("pandas")` 跳过 —— **"云环境预演"对 `official_loader`(四头标签的唯一来源,2026-08-13 backlog #124 加入 TI-RADS 头后由三头扩为四头)覆盖率为 0**,一直在空转最关键的模块。补装后 collected 从 782 升到 **794,与 `Demo_D` 主环境完全一致**。
+> ⚠️ **仍不可跨环境比 passed 数**:`Demo_D` 主环境当前口径 = **814 collected / 813 passed + 1 skipped**(2026-08-13 backlog #124 TI-RADS 头补齐 + Gate2 审查后补回归测试对拍;本行旧写的 737/795/813 已过时)。torch2.8 预演环境待下次云端对拍重新确认 TI-RADS 覆盖(加入前 collected 与主环境同为 795);判回归须**同环境**前后对拍,勿拿两环境数字相减。
 > ⚠️ 曾误记为"py3.10.18 + venv 建在 A800",两处均已实测纠正(A800 glibc 2.23 装不了 torch2.7+,那个 venv 从未建成)。
 
 | 行 | 现状 | 改为 | 理由 |
@@ -148,4 +148,4 @@
 - ✅ **权重可上传**(用户确认官方平台支持)→ 不必打进镜像,#111 的"权重进镜像"不再是唯一解。
 - ✅ **不自建镜像**:直接用官方 base(§0),故"镜像大小上限 / 私有镜像 sshd / 本地能否拉 `10.1.63.4` 内网 registry"三条**全部不再阻塞**(内网 registry 本地本来就拉不到,只能平台内用——而我们正是在平台内用)。
 - ⏳ **仍待官方**:容器与权重的**交付时序**(权重什么时候、怎么进容器),这决定 #123 启动硬门怎么写。已在用户提交赛事组的问题清单里。
-- ⏳ **待实测**:容器内真实显存(`nvidia-smi`)、timm 1.x backbone 权重 tag 可用性。
+- ✅ **容器内真实显存已实测(2026-08-12)**:云 agent 容器内 `nvidia-smi` = **RTX 5090 32G**(曾待实测的两项第一项已落地,见 §0)。**timm 1.x backbone 权重 tag 可用性已实测排除**(同上节 §2,`timm 1.0.28 下 backbone 加载正常`)。

@@ -245,12 +245,26 @@ def _is_lesion_roi(roi_name: str) -> bool:
 
 
 def _mask_path_for_roi(img_dir: str, roi_name: str) -> Optional[str]:
-    """按 RoiName 定位 mask 文件:M→`M_*_mask.nii.gz`、病灶N→`病灶N_*_mask.nii.gz`。
+    """按 RoiName 定位 mask 文件:M→`M_1_mask.nii.gz`、病灶N→`病灶N_N_mask.nii.gz`。
 
     用 glob 而非硬拼数字(定稿写 `病灶N_N_mask.nii.gz`,但第二段编号不完全确定),
     命中第一个;找不到返回 None。
+
+    🔴 **两种命名都要收(2026-08-13 Gate2 加固)**:`{roi}_*_mask.nii.gz` 里的 `*`
+    在 fnmatch 语义下**至少吃一个字符**,所以该模式结构性地匹配不上无编号的裸
+    `M_mask.nii.gz`。定稿 §1.4/§2/§3 三处均写实测命名为 `M_1_mask.nii.gz`(带段编号),
+    故当前不触发;但万一官方数据里存在无编号变体,漏匹配是**静默失败** ——
+    mask_path=None → `valid_mask=0` → 主病灶分割监督消失,动态路线还会因定位不到
+    非零帧而整例跳过(:379),全程不报错、不告警,只是分数莫名偏低。官方数据禁本地、
+    上云只有一次机会,多 glob 一次的成本是零。
+    排序后取第一个:带编号的 `M_1_mask` 天然排在 `M_mask` 之前('1'<'m'),
+    即两者并存时仍优先用定稿实测的那种命名。
     """
-    hits = sorted(glob.glob(os.path.join(img_dir, f"{_cell_str(roi_name)}_*_mask.nii.gz")))
+    roi_s = _cell_str(roi_name)
+    hits = sorted(
+        glob.glob(os.path.join(img_dir, f"{roi_s}_*_mask.nii.gz"))
+        + glob.glob(os.path.join(img_dir, f"{roi_s}_mask.nii.gz"))
+    )
     return hits[0] if hits else None
 
 

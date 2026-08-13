@@ -315,3 +315,43 @@ def test_dynamic_no_mask_skipped(mini_root):
     samples = O.build_official_samples(root, xlsx)
     assert all(not s["is_dynamic"] for s in samples)       # P3 动态被跳过
     assert len(samples) == 2                               # 仅剩 P1/P2 静态
+
+
+def test_mask_glob_matches_both_namings(tmp_path):
+    """mask 定位必须同时兼容 `M_1_mask.nii.gz`(定稿实测)与裸 `M_mask.nii.gz`。
+
+    2026-08-13 Gate2 加固:原模式只有 `{roi}_*_mask.nii.gz`,而 fnmatch 的 `*`
+    **至少吃一个字符**,结构性地匹配不上无编号命名。漏匹配是**静默失败**——
+    mask_path=None → valid_mask=0 → 主病灶分割监督消失、动态整例跳过,全程不报错。
+    定稿三处均写实测为带编号命名,故当前不触发;本测试钉死"两种都收"这个加固,
+    防止后人"简化"回单一模式。
+    """
+    d = tmp_path / "case"
+    d.mkdir()
+
+    # ① 只有带段编号的命名(定稿实测形态)
+    (d / "M_1_mask.nii.gz").write_bytes(b"x")
+    got = O._mask_path_for_roi(str(d), "M")
+    assert got is not None and got.endswith("M_1_mask.nii.gz")
+
+    # ② 只有裸命名(无段编号)——加固前这里必然 None
+    (d / "M_1_mask.nii.gz").unlink()
+    (d / "M_mask.nii.gz").write_bytes(b"x")
+    got = O._mask_path_for_roi(str(d), "M")
+    assert got is not None and got.endswith("M_mask.nii.gz"), (
+        "裸 M_mask.nii.gz 未被匹配 —— `{roi}_*_mask` 的 `*` 至少吃一个字符,"
+        "必须额外 glob 一次无编号形态,否则主病灶 mask 会静默丢失。"
+    )
+
+    # ③ 两者并存 → 优先带编号那个('1' < 'm',sorted 天然靠前)
+    (d / "M_1_mask.nii.gz").write_bytes(b"x")
+    got = O._mask_path_for_roi(str(d), "M")
+    assert got is not None and got.endswith("M_1_mask.nii.gz")
+
+    # ④ 中文次病灶同样两种命名都认
+    (d / "病灶1_mask.nii.gz").write_bytes(b"x")
+    got = O._mask_path_for_roi(str(d), "病灶1")
+    assert got is not None and got.endswith("病灶1_mask.nii.gz")
+
+    # ⑤ 无任何匹配 → None(不抛异常)
+    assert O._mask_path_for_roi(str(d), "病灶9") is None

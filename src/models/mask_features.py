@@ -40,9 +40,10 @@ def nodule_scale_from_mask(soft_mask: torch.Tensor) -> torch.Tensor:
     别因为「训练跑得好好的」就以为这条防护多余。
     用 `sum(dtype=torch.float32)` 而非 `.float().sum()`:前者直接以 fp32 累加,后者
     先物化一份整张 [B,1,H,W] 的 fp32 拷贝(实测 fp16/batch=4 峰值 6.29MB vs 2.10MB)。
-    二者数值严格等价,在 14G 显存约束下取更省的写法。
+    二者数值严格等价,取更省的写法(官方 32G 显存,2026-08-12 nvidia-smi 实测)。
     `tests/test_head_interfaces.py::test_nodule_scale_survives_fp16_sum_overflow`
     用反证锁死这条(该测试自带「反证失效」保护,防它哪天变成永远通过的假门)。
+    实参取舍只谈峰值 MB 数,不依赖平台显存口径(官方 32G,2026-08-12 nvidia-smi 实测)。
 
     `clamp(min=0)` 不是冗余:本函数是**公开函数**,契约不限定入参来自 sigmoid。
     若未来有人传 logits 进来,负面积会让 `sqrt` 产出 NaN 并静默污染 T 头输入。

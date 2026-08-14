@@ -65,25 +65,25 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 
 | File | Responsibility |
 |:---|:---|
-| `train_step.py` | `train_batch()` — single batch forward/backward with MixUp, vCLUB, SLR, AMP;模块级 `build_official_head_targets()` 组装三头 targets(见下) |
+| `train_step.py` | `train_batch()` — single batch forward/backward with MixUp, vCLUB, SLR, AMP;模块级 `build_official_head_targets()` 组装四头 targets(见下) |
 | `validate_step.py` | `validate_batch()` — single batch validation with Val Diag print;返回 **8 元组**(新增 `official_records`);`collect_official_records()`/`_official_head_targets()` |
 | `metrics_official.py` | **官方口径验证指标(阶段 2.4 新增)**:病灶级聚合(同 `lesion_id` 多帧概率取均值)+ 官方筛选(见下) |
 | `slr.py` | `compute_slr_weights()` — Supervised Label Rectification (1000-sample history, mean+2σ anomaly) |
 | `vclub.py` | `vclub_learning_step()`, `compute_vclub_mi_bound()` — mutual information decoupling |
 | `bn_freeze.py` | `set_frozen_modules_eval()` — automatic BatchNorm eval for frozen modules |
 
-### 官方三头训练模块(Phase E,2026-08-13 新增,均在 `src/training/` 顶层)
+### 官方四头训练模块(Phase E,2026-08-13 新增;backlog #124 补 TI-RADS 头后同一套调度自动覆盖四头,均在 `src/training/` 顶层)
 
 | File | Responsibility | 硬约束 |
 |:---|:---|:---|
-| `schedule_official.py` | 官方三头 A/B/C 阶段调度:`get_official_stage()`/`official_head_lr()`/`configure_official_stage()` | 🔴 **相邻 epoch lr 比值 ≤5**(`MAX_LR_JUMP_RATIO`),把 `stages.py` 的 100 倍跳变事故钉成不可能;返回契约与 `configure_stage_parameters` 同型 `(param_groups, lr, stage_name)`;**绝不复用/修改 `stages.py`** |
+| `schedule_official.py` | 官方四头 A/B/C 阶段调度:`get_official_stage()`/`official_head_lr()`/`configure_official_stage()` | 🔴 **相邻 epoch lr 比值 ≤5**(`MAX_LR_JUMP_RATIO`),把 `stages.py` 的 100 倍跳变事故钉成不可能;返回契约与 `configure_stage_parameters` 同型 `(param_groups, lr, stage_name)`;**绝不复用/修改 `stages.py`** |
 | `jsonl_logger.py` | V2.1 强制 JSONL 训练日志(`JsonlLogger`) | 云端路径写死 `/2026aicompetition/workspace/logs`(`OFFICIAL_LOG_DIR`,Windows 本地不可写,冒烟须 `--log-dir logs`);**逐行 flush**(审查随时读,缓冲区里的行读不到 = 判罚口径下自曝) |
 | `reproducibility.py` | seed 四件套共享助手:`seed_worker()`/`configure_reproducibility()` | sampler / loader **两个独立 generator**(共用会让改 `num_workers` 连带改变采样序列);`train.py` 内那份是 legacy 已验证路径,**不动**,两份漂移各自的测试会红 |
 
-**阶段划分与 lr**(`lr_base` 取 `config.train.lr`):A=epoch 1-10(冻 backbone/分割/CBM,只训三头,线性 warmup 至 lr_base)、
+**阶段划分与 lr**(`lr_base` 取 `config.train.lr`):A=epoch 1-10(冻 backbone/分割/CBM,只训四头,线性 warmup 至 lr_base)、
 B=11-30(解冻 `cls_backbone.blocks[5]/[6]`,LLRD:blocks[6]=头 lr×0.1、blocks[5] 再乘 η=0.75,余弦退火至 ×0.1)、
 C=31-35(重新全冻,头部固定 lr_base×0.05;温度标定在推理侧 `calibration.py` 不在此)。
-三头在**所有** legacy stage 恒冻结(`OFFICIAL_HEAD_PREFIXES`),两条调度线互不干扰。
+四头(位置/侵犯/临床T/TI-RADS)在**所有** legacy stage 恒冻结(`OFFICIAL_HEAD_PREFIXES`,含 `tirads_head`),两条调度线互不干扰。
 入口是 `scripts/train_official.py`(**不动 `train.py`**),数值锁定见 `tests/test_official_schedule.py`(16 项)。
 
 
@@ -93,7 +93,7 @@ C=31-35(重新全冻,头部固定 lr_base×0.05;温度标定在推理侧 `calibr
 
 ### `metrics_official.py`(官方口径验证指标,阶段 2.4)
 
-病灶级聚合(同 `lesion_id` 多帧概率取均值、标签取首)+ 官方筛选(金标准侧,非预测侧):**全部指标只取 `is_main==1 且 valid_*==1`**;ETE/T 再加金标准 `malignancy==1`;位置/良恶性/TI-RADS 不限恶性。指标:良恶意 `average_precision_score`(AUC-PR)、位置 `roc_auc_score(multi_class='ovr', average='weighted')`(剔除缺席类+重归一化,**2 类时走二分类分支**——sklearn 对 2 类拒收 [N,2] 矩阵)、ETE `cohen_kappa_score(weights='quadratic')`(官方只说加权 Kappa 未指线性/二次,取 quadratic 并标注假设)、T `roc_auc_score`(t_conf 当 score)。单类/空集返回 None 不抛异常。**训练侧代理性质**:无 IoU 匈牙利匹配(训练用 GT mask 等价"匹配必成功"),数字与官方线上分不可直接对齐,只用于相对比较与选模。sklearn 2 类分支与加权方向均由 `tests/test_metrics_official.py`(13 条)钉死。
+病灶级聚合(同 `lesion_id` 多帧概率取均值、标签取首)+ 官方筛选(金标准侧,非预测侧):**全部指标只取 `is_main==1 且 valid_*==1`**;ETE/T 再加金标准 `malignancy==1`;位置/良恶性/TI-RADS 不限恶性。指标:良恶意 `average_precision_score`(AUC-PR)、位置 `roc_auc_score(multi_class='ovr', average='weighted')`(剔除缺席类+重归一化,**2 类时走二分类分支**——sklearn 对 2 类拒收 [N,2] 矩阵)、ETE `cohen_kappa_score(weights='quadratic')`(官方只说加权 Kappa 未指线性/二次,取 quadratic 并标注假设)、T `roc_auc_score`(t_conf 当 score)、TI-RADS `cohen_kappa_score(weights='quadratic')`(不限恶性,与位置同、与ETE/T不同)。单类/空集返回 None 不抛异常。**训练侧代理性质**:无 IoU 匈牙利匹配(训练用 GT mask 等价"匹配必成功"),数字与官方线上分不可直接对齐,只用于相对比较与选模。sklearn 2 类分支与加权方向均由 `tests/test_metrics_official.py`(15 条)钉死。
 
 ### `trainer.py` (Thin Orchestrator)
 

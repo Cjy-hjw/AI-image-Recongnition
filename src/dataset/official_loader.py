@@ -27,6 +27,7 @@ import os
 import glob
 import re
 import random
+import sys
 import unicodedata
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -73,18 +74,27 @@ HAS_OPENPYXL = _ilu.find_spec("openpyxl") is not None
 _FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "patient_id":     ("PatientId", "患者ID", "患者编号", "patient_id"),
     "series_uid":     ("SeriesUid", "SeriesInstanceUID", "序列UID"),   # 静态图=磁盘子目录名
-    "image_property": ("图像性质",),                                    # 1=静态 2=动态
+    # 🔴 **可选列,不是必需列**。官方 74 列表头里没有「图像性质」(数据集概况.md 列0-73
+    # 全量清单)。静动判据已改为探测磁盘扩展名,本列仅在存在时做一致性校验。保留候选名
+    # 是为了"若某轮数据真有这列就顺手校验",不命中完全不影响训练。
+    "image_property": ("图像性质", "ImageProperty", "图像类型"),        # 1=静态 2=动态
     "roi_name":       ("RoiName", "ROI名称", "roi_name"),
     "slice_index":    ("ANNOTATION->SliceIndex", "SliceIndex"),        # 1-based 帧号
-    # 临床标签列
-    "malignancy":     ("ROI良恶性", "ROI->CLINICAL->良恶性", "良恶性"),  # 恶/良
+    # 临床标签列。列号依据 `docs/8.1赛事公开资料/数据集概况.md`(74 列全量清单):
+    # 52 良恶性 / 53 TI-RADS / 59 甲状腺外侵犯 / 60 主病灶位置 / 61 临床T分期。
+    # ⚠️ 候选名的空格/全角/大小写差异已由 `_resolve_columns` 的归一化匹配兜住,
+    #    **不需要**为 `甲状腺 外侵犯` 这类空格变体单独加一条候选名。
+    "malignancy":     ("ROI->CLINICAL->良恶性", "ROI良恶性", "良恶性"),  # 恶/良/无
     "lesion_loc":     ("主病灶位置", "病灶位置", "lesion_loc"),          # 混写 2左中叶
     "extrathy_ext":   ("甲状腺外侵犯", "ETE", "extrathy_ext"),           # 混写 2甲状腺包膜
     "clin_t_stage":   ("临床T分期", "T分期", "clin_t_stage"),           # 混写 1有 / 0无
     # TI-RADS 总分类(非"详细评分子项",两者是不同粒度的列,定稿 §2.2)。
-    # `ROI-TIRADS` 放第一位:定稿 §1.7 全量复核确认的真实列名,值字面 `V类`(无数字前缀)。
-    "tirads":         ("ROI-TIRADS", "ROI->CLINICAL->TI-RADS", "TI-RADS",
-                        "TIRADS", "TI_RADS", "TI-RADS分类", "TI-RADS总分类"),
+    # `ROI->CLINICAL->TI-RADS`(列53)放第一位。⚠️ 末位 `ROI->CLINICAL->TI-RDAS` 是官方表
+    # 列54 的**拼写错误冗余列**(RDAS≠RADS,数据集概况.md 已标注),正常应命中列53;放在
+    # 最后仅作兜底,防列53 缺失时彻底零监督。切勿把它排到前面——两列同信息时应优先正确列。
+    "tirads":         ("ROI->CLINICAL->TI-RADS", "ROI-TIRADS", "TI-RADS",
+                        "TIRADS", "TI_RADS", "TI-RADS分类", "TI-RADS总分类",
+                        "ROI->CLINICAL->TI-RDAS"),
     # CBM 概念子标签(列名/编码映射待真实表复核;命中则按数字前缀解析,缺失→valid=0)
     "composition":    ("成分", "composition"),
     "echogenicity":   ("回声", "echogenicity"),
@@ -228,12 +238,43 @@ def _parse_concept(v) -> Optional[int]:
 
 
 # ── xlsx 解析 ───────────────────────────────────────────────────────────────
+def _normalize_col(name: str) -> str:
+    """列名归一化:去所有空白 + 全角转半角 + 转小写。
+
+    🔴 **不要退回精确匹配**。官方 xlsx 的表头存在同一字段的多种书写变体,精确匹配
+    (`a in cols`)对下列任一差异都会静默漏掉,而漏掉临床列**不报错**、只是该头全程
+    `valid_*=0` 零监督(最隐蔽的失败模式):
+      - 空格变体:云端实测报告过 `甲状腺 外侵犯`(中间有空格),而 `docs/8.1赛事公开
+        资料/数据集概况.md` 列59 记的是 `甲状腺外侵犯`(无空格)。两个来源矛盾,归一化
+        后二者等价,不必赌哪个对。
+      - 全角/半角:`ＴＩ－ＲＡＤＳ` vs `TI-RADS`、全角括号与减号。
+      - 大小写:`PatientId` vs `patientid` vs `PATIENTID`。
+    归一化只用于**匹配**,`colmap` 里存的仍是 DataFrame 的原始列名(取值时必须用原名)。
+    """
+    s = unicodedata.normalize("NFKC", str(name))
+    return "".join(s.split()).lower()
+
+
 def _resolve_columns(columns) -> Dict[str, Optional[str]]:
-    """逻辑字段 → DataFrame 实际列名(候选里第一个存在的);找不到记 None。"""
+    """逻辑字段 → DataFrame 实际列名(候选里第一个存在的);找不到记 None。
+
+    两轮匹配:先精确(最快、最不容易误命中),再归一化(容忍空格/全角/大小写变体)。
+    返回的始终是**原始列名**,供 `row[col]` 取值。
+    """
     cols = list(columns)
+    norm_to_orig: Dict[str, str] = {}
+    for c in cols:
+        # 首个命中优先:同一归一化键有多列时(如冗余的拼写错误列),保留靠前的那个,
+        # 与精确匹配"候选顺序即优先级"的语义一致。
+        norm_to_orig.setdefault(_normalize_col(c), c)
+
     colmap: Dict[str, Optional[str]] = {}
     for logical, aliases in _FIELD_ALIASES.items():
-        colmap[logical] = next((a for a in aliases if a in cols), None)
+        hit = next((a for a in aliases if a in cols), None)
+        if hit is None:
+            hit = next((norm_to_orig[k] for a in aliases
+                        if (k := _normalize_col(a)) in norm_to_orig), None)
+        colmap[logical] = hit
     return colmap
 
 
@@ -249,8 +290,10 @@ def parse_annotation_xlsx(
 
     Raises:
         RuntimeError: pandas 或 openpyxl 未安装。
-        KeyError:     关键列(patient_id / image_property / roi_name)全候选名皆缺失
+        KeyError:     关键列(patient_id / roi_name)全候选名皆缺失
                       —— 宁可显式报错,不静默产出空样本集。
+                      ⚠️ `image_property` **不在**此列表(2026-08-14 实测:官方表无该列),
+                      它缺失只走软降级,详见函数体内注释。
     """
     if not HAS_PANDAS:
         raise RuntimeError("pandas 未安装,无法读 .xlsx 官方标注表")
@@ -268,12 +311,20 @@ def parse_annotation_xlsx(
     df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=1, dtype=str)
     colmap = _resolve_columns(df.columns)
 
-    for key in ("patient_id", "image_property", "roi_name"):
+    for key in ("patient_id", "roi_name"):
         if colmap[key] is None:
             raise KeyError(
                 f"官方标注表缺关键列 `{key}`(候选名 {_FIELD_ALIASES[key]} 均未命中)。"
                 f"表头实为 {list(df.columns)} —— 请据真实表更新 _FIELD_ALIASES。"
             )
+    # 🔴 `image_property` **不在**必需列里(2026-08-14 云端真数据实测修正)。
+    # 官方 74 列表头中根本没有「图像性质」这一列(`docs/8.1赛事公开资料/数据集概况.md`
+    # 列 0-73 全量清单可查),此前把它列为必需列导致真数据一进来必 KeyError。
+    # 根因不是列名写错,是**我方从未核实过该列存在**:证据链 14 轮里它只在第一轮出现过
+    # 一次、原文写的是"推断为图像性质列,需 Excel 验证",却被当成已确认写进了代码注释。
+    # 现在静动判据改为**探测磁盘文件扩展名**(见 build_official_samples),那是定稿 §1.3
+    # 「.dcm=静 / .nii.gz=动,全量互斥 0 混合」的直接证据,也与推理侧按扩展名分发一致,
+    # 比表里的字段更可靠。该列若真存在则作为**辅助校验**使用,不存在也不影响训练。
 
     records: List[Dict] = []
     for _, row in df.iterrows():
@@ -381,6 +432,24 @@ _CLINICAL_LOGICAL_FIELDS = (
 )
 
 
+def _safe_print(msg: str) -> None:
+    """编码安全的 print —— 本模块所有诊断输出都必须走这里。
+
+    🔴 **不要退回裸 print**:本模块的诊断信息全是中文,而云端官方容器常见
+    `LANG=C`/`POSIX` locale(`sys.stdout.encoding` 为 ascii),Windows 中文控制台
+    则是 gbk。两者下 `print("临床列命中:...")` 都会 `UnicodeEncodeError` **直接
+    崩掉训练**,而崩点恰好是"列名没命中、最需要看到告警"的时候。
+    实测:`PYTHONIOENCODING=ascii python -c "print('中文')"` → UnicodeEncodeError。
+    注意崩的是**中文本身**不是 emoji —— 只删 emoji 不解决问题。
+    这里退化成 `?` 也远好过让训练崩在一行日志上。
+    """
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(msg.encode(enc, "replace").decode(enc, "replace"))
+
+
 def _warn_missing_clinical_columns(colmap: Dict[str, Optional[str]]) -> None:
     """`build_official_samples` 启动时打印临床列命中摘要,未命中项显式 warning。
 
@@ -390,9 +459,9 @@ def _warn_missing_clinical_columns(colmap: Dict[str, Optional[str]]) -> None:
     """
     missing = [f for f in _CLINICAL_LOGICAL_FIELDS if colmap.get(f) is None]
     hit = {f: colmap[f] for f in _CLINICAL_LOGICAL_FIELDS if colmap.get(f) is not None}
-    print(f"--> [official_loader] 临床列命中:{hit}")
+    _safe_print(f"--> [official_loader] 临床列命中:{hit}")
     if missing:
-        print(
+        _safe_print(
             f"--> [official_loader] ⚠️ 以下逻辑字段未命中任何候选列名(该任务将零监督,"
             f"valid_*=0 全程静默):{missing}。核对 _FIELD_ALIASES 候选名与真实表头是否一致。"
         )
@@ -424,19 +493,41 @@ def build_official_samples(
 
     samples: List[Dict] = []
     for pid, recs in by_patient.items():
-        # 患者级 fallback:某些行 图像性质 可能空,用该患者任一非空值兜底(静动互斥,定稿 §1.3)。
+        # 静动判据 = **磁盘文件扩展名**(定稿 §1.3:.dcm 静 / .nii.gz 动,全量互斥 0 混合)。
+        # 不用表里的「图像性质」列:官方 74 列表头中没有该列(见 parse_annotation_xlsx 注释)。
+        # 每患者探一次(静动是患者级属性),避免逐行重复 I/O。
+        dyn_path = os.path.join(root, pid, pid, f"{pid}.nii.gz")
+        patient_is_dynamic = os.path.exists(dyn_path)
+        # 若表里恰好存在该列,取患者级非空值做**一致性校验**(不参与判定,只在冲突时告警),
+        # 便于发现"磁盘与标注表不一致"这类上游数据问题。
         patient_prop = next((_digit_prefix(r.get("image_property"))
                              for r in recs if not _is_empty(r.get("image_property"))), None)
+        if patient_prop is not None and (patient_prop == 2) != patient_is_dynamic:
+            _safe_print(f"--> [official_loader] ⚠️ 患者 {pid} 静动判据冲突:"
+                        f"表列图像性质={patient_prop}(1静/2动) 但磁盘 {'有' if patient_is_dynamic else '无'} "
+                        f"{pid}.nii.gz —— 以磁盘为准继续。")
 
         for rec in recs:
             roi = _cell_str(rec.get("roi_name"))
             if not _is_lesion_roi(roi):
                 continue  # 关键帧/开始/结束:仅坐标,不入分类/分割样本
 
-            # 图像性质是**逐行**语义(定稿 §4.2 项4:该行走 Col15 还是 PatientId),
-            # 优先按本行值分派;本行空则回退患者级。
-            rp = _digit_prefix(rec.get("image_property"))
-            is_dynamic = ((rp if rp is not None else patient_prop) == 2)
+            # 静动判据:患者级探磁盘为主,**行级 series 目录为兜底**。
+            # 主判据依据 = 证据链第10轮全量扫描 5401 个 **PatientId 目录**:仅静 5057 /
+            # 仅动 343 / 混合 0(5057+343=5400≈5401 全覆盖,单位就是患者,不是子目录)。
+            # 但"0 混合"终究是一次性实测结论,而误判的后果是**静默**的(静态行的标签会被
+            # 挂到动态 nii.gz 上,不报错、不跳过、照常训完),故不赌它:该行若明确写了
+            # series_uid 且那个目录下真有 .dcm,就按静态处理——磁盘实物比统计结论硬。
+            is_dynamic = patient_is_dynamic
+            if is_dynamic:
+                _series = _cell_str(rec.get("series_uid"))
+                if _series and glob.glob(os.path.join(root, pid, _series, "*.dcm")):
+                    is_dynamic = False
+                    _safe_print(
+                        f"--> [official_loader] ⚠️ 患者 {pid} 同时存在动态 {pid}.nii.gz 与静态"
+                        f"序列目录 {_series}(含 .dcm)——本行按**静态**处理。这与证据链第10轮"
+                        f"「患者级 0 混合」矛盾,请回报此 PatientId。"
+                    )
 
             if is_dynamic:
                 img_dir = os.path.join(root, pid, pid)

@@ -561,6 +561,8 @@ def block_sample_dry_run(root: str) -> None:
     dyn_no_mask = 0
     pid_dir_exists = pid_dir_missing = 0
     static_series_dir_exists = static_series_dir_missing = 0
+    prop_conflicts = 0        # 表列 image_property 与磁盘扩展名判据冲突的患者数
+    mixed_patients: set = set()   # 患者级静动混合(证据链第10轮实测应为 0,非 0 需回报)
     sample_bad_paths = []  # 收集少量未命中案例供人工核查
 
     for pid, rows in by_patient.items():
@@ -571,12 +573,23 @@ def block_sample_dry_run(root: str) -> None:
             pid_dir_missing += 1
             continue
 
+        # 静动判据 = **磁盘文件扩展名**,与 `official_loader.build_official_samples` 同款。
+        # 🔴 **不要退回读 `image_property` 列**(2026-08-14 实测:官方 74 列表头无该列)。
+        # 旧写法 `is_dynamic = (patient_prop == 2)` 在该列缺失时 `patient_prop` 恒 None
+        # → `is_dynamic` 恒 False → **所有动态样本被静默判成静态**、`n_dynamic` 恒 0,
+        # 本脚本是数据探查工具,这种失真不报错、只让统计结论全错,比崩溃更坏。
+        patient_is_dynamic = os.path.exists(
+            os.path.join(root, pid, pid, f"{pid}.nii.gz")
+        )
+        # 该列若真存在则仅作一致性校验,不参与判定(与 loader 行为一致)
         patient_prop = None
         for r in rows:
             pv = _digit_prefix(r.get(prop_col)) if prop_col else None
             if pv is not None:
                 patient_prop = pv
                 break
+        if patient_prop is not None and (patient_prop == 2) != patient_is_dynamic:
+            prop_conflicts += 1
 
         for r in rows:
             roi = _cell_str(r.get(roi_col))
@@ -584,8 +597,14 @@ def block_sample_dry_run(root: str) -> None:
                 continue
             total_lesion_rows += 1
 
-            rp = _digit_prefix(r.get(prop_col)) if prop_col else None
-            is_dynamic = ((rp if rp is not None else patient_prop) == 2)
+            # 行级兜底:该行明确写了 series_uid 且那个目录下真有 .dcm → 按静态
+            # (防患者级混合时静态行被误挂到动态 nii 上,与 loader 同款)
+            is_dynamic = patient_is_dynamic
+            if is_dynamic and series_col is not None:
+                _s = _cell_str(r.get(series_col))
+                if _s and glob.glob(os.path.join(root, pid, _s, "*.dcm")):
+                    is_dynamic = False
+                    mixed_patients.add(pid)
 
             if is_dynamic:
                 n_dynamic += 1
@@ -634,7 +653,15 @@ def block_sample_dry_run(root: str) -> None:
     print(f"  一级目录(=PatientId?)存在 {pid_dir_exists} / 缺失 {pid_dir_missing}"
           f"（缺失说明 xlsx 患者在磁盘找不到对应目录,需确认目录命名口径）")
     print(f"  病灶行(M/病灶N,已排除关键帧/开始/结束) 共 {total_lesion_rows}"
-          f"  静态={n_static}  动态={n_dynamic}")
+          f"  静态={n_static}  动态={n_dynamic}"
+          f"  ← 静动判据=磁盘扩展名({{pid}}/{{pid}}/{{pid}}.nii.gz 存在即动态)")
+    if prop_conflicts:
+        print(f"  ⚠️ 表列「图像性质」与磁盘判据冲突的患者数 = {prop_conflicts}"
+              f"（以磁盘为准;该列在官方表里本不存在,若这里非 0 说明数据换版了,请回报）")
+    if mixed_patients:
+        print(f"  🔴 患者级静动混合 = {len(mixed_patients)} 个"
+              f"（同时有 {{pid}}.nii.gz 与含 .dcm 的 series 目录;证据链第10轮实测应为 0,"
+              f"非 0 请回报这些 PatientId）:{sorted(mixed_patients)[:5]}")
     print(f"  静态图 series 子目录命中 {static_series_dir_exists} / 缺失 {static_series_dir_missing}")
     print(f"  原始影像文件命中 {img_hit} / 未命中 {img_miss}"
           f"（未命中=该行会被 loader 跳过,不构成样本）")

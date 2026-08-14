@@ -418,3 +418,85 @@ def test_mask_glob_matches_both_namings(tmp_path):
 
     # ⑤ 无任何匹配 → None(不抛异常)
     assert O._mask_path_for_roi(str(d), "病灶9") is None
+
+
+# ── 列名解析:真实表头变体(2026-08-14 云端真数据实测反推)────────────────────
+def test_resolve_columns_real_header_variants():
+    """归一化匹配必须吃下真实 xlsx 的列名变体,否则临床列静默零监督。
+
+    背景(必须保留,否则后人会把归一化改回精确匹配):
+    2026-08-14 云端第一次真训直接 KeyError,暴露两类问题——
+      ① 「图像性质」列在官方 74 列表头里**根本不存在**(`docs/8.1赛事公开资料/
+         数据集概况.md` 列 0-73 全量清单),而它曾被列为必需列 → 必崩;
+      ② 「甲状腺外侵犯」云端实测报告为 `甲状腺 外侵犯`(中间有空格),与数据集概况.md
+         记录的无空格版矛盾。空格差异在精确匹配下**不报错**、只是 valid_ete=0 全程
+         零监督,是最隐蔽的失败模式。
+    故本测试钉死:临床列的空格/全角/大小写变体都必须命中。
+    """
+    cols = [
+        "PatientId", "SeriesUid", "RoiName",
+        "ROI->CLINICAL->良恶性",        # 列52
+        "ROI->CLINICAL->TI-RADS",       # 列53
+        "甲状腺 外侵犯",                 # 列59:云端实测带空格
+        "主病灶位置",                    # 列60
+        "临床T分期",                     # 列61
+    ]
+    cm = O._resolve_columns(cols)
+    assert cm["malignancy"] == "ROI->CLINICAL->良恶性"
+    assert cm["tirads"] == "ROI->CLINICAL->TI-RADS"
+    assert cm["lesion_loc"] == "主病灶位置"
+    assert cm["clin_t_stage"] == "临床T分期"
+    assert cm["extrathy_ext"] == "甲状腺 外侵犯", (
+        "带空格的『甲状腺 外侵犯』未命中 —— 归一化匹配被改回精确匹配了?"
+        "这会让 ETE 头全程 valid=0 零监督且不报任何错。"
+    )
+    # 返回值必须是**原始列名**(含空格),否则 row[col] 取值会 KeyError
+    assert cm["extrathy_ext"] in cols
+    # image_property 不存在也不该抛,只是记 None(它已不是必需列)
+    assert cm["image_property"] is None
+
+
+def test_resolve_columns_normalizes_fullwidth_and_case():
+    """全角/半角、大小写差异同样要吃下(同一字段的常见书写变体)。"""
+    cm = O._resolve_columns(["ＰａｔｉｅｎｔＩｄ", "ｒｏｉｎａｍｅ", "ＴＩ－ＲＡＤＳ"])
+    assert cm["patient_id"] == "ＰａｔｉｅｎｔＩｄ"
+    assert cm["roi_name"] == "ｒｏｉｎａｍｅ"
+    assert cm["tirads"] == "ＴＩ－ＲＡＤＳ"
+
+
+def test_resolve_columns_prefers_correct_over_misspelled_tirads():
+    """官方列54 `TI-RDAS` 是拼写错误冗余列;两列并存时必须优先正确的列53。"""
+    cm = O._resolve_columns([
+        "PatientId", "RoiName",
+        "ROI->CLINICAL->TI-RDAS",    # 列54 拼写错误(RDAS)
+        "ROI->CLINICAL->TI-RADS",    # 列53 正确
+    ])
+    assert cm["tirads"] == "ROI->CLINICAL->TI-RADS", (
+        "拼写错误列被优先命中 —— 候选名顺序被改动了?正确列必须排在 TI-RDAS 之前。"
+    )
+    # 只有错误列时才用它兜底(总比零监督好)
+    cm2 = O._resolve_columns(["PatientId", "RoiName", "ROI->CLINICAL->TI-RDAS"])
+    assert cm2["tirads"] == "ROI->CLINICAL->TI-RDAS"
+
+
+def test_missing_image_property_column_does_not_crash(mini_root):
+    """官方表无「图像性质」列时,静动判据靠磁盘扩展名,训练样本照常构建。
+
+    这是 2026-08-14 云端真训 KeyError 的直接回归测试:该列曾是必需列 → 必崩。
+    """
+    root, xlsx = mini_root
+    df = pd.read_excel(xlsx, sheet_name="ROI级别", header=1, dtype=str)
+    df = df.drop(columns=["图像性质"])              # 复刻官方真实表:压根没有这列
+    xlsx2 = os.path.join(os.path.dirname(xlsx), "labels_no_imgprop.xlsx")
+    df.to_excel(xlsx2, sheet_name="ROI级别", index=False, startrow=1)
+
+    samples = O.build_official_samples(root, xlsx2, "ROI级别")
+    assert samples, "无『图像性质』列时构不出样本 —— 静动判据没改成探磁盘?"
+    # P3 是动态(磁盘有 P3/P3/P3.nii.gz),必须仍被识别为动态并按帧展开
+    p3 = [s for s in samples if s["patient_key"] == "P3"]
+    assert p3 and all(s["is_dynamic"] for s in p3), (
+        "动态患者未被识别 —— 磁盘扩展名判据失效。"
+    )
+    # P1/P2 静态
+    p12 = [s for s in samples if s["patient_key"] in ("P1", "P2")]
+    assert p12 and not any(s["is_dynamic"] for s in p12)

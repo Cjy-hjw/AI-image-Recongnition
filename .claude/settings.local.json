@@ -10,7 +10,10 @@
       "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 PYTHONWARNINGS=ignore D:/program/Python/anaconda/envs/Demo_D/python.exe -m pytest tests/test_phase_refactor.py -q)",
       "Bash(cat .claude/settings.local.json)",
       "Bash(cat .claude/settings.json)",
-      "Skill(update-config)"
+      "Skill(update-config)",
+      "Bash(rm -f \"C:/2026aicompetition/workspace/logs/train.jsonl\")",
+      "Bash(rmdir \"C:/2026aicompetition/workspace/logs\" \"C:/2026aicompetition/workspace\" \"C:/2026aicompetition\")",
+      "Read(//c/2026aicompetition/**)"
     ]
   }
 }

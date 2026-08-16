@@ -413,13 +413,16 @@ SEG_WARN_EPOCH, SEG_WARN_DICE = 5, 0.10
 # mask 的前景占比,也正是官方 IoU 匹配实际消费的那个量 —— 判据与评分口径同构,
 # 不再是间接的分布形状代理。实测 8/8 场景全判对(`tmp_main_overhalf_judge.py`)。
 #
-# 阈值:下界 1e-4(≈26 像素)—— 最小真实病灶 0.1% ≈ 262 像素,留 10 倍误杀余量;
-#       上界 0.5 —— 前景占比过半必然是崩的(mask 全 1 与全 0 同样拿不到分)。
-# epoch 选点 8:Stage A(1-10)已跑过大半;真实数据 6626 样本 / batch16 ≈ 414 step/epoch,
-#       ep8 累计约 3300 步,远超本地实测"5 步即出现空间结构"的量级。
+# 阈值:下界 1e-4(≈26 像素)—— 最小真实病灶 0.1% ≈ 262 像素,留 10 倍误杀余量。
+# 🔴 **只设下界,不设上界(2026-08-16 实测否掉了上界门,勿再加回)**:曾加过
+# "占比 >0.5 → abort"防"全图判成前景",实测**会误杀正常收敛的模型** ——
+# 随机初始化时输出普遍 >0.5(frac≈1.0),收敛到真值(1% 前景)**必然要穿过 0.5 这条线**:
+# 实测 step0 frac=1.000 → step10 0.926 → step20 0.555 → step25 0.219 → step60 0.0099
+# (最终等于真值),中间 step10-20 那段会被上界门打死。上界是必经之路不是崩溃信号。
+# 真正的"全图判前景"崩溃态会一直卡在高位不下来,那由 ep20 的 dice 兜底门抓
+# (frac 恒 1.0 时 IoU 极低 → dice 上不去)。
 SEG_FROZEN_EPOCH = 8
 SEG_FG_FRAC_LO = 1e-4         # 低于此 = 几乎什么都没预测(含恒全零)
-SEG_FG_FRAC_HI = 0.5          # 高于此 = 全图判成前景,同样是崩的
 
 # dice 硬门保留为**最后兜底**,阈值大幅放宽:ep20 是 γ=0 干净监督窗口的末尾
 # (`compute_gamma_prior` ep>20 才起步),此时仍连 0.02 都到不了,剩下 15 个 epoch
@@ -511,18 +514,13 @@ def evaluate_seg_guards(epoch: int, val_dice, metrics: dict, epochs: int):
                 f"预测 mask 恒空 → 官方 IoU≥0.5 匹配零命中 → 五项分类/分期全部零样本 "
                 f"→ Sclin≈0,继续跑满也是白烧。检查 "
                 f"schedule_official.SEG_TRAIN_PREFIXES 是否真的进了 optimizer。"), warns
-        if frac > SEG_FG_FRAC_HI:
-            return "seg_all_foreground", (
-                f"[分割 abort] epoch {epoch} 预测 mask 前景占比 {frac:.4f} > "
-                f"{SEG_FG_FRAC_HI} —— 模型把过半图像判成结节。真实病灶只占 0.1%~3%,"
-                f"这种输出与全零同样拿不到 IoU 匹配,且通常意味着分割损失已经发散。"), warns
 
     # ③ dice 兜底门(ep20 = γ=0 干净监督窗口末尾,阈值 0.02 极低不误杀)
     if epoch >= SEG_ABORT_EPOCH and val_dice < SEG_ABORT_DICE:
         return "seg_not_learning", (
             f"[分割 abort] epoch {epoch} val_dice={val_dice:.4f} < {SEG_ABORT_DICE} "
             f"—— 跑完 γ=0 的干净监督窗口(ep1-20)仍未出分割,剩余 epoch 救不回来。"
-            f"注意此门是兜底:概率分布若同时正常(spread 够大),说明是在学但极慢,"
+            f"注意此门是兜底:前景占比若同时正常(>1e-4),说明是在学但极慢,"
             f"回报 seg_prob_* 三项再判。"), warns
 
     return None, "", warns

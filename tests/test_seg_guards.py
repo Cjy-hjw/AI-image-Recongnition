@@ -14,10 +14,21 @@
 |---|---|---|
 | v1 | `val_dice < 0.05` @ep12 | hard dice 先 `p>0.5` 二值化,真实病灶仅占 512² 的 0.1-3%,分割**在学**但前景 logit 未越 0 时 dice 长期恒 0 → 必然误杀 |
 | v2 | `spread = p_max − p_mean < 0.01` | **实测 3/8 场景判错**(`tmp_main_spread_reverse_hole.py`):① 有结构但整体偏低(max=0.45,spread=0.396)→ 放行,而 mask 仍全零、Sclin 仍 0;② 常量图 + 4 个异常像素(spread=0.545)→ 放行。根因:max/mean 都是单点或全局标量,几个像素就能骗过 |
-| **v3(当前)** | `seg_over_half_frac ∈ [1e-4, 0.5]` | 它**直接就是**预测 mask 的前景占比,正是官方 IoU 匹配消费的量,与评分口径同构。实测 8/8 场景全对(`tmp_main_overhalf_judge.py`) |
+| **v3(当前)** | `seg_over_half_frac >= 1e-4`(**只有下界**) | 它**直接就是**预测 mask 的前景占比,正是官方 IoU 匹配消费的量,与评分口径同构 |
 
-阈值来源:下界 `1e-4` ≈ 26 像素,而最小真实病灶 0.1% ≈ 262 像素 → 10 倍误杀余量;
-上界 `0.5` —— 前景过半必然是崩的(mask 全 1 与全 0 同样拿不到 IoU 匹配)。
+阈值来源:下界 `1e-4` ≈ 26 像素,而最小真实病灶 0.1% ≈ 262 像素 → 10 倍误杀余量。
+
+🔴 **曾加过上界 0.5(防"全图判成前景"),已被实测否掉、勿再加回**:随机初始化时输出
+普遍 >0.5(frac≈1.0),收敛到真值**必然穿过 0.5** —— 实测 step0 1.000 → step10 0.926
+→ step20 0.555 → step25 0.219 → step60 0.0099(精确等于真值)。上界门会在 step10-20
+那段把正常收敛的模型打死。见 `test_high_foreground_during_convergence_not_killed`。
+
+⚠️ **本地冒烟(`--mock-labels --smoke`)里 `seg_over_half` 三个 epoch 全是 0.0,
+这不是 v3 会误杀真实训练的证据**(独立审查核实):mock 用 64 张随机图、`mask=None`
+→ 合成的稀疏前景密度≈0 且无空间结构,每 epoch 只有 4 步。真实数据 6626 样本 /
+batch 16 ≈ 414 step/epoch,ep8 累计约 3300 步,且 mask 监督齐备(`n_valid_mask`
+实测恒 16/16)。**但 ep8 的真实余量仍以云端首轮实测为准** —— `seg_over_half_frac`
+已写进 JSONL,首轮务必回报。
 """
 import importlib.util
 import math
@@ -37,7 +48,6 @@ _SPEC.loader.exec_module(train_official)
 evaluate_seg_guards = train_official.evaluate_seg_guards
 SEG_FROZEN_EPOCH = train_official.SEG_FROZEN_EPOCH
 SEG_FG_FRAC_LO = train_official.SEG_FG_FRAC_LO
-SEG_FG_FRAC_HI = train_official.SEG_FG_FRAC_HI
 SEG_ABORT_EPOCH = train_official.SEG_ABORT_EPOCH
 SEG_ABORT_DICE = train_official.SEG_ABORT_DICE
 SEG_WARN_EPOCH = train_official.SEG_WARN_EPOCH
@@ -123,18 +133,38 @@ def test_v2_hole_constant_map_with_outlier_pixels():
     assert reason == "seg_no_foreground"
 
 
-def test_constant_map_above_half_is_caught():
-    """整张图都 >0.5(mask 全 1)同样是废输出,必须 abort。
+@pytest.mark.parametrize("frac,step", [
+    (1.000, "step 0(随机初始化)"),
+    (0.926, "step 10"),
+    (0.555, "step 20"),
+    (0.219, "step 25"),
+])
+def test_high_foreground_during_convergence_not_killed(frac, step):
+    """🔴 **高前景占比是收敛的必经之路,不得 abort(2026-08-16 实测否掉上界门)**。
 
-    v2 靠 spread≈0 恰好也能抓住这个,但理由是错的(它抓的是"分布没展开",
-    而真正的问题是"前景占满全图")。v3 用上界 0.5 直接判。
+    曾加过"占比 >0.5 → abort"防"全图判成结节",**实测会误杀正常收敛的模型**:
+    随机初始化时输出普遍 >0.5(frac≈1.0),要收敛到真值(1% 前景)**必然穿过 0.5**。
+    本地实测轨迹(BCE + 1% 前景 target):
+        step0 1.000 → step10 0.926 → step20 0.555 → step25 0.219 → step60 0.0099
+    最后精确收敛到真值 0.0099。上界门会在 step10-20 那段把它打死。
+
+    真正的"全图判前景"崩溃态会**一直卡在高位不下来**,由 ep20 的 dice 兜底门抓
+    (frac 恒 1.0 → IoU 极低 → dice 上不去)。占比本身区分不了这两者。
     """
-    reason, msg, _w = evaluate_seg_guards(
-        epoch=SEG_FROZEN_EPOCH, val_dice=0.0,
-        metrics=_m(fg=1.0, pmean=0.7, pmax=0.7), epochs=35,
+    reason, _m2, _w = evaluate_seg_guards(
+        epoch=SEG_FROZEN_EPOCH, val_dice=0.0, metrics=_m(fg=frac), epochs=35,
     )
-    assert reason == "seg_all_foreground"
-    assert "过半" in msg
+    assert reason is None, f"{step} frac={frac} 被上界门误杀(上界门不该存在)"
+
+
+def test_no_upper_bound_constant_exists():
+    """钉死"上界门已移除"这个事实本身。
+
+    若后人重新引入 `SEG_FG_FRAC_HI`,这条会红并指向上面的实测轨迹。
+    """
+    assert not hasattr(train_official, "SEG_FG_FRAC_HI"), (
+        "上界门被重新引入了 —— 见 test_high_foreground_during_convergence_not_killed "
+        "的实测:收敛必然穿过 0.5,上界门会误杀正常训练")
 
 
 # ── 3. 在学的模型不得被误杀(硬编码占比,不引用常量)──────────────────────
@@ -292,7 +322,7 @@ def test_boundary_values_inclusive():
 
     钉死这个是因为边界方向错了会在真实数据上产生难以复现的偶发 abort。
     """
-    for fg in (SEG_FG_FRAC_LO, SEG_FG_FRAC_HI):
+    for fg in (SEG_FG_FRAC_LO,):
         reason, _m2, _w = evaluate_seg_guards(
             epoch=SEG_FROZEN_EPOCH, val_dice=0.5, metrics=_m(fg=fg), epochs=35,
         )

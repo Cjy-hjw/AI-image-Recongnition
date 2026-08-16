@@ -8,10 +8,21 @@ mal loss 首启 + 物理先验满强度四件事同 epoch 齐发)。三头是随
 上从零学,一旦搭上那条崩塌调度,模型只能提交一次、踩上去无法补救。故按
 `docs/训练与架构/训练架构方案.md` 另建 A/B/C:
 
-  Stage A (epoch 1-10) :冻结 backbone/分割/CBM,**只训三头**;头 lr 线性 warmup 至 lr_base。
-  Stage B (epoch 11-30):解冻 cls_backbone Top-2 block,LLRD(backbone lr = 头 lr ×
+  Stage A (epoch 1-10) :冻结 cls_backbone/CBM,训四头 + **分割前向链**;头 lr 线性 warmup 至 lr_base。
+  Stage B (epoch 11-30):额外解冻 cls_backbone Top-2 block,LLRD(backbone lr = 头 lr ×
                          backbone_lr_scale,逐 block 再乘 η 衰减),余弦退火。
-  Stage C (epoch 31-35):全冻结,仅头部低 lr 微调(温度标定放推理侧 calibration.py)。
+  Stage C (epoch 31-35):回到 A 的可训集(四头 + 分割),头部低 lr 微调(温度标定放推理侧
+                         calibration.py)。
+
+🔴 **2026-08-16 契约变更:分割前向链改为 A/B/C 全程可训**(原为全程冻结)。
+   原设计冻结分割是为「保证**已有**分割 DICE 不退化」(`训练架构方案.md:100`),
+   其中「已有」指 warm-start 权重 `best_model_mixtrain_xl_e40.pth`。该权重现已
+   **三路皆断**(A800 拒连 / 云端产物按赛规不能导出 / 仓库 `checkpoints/` 被
+   gitignore 且为空),前提整体消失。而冻结的实测后果是:35 epoch 下 `val_dice`
+   恒 0.0007、`pred_prob` 全域 <0.5 → `pred_mask` 恒全零 → 官方匈牙利 IoU≥0.5
+   匹配零命中 → 五项分类/分期**零样本** → Sclin ≈ 0(`docs/项目现状总纲.md` §6③,
+   附官方评审规则原文行号 221/225/227)。**分割不是"四项里的一项",是整个评分的
+   闸门**,故改为在官方数据上从 ImageNet 底座 + 随机解码器自训。
 
 ## 硬约束
 
@@ -20,9 +31,17 @@ mal loss 首启 + 物理先验满强度四件事同 epoch 齐发)。三头是随
 🔴 **BN 冻结**:冻结的子模块必须置 eval,否则"参数冻了但 running stats 仍更新"的数值
    病态(BN 冻结遗漏教训)。本模块**只设 requires_grad**;`set_frozen_modules_eval`
    由训练循环在 `model.train()` 之后调用(eval/train 是运行态,不属参数配置职责)。
-   三头(位置/ETE/临床T)在所有官方 stage **全程可训**,其内含的 BatchNorm2d 始终
-   正常训练;Stage B 解冻的是**整个** block(全参可训),不存在"子模块内部分冻结"的
-   BN 病态。
+   四头(位置/ETE/临床T/TI-RADS)与分割前向链在所有官方 stage **全程可训**,其内含的
+   BatchNorm/LayerNorm 始终正常训练;Stage B 解冻的是**整个** block(全参可训),
+   不存在"子模块内部分冻结"的 BN 病态。
+🔴 **分割必须整块解冻**:`bn_freeze.set_frozen_modules_eval` 的判据是「模块自身参数
+   **全部** requires_grad=False → eval()」。整块解冻 → 自动保持 train 态。若只解冻
+   部分参数(如解 conv 留 BN),会落进 `tests/test_bn_freeze.py` 钉死的"兄弟 BN 仍被
+   更新"病态。
+🔴 **解冻即须进 param_groups**:`requires_grad` 与 optimizer 参数集合必须严格对齐。
+   只设 requires_grad 而漏建 param_group,梯度会跨 batch **永不清零、累积至溢出**
+   (`src/models/AGENTS.md:62` 的 LoRA 同形事故 / `QA_VP.md §1.1`)。既有防线是
+   `tests/test_official_schedule.py::test_optimizer_covers_all_trainable_except_vclub`。
 
 ## 返回契约
 
@@ -46,6 +65,16 @@ STAGE_C_END = 35   # C: 31..35(总 epoch 数)
 # 靠输出的两层 = blocks[5]/blocks[6](blocks[6] 把 208→352,最靠近 pooled 特征)。
 # LLRD:越靠输出层 lr 越大 —— blocks[6] 取满 scale,blocks[5] 再乘 η。
 STAGE_B_UNFREEZE = ("cls_backbone.blocks.6", "cls_backbone.blocks.5")
+
+# ── 分割前向链(2026-08-16 起 A/B/C 全程可训,理由见模块 docstring)───────────
+# 拆两组只为分配不同 lr,不是"部分解冻"——两组合起来即完整前向链,整块可训。
+# 解码器(up_stages/dec_stages/seg_head)是**随机初始化**的 → 与四头同待遇,取满 head_lr。
+SEG_TRAIN_DECODER = ("up_stages", "dec_stages", "seg_head")
+# 分割主干(convnext_nano)带 **ImageNet 预训练** → lr = head_lr × backbone_lr_scale,
+# 与 Stage B 的 blocks[6] 档**数值重合**,不新增第三档 lr。
+SEG_TRAIN_BACKBONE = ("seg_backbone",)
+# 全程可训集合(四头由 _HEAD_PREFIXES 另行放行)。
+SEG_TRAIN_PREFIXES = SEG_TRAIN_DECODER + SEG_TRAIN_BACKBONE
 
 _HEAD_PREFIXES = MultiTaskThyroidModel.OFFICIAL_HEAD_PREFIXES
 
@@ -130,21 +159,36 @@ def configure_official_stage(
     ## requires_grad 政策(逐 stage)
 
     - vclub:恒 True(独立 `vclub_optimizer` 管,排除出主 param_groups —— 与 stages.py 一致)。
-    - 三头:恒 True。
-    - Stage A / C:除三头 + vclub 外全冻。
+    - 四头:恒 True。
+    - **分割前向链**(`SEG_TRAIN_PREFIXES`):恒 True(2026-08-16 起,见模块 docstring)。
+    - Stage A / C:除四头 + 分割 + vclub 外全冻。
     - Stage B:额外解冻 `STAGE_B_UNFREEZE`(cls_backbone Top-2 block)。
     - criterion.mal_loss_fn(AUCM 对偶):`requires_grad = not freeze_legacy`。
+
+    ## lr 档位
+
+    | 组 | lr |
+    |---|---|
+    | 四头 + 分割解码器(随机初始化) | `head_lr` |
+    | 分割主干(ImageNet) | `head_lr × backbone_lr_scale` |
+    | Stage B `cls_backbone.blocks[6]` | `head_lr × backbone_lr_scale` (同上,刻意重合) |
+    | Stage B `cls_backbone.blocks[5]` | `head_lr × backbone_lr_scale × llrd_eta` |
+
+    刻意不新增第三档 lr —— 相邻 epoch lr 比值约束与既有测试均按两档写死。
     """
     stage = get_official_stage(epoch)
     head_lr = official_head_lr(epoch, lr_base)
 
     # ── 1. 设 requires_grad ──────────────────────────────────────────────
     unfreeze_extra = STAGE_B_UNFREEZE if stage == "B" else ()
+    # 恒可训集:四头 + 分割前向链。分割整块解冻(解码器 + 主干同时放行),
+    # 避免 bn_freeze 的"兄弟 BN 仍被更新"病态。
+    always_train = tuple(_HEAD_PREFIXES) + SEG_TRAIN_PREFIXES
     for name, p in model.named_parameters():
         if "vclub" in name:
             p.requires_grad = True
             continue
-        if any(name.startswith(pfx) for pfx in _HEAD_PREFIXES):
+        if any(name.startswith(pfx) for pfx in always_train):
             p.requires_grad = True
             continue
         p.requires_grad = any(name.startswith(pfx) for pfx in unfreeze_extra)
@@ -154,17 +198,34 @@ def configure_official_stage(
         p.requires_grad = not freeze_legacy
 
     # ── 2. 建 param_groups ───────────────────────────────────────────────
-    # 头参数:所有官方三头前缀,统一 head_lr。
+    # 满 head_lr 组:四头 + 分割解码器(都是随机初始化,同待遇)。
+    _head_lr_prefixes = tuple(_HEAD_PREFIXES) + SEG_TRAIN_DECODER
     head_named = [
         (n, p) for n, p in model.named_parameters()
         if p.requires_grad and "vclub" not in n
-        and any(n.startswith(pfx) for pfx in _HEAD_PREFIXES)
+        and any(n.startswith(pfx) for pfx in _head_lr_prefixes)
     ]
     head_decay, head_no_decay = _split_decay(head_named)
     param_groups: List[Dict] = [
         {"params": head_decay, "weight_decay": weight_decay, "lr": head_lr},
         {"params": head_no_decay, "weight_decay": 0.0, "lr": head_lr},
     ]
+
+    # 分割主干组(ImageNet 预训练)—— lr = head_lr × scale,与 blocks[6] 同档。
+    seg_bb_named = [
+        (n, p) for n, p in model.named_parameters()
+        if p.requires_grad and "vclub" not in n
+        and any(n.startswith(pfx) for pfx in SEG_TRAIN_BACKBONE)
+    ]
+    if seg_bb_named:
+        seg_bb_lr = head_lr * backbone_lr_scale
+        seg_bb_decay, seg_bb_no_decay = _split_decay(seg_bb_named)
+        param_groups.append(
+            {"params": seg_bb_decay, "weight_decay": weight_decay, "lr": seg_bb_lr}
+        )
+        param_groups.append(
+            {"params": seg_bb_no_decay, "weight_decay": 0.0, "lr": seg_bb_lr}
+        )
 
     # Stage B backbone 组:逐 block LLRD。blocks[6] = head_lr×scale,blocks[5] = ×scale×η。
     if stage == "B":
@@ -192,8 +253,8 @@ def configure_official_stage(
             param_groups.append({"params": duals, "weight_decay": 0.0, "lr": head_lr})
 
     stage_name = {
-        "A": "Official Stage A: heads warmup (backbone/seg/CBM frozen)",
-        "B": "Official Stage B: LLRD unfreeze cls Top-2",
-        "C": "Official Stage C: heads low-lr calibration",
+        "A": "Official Stage A: heads+seg warmup (cls_backbone/CBM frozen)",
+        "B": "Official Stage B: heads+seg + LLRD unfreeze cls Top-2",
+        "C": "Official Stage C: heads+seg low-lr calibration",
     }[stage]
     return param_groups, head_lr, stage_name

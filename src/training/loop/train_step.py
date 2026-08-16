@@ -62,8 +62,27 @@ def build_official_head_targets(labels, mix_info, batch_size, device):
     if mix_info is not None:
         lam = mix_info["lam"].to(device)
         idx = mix_info["index"].to(device)
-        donor = lam == 0.0                      # 继承 donor 标签
-        hard = donor | (lam == 1.0)             # 归属明确(硬继承)才留监督
+        # 🔴 主导权阈值(2026-08-14 修真 bug,勿改回 `== 0.0` / `== 1.0`)
+        #
+        # 修复前用的是**精确相等**:`donor = lam == 0.0`、`hard = donor | (lam == 1.0)`。
+        # CutMix 分支会把 `lams` 逐样本判成 0.0/1.0(DR-CutMix 按 donor 占比 0.65/0.35),
+        # 所以精确相等对它成立;但 **MixUp 分支的 `lams` 是全批同一个
+        # `lam ~ Beta(0.2,0.2)`,严格落在 (0,1)** —— 于是 MixUp 一触发,`hard` 全 False,
+        # **四头(位置/ETE/临床T/TI-RADS)的 valid 被整批乘成 0**。
+        #   实测后果:`apply_mixup_or_cutmix(prob=0.3)` 且 CutMix/MixUp 各半 →
+        #   约 15% 的 batch 四头零监督,不报错、只是没学。这正是 2026-08-14 首次真训
+        #   loss 在 ~5/~0.8 双峰跳动的根因(低值行四头分项全 0.0)。
+        #
+        # 改用与 DR-CutMix **同一套阈值**(0.65/0.35)判主导方:MixUp 里 donor 占比 = 1-lam,
+        # 故 `lam <= 0.35` 判 donor 主导、`lam >= 0.65` 判 recipient 主导,中间才屏蔽。
+        # ⚠️ **对 CutMix 完全等价**(其 lams 已是 0.0/1.0,`0.0<=0.35`、`1.0>=0.65` 恒成立),
+        #    行为不变;中间档 CutMix 靠 `mask_weight=0` 屏蔽,这条路径也未动。
+        # ⚠️ **刻意只改这里、不动 `mixup.py`**:`lam` 还被 CBM 概念损失
+        #    (`losses/components/concepts.py:39-105` 软插值)与 SLR(`loop/slr.py:35`)
+        #    当**软加权系数**消费,在 mixup 侧硬化成 0/1 会连带改掉旧任务的数学;
+        #    而本处的闸门只服务四头。`mask_weight` 同理不动(它还门控概念损失)。
+        donor = lam <= 0.35                     # donor 占比 >= 0.65 → 继承 donor 标签
+        hard = donor | (lam >= 0.65)            # 归属明确(硬继承)才留监督
         # is_main 跟着标签走:donor 位继承 donor 的主病灶属性,否则会把次病灶
         # 的标签当主病灶训(标签换了、屏蔽没换)
         main_w = torch.where(donor, main_w[idx], main_w)

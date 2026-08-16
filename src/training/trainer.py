@@ -85,6 +85,8 @@ def validate_epoch(model, loader, criterion, device, epoch=1, official_metrics_o
             为什么用出参而不是加返回值:`train.py:337` 按 5 元组解包本函数,加宽
             返回值会直接破坏 legacy 训练入口(lane2b 实测该处是唯一调用点)。
             三头键缺席的数据集(legacy)→ 写入全 None 的指标 dict。
+            本轮 val 的平均分割 Dice 会一并传给 `compute_official_metrics`,
+            使 `composite` 把分割纳入选模判据(2026-08-16)。
     """
     model.eval()
     criterion.eval()
@@ -96,6 +98,9 @@ def validate_epoch(model, loader, criterion, device, epoch=1, official_metrics_o
     all_mal_probs: list[float] = []
     all_mal_targets: list[int] = []
     official_records: list[dict] = []
+    # 分割概率分布累加器(全批,非只第一批)。语义与动机见 `validate_batch` 的
+    # `seg_prob_out` docstring —— 它是"分割正在升温"的先行指标,比 hard dice 早。
+    seg_prob_stats: dict = {}
 
     from src.training.stages import get_stage_number
 
@@ -113,7 +118,8 @@ def validate_epoch(model, loader, criterion, device, epoch=1, official_metrics_o
                 mal_targets,
                 batch_records,
             ) = validate_batch(
-                model, images, masks, labels, criterion, device, stage, batch_idx, epoch
+                model, images, masks, labels, criterion, device, stage, batch_idx, epoch,
+                seg_prob_out=seg_prob_stats,
             )
 
             val_loss += loss.item()
@@ -126,15 +132,28 @@ def validate_epoch(model, loader, criterion, device, epoch=1, official_metrics_o
             if official_metrics_out is not None:
                 official_records.extend(batch_records)
 
-    if official_metrics_out is not None:
-        from src.training.metrics_official import compute_official_metrics
-
-        official_metrics_out.update(compute_official_metrics(official_records))
-
     avg_loss = val_loss / len(loader)
     avg_loss_l2 = val_loss_l2 / len(loader)
     avg_dice = seg_dice / total_samples
     avg_acc = mal_correct / total_samples
+
+    # 🔴 顺序敏感:必须在 `avg_dice` 算出**之后**才 update —— composite 要把分割
+    # Dice 并进均值(分割是官方评分闸门,详见 `metrics_official.compute_official_metrics`
+    # 的 seg_dice 段)。此块 2026-08-16 从 `avg_loss` 之前挪到这里,勿再挪回去。
+    if official_metrics_out is not None:
+        from src.training.metrics_official import compute_official_metrics
+
+        official_metrics_out.update(
+            compute_official_metrics(official_records, seg_dice=avg_dice)
+        )
+        # 分割概率分布(诊断字段,非官方指标)。放在 update 之后写,避免被覆盖。
+        n_px = seg_prob_stats.get("count", 0)
+        if n_px:
+            official_metrics_out["seg_prob_mean"] = seg_prob_stats["sum"] / n_px
+            official_metrics_out["seg_prob_max"] = seg_prob_stats["max"]
+            official_metrics_out["seg_over_half_frac"] = (
+                seg_prob_stats.get("over_half", 0) / n_px
+            )
 
     if stage == 1:
         val_auc = None

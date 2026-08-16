@@ -111,11 +111,24 @@ def collect_official_records(outputs, labels, targets):
 
 
 def validate_batch(
-    model, images, masks, labels, criterion, device, stage, batch_idx, epoch
+    model, images, masks, labels, criterion, device, stage, batch_idx, epoch,
+    seg_prob_out=None,
 ):
     """
     单个批次的验证逻辑。
 
+    Args:
+        seg_prob_out: 可选 dict。传入时**原地累加**分割 `pred_prob` 的统计量
+            (`sum`/`count`/`max`/`over_half`),供 `validate_epoch` 汇总后写进 JSONL。
+            🔴 **为什么需要(2026-08-16,勿删)**:`pred_prob` 此前**只在 `batch_idx==0`
+            打一行 stdout**,JSONL 里完全没有。而 2026-08-15 那轮之所以能定位到
+            "分割全程冻结"这个根因,靠的正是这个数(全域 0.4425~0.4463 < 0.5 →
+            `pred_mask` 恒全零)。分割改自训后,它是"分割正在升温"的**唯一先行指标**
+            —— hard `val_dice` 在前景 logit 越过 0 之前一直是 0.0,而 `pred_prob`
+            的均值/最大值/过半像素占比会先动。没有它,云端 agent 在护栏触发前
+            只能对着 `dice=0.000` 盲等。
+            用出参而非加返回值:本函数返回 8 元组,`trainer.py:117` 按位解包,
+            加宽会破坏既有调用点。
     Returns:
         loss: 损失
         loss_dict: 损失字典
@@ -161,6 +174,16 @@ def validate_batch(
             f"  [Val Diag] pred_prob: mean={pred_mean:.4f}, std={pred_std:.4f}, min={pred_prob.min().item():.4f}, max={pred_prob.max().item():.4f}",
             flush=True,
         )
+
+    # 分割概率分布统计(全批累加,不只第一批)——供 JSONL 观测分割升温。
+    # 语义见本函数 docstring 的 `seg_prob_out` 段。`over_half` 是**过阈值像素占比**:
+    # hard dice 只有在这个数离开 0 之后才可能非零,故它比 dice 更早给出信号。
+    if seg_prob_out is not None:
+        n = pred_prob.numel()
+        seg_prob_out["sum"] = seg_prob_out.get("sum", 0.0) + pred_prob.sum().item()
+        seg_prob_out["count"] = seg_prob_out.get("count", 0) + n
+        seg_prob_out["max"] = max(seg_prob_out.get("max", 0.0), pred_prob.max().item())
+        seg_prob_out["over_half"] = seg_prob_out.get("over_half", 0) + int(pred_mask.sum().item())
 
     intersection = (pred_mask * targets["mask"]).sum(dim=(2, 3))
     union = pred_mask.sum(dim=(2, 3)) + targets["mask"].sum(dim=(2, 3))

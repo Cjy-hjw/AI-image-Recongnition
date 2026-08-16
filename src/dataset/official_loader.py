@@ -612,6 +612,51 @@ def _read_nifti_frame_gray(path: str, frame_index: int) -> np.ndarray:
     return np.asarray(frames[pos])
 
 
+def resize_img_to(img: np.ndarray, size: int) -> np.ndarray:
+    """灰度帧 → (size,size)。**训练侧 resize 口径的单一权威**,预抽取脚本必须复用本函数。
+
+    🔴 别再抄一份:`scripts/data/preextract_dynamic.py` 把帧提前算好存 PNG,与
+    `__getitem__` 现算是**同一次计算的两个时点**。两处各写一份 cv2.resize 调用,当前
+    逐位一致(实测 5 种尺寸),但任何一方将来改插值方式/加抗锯齿,另一方不会跟着变 ——
+    结果是缓存图与实时图悄悄不同,而 loss 照常下降、指标只是略低,本地永远查不出。
+    """
+    if img.shape[:2] != (size, size):
+        img = cv2.resize(img, (size, size))
+    return img
+
+
+def resize_mask_to(mask: np.ndarray, size: int) -> np.ndarray:
+    """mask → (size,size),**必须 INTER_NEAREST**(双线性会在边界造出 0/1 之外的中间值,
+    虽然下游统一 `>0` 二值化不会崩,但前景面积会系统性变化)。理由同 `resize_img_to`。"""
+    if mask.shape[:2] != (size, size):
+        mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
+    return mask
+
+
+def _read_cached_pair(img_png: str, msk_png: str) -> Tuple[np.ndarray, np.ndarray]:
+    """读预抽取缓存的 (影像帧, mask 帧),均为 uint8 灰度 (H,W)。
+
+    产出方是 `scripts/data/preextract_dynamic.py`,存的是 **resize 之后、增强之前**
+    的那一张,与走 .nii.gz 的原路径数值等价。
+
+    🔴 **缺文件必须抛异常,不得静默返回零图**:缓存缺失意味着预抽取没覆盖到这个样本,
+    静默补零 = 拿全黑图 + 全零 mask 当真样本训(分割监督被污染、四头标签还在),
+    loss 照常下降、本地永远查不出根因。宁可训练启动即崩。
+
+    用 `np.fromfile + cv2.imdecode` 而非 `cv2.imread`:后者在非 ASCII 路径下静默
+    返回 None(官方数据路径含中文的可能性不为零),错误信息与"路径编码"毫无关联。
+    """
+    out = []
+    for p in (img_png, msk_png):
+        if not p or not os.path.exists(p):
+            raise RuntimeError(f"预抽取缓存缺失: {p}(重跑 scripts/data/preextract_dynamic.py)")
+        a = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if a is None:
+            raise RuntimeError(f"预抽取缓存解码失败(文件损坏?): {p}")
+        out.append(a)
+    return out[0], out[1]
+
+
 # ── Dataset ────────────────────────────────────────────────────────────────
 class OfficialThyroidDataset(Dataset):
     """官方数据集。输出 `(img[1,H,W]f32∈[0,1], mask[1,H,W]f32, labels)`,同 ThyroidDataset。
@@ -620,8 +665,9 @@ class OfficialThyroidDataset(Dataset):
     + 三新维度(lesion_loc/extrathy_ext/clin_t_stage)+ 全部 `valid_{task}`/`valid_mask`。
     三新维度键"只产出、暂不消费"——train_step/损失接线在 Phase 2(当前忽略额外键,无害)。
 
-    ⚠️ 性能:动态样本每次 __getitem__ 重解码整段 .nii.gz(影像+mask)。正确性优先,
-       Phase 4 训练前若成瓶颈再做帧缓存/预抽取。
+    ⚠️ 性能:动态样本命中 `cache_img` 走 `_read_cached_pair`(预抽取 PNG),**不再重解码**
+       `.nii.gz`;无 cache 键回落原路径(每样本全量解压影像+mask 两个体积)。预抽取见
+       `scripts/data/preextract_dynamic.py`,缓存数值等价、见 `_read_cached_pair` 注释。
     """
 
     def __init__(self, samples: List[Dict], img_size: int = 512, transform=None,
@@ -645,21 +691,23 @@ class OfficialThyroidDataset(Dataset):
         return len(self.samples)
 
     def _resize_img(self, img: np.ndarray) -> np.ndarray:
-        if img.shape[:2] != (self.img_size, self.img_size):
-            img = cv2.resize(img, (self.img_size, self.img_size))
-        return img
+        return resize_img_to(img, self.img_size)      # 口径单一权威,见该函数 docstring
 
     def _resize_mask(self, mask: np.ndarray) -> np.ndarray:
-        if mask.shape[:2] != (self.img_size, self.img_size):
-            mask = cv2.resize(
-                mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST
-            )
-        return mask
+        return resize_mask_to(mask, self.img_size)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
 
-        if s["is_dynamic"]:
+        if s["is_dynamic"] and s.get("cache_img"):
+            # 预抽取缓存命中(scripts/data/preextract_dynamic.py 产物)。
+            # 🔴 走这条就**不碰 .nii.gz**:原路径每样本要全量解压影像+mask 两个体积
+            # (各 258MB 量级、~4s),1400 动态样本 × 35 epoch ≈ 24 小时纯解压,且
+            # num_workers=12 时瞬时占用 ~8.4GB —— 首轮真训的 `invalid block type`
+            # 与步耗时 22 倍抖动即由此而来。缓存图是 resize 之后、增强之前的那一张,
+            # 与原路径**数值等价**(见预抽取脚本 docstring),下面的 _resize_* 对它是 no-op。
+            img, mask = _read_cached_pair(s["cache_img"], s["cache_msk"])
+        elif s["is_dynamic"]:
             img = _read_nifti_frame_gray(s["img_path"], s["frame_index"])
             mask = self._dynamic_mask_frame(s["mask_path"], s["frame_index"])
         else:
@@ -714,6 +762,25 @@ class OfficialThyroidDataset(Dataset):
         return binf[pos]
 
 
+def _load_samples_pkl(path: str) -> Tuple[List[Dict], Dict]:
+    """加载预抽取产物 `samples.pkl` → (samples, meta)。
+
+    格式由 `scripts/data/preextract_dynamic.py` 写出:`{"_meta": {...}, "samples": [...]}`。
+    只认这一种带 `_meta` 的字典;裸 list 一律拒绝 —— 没有 meta 就无从校验 img_size,
+    而 img_size 不一致是**静默掉画质**的那类 bug,不能靠"大概是对的"放行。
+    """
+    import pickle
+    if not os.path.exists(path):
+        raise RuntimeError(f"samples.pkl 不存在: {path}(先跑 scripts/data/preextract_dynamic.py)")
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict) or "samples" not in payload:
+        raise RuntimeError(
+            f"samples.pkl 格式不对(缺 'samples' 键): {path}。"
+            f"须由 scripts/data/preextract_dynamic.py 生成")
+    return payload["samples"], payload.get("_meta", {})
+
+
 def build_official_datasets(
     root: str,
     xlsx_path: str,
@@ -723,6 +790,7 @@ def build_official_datasets(
     train_transform=None,
     sheet_name: str = "ROI级别",
     hflip_prob: float = 0.0,
+    samples_pkl: Optional[str] = None,
 ) -> Tuple["OfficialThyroidDataset", "OfficialThyroidDataset"]:
     """便捷入口:构样本 → 患者分组切分 → 建 train/val Dataset。返回 (train_ds, val_ds)。
 
@@ -733,8 +801,31 @@ def build_official_datasets(
     ⚠️ `seed` **只喂给切分**,不传给 Dataset —— Dataset 的翻转 RNG 必须留 None 走全局
     random(由 DataLoader 的 worker_init_fn 每 worker/每 epoch 播种)。曾把这个 seed
     一并传下去,实测导致翻转序列跨 epoch 逐位相同,见 `OfficialThyroidDataset.__init__`。
+
+    `samples_pkl`:预抽取产物 `<cache-dir>/samples.pkl`(见
+    `scripts/data/preextract_dynamic.py`)。给了就**跳过整个扫描重建**——原路径要重扫
+    xlsx 并为定位动态非零帧解压 343 个 mask,实测 10-25 分钟,每次启动都付一遍。
+    pkl 里的动态样本自带 `cache_img`/`cache_msk`,`__getitem__` 随之走 PNG 而非 .nii.gz。
+    切分仍在此处按同一 `seed`/`val_frac` 现算,故换 seed 不必重跑预抽取。
     """
-    samples = build_official_samples(root, xlsx_path, sheet_name)
+    if samples_pkl:
+        samples, meta = _load_samples_pkl(samples_pkl)
+        if meta.get("partial"):
+            # 🔴 硬拒而非告警:`--limit N` 的 pkl 只覆盖 N 个动态影像文件,其余动态样本
+            # 没有缓存、会**静默回落**到全量解压的原路径 —— 既没提速又只验了一小部分,
+            # 而表面上训练照跑、日志照出。这正是"合法但全错"那一类,必须堵死在入口。
+            raise RuntimeError(
+                f"{samples_pkl} 是 --limit 模式产出的残件(_meta.partial=True),不能用于训练。"
+                f"去掉 --limit 重跑 scripts/data/preextract_dynamic.py 生成完整缓存")
+        cached_size = meta.get("img_size")
+        if cached_size is not None and int(cached_size) != int(img_size):
+            # 不 raise:降采样后再插值回去只掉画质、不改契约,硬崩会把人堵在门外;
+            # 但必须吼出来 —— 静默掉画质是本项目最怕的一类 bug。
+            _safe_print(
+                f"[WARN] 预抽取缓存 img_size={cached_size} != 训练 img_size={img_size},"
+                f"缓存帧会被二次 resize(掉画质)。重跑预抽取时传 --img-size {img_size}")
+    else:
+        samples = build_official_samples(root, xlsx_path, sheet_name)
     if not samples:
         raise RuntimeError(f"未在 {root} + {xlsx_path} 构造出任何样本,检查路径/表头")
     train_s, val_s = patient_grouped_split(samples, val_frac=val_frac, seed=seed)

@@ -68,7 +68,7 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 | `train_step.py` | `train_batch()` — single batch forward/backward with MixUp, vCLUB, SLR, AMP;模块级 `build_official_head_targets()` 组装四头 targets(见下) |
 | `validate_step.py` | `validate_batch()` — single batch validation with Val Diag print;返回 **8 元组**(新增 `official_records`);`collect_official_records()`/`_official_head_targets()` |
 | `metrics_official.py` | **官方口径验证指标(阶段 2.4 新增)**:病灶级聚合(同 `lesion_id` 多帧概率取均值)+ 官方筛选(见下) |
-| `slr.py` | `compute_slr_weights()` — Supervised Label Rectification (1000-sample history, mean+2σ anomaly) |
+| `slr.py` | `compute_slr_weights()` — Supervised Label Rectification (1000-sample history, mean+2σ anomaly);把 `mix_info` 的 `lam` 当**软加权系数**消费(`slr.py:26-36` 按 `lam*raw_orig + (1-lam)*raw_perm` 插值),故四头监督闸门改动不得在 mixup 侧硬化 `lam`(见 `build_official_head_targets` 下方红线) |
 | `vclub.py` | `vclub_learning_step()`, `compute_vclub_mi_bound()` — mutual information decoupling |
 | `bn_freeze.py` | `set_frozen_modules_eval()` — automatic BatchNorm eval for frozen modules |
 
@@ -76,20 +76,25 @@ Stage freeze rules live on the model via `MultiTaskThyroidModel.set_training_sta
 
 | File | Responsibility | 硬约束 |
 |:---|:---|:---|
-| `schedule_official.py` | 官方四头 A/B/C 阶段调度:`get_official_stage()`/`official_head_lr()`/`configure_official_stage()` | 🔴 **相邻 epoch lr 比值 ≤5**(`MAX_LR_JUMP_RATIO`),把 `stages.py` 的 100 倍跳变事故钉成不可能;返回契约与 `configure_stage_parameters` 同型 `(param_groups, lr, stage_name)`;**绝不复用/修改 `stages.py`** |
-| `jsonl_logger.py` | V2.1 强制 JSONL 训练日志(`JsonlLogger`) | 云端路径写死 `/2026aicompetition/workspace/logs`(`OFFICIAL_LOG_DIR`,Windows 本地不可写,冒烟须 `--log-dir logs`);**逐行 flush**(审查随时读,缓冲区里的行读不到 = 判罚口径下自曝) |
+| `schedule_official.py` | 官方四头 A/B/C 阶段调度:`get_official_stage()`/`official_head_lr()`/`configure_official_stage()` | 🔴 **相邻 epoch lr 比值 ≤5**(`MAX_LR_JUMP_RATIO`),把 `stages.py` 的 100 倍跳变事故钉成不可能;返回契约与 `configure_stage_parameters` 同型 `(param_groups, lr, stage_name)`;**绝不复用/修改 `stages.py`**。🔴 **2026-08-16 契约变更:分割前向链(`seg_backbone`/`up_stages`/`dec_stages`/`seg_head`)改为 A/B/C 全程可训**——原设计冻结它是为「保护**已有**分割能力」(`训练架构方案.md:100`),而那个 warm-start 权重已三路不可达;冻结导致 `pred_mask` 恒全零 → 官方 IoU 匹配零命中 → 五项分类/分期零样本 → Sclin≈0(总纲 §6③)。解码器挂 `head_lr`(随机初始化)、ImageNet 主干挂 `head_lr×backbone_lr_scale`,**lr 档位与 Stage B 现有两档重合、不新增档次**。⚠️ **必须整块解冻**(部分解冻会触发 `bn_freeze` 的兄弟 BN 病态);⚠️ **解冻即须进 param_groups**(`requires_grad` 与 optimizer 集合必须严格对齐,否则梯度跨 batch 永不清零,见 `src/models/AGENTS.md:62` LoRA 同形事故) |
+| `jsonl_logger.py` | V2.1 强制 JSONL 训练日志(`JsonlLogger`) | 云端路径写死 `/2026aicompetition/workspace/logs`(`OFFICIAL_LOG_DIR`,Windows 本地不可写,冒烟须 `--log-dir logs`);**逐行 flush**(审查随时读,缓冲区里的行读不到 = 判罚口径下自曝);`log(extra={...})` 收额外诊断字段(子损失分解/`n_valid_*`),官方原文「**应包含**以下字段」= 最小必填集未禁额外键,但 ① `_RESERVED` assert 拦同名覆盖(静默改写 `loss` 比崩溃阴)② `_drop_nonfinite` 丢 NaN/Inf(`json.dumps` 默认写裸 `NaN`,非标准 JSON,严格解析器拒收整行;**丢弃不填 0** —— 填 0 会把"这项炸了"伪装成"收敛得好") |
 | `reproducibility.py` | seed 四件套共享助手:`seed_worker()`/`configure_reproducibility()` | sampler / loader **两个独立 generator**(共用会让改 `num_workers` 连带改变采样序列);`train.py` 内那份是 legacy 已验证路径,**不动**,两份漂移各自的测试会红 |
 
-**阶段划分与 lr**(`lr_base` 取 `config.train.lr`):A=epoch 1-10(冻 backbone/分割/CBM,只训四头,线性 warmup 至 lr_base)、
-B=11-30(解冻 `cls_backbone.blocks[5]/[6]`,LLRD:blocks[6]=头 lr×0.1、blocks[5] 再乘 η=0.75,余弦退火至 ×0.1)、
-C=31-35(重新全冻,头部固定 lr_base×0.05;温度标定在推理侧 `calibration.py` 不在此)。
+**阶段划分与 lr**(`lr_base` 取 `config.train.lr`):A=epoch 1-10(冻 cls_backbone/CBM,训四头 + **分割前向链**,线性 warmup 至 lr_base)、
+B=11-30(额外解冻 `cls_backbone.blocks[5]/[6]`,LLRD:blocks[6]=头 lr×0.1、blocks[5] 再乘 η=0.75,余弦退火至 ×0.1)、
+C=31-35(回到 A 的可训集,头部固定 lr_base×0.05;温度标定在推理侧 `calibration.py` 不在此)。
+🔴 **分割前向链(`seg_backbone`/`up_stages`/`dec_stages`/`seg_head`)A/B/C 全程可训**(2026-08-16 契约变更,理由见上表 `schedule_official.py` 行):
+解码器(随机初始化)挂 `head_lr`、与四头同组;ImageNet 主干挂 `head_lr×backbone_lr_scale`,与 Stage B 的 blocks[6] **同档不新增**。
+param_groups 组数实测:**A/C 各 5 组、B 9 组**(stage 边界重建 optimizer,stage 内按位置 zip 更 lr —— 同 stage 内组数与各组参数数恒定,已实测)。
 四头(位置/侵犯/临床T/TI-RADS)在**所有** legacy stage 恒冻结(`OFFICIAL_HEAD_PREFIXES`,含 `tirads_head`),两条调度线互不干扰。
-入口是 `scripts/train_official.py`(**不动 `train.py`**),数值锁定见 `tests/test_official_schedule.py`(16 项)。
+入口是 `scripts/train_official.py`(**不动 `train.py`**),数值锁定见 `tests/test_official_schedule.py`(18 项)。官方四头 JSONL 计数另逐文件钉死于 `tests/AGENTS.md` 各头小节。
 
 
 ### `build_official_head_targets()`(train_step.py,阶段 2.4 提取为可单测模块级函数)
 
-**必须在 mixup/cutmix 之后调用**——三头是硬标签 masked CE、无软标签路径,图像混了而标签不跟着换 = 静默错监督。混合后归属按 DR-CutMix 已算好的 `lam` 判定:`lam==0` 继承 donor(`index`)标签须 gather、`lam==1` 保留 recipient、其余(软 MixUp)整批屏蔽。validity 走 **targets 顶层直传键**(`valid_lesion_loc` 等,float [B]),**不进 `label_validity`**——后者只被 `malignancy.py:25`/`concepts.py:155` 消费,三头损失各自显式断言 [B] 一维 validity、根本不读它。🔴 **三头只训主病灶**:`is_main==0` 的次病灶(约 13% 带标注)validity 置 0(评审规则:三新维度仅对主病灶标注/评估);`is_main` 键缺席(legacy)全当主病灶,零回归。测试见 `tests/test_train_step_head_targets.py`(12 条)。
+**必须在 mixup/cutmix 之后调用**——三头是硬标签 masked CE、无软标签路径,图像混了而标签不跟着换 = 静默错监督。混合后归属按阈值分派(D 段 CutMix 的 `lam` 本由 DR-CutMix 算成 0.0/1.0;M 段 MixUp 的软 `lam` 在 `[0,1]` 内):`lam<=0.35` 继承 donor(`index`)标签须 gather、`lam>=0.65` 保留 recipient、其余(两分支中间段)整批屏蔽。validity 走 **targets 顶层直传键**(`valid_lesion_loc` 等,float [B]),**不进 `label_validity`**——后者只被 `malignancy.py:25`/`concepts.py:155` 消费,三头损失各自显式断言 [B] 一维 validity、根本不读它。🔴 **三头只训主病灶**:`is_main==0` 的次病灶(约 13% 带标注)validity 置 0(评审规则:三新维度仅对主病灶标注/评估);`is_main` 键缺席(legacy)全当主病灶,零回归。测试见 `tests/test_train_step_head_targets.py`(12 条)+ `tests/test_mixup_label_dominance.py`(12 项,2026-08-15)。
+
+🔴 **监督闸门阈值 2 行修复(2026-08-15,loss 双峰 ~5/~0.8 的根因)**:`donor = lam == 0.0` → **`lam <= 0.35`**;`hard = donor | (lam == 1.0)` → **`donor | (lam >= 0.65)`**。根因:CutMix 分支的 `lams` 确由 DR-CutMix 判成 0.0/1.0(精确相等成立),但 **MixUp 分支的 `lam ~ Beta(0.2,0.2)` 严格落在 (0,1)** → 旧判据下 `hard` 全 False → 四头 valid 被整批乘 0。`prob=0.3` 且 CutMix/MixUp 各半 → 约 **15% 的 batch 四头零监督**,不报错、只是没学,表现为 loss 在两个值域间跳。**刻意只改 train_step.py 的闸门、不动 `src/dataset/augmentation/mixup.py`**——`lam` 还被 CBM 概念损失(`src/models/losses/components/concepts.py:39-105`,`resolve_mix_params` 后 SLR 软插值、`mask_weight` 门控)与 SLR(`slr.py:26-36` 按 `lam*orig + (1-lam)*perm` 插值)当**软加权系数**消费,在 mixup 侧硬化成 0/1 会连带改掉旧任务的数学;`mask_weight` 同理不动(它还门控概念损失)。对 CutMix **完全等价**(其 lams 已是 0.0/1.0,`0.0<=0.35`/`1.0>=0.65` 恒成立)。回归测试 `tests/test_mixup_label_dominance.py`(12 项,含反向保护"mixup.py 必须仍产出软 lam")。
 
 ### `metrics_official.py`(官方口径验证指标,阶段 2.4)
 

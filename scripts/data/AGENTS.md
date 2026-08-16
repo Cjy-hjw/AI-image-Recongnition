@@ -11,6 +11,7 @@
 | `convert_ddti.py` | DDTI 数据集(XML 标注)→ 统一图像+mask+CSV 格式转换 |
 | `diag_pathology.py` | 一次性诊断:27021604 batch1 CSV fname 与磁盘文件名不匹配排查(A800 本地一次性,非 CLI) |
 | `duipai_probe_vs_head.py` | 一次性对拍:probe(AUC0.705) vs 训练 linear_head(0.50-0.55) 泄漏根因锁死(A800 一次性,佐证随机KFold泄漏) |
+| `preextract_dynamic.py` | **动态 .nii.gz 预抽取 PNG 缓存(2026-08-15 新增)**——官方数据训练性能修复,详见 `scripts/AGENTS.md` §1 Package Structure 该行与 `src/dataset/AGENTS.md` 官方数据加载器节 |
 
 `format_tn3k.py`(项目根)是 thin CLI,从 `scripts/data/` 导入。
 

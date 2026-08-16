@@ -27,17 +27,19 @@
 | `test_model_runner.py` | `build_model`(2026-07-10 新增，回归测试) — 裸 state_dict 正常加载、`{"state_dict":...}` 包装格式正确解包、unexpected/missing keys 硬报错(拒绝静默部分加载)、checkpoint 缺失时仍降级随机初始化(向后兼容)；`run_forward`(2026-07-11 新增，两轮修复，`TestRunForwardCpuFp16Fallback`+`TestRunForwardGpuPrecisionRegression`) — CPU+fp16 autocast "假降级"修复回归、**CPU+fp32 不崩溃**(第一轮修复误把此分支 dtype 从 bfloat16 改成 float16 引入新回归，CI test job 实测抓到，第二轮改为 CPU 上 dtype 恒 bfloat16)、bf16-on-cpu 未被连带破坏、GPU fp32/fp16/bf16 三值回归(skipif 无 CUDA)；`load_config`(2026-07-11 新增，`TestLoadConfig`) — 合法配置正常解析、文件不存在抛 `FileNotFoundError`、YAML 格式错误抛异常、缺 `environment.device` 键抛 `KeyError`(供 predict.py/video_predict.py 的 try/except Exception 统一兜底) | 15 | — |
 | `test_gate8_adaptor_isolation.py` | `gate8_adaptor_isolation`(2026-07-11 新增) — TaskAlignmentAdaptor cls→seg 梯度隔离审计的正面/负面回归；正面:真实代码(`.detach()` 正确)+ 模拟前序 Gate 遗留的 `requires_grad=False` 污染状态下仍判定通过、`seg_backbone` 梯度精确 `0.0`、`gamma`/`requires_grad` 复位无副作用(2026-07-11 Gate2 review 非阻塞建议补齐:此前 finally 只复原 gamma 没复原 requires_grad,依赖"Gate8 是最后一个 Gate"这个隐性顺序假设,现改为逐参数显式记录+复原);负面:monkeypatch `torch.Tensor.detach` 为恒等函数模拟误删,断言 Gate 检测到泄漏并返回 False(踩坑记录:`TaskAlignmentAdaptor.gamma` 零初始化会让正确/错误 detach 都测出梯度 0,Gate 内部强制拨到非零才能让负面测试真正生效,详见该 Gate 源码注释) | 2 | — |
 | `test_prediction_json.py` | prediction.json schema 构造与校验(2026-08-01 新增;**2026-08-10 A3 起 v21_output 经它组装/校验,并入 V2.1 交付链路**) | 19 | Phase 5 |
-| `test_v21_output.py` | **V2.1 单病例输出写盘入口**(2026-08-10 A3 新增)——`write_case_v21` 静/动两链路:静态把 case_pipeline 结果落成 `{case_dir}/{subdir_uid}/nodule_NNN.nii.gz` + `prediction.json`(StudyUID=PatientId、MaskFile 相对路径正斜杠、原子写、阴性空数组合法、缺 orig_hw 报 V21 错误);动态逐帧 resize 回原图 + scatter 回填全帧 3D mask + 3D 连通域跨帧关联;占位维度(ETE=1/Location 均匀/T=0)结构合规 | 11 | Phase 5 |
+| `test_v21_output.py` | **V2.1 单病例输出写盘入口**(2026-08-10 A3 新增)——`write_case_v21` 静/动两链路:静态把 case_pipeline 结果落成 `{case_dir}/{subdir_uid}/nodule_NNN.nii.gz` + `prediction.json`(StudyUID=PatientId、MaskFile 相对路径正斜杠、原子写、阴性空数组合法、缺 orig_hw 报 V21 错误);动态逐帧 resize 回原图 + scatter 回填全帧 3D mask + 3D 连通域跨帧关联;占位维度(ETE=1/Location 均匀/T=0)结构合规(仍为占位,接线在 backlog #116b,依赖四头训练完成) | 11 | Phase 5 |
 | `test_service_runner.py` | **runner 批量编排**(2026-08-10 A2 新增)——mock 掉 heavy 依赖只留编排逻辑:逐病例调 write_case_v21 且 case_dir={output}/{patient_id}、静/动 kind 分派、processing_ms 非负 int、gatekeeper 每病例照跑、**单病例失败隔离**(一例 diagnose 崩溃不影响其余 + 落结构合规 ERROR 占位)、loader 失败隔离、**模型只 build 一次**(跨病例 + 跨多次 build_service_runner 缓存)、空/无效/全非影像目录不崩 | 12 | Phase 5 |
 | `test_head_interfaces.py` | **三头接入接口契约**(2026-08-12 Phase2 阶段2.0 新增)——守四条「删掉就静默出错」的契约:① `stage4_spatial` 通道数是 `CLS_POOLED_DIM`(352) 而非 `CLS_STAGE4_CHANNELS`(208)，且自带 352≠208 反向锚点防断言失去区分力;② 命名即契约(`stage4_spatial` 有梯度、两个 `*_detached` 无梯度);③ 🔴 从 `stage4_spatial` 反传 `seg_backbone` 梯度**精确 0**(用 `!=0.0` 而非容差,对 NaN 敏感,同 Gate 8 论证)——保住 Gate 8 前提、防三头重开 Stage2 崩塌的物理先验回流;④ fp16 求和溢出反证(自带「反证失效」保护:先断言朴素 `.sum()==inf`,否则说明该测试已对 fp32 累加器失去区分力) | 14 | Phase 2 |
 | `test_location_head.py` | **位置头契约**(2026-08-12 Phase2 阶段2.1 新增)——守「错了不崩、只静默学错」那几条:① 因子分解**拼接顺序**必须对齐 `LOCATION_LABELS`(用非对称确定性输入逐格核对——顺序错了概率和仍为 1、JSON 仍合法,只是左叶预测填进右叶槽);② 7 维**严格**和为 1(数学恒等式非再归一化);③ 峡部 level 标签是 `-1`,须 clamp+validity 双保险(附反证:直接喂 `cross_entropy` 确实越界);④ 标签越界**正负不对称**(`idx=7` IndexError 而 `idx=-1` 走负索引静默取末元素)双向拦截;⑤ `[B,1]` validity 隐式广播成 `[B,B]` 静默放大 loss(附反证坐实该坑真实存在);⑥ 🔴 **CoordConv 必须先过非线性再池化**——三段反证(普通卷积不可分 → **裸 CoordConv 仍不可分** → 加 ReLU 才可分),卷积线性可拆使坐标贡献退化为常数偏置被 GAP 平均掉;⑦ 水平翻转联动翻标签 | 25 | Phase 2 |
-| `test_extension_head.py` | **ETE 侵犯头契约**(2026-08-12 Phase2 阶段2.2 新增)——守「稀有类静默学错 + CB 保护失效」那几条:① 4 类 ETE 概率**严格**和为 1、argmax 与分布自洽;② 类别顺序对齐 `ET4 码`（无/甲状腺包膜/毗邻软组织/血管，计数 3906/267/67/5）；③ `class_balanced_weights` 乘性加权数值（β=0.99 默认 → 血管:无=20.4:1，β=0.9→2.4:1 / 0.999→196.4:1 / 0.9999→646.9:1 全表锁定）；④ CB-Focal γ 聚焦 + Logit-Adjustment 先验补偿存在且不翻转方向；⑤ `boundary_band_from_mask` 带宽 = `kernel_size−1`（k=3→2px / 5→4px / 7→6px 实测，实现取 k=5 → 4px）；⑥ 头/损失同名不同职责（`heads/extension.py` vs `losses/components/extension.py`）不致误导；⑦ 参数量 0.063M | 39 | Phase 2 |
+| `test_extension_head.py` | **ETE 侵犯头契约**(2026-08-12 Phase2 阶段2.2 新增)——守「稀有类静默学错 + CB 保护失效」那几条:① 4 类 ETE 概率**严格**和为 1、argmax 与分布自洽;② 类别顺序对齐 `ET4 码`(无/甲状腺包膜/毗邻软组织/血管,计数 3906/267/67/5);③ `class_balanced_weights` 乘性加权数值(β=0.99 默认 → 血管:无=20.4:1,β=0.9→2.4:1 / 0.999→196.4:1 / 0.9999→646.9:1 全表锁定);④ CB-Focal γ 聚焦 + Logit-Adjustment 先验补偿存在且不翻转方向;⑤ `boundary_band_from_mask` 带宽 = `kernel_size−1`(k=3→2px / 5→4px / 7→6px 实测,实现取 k=5 → 4px);⑥ 头/损失同名不同职责(`heads/extension.py` vs `losses/components/extension.py`)不致误导;⑦ 参数量 0.063M | 39 | Phase 2 |
 | `test_clinical_t_head.py` | **T 临床显著性头契约**(2026-08-12 Phase2 阶段2.3 新增)——守「统计门控 + 尺度 log 通道 + 梯度隔离」那几条:① `t_conf` 是 **P(T=1) 不是 max prob**(填成 max prob 强阴性样本置信度≈1.0 即失败,反构造强 T=0/T=1 常数 logits 双向验证);② `T_conf` 一维 `[B]`(`[B,1]` 隐式广播 QA_VP §2.2);③ 🔴 ETE 旁路 `detach`+softmax——ETE logits 平移不变、**不反灌 ETE/侵犯头梯度**(ETA 是官方独立计分维度,含反证:改 ETE 分布必须改输出);④ `nodule_scale` 同样 detach 不回流分割主干;⑤ scale=0(空 mask 阴性)→log0=-inf 经 `clamp(min=1e-4)` 兜住不 NaN;⑥ 🔴 scale 的 **log 通道白盒 hook 验证**(等倍数 scale 对在 log 通道上间距恒 ln2≈0.6931,线性通道 40 倍差作反证——黑盒"输出不同"零区分力已实证,把 log 通道换第二份线性 s 照样全绿);⑦ 禁 BN1d(train+batch=1 实测 ValueError,结构检查+实跑双断言);⑧ 类权重:临床 T 千级计数下**抄侵犯头的 β=0.99 = 权重比恒 1.0 静默失效**(钉死实测防"统一一下超参",β=0.9999→1.28 仍弱于逆频率 1.3162,反证同函数在 ETE 长尾 3906/267/67/5 确实 20.4:1);⑨ 损失:validity 一维拒广播、标签越界正负双向拒、全无效零损失零梯度、分母只数有效样本、类权重按**标签**索引非 argmax、无权重时退化为裸 CE、label_smoothing 越界拒 + **LS 把 P(T=1) 上界钳死在 1−ls/2**(ls=0.05→0.975/0.1→0.95,训到收敛实测钉住)、±1000 logits 下损失梯度有限、bf16 autocast 有限值;⑩ 🔴 端到端参数级梯度隔离(真 `MultiTaskThyroidModel`+真 `ExtensionHead`):seg_backbone/cbm_head/**ExtensionHead 参数** 均零梯度,cls_backbone **必须**有梯度作反证 | 26 | Phase 2 |
 | `test_case_discovery.py` | **病例发现**(2026-08-10 A2 新增)——`discover_cases` 递归遍历 + 静/动分派(.dcm→static,.nii.gz/.nii→dynamic)、静态读 DICOM 头取 PatientID/SeriesUID、动态按组委会口径取直接父目录名(PatientId=AccessionNumber)、路径推断兜底、空/不存在目录返回 []、**跨文件系统确定性顺序契约**(monkeypatch 反转 `os.scandir` 返回序,断言发现顺序仍为字典序 DFS——2026-08-12 CI run 31512732898 因 `os.walk` 未排子目录、Linux 走 hash 序而 flaky,`dirs.sort()` 修复后由本用例钉死);依赖 pydicom/nibabel 缺则 skip | 40 | Phase 5 |
+| `test_mixup_label_dominance.py` | **四头监督闸门 lam 阈值分派 + 软 lam 反向保护**(2026-08-15 新增)——详见下方专节 | 12 | Phase 2 |
+| `test_dynamic_frame_cache.py` | **预抽取 PNG 缓存契约**(2026-08-15 新增)——详见下方专节 | 9 | Phase 1 |
 
 ---
 
-## `test_official_loader.py` — 官方数据加载器契约(14 用例,2026-08-10 + 2026-08-12 阶段2.4 扩 + 2026-08-13 Phase E hflip RNG 防回归 + Gate2 mask 命名 glob 防回归)
+## `test_official_loader.py` — 官方数据加载器契约(14 用例,2026-08-10 + 2026-08-12 阶段2.4 扩 + 2026-08-13 Phase E hflip RNG 防回归 + Gate2 mask 命名 glob 防回归;缓存依赖**另见** `test_dynamic_frame_cache.py`)
 
 合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
 
@@ -53,10 +55,12 @@
 后者钉的是"已知缺陷 100 倍跳变确实存在",本文件钉的是"新调度**不许**出现这种跳变"。
 锁定内容:**相邻 epoch lr 比值 ≤5**(逐点扫 1..35,`MAX_LR_JUMP_RATIO`)+ A/B/C 边界与端点值
 (A 段 e1=lr_base×0.1 线性升至 e10=lr_base、B 段 e11 回到 lr_base 余弦退至 e30=×0.1、C 段固定 ×0.05)
-+ A 段严格上升 / B 段严格下降 + **各 stage 冻结集合**(A/C 只训三头+vclub;B 额外解冻且**仅**解冻
-`cls_backbone.blocks[5]/[6]`,seg 主干恒冻)+ **optimizer 全覆盖**(vclub 除外,双向:漏进=永不更新、
++ A 段严格上升 / B 段严格下降 + **各 stage 冻结集合**(A/C 训四头 + **分割前向链** + vclub;B 额外解冻且**仅**额外解冻
+`cls_backbone.blocks[5]/[6]`)+ **optimizer 全覆盖**(vclub 除外,双向:漏进=永不更新、
 误进=双重更新)+ AUCM 对偶随 `freeze_legacy` 的绑定/冻结双态 + **LLRD 方向**(blocks[6]=头 lr×0.1 >
-blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结主干 BN 置 eval、三头保持 train)
+blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主干 BN 置 eval、四头与分割保持 train)
++ 🔴 **分割解冻契约**(2026-08-16 新增,A/B/C 三 stage 各自:可训 ∧ 进 optimizer;解码器 lr=head_lr、
+主干 lr=head_lr×scale 且只落一档;无参数进两组)
 + JSONL 必填字段/ISO8601 带毫秒 Z/逐行可解析/非法 phase·mode 拒绝。纯 CPU、`pretrained=False`。
 
 | Test | 验证内容 |
@@ -73,9 +77,9 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结主干 BN 置
 | `test_hflip_skips_invalid_location` | 位置标签 invalid 时 hflip **不翻**(不编造监督) |
 | `test_val_dataset_has_no_hflip` | val 数据集恒无 hflip(翻转会改位置标签,val 必须原样) |
 
-## `test_train_step_head_targets.py` — 三头 targets 口径(12 用例,2026-08-12 阶段 2.4)
+## `test_train_step_head_targets.py` — 三头 targets 口径(12 用例,2026-08-12 阶段 2.4;闸门归属 2026-08-15 后见 `test_mixup_label_dominance.py`)
 
-`train_step.build_official_head_targets` 的三条"错了不报错、只让指标系统性偏低"红线:① **三头只训主病灶**(`is_main==0` → validity=0,评审规则点评口径);② **mixup 后标签归属**(DR-CutMix lam==0 继承 donor 标签,含 is_main/validity 一起 gather);③ **软 MixUp 整批屏蔽**(硬标签无软化路径)。另含:is_main 缺席(legacy)全当主病灶零回归、is_main×原 validity 相乘、cutmix mask_weight=0 屏蔽、legacy 无三头键返回空 dict、部分键只出 present 任务、缺 valid_* 默认全有效、validity 必须 [B] 一维 float([B,1] 隐式广播成 [B,B])。
+`train_step.build_official_head_targets` 的三条"错了不报错、只让指标系统性偏低"红线:① **三头只训主病灶**(`is_main==0` → validity=0,评审规则点评口径);② **mixup 后标签归属**(DR-CutMix lam==0 继承 donor 标签,含 is_main/validity 一起 gather);③ **混合归属按 lam 阈值分派**(2026-08-15 修复后:`lam<=0.35` 继承 donor、`lam>=0.65` 保留 recipient,中间段屏蔽——对 MixUp 软 lam 也恢复监督,历史以"软 MixUp 整批屏蔽"为旧行为,归属细节以 `test_mixup_label_dominance.py` 为准)。另含:is_main 缺席(legacy)全当主病灶零回归、is_main×原 validity 相乘、cutmix mask_weight=0 屏蔽、legacy 无三头键返回空 dict、部分键只出 present 任务、缺 valid_* 默认全有效、validity 必须 [B] 一维 float([B,1] 隐式广播成 [B,B])。
 
 🔴 **`import sklearn` 必须在 torch / src.training 之前**(文件顶部先 `import sklearn.metrics` + docstring 记录):Windows + Demo_D 下先 import torch 再走 src.training → OpenMP DLL 冲突段错误(EXIT=-1073741819,pytest 报 exit 5),最小复现两行 import;**Linux 云端不复现**。新测试若 import `src.training` 链需注意导入顺序。
 
@@ -87,9 +91,17 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结主干 BN 置
 
 目标三(60%权重)四子任务里此前唯一无训练信号的任务补齐后的单测。判据强度参照 extension/clinical_t 头:① 输出契约(形状/`tirads_probs`和为1/fp32);② **梯度隔离**(五个 CBM 概念 logits 全部 `.detach()`,`test_head_does_not_backprop_into_cbm_concepts` 去掉任一 detach 即失败;`test_head_concepts_actually_feed_output` 反证非空转);③ **罗马数字精确查表**(`test_roman_numeral_exact_match_not_substring`,IV/III 不被子串判成 I/II,loader 侧 `official_loader._parse_tirads`);④ **masked loss**(全 invalid 精确 0 且无 NaN、λ 线性缩放、类权重按标签而非预测索引、validity 必须 [B] 一维、标签越界拒绝);⑤ **可选二次有序项**(默认 `ordinal_weight=0` 对 total 精确无贡献,权重>0 时才建图——2026-08-13 Gate2 审查后从"无条件计算"改为门控,`test_ordinal_term_zero_weight_has_no_effect`/`test_ordinal_term_penalizes_far_predictions_more` 双向锁定语义);⑥ `inverse_frequency_weights` re-export 校验(与 `clinical_t.py` 同一函数对象,非复制)。
 
+## `test_mixup_label_dominance.py` — 四头监督闸门 + 软 lam 保护(12 项,2026-08-15;并对应 `src/training/AGENTS.md` 闸门红线、`test_train_step_head_targets.py` 的 mixup 归属第②条。总应付口径另见 `test_official_schedule.py` 头部注释)
+
+钉死 `build_official_head_targets` 的归属闸门改为 **lam 阈值分派**。① **主导方明确必须保留监督且标签继承对称正确**(`mixed = lam*recipient+(1-lam)*donor` → lam 小=donor 主导;6 参数化:0.00/0.05/0.35→donor 标签,0.65/0.95/1.00→recipient 标签,边界值 0.35/0.65 掐在阈值上)——方向判反比零监督更糟(错标签是学反);② **归属不明(0.35<lam<0.65)仍屏蔽**(四头是硬标签 masked CE,真·五五开的混合图配单一硬标签就是喂错标签,这条**不是** bug);③ **CutMix 行为完全不变**(其 lams 已是 0.0/1.0,新阈值对其完全等价的边界条件);④ 🔴 **反向保护:断言 `mixup.py` 必须仍产出软 lam 且 `mask_weight` 恒 1.0**——若有人"顺手"在增强侧硬化成 0/1,CBM 概念损失(`concepts.py` 的 `lam*loss_a+(1-lam)*loss_b`)与 SLR 的软插值数学会被静默改掉;修复范围刻意只在 train_step 的闸门;⑤ **量化修复收益**:Beta(0.2,0.2) 4000 抽样的 `(lam<=0.35)|(lam>=0.65)` 保留率 > 0.75(修复前 MixUp 分支保留率恒 0%)。全部 CPU、无权重。本次改动新增测试数 +12(加上 `test_dynamic_frame_cache.py` +9 共 +21),精确值以 `pytest --collect-only` 为准。
+
+## `test_dynamic_frame_cache.py` — 预抽取 PNG 缓存契约(9 项,2026-08-15;`test_complete_pkl_is_accepted_by_the_real_gate` 是 2 参数化用例)
+
+`OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
+
 ## 测试总数(单一权威,2026-08-13 `Demo_D` 主环境实测,backlog #124 Gate2 审查+F1回归测试后重新对拍)
 
-**`pytest --collect-only`=814 / 全套 813 passed + 1 skipped**(2026-08-12 快照 795 collected / 794 passed+1 skipped 已过时,+19 = 本轮 `test_tirads_head.py` 新增15 + `test_official_loader.py`/`test_metrics_official.py` 补充断言各 +1/+2 + Gate2 审查后补的 `test_tirads_parse_known_gaps_pinned_by_regression` +1)。
+**`pytest --collect-only`=856 / 全套 855 passed + 1 skipped**(2026-08-16 快照;此前 841/840 已过时,**+15 = 分割解冻契约改动**:`test_official_schedule.py` +8(四个旧断言翻转 + 新增 `test_seg_trainable_and_in_optimizer_in_all_stages`/`test_seg_lr_tiers` 各 3 参数化、`test_seg_backbone_group_is_single_tier`、`test_no_param_in_two_groups`)、`test_metrics_official.py` +7(seg_dice 并入 composite:默认/生效/退化/非有限/越界值域/numpy标量/空 records);再往前 +9 = `test_dynamic_frame_cache.py`(动态帧预抽取缓存 8 条 def / 9 项,完整-pkl 放行那条是 2 参数化:partial=False 与键缺失);再往前 +6 = `test_official_schedule.py` 新增 `test_jsonl_logger_extra_fields_merged_and_reserved_protected`(含规范字段防覆盖的 5 个撞名子断言)与 `test_jsonl_logger_drops_nonfinite_extra`(NaN/Inf 丢弃 + 严格 JSON 解析))。
 
 - **四头(位置/侵犯/临床T/TI-RADS)相关单测合计 142**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12 + backlog #124 `test_tirads_head.py` 15),Demo_D 实测通过;A800(torch2.6)/torch2.8 预演环境覆盖 TI-RADS 头待下次云端对拍确认(本轮仅 Windows+CPU 与真 CUDA `probe_heads_cuda.py` 双路验证)。
 - ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 **789 passed + 6 skipped**(2026-08-13 实测,**collected 795 与主环境一致**);旧记的 620 是 08-12 快照、已失效,且 08-13 补装 pandas+openpyxl 之前该环境只能收集 782 —— `tests/test_official_loader.py` 整模块被 `pytest.importorskip("pandas")` 跳过,预演对 `official_loader` 覆盖率为 0。skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。

@@ -40,9 +40,19 @@
 
 云端训练的**原始日志**，按 `<日期>_train_<来源>.md` 命名。
 
+| 文件 | 内容 |
+|---|---|
+| `20260815_train_jsonl.md` / `_stdout.md` | **第 4 轮**（35 ep）。分割全程冻结，`val_dice` 恒 0.0007、`seg_over_half` 恒 0 → Sclin≈0 的那一轮 |
+| `20260817_train_r5_seg_unfrozen.md` | **第 5 轮**（35 ep，backlog #127 后）。分割 A/B/C 全程自训，闸门打开：`val_dice` 0.6528、`seg_over_half` 0.0330、best `composite=0.6368@ep21`。stdout + `nvidia-smi` + JSONL step 行混排 |
+
 🔴 **不要删**：赛规禁止导出云端产物，这是那几轮训练的唯一副本。
 派生文档（总纲 §6、订正史）里只留了峰值与结论，逐 epoch 的
 `loss_seg`/`n_valid_*`/各步损失只在这里，下一轮做同比时要用。
 
 ⚠️ `20260815_train_jsonl.md` 头尾有截断污染（开头一行提示文字、尾部 JSON 缺闭合括号），
 解析时用 `json.JSONDecoder().raw_decode` 逐段解，别整体 `json.loads`。
+
+⚠️ `20260817_train_r5_seg_unfrozen.md` 是**分段粘贴**的，注意两点：
+① 靠后的 epoch 行**缺 `seg_pmax` 字段**（复制时被截断），解析正则须容忍字段缺失；
+② `ep33` 出现两行（一行字段不全），是粘贴重复不是训练异常 —— 前后 epoch 连续、
+全程 0 warn / 0 abort / 0 NaN。

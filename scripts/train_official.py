@@ -36,6 +36,7 @@ warm-start,官方数据只在云端 —— 本地只能 `--mock-labels --smoke` 
   python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-size 4
 """
 import argparse
+import math
 import os
 import sys
 
@@ -321,8 +322,228 @@ def run_official_epoch(
         n += 1
         if logger is not None and batch_idx % log_every == 0:
             logger.log(epoch=epoch, step=batch_idx, phase="train",
-                       loss=float(loss.item()), lr=head_lr)
+                       loss=float(loss.item()), lr=head_lr,
+                       extra=_step_diagnostics(loss_dict, labels))
     return running / max(n, 1)
+
+
+# JSONL 诊断字段用到的 valid_* 键 → 输出键名(`n_valid_` 前缀)。
+# 顺序即日志字段顺序,便于人眼扫。
+# ⚠️ 这些是 **loader 原始值**,不是最终进损失的有效监督数 —— 见 `_step_diagnostics`
+#    docstring 里的"两级闸门"说明。`is_main` 单独记,就是为了让二者的差可见。
+_VALID_KEYS = (
+    "valid_malignancy", "valid_lesion_loc", "valid_extrathy_ext",
+    "valid_clin_t_stage", "valid_tirads", "valid_mask", "is_main",
+)
+
+
+def _step_diagnostics(loss_dict, labels) -> dict:
+    """把子损失分解 + 各头有效标签数打成 JSONL 的 `extra` 字段。
+
+    🔴 **为什么必须有(2026-08-14,勿删)**:首次真数据训练的日志只有总 loss,
+    出现 ~5 / ~0.8 双峰却无从定位是哪个头 —— `train_batch` 返回的 `loss_dict`
+    此前被直接丢弃。总 loss 是所有子损失经 SLR/FAMO 动态加权后的标量,**从它
+    反推组成是不可能的**,只能靠猜;而本项目已两次栽在"推断被当成事实"上。
+
+    `n_valid_*` 单独记的理由(不能用 loss 是否为 0 替代):masked CE 在该头
+    valid 全 0 时返回**精确 0**,与"损失已收敛到 0"在日志里长得一模一样。
+    四头是随机初始化的新头,"某头是否真的在受监督"是本轮训练的头号判据
+    (列名命中 ≠ 取值解析成功 ≠ 有监督样本),必须直接观测计数而非旁推。
+
+    🔴 **`n_valid_*` 是 loader 原始值,不等于最终进损失的监督数(2026-08-14 实证)**:
+    有效监督要过**两级闸门**,都在 `build_official_head_targets`(`train_step.py`)里:
+      ① `× is_main` —— 官方口径下四头只评主病灶,次病灶(`病灶N`)标签不进损失;
+      ② `× hard.float() × mask_weight` —— mixup/cutmix 触发时,归属不明确的样本屏蔽。
+    故 `n_valid_lesion_loc=12` 与 `loss_location=0.0` **可以同时出现且都没错**。
+    真实事故:曾据此误判"90% 样本白训、标签解析失败",实际标签解析完全正常,
+    是闸门②(MixUp 分支的 `lam ~ Beta(0.2,0.2)` 落在 (0,1),而闸门用了精确相等
+    `lam==0.0`/`==1.0`)把四头监督整批清零 —— 已于 2026-08-15 修复,改用与
+    DR-CutMix 同一套阈值(`lam<=0.35`/`>=0.65`)。
+    🔴 **修复在 `src/training/loop/train_step.py` 的闸门,不在 `mixup.py`**:
+    `lam` 还被 CBM 概念损失与 SLR 当软加权系数消费,在 mixup 侧硬化会改掉旧任务的
+    数学(此处曾误写成 mixup.py,是第一版被撤回方案的残留,勿据此去 mixup.py 找)。
+    **`is_main` 一并记就是为了让这个差可见。**
+
+    容错:任何一项取不到都跳过而非抛异常 —— 诊断字段炸掉整轮训练是本末倒置。
+    """
+    out: dict = {}
+    if loss_dict:
+        for k, v in loss_dict.items():
+            try:
+                out[f"loss_{k}"] = round(float(v.item() if hasattr(v, "item") else v), 6)
+            except (TypeError, ValueError, RuntimeError):
+                continue  # 非标量项(如权重向量)跳过,不阻断训练
+    if isinstance(labels, dict):
+        for k in _VALID_KEYS:
+            v = labels.get(k)
+            if v is None:
+                continue
+            try:
+                out[f"n_{k}"] = int(v.sum().item() if hasattr(v, "sum") else v)
+            except (TypeError, ValueError, RuntimeError):
+                continue
+    return out
+
+
+# ── 分割护栏阈值(2026-08-16 分割改自训后新增)────────────────────────────────
+# 语义:下限门(分割没学起来),与既有的"相对基线跌 N 点"上限门互补。
+# 🔴 **与 stage 边界耦合**:下面的 epoch 选点依据是 `schedule_official.STAGE_A_END=10`
+# (ep11 起进 Stage B)与 `stages.compute_gamma_prior` 的 γ=0 窗口(ep1-20)。若日后
+# 重排 A/B/C 边界或 γ 退火起点,**必须同步改这里** —— 否则护栏会静默退化成
+# "warmup 期就判死刑"或"跑完才判",两种失效都不报错。
+SEG_WARN_EPOCH, SEG_WARN_DICE = 5, 0.10
+
+# 🔴 **硬 abort 用「预测 mask 的前景占比」判,不用 dice、也不用概率分布形状**
+#    (2026-08-16 第三/四轮审查后定稿,中间否掉过两版,过程见下)
+#
+# 【否掉的第一版】dice 门(ep12/0.05):hard `val_dice` 先 `(pred_prob>0.5)` 二值化,
+# 而真实病灶掩膜只占 512² 的 0.1%~3%(静态 M 掩膜实测 20-90px)。分割**确实在学**
+# 但前景 logit 尚未越过 0 的阶段可持续很多 epoch,dice 全程恒 0 → 早期用 dice 设硬门
+# 必然误杀。本地实测佐证:可训态 40 step 时输出已明显有结构,同期 dice 仍在地板上。
+#
+# 【否掉的第二版】概率分布 spread(`seg_prob_max − seg_prob_mean`):看似能抓住上一轮
+# "处处 0.445"的指纹,但**主会话自查实测证伪,3/8 场景判错**
+# (`tmp_main_spread_reverse_hole.py`):
+#   ① 有空间结构但整体偏低(max=0.45/mean=0.05,spread=0.396 很大)→ 护栏放行,
+#      而 `p>0.5` 仍全零、mask 全零、Sclin 照样 0 —— **假的安全感,最危险**;
+#   ② 常量图 + 4 个异常像素(spread=0.545)→ 放行,而整体毫无结构。
+# 根因:max 与 mean 都是单点/全局标量,不稳健,几个像素就能骗过。
+#
+# 【定稿】`seg_over_half_frac` = `(pred_prob > 0.5)` 的像素占比。它**直接就是**预测
+# mask 的前景占比,也正是官方 IoU 匹配实际消费的那个量 —— 判据与评分口径同构,
+# 不再是间接的分布形状代理。实测 8/8 场景全判对(`tmp_main_overhalf_judge.py`)。
+#
+# 阈值:下界 1e-4(≈26 像素)—— 最小真实病灶 0.1% ≈ 262 像素,留 10 倍误杀余量;
+#       上界 0.5 —— 前景占比过半必然是崩的(mask 全 1 与全 0 同样拿不到分)。
+# epoch 选点 8:Stage A(1-10)已跑过大半;真实数据 6626 样本 / batch16 ≈ 414 step/epoch,
+#       ep8 累计约 3300 步,远超本地实测"5 步即出现空间结构"的量级。
+SEG_FROZEN_EPOCH = 8
+SEG_FG_FRAC_LO = 1e-4         # 低于此 = 几乎什么都没预测(含恒全零)
+SEG_FG_FRAC_HI = 0.5          # 高于此 = 全图判成前景,同样是崩的
+
+# dice 硬门保留为**最后兜底**,阈值大幅放宽:ep20 是 γ=0 干净监督窗口的末尾
+# (`compute_gamma_prior` ep>20 才起步),此时仍连 0.02 都到不了,剩下 15 个 epoch
+# 也救不回来。0.02 极低,不构成对"慢但在学"的误杀。
+SEG_ABORT_EPOCH, SEG_ABORT_DICE = 20, 0.02
+# composite 早停警告阈值。口径含 seg_dice 后由 0.35 下调,见 main() 注释。
+COMPOSITE_WARN = 0.30
+
+
+def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss) -> dict:
+    """epoch 级 val 指标 → JSONL `extra` 字段。
+
+    🔴 **为什么必须写 JSONL(2026-08-15 实证,勿删)**:这些指标此前**只走 stdout**
+    (`print`),而 `python` 不加 `-u` 时 stdout 是 8KB 块缓冲 —— 上一轮 35 epoch
+    真训要攒到 ep25 才第一次刷新,整个训练前 2/3 完全看不到指标,等于盲跑。
+    `JsonlLogger` 逐行 flush,不受管道缓冲影响,是唯一可靠的实时观测面。
+
+    `malignancy_auc_pr` 尤其不能漏:它是目标三的核心项(良恶性 AUC-PR),上一轮
+    **完全没打印**,0.888 这个数是靠 `composite×5 − 其余四项`**反推**出来的。
+
+    None 值直接跳过(不填 0)—— 填 0 会把"这项算不出来"伪装成"分数是 0"。
+    `JsonlLogger._drop_nonfinite` 另会兜掉 NaN/Inf。
+    """
+    out: dict = {
+        "train_loss": round(float(train_loss), 6),
+        "val_dice": round(float(val_dice), 6),
+        "val_acc": round(float(val_acc), 6),
+    }
+    if val_auc is not None:
+        out["val_auc_legacy"] = round(float(val_auc), 6)
+    for k in (
+        "malignancy_auc_pr", "location_weighted_auc", "ete_weighted_kappa",
+        "clinical_t_auc", "tirads_weighted_kappa", "composite", "n_lesions",
+        # 分割概率分布(诊断,非官方指标)。🔴 **它是分割升温的先行指标**:
+        # hard `val_dice` 要等前景 logit 越过 0 才会离开 0,而这三个数会先动 ——
+        # 2026-08-15 正是靠 `pred_prob` 全域 <0.5 才定位到"分割全程冻结"。
+        # 此前它只在 `batch_idx==0` 打一行 stdout,JSONL 里完全没有。
+        "seg_prob_mean", "seg_prob_max", "seg_over_half_frac",
+    ):
+        v = metrics.get(k)
+        if v is None:
+            continue
+        out[k] = int(v) if k == "n_lesions" else round(float(v), 6)
+    return out
+
+
+def evaluate_seg_guards(epoch: int, val_dice, metrics: dict, epochs: int):
+    """分割护栏的**纯判定**:返回 `(abort_reason, abort_message, warn_lines)`。
+
+    🔴 **为什么抽成纯函数(2026-08-16 Gate2 lane3 指出)**:护栏是"防白烧 24 小时"的
+    唯一开关,而它原本内联在 `main()` 的 epoch 循环里 —— 需要真跑训练才能触到,
+    等于**零测试覆盖**。抽出来后每个分支都能用构造值直接钉死(见
+    `tests/test_seg_guards.py`),包括最关键的"上一轮真实失败样本必须被抓住"。
+
+    返回约定(三元组,刻意不复用同一个位置放两种类型 —— 那样调用方必须靠 reason
+    是否为 None 来推断第二个值的类型,静态检查也过不了):
+      - `reason` 非 None → 调用方须 `_abort(reason, message)`
+      - `warn_lines` → 调用方逐条打印,继续训练
+
+    判定顺序**有意如此**(先致命后诊断),各门的阈值论证见模块顶部 SEG_* 常量注释。
+    """
+    warns: list = []
+
+    # ① NaN:必须最先拦。`float('nan') < 阈值` 恒 False,不在此拦下则后面所有
+    #    数值门全部静默失效、一路跑满 —— 正是本轮要消灭的"跑完才发现白跑"。
+    if not math.isfinite(val_dice):
+        return "nonfinite_dice", (
+            f"[分割 abort] epoch {epoch} val_dice={val_dice} 非有限值 —— "
+            f"前向或损失数值失控。注意 `NaN < 阈值` 恒为 False,若不在此拦下,"
+            f"后面所有护栏会静默失效、白跑满 {epochs} 个 epoch。"), warns
+
+    if epoch >= SEG_WARN_EPOCH and val_dice < SEG_WARN_DICE:
+        warns.append(
+            f"  [分割 warn] epoch {epoch} val_dice={val_dice:.4f} < {SEG_WARN_DICE} "
+            f"—— 分割可能没学起来,盯住下一轮是否上升")
+
+    # ② 主门:预测 mask 的前景占比。判据与官方 IoU 匹配消费的量同构 ——
+    #    "预测里到底有没有前景",而不是概率分布的形状(那个代理量已被实测证伪,
+    #    见模块顶部 SEG_FG_FRAC_* 注释的【否掉的第二版】)。
+    #    诊断量缺失(mock/异常)则跳过 —— 不拿 None 当 0 判死刑。
+    fg_frac = metrics.get("seg_over_half_frac")
+    if epoch >= SEG_FROZEN_EPOCH and fg_frac is not None:
+        frac = float(fg_frac)
+        if frac < SEG_FG_FRAC_LO:
+            return "seg_no_foreground", (
+                f"[分割 abort] epoch {epoch} 预测 mask 前景占比 {frac:.6g} < "
+                f"{SEG_FG_FRAC_LO} —— 模型几乎一个结节都不输出"
+                f"(2026-08-15 那轮就是全域 pred_prob<0.5、前景占比恒 0,跑满 35 epoch)。"
+                f"预测 mask 恒空 → 官方 IoU≥0.5 匹配零命中 → 五项分类/分期全部零样本 "
+                f"→ Sclin≈0,继续跑满也是白烧。检查 "
+                f"schedule_official.SEG_TRAIN_PREFIXES 是否真的进了 optimizer。"), warns
+        if frac > SEG_FG_FRAC_HI:
+            return "seg_all_foreground", (
+                f"[分割 abort] epoch {epoch} 预测 mask 前景占比 {frac:.4f} > "
+                f"{SEG_FG_FRAC_HI} —— 模型把过半图像判成结节。真实病灶只占 0.1%~3%,"
+                f"这种输出与全零同样拿不到 IoU 匹配,且通常意味着分割损失已经发散。"), warns
+
+    # ③ dice 兜底门(ep20 = γ=0 干净监督窗口末尾,阈值 0.02 极低不误杀)
+    if epoch >= SEG_ABORT_EPOCH and val_dice < SEG_ABORT_DICE:
+        return "seg_not_learning", (
+            f"[分割 abort] epoch {epoch} val_dice={val_dice:.4f} < {SEG_ABORT_DICE} "
+            f"—— 跑完 γ=0 的干净监督窗口(ep1-20)仍未出分割,剩余 epoch 救不回来。"
+            f"注意此门是兜底:概率分布若同时正常(spread 够大),说明是在学但极慢,"
+            f"回报 seg_prob_* 三项再判。"), warns
+
+    return None, "", warns
+
+
+def _abort(logger, epoch: int, reason: str, message: str):
+    """abort 前先把原因写进 JSONL,再抛异常。
+
+    🔴 **为什么不能只 raise**:异常只走 stderr,而云端 agent 回报时常常只发 JSONL。
+    abort 的**原因**是最关键的一条信息(是"分割没学起来"还是"数值失控"?两者处理完全不同),
+    丢了它等于让排查从零开始。`JsonlLogger` 逐行 flush,写完立刻可读。
+
+    落盘失败不能掩盖真正的 abort 原因,故 log 本身的异常吞掉(诊断字段炸掉整轮是本末倒置)。
+    """
+    if logger is not None:
+        try:
+            logger.log(epoch=epoch, step=0, phase="val",
+                       extra={"abort_reason": reason, "abort_message": message})
+        except Exception:
+            pass
+    raise RuntimeError(message)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,6 +554,10 @@ def main():
     parser.add_argument("--config", default="configs/thyroid_config.yaml")
     parser.add_argument("--data-root", default=None, help="官方 annotation 根目录")
     parser.add_argument("--xlsx", default=None, help="官方标注 xlsx 路径")
+    parser.add_argument(
+        "--samples-pkl", default=None,
+        help="预抽取产物 <cache-dir>/samples.pkl(scripts/data/preextract_dynamic.py 生成)。"
+             "给了就跳过 10-25 分钟的样本重建,动态样本改读 PNG 缓存而非全量解压 .nii.gz")
     parser.add_argument("--epochs", type=int, default=STAGE_C_END, help=f"默认 {STAGE_C_END}(A/B/C 全程)")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None, help="头 lr 基准;缺省取 config.train.lr")
@@ -406,6 +631,7 @@ def main():
         train_ds, val_ds = build_official_datasets(
             args.data_root, args.xlsx, img_size=img_size, seed=seed,
             train_transform=get_train_transforms(), hflip_prob=args.hflip_prob,
+            samples_pkl=args.samples_pkl,
         )
     num_workers = 0 if (args.smoke or device.type == "cpu") else config["environment"]["num_workers"]
     train_loader = DataLoader(
@@ -489,28 +715,64 @@ def main():
                 model, val_loader, criterion, device, epoch=epoch, official_metrics_out=metrics
             )
             composite = metrics.get("composite")
-            logger.log(epoch=epoch, step=0, phase="val", loss=float(val_loss), lr=head_lr)
+            # 🔴 epoch 级指标必须进 JSONL,不能只 print(2026-08-15 血泪):`print` 走
+            # stdout,不加 `python -u` 时是 8KB 块缓冲 —— 上一轮真训攒到 ep25 才第一次
+            # 刷新,全程等于瞎跑。JsonlLogger 逐行 flush、不受管道缓冲影响。
+            # V2.1 契约核对(`赛事开发规范-赛道七V2.1提取.md:10-65`):必填仅
+            # timestamp/epoch/step/phase/mode/data_source,额外字段不禁止。
+            logger.log(
+                epoch=epoch, step=0, phase="val", loss=float(val_loss), lr=head_lr,
+                extra=_epoch_metrics_extra(metrics, val_dice, val_acc, val_auc, avg_loss),
+            )
             print(
                 f"Epoch {epoch:02d}/{epochs} [{stage_name}] train_loss={avg_loss:.4f} "
-                f"val_dice={val_dice:.4f} composite={composite} "
+                f"val_dice={val_dice:.4f} "
+                f"seg_p={metrics.get('seg_prob_mean')} "
+                f"seg_pmax={metrics.get('seg_prob_max')} "
+                f"seg_over_half={metrics.get('seg_over_half_frac')} "
+                f"composite={composite} "
+                f"mal_auc_pr={metrics.get('malignancy_auc_pr')} "
                 f"loc_auc={metrics.get('location_weighted_auc')} "
                 f"ete_kappa={metrics.get('ete_weighted_kappa')} t_auc={metrics.get('clinical_t_auc')} "
                 f"tirads_kappa={metrics.get('tirads_weighted_kappa')}"
             )
 
-            # Dice 护栏(仅真数据有基线):相对 warm-start 基线跌 >3 点 abort、>1 点 warn。
+            # ── 分割护栏 ────────────────────────────────────────────────────
+            # 🔴 下限护栏(2026-08-16 新增):分割自训后 val_dice 从 ≈0 起步,原来的
+            # "相对 warm-start 基线跌 >3 点"护栏在 0.0007 基线上**永远触发不了**,
+            # 等于没有护栏。而分割是官方评分闸门(全零 mask → 零匹配 → Sclin≈0),
+            # 训不起来必须尽早停,别烧满 35 epoch(云端一轮约 24 小时)。
+            # 判定逻辑全部在 `evaluate_seg_guards()`(纯函数,便于测试),阈值论证见
+            # 模块顶部 SEG_* 常量注释。
+            reason, abort_msg, warn_lines = evaluate_seg_guards(
+                epoch, val_dice, metrics, epochs)
+            # 🔴 **warn 必须在 abort 之前打印**(2026-08-16 第四轮审查抓到的回归):
+            # 抽成纯函数前 warn 是立即 `print` 的,abort 时 stdout 上先有 warn 再崩;
+            # 抽出后 warn 收进 list、abort 分支提前 return —— **abort 那一轮的 warn
+            # 就丢了**,而那恰恰是最该看到的诊断信息(比如"dice 偏低"与"前景占比为 0"
+            # 同时出现,能直接区分是没学起来还是学歪了)。
+            for line in warn_lines:
+                print(line)
+            if reason is not None:
+                _abort(logger, epoch, reason, abort_msg)
+
+            # 相对基线护栏(仅真数据 + 有 warm-start 基线时有意义):跌 >3 点 abort、
+            # >1 点 warn。分割自训场景下基线≈0、本护栏基本不触发,但 warm-start 回归
+            # 可用时它仍是防"重演 Stage2 崩塌"的那道门,保留不动。
             if dice_baseline is not None:
                 drop = dice_baseline - val_dice
                 if drop > 0.03:
-                    raise RuntimeError(
-                        f"[护栏 abort] val Dice {val_dice:.4f} 相对基线 {dice_baseline:.4f} "
-                        f"跌 {drop*100:.1f}>3 点 —— 疑似重演 Stage2 崩塌,停机排查。"
-                    )
+                    _abort(logger, epoch, "dice_collapse",
+                           f"[护栏 abort] val Dice {val_dice:.4f} 相对基线 {dice_baseline:.4f} "
+                           f"跌 {drop*100:.1f}>3 点 —— 疑似重演 Stage2 崩塌,停机排查。")
                 if drop > 0.01:
                     print(f"  [护栏 warn] val Dice 跌 {drop*100:.2f} 点(>1,<3)")
 
-            # 早停熔断(rules§3):epoch 3 后 composite 仍随机(≤0.5)且非 None → 警告
-            if epoch >= 3 and composite is not None and composite < 0.35:
+            # 早停熔断(rules§3):epoch 3 后 composite 仍偏低 → 警告。
+            # ⚠️ 阈值 2026-08-16 由 0.35 下调:composite 口径从"5 项分类均值"变成
+            # "含 seg_dice 的 6 项均值",早期 epoch 分割≈0 会把它系统性拉低约 1/6
+            # (上一轮 ep1 的 0.363 换算到新口径约 0.303),不调会立刻误报。
+            if epoch >= 3 and composite is not None and composite < COMPOSITE_WARN:
                 print(f"  [早停 warn] epoch {epoch} composite={composite:.3f} 偏低,关注是否发散")
 
             # 选模:composite 更优则存(mock 下 composite 可能全 None,存最后一轮兜底)
@@ -518,6 +780,10 @@ def main():
                 best_composite = composite
                 torch.save(model.state_dict(), args.out)
                 print(f"--> 保存 best(composite={composite:.4f})→ {args.out}")
+                # checkpoint 字段填实际路径(此前恒 null);V2.1 样例即
+                # `"checkpoints/best_model.pth"` 这种相对路径。
+                logger.log(epoch=epoch, step=0, phase="val", checkpoint=args.out,
+                           extra={"composite_best": round(float(composite), 6)})
         # 循环结束:composite 可能全程 None(val 子集单类/无恶性主病灶时各指标均不可算),
         # 此时无条件存最终权重保证有产物。**不能加 `not os.path.exists(args.out)`**——
         # 第二次运行时该文件已存在,兜底会被跳过、训练白跑零产出(Gate2 lane4 查出)。

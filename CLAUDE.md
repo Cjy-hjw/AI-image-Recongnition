@@ -28,7 +28,9 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 814 collected / 813 passed+1 skipped，2026-08-13 backlog #124 TI-RADS头补齐 + Gate2审查后补回归测试对拍；
+# 完整测试套件（本地可跑，实测 856 collected / 855 passed+1 skipped，2026-08-16 分割解冻契约改动
+# 回归测试（+15，改动前 841/840）：test_official_schedule.py +8、test_metrics_official.py +7。
+# 精确计数以 pytest --collect-only 实跑为准；
 # ⚠️ 测试总数跨 Python 环境不可比，
 # torch2.8 预演环境待下次云端对拍重新确认（08-13 早些时候 TI-RADS 加入前为 789/6，collected 795 与主环境一致），判回归须同环境前后对拍）
 pytest tests/ -v
@@ -82,10 +84,16 @@ python scripts/train_thyus2path_lora.py --data-root data/27021604_extract --lp-e
 python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-size 4
 
 # 云端真数据正式训练（官方数据禁本地；A=1-10 冻主干温升三头 / B=11-30 LLRD / C=31-35 校准）
+# ⚠️ 先跑预抽取 PNG 缓存（下面一条命令，只跑一次，约 35-45 分钟），再用 --samples-pkl 启动训练——
+# 否则每个 epoch 对每个动态样本全量解压两个 258MB 体积，35 epoch 纯解压 ~24 小时就是白烧
+# （动态 mask 文件 0.2-0.3MB 是压缩后大小，解压后与影像同体素数，勿据文件大小判"小头"）。
 # JSONL 日志默认落 V2.1 强制路径 /2026aicompetition/workspace/logs（不传 --log-dir）
 # 默认保留 legacy 多任务损失守护旧任务不退化；纯头训练传 --freeze-legacy
+python scripts/data/preextract_dynamic.py --data-root /2026aicompetition/datasets/training/annotation \
+    --xlsx <标注.xlsx> --cache-dir /2026aicompetition/workspace/cache [--limit 3]  # 先 --limit 3 验管道，约 1 分钟，再全量约 35-45 分钟
 python scripts/train_official.py --data-root /2026aicompetition/datasets/training/annotation \
     --xlsx <标注.xlsx> --resume-from checkpoints/best_model_mixtrain_xl_e40.pth \
+    --samples-pkl /2026aicompetition/workspace/cache/samples.pkl \
     --out checkpoints/official_heads_best.pth
 ```
 

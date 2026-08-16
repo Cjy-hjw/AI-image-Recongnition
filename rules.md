@@ -40,6 +40,10 @@ Before deploying or starting full training, you **MUST** execute the double-gate
 ## 3. Early Failure & Short-circuiting (Early Stopping Validation)
 To prevent wasting GPU hours on diverging models, we enforce a training gatekeeper rule:
 * **Rule**: Epoch 3 后 `val_dice < 0.10` 或分类指标随机时，训练脚本自动中止并记录原因，释放 GPU 资源。
+* 🔴 **例外:分割自训场景按 `scripts/train_official.py` 的 `SEG_*` 常量执行(2026-08-16)**。上面的 ep3/0.10 是为**有 warm-start 底座**的场景写的;官方四头训练自 2026-08-16 起分割从"ImageNet 主干 + 随机解码器"自训,此时**不能用 dice 设早期硬门** —— `val_dice` 是 **hard Dice**(`validate_step.py` 先 `(pred_prob>0.5)` 二值化),而真实病灶掩膜只占 512² 的 **0.1%~3%**,分割**确实在学**但前景 logit 尚未越过 0 的阶段可持续很多 epoch,dice 全程恒 0 → ep3 判死刑必然**误杀**(代价 = 白费一次 1-2 小时的人工审核上传窗口 + 一轮 24h 机会)。
+  - **该路径实际用的判据 = 预测 mask 的前景占比**(`seg_over_half_frac`,即 `(pred_prob>0.5)` 的像素占比):**ep≥8 且占比 ∉ [1e-4, 0.5] → abort**。它直接就是官方 IoU 匹配消费的那个量,与评分口径同构。dice 门降级为兜底(**ep≥20 且 dice<0.02**,ep20 = γ=0 干净监督窗口末尾);dice<0.10 仅 warn 不停机。
+  - 🔴 **中间否掉过一版"概率分布 spread(`p_max−p_mean`)"判据,勿再改回**:实测 3/8 场景判错 —— 有空间结构但整体偏低(max=0.45,spread=0.396)会被放行,而 `p>0.5` 仍全零、mask 全零、Sclin 照样 0(**假的安全感**);常量图 + 4 个异常像素同样骗过它。根因是 max/mean 都是单点或全局标量。回归测试 `tests/test_seg_guards.py::test_v2_hole_*` 已把这两个反例钉死。
+  - 两套阈值并存,按"分割是否有 warm-start"选用。
 
 ## 4. GradScaler & AMP Rules → `src/training/AGENTS.md` §2
 *See `src/training/AGENTS.md` §2 "GradScaler Protocol" for mixed precision rules.*

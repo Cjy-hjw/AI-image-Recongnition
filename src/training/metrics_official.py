@@ -173,20 +173,58 @@ def _tirads_weighted_kappa(rows: List[Dict]) -> Optional[float]:
     return None if np.isnan(k) else float(k)
 
 
-def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
+def _sanitize_seg_dice(seg_dice) -> Optional[float]:
+    """把外部传入的 Dice 规整成"可用则 float、不可用则 None"。
+
+    🔴 **只接受 [0,1] 内的有限值**。Dice 的定义域就是 [0,1],越界即"算坏了",
+    一律整体丢弃(`seg_dice` 键写 None、也不进 composite)。
+
+    **丢弃而非 clamp**:clamp 会把"算坏了"伪装成一个看似合理的分数,与
+    `jsonl_logger._drop_nonfinite` 是同一个取舍(缺字段一眼看得出异常,
+    填个数字则永远发现不了)。
+
+    **为什么不能只判 `np.isfinite`**(Gate2 lane1 实测):`isfinite(-0.1)` 为 True,
+    负 dice 会被放行并拉低 composite;而 NaN 一旦混进 `np.mean`,composite 也是
+    NaN → 选模的 `composite > best_composite` 恒 False → 整轮训练一个 checkpoint
+    都存不下来。两种都必须在入口拦掉。
+
+    真实路径下二者均不可达 —— 除零不可达(`validate_step` 的 dice 分母恒带 +1e-6
+    平滑),NaN 仅在前向/损失已数值失控时理论可达。**这是防御性入口校验,不是在修
+    已发生的 bug;但也不要因为"不可达"就删掉它** —— 护栏的意义正是防不该发生的事,
+    且 NaN 混进 `np.mean` 的后果(整轮存不下 checkpoint)远大于这几行的成本。
+    """
+    if seg_dice is None:
+        return None
+    v = float(seg_dice)
+    return v if (np.isfinite(v) and 0.0 <= v <= 1.0) else None
+
+
+def compute_official_metrics(
+    records: List[Dict], seg_dice=None
+) -> Dict[str, Optional[float]]:
     """从 `collect_official_records` 的逐样本记录算全部官方口径指标。
 
     Args:
         records: `validate_step.collect_official_records` 的输出(可跨批 extend)。
+        seg_dice: 本轮 val 的平均分割 Dice(`validate_epoch` 的 `avg_dice`)。给了就
+            **并入 composite**;None(默认)则 composite 仍是纯分类均值,老调用点零回归。
+            **只接受 [0,1] 内的有限值**,越界/NaN/Inf 一律整体丢弃(`seg_dice` 键写
+            None、不进 composite)。
     Returns:
         dict:`malignancy_auc_pr` / `location_weighted_auc` / `ete_weighted_kappa`
-        / `clinical_t_auc` / `tirads_weighted_kappa` / `n_lesions`。任一指标不可算
-        (样本不足/单类)→ None,**不抛异常**(早期 epoch 的 val 子集常只剩一类,
-        抛异常会中断整个训练)。
+        / `clinical_t_auc` / `tirads_weighted_kappa` / `seg_dice` / `n_lesions`。任一
+        指标不可算(样本不足/单类)→ None,**不抛异常**(早期 epoch 的 val 子集常只剩
+        一类,抛异常会中断整个训练)。
 
     `composite` 是**我方自定义的选模标量**,不是官方分:取全部可算指标的算术均值。
     官方 60%/40% 的内部子权重未公布,故不做加权;这只是"哪个 checkpoint 更好"的
     单调代理,不得对外声称为预估得分。
+
+    🔴 **seg_dice 必须能进 composite(2026-08-16)**:分割是官方评分的**闸门**——
+    预测 mask 全零 → 匈牙利 IoU≥0.5 匹配零命中 → 五项分类/分期全部零样本 → Sclin≈0
+    (`docs/项目现状总纲.md` §6③)。此前 composite 只取 5 个分类指标均值、完全不含
+    dice,即便分割训起来了,选模也会挑"分类略好但分割崩了"的 checkpoint,重演
+    2026-08-15 那轮的覆辙。
     """
     if not records:
         return {
@@ -195,6 +233,7 @@ def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
             "ete_weighted_kappa": None,
             "clinical_t_auc": None,
             "tirads_weighted_kappa": None,
+            "seg_dice": _sanitize_seg_dice(seg_dice),
             "composite": None,
             "n_lesions": 0,
         }
@@ -208,6 +247,13 @@ def compute_official_metrics(records: List[Dict]) -> Dict[str, Optional[float]]:
         "tirads_weighted_kappa": _tirads_weighted_kappa(rows),
     }
     usable = [v for v in metrics.values() if v is not None]
+    # seg_dice 单独加在 usable 之后(而非放进 metrics 再统一筛):它不是"官方口径分类
+    # 指标",放进 metrics 字典参与上面的 dict 遍历会让含义混淆;但它必须参与均值。
+    # 值域/有限性校验统一在 `_sanitize_seg_dice`(两个 return 分支共用同一份判据)。
+    seg_val = _sanitize_seg_dice(seg_dice)
+    if seg_val is not None:
+        usable.append(seg_val)
+    metrics["seg_dice"] = seg_val
     metrics["composite"] = float(np.mean(usable)) if usable else None
     metrics["n_lesions"] = len(rows)
     return metrics

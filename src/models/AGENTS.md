@@ -42,7 +42,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 |:---|:---|
 | `components/__init__.py` | Re-exports all computation functions |
 | `components/segmentation.py` | `compute_segmentation_loss(bce_fn, dice_fn, outputs, targets)` |
-| `components/concepts.py` | `resolve_mix_params(outputs, mix_info)`, `compute_concept_losses(outputs, targets, lam, index, mask_weight, label_smoothing, tirads_matrix)` |
+| `components/concepts.py` | `resolve_mix_params(outputs, mix_info)`, `compute_concept_losses(outputs, targets, lam, index, mask_weight, label_smoothing, tirads_matrix)`;⚠️ 本组件把 `lam` 当**软插值系数**、`mask_weight` 当**门控系数**消费(2026-08-15 起四头监督闸门只能在 train_step 侧按阈值分派、**禁在 mixup.py 侧把软 lam 硬化成 0/1**——会连带改掉本组件的软插值数学,见 `src/training/AGENTS.md` 闸门红线) |
 | `components/malignancy.py` | `compute_malignancy_losses(mal_loss_fn, supcon_loss_fn, outputs, targets, mask_weight, slr_weights)` |
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |
 | `components/regularizers.py` | `compute_regularizers(total_loss, outputs, lambda_latent, delta_budget, spin_l1_weight)` — 拉格朗日约束 g=loss_l2-delta_budget≤0。参数方向:grad=λ·grad(loss_l2),λ>0 恒成立故残差恒被往小推,约束满足(g≤0)只减量级不翻转方向;乘子 `λ←λ+η·g` 违反加压/满足松绑(2026-08-11 #120 核实为误报,方向正确,见文件内注释) |

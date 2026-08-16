@@ -308,3 +308,118 @@ def test_composite_is_mean_of_available_metrics_only():
               if m[k] is not None]
     assert m["composite"] == pytest.approx(float(np.mean(usable)))
     assert len(usable) < 4, "本例应有指标不可算,否则测不到'不当 0 计入'"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# seg_dice 并入 composite(2026-08-16 新增)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _usable_classification(m) -> list:
+    """m 里可算的**分类**指标(不含 seg_dice/composite/n_lesions)。
+
+    显式 `float(v)` 是为了让静态检查器看出这是 `list[float]` 而非 `list[float|None]`
+    —— `np.mean` 对后者会报 overload 不匹配。
+    """
+    out = []
+    for k in ("malignancy_auc_pr", "location_weighted_auc", "ete_weighted_kappa",
+              "clinical_t_auc", "tirads_weighted_kappa"):
+        v = m[k]
+        if v is not None:
+            out.append(float(v))
+    return out
+
+
+def test_seg_dice_default_none_keeps_legacy_composite():
+    """不传 seg_dice → composite 与旧口径逐位一致(老调用点零回归)。"""
+    recs = [_rec("A", mal=1, mal_p=0.9, loc=0), _rec("B", mal=0, mal_p=0.1, loc=1)]
+    m = compute_official_metrics(recs)
+    assert m["seg_dice"] is None
+    assert m["composite"] == pytest.approx(float(np.mean(_usable_classification(m))))
+
+
+def test_seg_dice_enters_composite_mean():
+    """🔴 传了 seg_dice 就必须进 composite 的算术均值。
+
+    这是 2026-08-16 改动的**核心断言**:分割是官方评分闸门(mask 全零 → 匈牙利
+    IoU≥0.5 零命中 → 五项分类/分期零样本 → Sclin≈0),而 composite 是选模判据。
+    若 dice 不进 composite,选模会挑"分类略好但分割崩了"的 checkpoint —— 2026-08-15
+    那轮正是如此(35 epoch 全部 checkpoint 的 val_dice 都是 0.0007)。
+    """
+    recs = [_rec("A", mal=1, mal_p=0.9, loc=0), _rec("B", mal=0, mal_p=0.1, loc=1)]
+    dice = 0.42
+    m = compute_official_metrics(recs, seg_dice=dice)
+    assert m["seg_dice"] == pytest.approx(dice)
+    expected = float(np.mean(_usable_classification(m) + [dice]))
+    assert m["composite"] == pytest.approx(expected)
+
+    # 低 dice 必须把 composite 拉下来(单调性:否则选模仍对闸门视而不见)
+    m_low = compute_official_metrics(recs, seg_dice=0.001)
+    lo, hi = m_low["composite"], m["composite"]
+    assert lo is not None and hi is not None
+    assert lo < hi, "dice 更低时 composite 必须更低"
+
+
+def test_seg_dice_only_no_classification_metrics():
+    """分类全不可算时,composite 退化为 seg_dice 本身(而非 None)。
+
+    早期 epoch 的 val 子集常只剩一类 → 五项分类全 None。此时若 composite 也是 None,
+    选模会全程走 `best_composite < 0` 的兜底分支、只存最后一轮,分割训得再好也选不出来。
+    """
+    recs = [_rec("A", mal=1, mal_p=0.9, loc=0)]   # 单样本 → 各分类指标均不可算
+    m = compute_official_metrics(recs, seg_dice=0.31)
+    assert not _usable_classification(m), "本例应无可算分类指标,否则测不到退化路径"
+    assert m["composite"] == pytest.approx(0.31)
+
+
+def test_seg_dice_nonfinite_ignored():
+    """NaN/Inf 的 dice 不得毒化 composite —— 均值一旦变 NaN,选模比较恒 False、
+    整轮训练一个 checkpoint 都存不下来。"""
+    recs = [_rec("A", mal=1, mal_p=0.9, loc=0), _rec("B", mal=0, mal_p=0.1, loc=1)]
+    base = compute_official_metrics(recs)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        m = compute_official_metrics(recs, seg_dice=bad)
+        assert m["composite"] == pytest.approx(base["composite"]), (
+            f"seg_dice={bad} 应被忽略,composite 退回纯分类口径"
+        )
+        assert m["seg_dice"] is None, f"seg_dice={bad} 不得写进 dict(会流进 JSONL)"
+
+
+def test_seg_dice_out_of_range_ignored():
+    """🔴 值域校验:Dice 定义域是 [0,1],越界一律丢弃。
+
+    Gate2 lane1 实测发现:只判 `np.isfinite` 时 **负 dice 会被放行**
+    (`isfinite(-0.1)` 为 True),悄悄拉低 composite 而不报错。
+    真实路径下不可达(`validate_step` 的 dice 带平滑、值域受限),这是入口防御。
+    """
+    recs = [_rec("A", mal=1, mal_p=0.9, loc=0), _rec("B", mal=0, mal_p=0.1, loc=1)]
+    base = compute_official_metrics(recs)
+    for bad in (-0.1, -1.0, 1.5, 100.0):
+        m = compute_official_metrics(recs, seg_dice=bad)
+        assert m["seg_dice"] is None, f"seg_dice={bad} 越界,应丢弃"
+        assert m["composite"] == pytest.approx(base["composite"]), (
+            f"seg_dice={bad} 越界,不得进 composite"
+        )
+    # 边界值 0.0 / 1.0 是**合法**的,不能一起误杀
+    for good in (0.0, 1.0):
+        m = compute_official_metrics(recs, seg_dice=good)
+        assert m["seg_dice"] == pytest.approx(good), f"seg_dice={good} 是合法边界值"
+
+
+def test_seg_dice_accepts_numpy_scalar():
+    """numpy 标量 / 0 维 array 应与 Python float 等价(实际链路里 avg_dice 的
+    类型取决于上游累加方式,不该因类型不同而静默失效)。"""
+    recs = [_rec("A", mal=1, mal_p=0.9, loc=0), _rec("B", mal=0, mal_p=0.1, loc=1)]
+    ref = compute_official_metrics(recs, seg_dice=0.42)
+    for v in (np.float32(0.42), np.float64(0.42), np.array(0.42)):
+        m = compute_official_metrics(recs, seg_dice=v)
+        assert m["seg_dice"] == pytest.approx(0.42, abs=1e-6)
+        assert m["composite"] == pytest.approx(ref["composite"], abs=1e-6)
+
+
+def test_seg_dice_present_when_records_empty():
+    """records 为空(val 无有效病灶)时 seg_dice 仍原样回传 —— 分割 Dice 与是否有
+    分类标签无关,不该因为分类没样本就把它一起丢掉。"""
+    m = compute_official_metrics([], seg_dice=0.25)
+    assert m["seg_dice"] == pytest.approx(0.25)
+    assert m["n_lesions"] == 0

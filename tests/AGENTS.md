@@ -99,9 +99,22 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 `OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
 
-## 测试总数(单一权威,2026-08-13 `Demo_D` 主环境实测,backlog #124 Gate2 审查+F1回归测试后重新对拍)
+## 测试总数(单一权威,2026-08-17 `Demo_D` 主环境实测)
 
-**`pytest --collect-only`=856 / 全套 855 passed + 1 skipped**(2026-08-16 快照;此前 841/840 已过时,**+15 = 分割解冻契约改动**:`test_official_schedule.py` +8(四个旧断言翻转 + 新增 `test_seg_trainable_and_in_optimizer_in_all_stages`/`test_seg_lr_tiers` 各 3 参数化、`test_seg_backbone_group_is_single_tier`、`test_no_param_in_two_groups`)、`test_metrics_official.py` +7(seg_dice 并入 composite:默认/生效/退化/非有限/越界值域/numpy标量/空 records);再往前 +9 = `test_dynamic_frame_cache.py`(动态帧预抽取缓存 8 条 def / 9 项,完整-pkl 放行那条是 2 参数化:partial=False 与键缺失);再往前 +6 = `test_official_schedule.py` 新增 `test_jsonl_logger_extra_fields_merged_and_reserved_protected`(含规范字段防覆盖的 5 个撞名子断言)与 `test_jsonl_logger_drops_nonfinite_extra`(NaN/Inf 丢弃 + 严格 JSON 解析))。
+**`pytest --collect-only`=891 / 全套 890 passed + 1 skipped**(2026-08-17 快照)。
+演进链:**856**(2026-08-16)**+35 = `test_seg_guards.py`**(backlog #127 分割护栏,
+判据从 dice→概率 spread→预测 mask 前景占比两次改版的回归钉子,含 **9 路变异测试**
+与 `test_v2_hole_*` 两个反例——那两个把「有结构但 max=0.45 被放行而 mask 仍全零」
+和「常量图+4 个异常像素」钉死,勿删);
+856 由 841 **+15 = 分割解冻契约改动**:`test_official_schedule.py` +8(四个旧断言翻转 +
+新增 `test_seg_trainable_and_in_optimizer_in_all_stages`/`test_seg_lr_tiers` 各 3 参数化、
+`test_seg_backbone_group_is_single_tier`、`test_no_param_in_two_groups`)、
+`test_metrics_official.py` +7(seg_dice 并入 composite:默认/生效/退化/非有限/越界值域/
+numpy标量/空 records);再往前 +9 = `test_dynamic_frame_cache.py`(动态帧预抽取缓存 8 条 def /
+9 项,完整-pkl 放行那条是 2 参数化:partial=False 与键缺失);再往前 +6 =
+`test_official_schedule.py` 新增 `test_jsonl_logger_extra_fields_merged_and_reserved_protected`
+(含规范字段防覆盖的 5 个撞名子断言)与 `test_jsonl_logger_drops_nonfinite_extra`
+(NaN/Inf 丢弃 + 严格 JSON 解析)。
 
 - **四头(位置/侵犯/临床T/TI-RADS)相关单测合计 142**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` 39 + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12 + backlog #124 `test_tirads_head.py` 15),Demo_D 实测通过;A800(torch2.6)/torch2.8 预演环境覆盖 TI-RADS 头待下次云端对拍确认(本轮仅 Windows+CPU 与真 CUDA `probe_heads_cuda.py` 双路验证)。
 - ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 **789 passed + 6 skipped**(2026-08-13 实测,**collected 795 与主环境一致**);旧记的 620 是 08-12 快照、已失效,且 08-13 补装 pandas+openpyxl 之前该环境只能收集 782 —— `tests/test_official_loader.py` 整模块被 `pytest.importorskip("pandas")` 跳过,预演对 `official_loader` 覆盖率为 0。skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。

@@ -34,7 +34,12 @@ _SOFTMAX_HEADS = {
 
 
 def _fake_outputs(seed: int = 0) -> dict:
-    """各头 logits,形状与 MultiTaskThyroidModel 输出对齐。"""
+    """各头 logits,形状与 MultiTaskThyroidModel 输出对齐。
+
+    ⚠️ 官方四头(`ete_probs`/`location_probs`/`t_probs`/`tirads_probs`)在真实模型里
+    **输出的已经是 softmax 概率**(各头内部自己算,见 `heads/*.py`),不是 logits ——
+    `decode_predictions` 对它们不再二次 softmax,故此处 fixture 也必须造归一化分布。
+    """
     torch.manual_seed(seed)
     return {
         "mask": torch.randn(1, 1, 8, 8),
@@ -44,6 +49,12 @@ def _fake_outputs(seed: int = 0) -> dict:
         "margin": torch.randn(1, len(MARGIN_MAP)),
         "foci": torch.randn(1, len(FOCI_MAP)),
         "malignancy": torch.randn(1, 2),
+        # 官方四头(#116b):已 softmax 的概率
+        "ete_probs": torch.softmax(torch.randn(1, 4), dim=1),
+        "location_probs": torch.softmax(torch.randn(1, 7), dim=1),
+        "t_probs": torch.softmax(torch.randn(1, 2), dim=1),
+        "tirads_probs": torch.softmax(torch.randn(1, 5), dim=1),
+        "t_conf": torch.rand(1),
     }
 
 
@@ -182,6 +193,65 @@ class TestNonFiniteProbabilityIsRejected:
         outputs["margin"] = torch.tensor([[float("nan"), 0.1, 0.2, 0.3]])
         with pytest.raises(ValueError, match="margin"):
             decode_predictions(outputs)
+
+    @pytest.mark.parametrize("head", [
+        "ete_probs", "location_probs", "t_probs", "tirads_probs", "t_conf",
+    ])
+    def test_official_heads_non_finite_raise(self, head):
+        """🔴 官方四头(#116b)同样硬拦 NaN,不得静默产出 argmax=0。
+
+        不拦的两个后果对四头**更严重**:① argmax 对全 NaN 静默返回 0 →
+        `+1` 后 ETE 报"1 无侵犯"、TI-RADS 报"1 类"、Location 报"1 左上叶" ——
+        全是合法编码,`validate_prediction_json` 放行,评测静默失分,
+        本地肉眼完全看不出;② NaN 写进 `LocationProbs`/`T_conf` 会让整份
+        prediction.json 变成非标准 JSON,严格解析器拒收 → 该病例零分。
+        """
+        outputs = _fake_outputs()
+        shape = outputs[head].shape
+        outputs[head] = torch.full(shape, float("nan"))
+        with pytest.raises(ValueError, match="NaN/Inf"):
+            decode_predictions(outputs)
+
+    @pytest.mark.parametrize("head", [
+        "ete_probs", "location_probs", "t_probs", "tirads_probs", "t_conf",
+    ])
+    def test_official_head_missing_key_raises_not_silently_defaults(self, head):
+        """🔴 四头键缺失必须 KeyError,**不得**兜底成占位。
+
+        四头是 `MultiTaskThyroidModel.forward` 的无条件输出。若缺席说明加载的是
+        不含四头结构的旧模型(如生产默认权重 `thyroidxl_merged_v2.pth`)——此时
+        静默兜底会让 prediction.json 写出确定性占位值,目标四 40% 三项 +
+        目标三 TI-RADS 全部失分且本地看不出来(JSON 完全合法)。宁可当场炸。
+        """
+        outputs = _fake_outputs()
+        del outputs[head]
+        with pytest.raises(KeyError):
+            decode_predictions(outputs)
+
+    def test_official_heads_not_re_softmaxed(self):
+        """🔴 四头概率**原样透传**,不得二次 softmax。
+
+        各头已在模型内部做过 fp32 softmax(`heads/*.py`),这里重算会把分布压平
+        (softmax(softmax(x)) ≠ softmax(x))—— argmax 不变故不会报错,但概率值全错,
+        而"必须输出概率分布"正是官方计分项。用一个**尖锐**分布对拍:若被二次
+        softmax,峰值会从 0.9 塌到约 0.35。
+        """
+        outputs = _fake_outputs()
+        sharp = [0.9, 0.04, 0.03, 0.03]
+        outputs["ete_probs"] = torch.tensor([sharp])
+        preds = decode_predictions(outputs)
+        np.testing.assert_allclose(preds["ete_probs"], sharp, atol=1e-6)
+
+    def test_official_heads_not_temperature_scaled(self):
+        """四头不在 `CALIBRATED_TASKS` 内 → 温度缩放对其**无效**(伪精度)。"""
+        from src.inference.calibration import TemperatureScaler
+        outputs = _fake_outputs(seed=7)
+        base = decode_predictions(outputs, calibrator=None)
+        # 给一个极端温度;若四头误走 calibrator,分布会被显著软化
+        cal = TemperatureScaler({"malignancy": 5.0})
+        scaled = decode_predictions(_fake_outputs(seed=7), calibrator=cal)
+        for key in ("ete_probs", "location_probs", "t_probs", "tirads_probs"):
+            np.testing.assert_allclose(base[key], scaled[key], atol=1e-9)
 
     def test_raises_dedicated_subclass_for_frame_isolation(self):
         """必须抛 `NonFiniteProbabilityError`(`ValueError` 子类),不能只是基类 ValueError。

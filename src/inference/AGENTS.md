@@ -164,7 +164,9 @@ Phase 1 给 `decode_predictions` 全部分类头加了 NaN/Inf 硬校验(`_asser
 ## 4. `postprocess.py` — Prediction Decoding
 
 ### `decode_predictions(outputs, calibrator=None)` → `dict`
-Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `comp_prob`, `echo_prob`, `shape_prob`, `margin_prob`, `foci_prob`, `mal_prob`, `mal_probs`。
+Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `comp_prob`, `echo_prob`, `shape_prob`, `margin_prob`, `foci_prob`, `mal_prob`, `mal_probs`, **`ete_probs`, `location_probs`, `t_probs`, `t_conf`, `tirads_probs`**(官方四头,#116b 2026-08-17 接入)。
+- **官方四头(位置/ETE/临床T/TI-RADS)**:**原样透传各头已算好的 fp32 softmax**(`heads/*.py` 内部已 softmax),`decode_predictions` **不再二次 softmax**(`softmax(softmax(x))≠softmax(x)`,argmax 不变但概率值全错,而"必须输出概率分布"正是官方计分项)。**不走 calibrator**(`CALIBRATED_TASKS` 不含四头,温度缩放对未标定的头是伪精度)。**键缺失即 KeyError 不兜底** —— 四头是 `MultiTaskThyroidModel.forward` 的无条件输出,缺席说明加载的是不含四头结构的旧模型(如 `thyroidxl_merged_v2.pth`),静默兜底会写出确定性占位值而目标四 40% 三项 + 目标三 TI-RADS 全部失分且 JSON 完全合法、本地看不出。
+- **`t_conf` 也过 `_assert_finite`**:官方《初赛评审规则》「置信度字段规范」明写 `Detection.confidence`/`Malignancy.confidence`/`T_conf` 若为 NaN/Inf/越界,**评估脚本统一按 0 处理、该样本在 AP/AUC-PR/AUC 中排最后** —— 不是崩溃而是静默垫底,比崩溃阴。
 - `calibrator`: 可选 `TemperatureScaler`。各分类头在 softmax/sigmoid **之前**先 `apply(task, logits)` 温度缩放;`None` 或全 T=1.0 时输出逐位等同无校准。各头统一 `.float()` 后再缩放(fp16 温度除法精度对齐),T>0 单调不改 argmax。mask 分割不走校准。
 - **`*_prob` = 完整概率分布**(2026-07-29 新增)。四个 softmax 头和为 1;`foci_prob` 是**多标签 sigmoid**,各元素独立、不求和。`mal_probs` = `[p_benign, p_malignant]`,`mal_prob` 恒等于 `mal_probs[1]`(同源,不允许两条计算路径)。
 - `*_idx` 取自概率向量的 argmax(softmax 严格单调,与对 logits 取 argmax 等价),保证索引与分布**自洽**——否则报告文字会和概率各说各话。
@@ -250,7 +252,7 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 ### `diagnose_static_case(model, img_np, config, calibrator, precision, device)` → `dict`
 
 单张静态图核心(输入已加载+已过 gatekeeper)。返回键:
-- `preds`: `decode_predictions` 全量输出(含软 `pred_mask`/`mask_binary`、各头 `*_idx`/`*_prob`、`mal_prob`/`mal_probs`);
+- `preds`: `decode_predictions` 全量输出(含软 `pred_mask`/`mask_binary`、各头 `*_idx`/`*_prob`、`mal_prob`/`mal_probs`、**官方四头 `ete_probs`/`location_probs`/`t_probs`/`t_conf`/`tirads_probs`**);
 - `img_tensor`: `preprocess_image` 产出的普通张量(供调用方在 inference_mode 之外重跑 Grad-CAM 复用);
 - `mask_resized`: `mask_binary` 用 `INTER_NEAREST` 缩放回**原图 H×W**;
 - `breakdown`: `build_tirads_breakdown` 的 TI-RADS 分项。
@@ -459,11 +461,35 @@ JSON 完全合法、指标只是"偏低",本地永远查不出根因。
 `location_label_to_index` 对阴性/未知返回 **`None` 而非 0** —— 把未知样本当"左上叶"
 训练会污染整个位置分布。
 
-### 占位值是已知缺口,不是终态
+### 🟢 四头已接真实预测(#116b,2026-08-17);占位路径仅剩 CLI 兜底
 
-三个新维度的分类头尚未训练。`build_nodule_entry` 对未提供的维度填保守占位:ETE=1
-(无侵犯)、Location 均匀分布(argmax 落"左上叶")、T=0。**占位保证 JSON 结构合规不丢
-分,但这三项本身得分等同随机。** 分类头训好后必须由调用方显式传入真实预测。
+**生产路径无占位**:`v21_output._shared_nodule_context` 把四头真实 softmax 转成官方编码,
+逐字段显式传给 `build_nodule_entry`。云端训练实测能力:`loc_auc` 0.7519 /
+`t_auc` 0.7441 / `tirads_kappa` 0.6887 / `ete_kappa` 0.2086。
+
+🔴 **编码换算 `code = argmax_idx + 1` 只对 ETE / TI-RADS / Location 成立;
+`T_ClinSig.T` 唯一不 +1**(官方 `T∈{0,1}` 与 0-based 下标同值)。
+写错 `+1` 的后果不对称:T 多加会得 2 被 `prediction_json` 拦成整例 ERROR(至少会炸);
+其余三项漏加只是变成**另一个合法码**(如"包膜侵犯"报成"无侵犯"),越界校验放行、
+JSON 合法、指标偏低,**本地永远查不出**。回归测试 `TestOfficialHeadWiring` 用
+**全部避开 idx0** 的 one-hot 参数化钉死(用 idx0 测等于没测:漏 `+1` 时 idx0 恰好也"对")。
+
+**`build_nodule_entry` 的占位兜底保留不删**(ETE=1/Location 均匀/T=0),供 CLI 调试等
+不产四头概率的调用方使用。→ 🔴 **在生产 `prediction.json` 里看到 `ETE=1 / 均匀
+LocationProbs / T=0 / T_conf=0.0` 这组值,是"四头没接上"的故障信号,不是"占位正常"**。
+最可靠单条判据:**`LocationProbs` 是均匀分布**(真实预测几乎不可能均匀,与权重质量无关)。
+
+**#116a 对冲键**:`build_nodule_entry` 可选参数 `tirads_probs`(5维)/`ete_probs`(4维),
+写出 `TI_RADS_Probs`/`ETE_Probs`;`None` 时**不写该键**(旧调用方零污染)。长度错即抛
+`PredictionSchemaError`(长度错 = 上游取错了头)。⚠️ 评审规则 `:251` 正面强制「概率向量
+键名必须与下表完全一致」而表里这两项只有 int → **自拟键名必然对不上,拿分概率≈0,
+纯防御性下注**;净收益仍 ≥0(赛道七无"不得含额外字段"条款,赛道八 `:540` 才有)。
+
+**动态走病灶级均值**:`_lesion_level_head_preds` 对 `per_frame` 全帧四头概率取**算术
+平均**(官方 `:215`「病灶级汇总,每个预测病灶仅贡献一个样本」),**与训练侧
+`metrics_official.aggregate_by_lesion` 同口径** —— 后者 docstring 明写「若推理侧改用
+取最大/中位数,这里要同步改,否则验证指标与交付表现脱节」,**两侧算法必须同步改**。
+`mal_prob`/`breakdown` 仍用关键帧口径(超出 #116b 范围,勿顺手改)。
 
 ### 两条不显眼但致命的校验
 
@@ -499,7 +525,8 @@ JSON 完全合法、指标只是"偏低",本地永远查不出根因。
   `orig_hw`,缺 `orig_hw` 直接 `V21OutputError`——绝不拿 resize 后的模型输入张量冒充原图。
 - **逐结节**:`nodule_split.split_nodules` 连通域拆分(2D 静态 / 3D 动态跨帧),每结节
   一个 `.nii.gz`(`nodule_NNN.nii.gz`,值域 `{0,1}`),`detection_confidence` 取区域内概率均值。
-- 每结节 `build_nodule_entry`(良恶性/TI-RADS 真实预测;ETE=1/Location 均匀/T=0 占位)→
+- 每结节 `build_nodule_entry`(良恶性/TI-RADS/ETE/位置/临床T **全部为四头真实预测**,#116b
+  2026-08-17 接线;另写 `TI_RADS_Probs`/`ETE_Probs` 对冲键)→
   `build_prediction_json` → `validate_prediction_json` → **原子写**(`.tmp` + `os.replace`)。
 - **阴性病例合法**(`split_nodules` 0 结节):`Nodules`/`MaskFiles` 空数组,仍写结构合规
   `prediction.json`。

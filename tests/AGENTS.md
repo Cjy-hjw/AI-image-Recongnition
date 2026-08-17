@@ -26,8 +26,8 @@
 | `test_bn_freeze.py` | `set_frozen_modules_eval`(2026-07-10 新增，回归测试) — 冻结子模块 BN running_var/mean 零漂移、不冻结时确实漂移(反向验证测试有效性)、可训练子模块不被误冻、LoRA 场景下同级独立 BN 子模块仍正确冻结 | 4 | — |
 | `test_model_runner.py` | `build_model`(2026-07-10 新增，回归测试) — 裸 state_dict 正常加载、`{"state_dict":...}` 包装格式正确解包、unexpected/missing keys 硬报错(拒绝静默部分加载)、checkpoint 缺失时仍降级随机初始化(向后兼容)；`run_forward`(2026-07-11 新增，两轮修复，`TestRunForwardCpuFp16Fallback`+`TestRunForwardGpuPrecisionRegression`) — CPU+fp16 autocast "假降级"修复回归、**CPU+fp32 不崩溃**(第一轮修复误把此分支 dtype 从 bfloat16 改成 float16 引入新回归，CI test job 实测抓到，第二轮改为 CPU 上 dtype 恒 bfloat16)、bf16-on-cpu 未被连带破坏、GPU fp32/fp16/bf16 三值回归(skipif 无 CUDA)；`load_config`(2026-07-11 新增，`TestLoadConfig`) — 合法配置正常解析、文件不存在抛 `FileNotFoundError`、YAML 格式错误抛异常、缺 `environment.device` 键抛 `KeyError`(供 predict.py/video_predict.py 的 try/except Exception 统一兜底) | 15 | — |
 | `test_gate8_adaptor_isolation.py` | `gate8_adaptor_isolation`(2026-07-11 新增) — TaskAlignmentAdaptor cls→seg 梯度隔离审计的正面/负面回归；正面:真实代码(`.detach()` 正确)+ 模拟前序 Gate 遗留的 `requires_grad=False` 污染状态下仍判定通过、`seg_backbone` 梯度精确 `0.0`、`gamma`/`requires_grad` 复位无副作用(2026-07-11 Gate2 review 非阻塞建议补齐:此前 finally 只复原 gamma 没复原 requires_grad,依赖"Gate8 是最后一个 Gate"这个隐性顺序假设,现改为逐参数显式记录+复原);负面:monkeypatch `torch.Tensor.detach` 为恒等函数模拟误删,断言 Gate 检测到泄漏并返回 False(踩坑记录:`TaskAlignmentAdaptor.gamma` 零初始化会让正确/错误 detach 都测出梯度 0,Gate 内部强制拨到非零才能让负面测试真正生效,详见该 Gate 源码注释) | 2 | — |
-| `test_prediction_json.py` | prediction.json schema 构造与校验(2026-08-01 新增;**2026-08-10 A3 起 v21_output 经它组装/校验,并入 V2.1 交付链路**) | 19 | Phase 5 |
-| `test_v21_output.py` | **V2.1 单病例输出写盘入口**(2026-08-10 A3 新增)——`write_case_v21` 静/动两链路:静态把 case_pipeline 结果落成 `{case_dir}/{subdir_uid}/nodule_NNN.nii.gz` + `prediction.json`(StudyUID=PatientId、MaskFile 相对路径正斜杠、原子写、阴性空数组合法、缺 orig_hw 报 V21 错误);动态逐帧 resize 回原图 + scatter 回填全帧 3D mask + 3D 连通域跨帧关联;占位维度(ETE=1/Location 均匀/T=0)结构合规(仍为占位,接线在 backlog #116b,依赖四头训练完成) | 11 | Phase 5 |
+| `test_prediction_json.py` | prediction.json schema 构造与校验(2026-08-01 新增;**2026-08-10 A3 起 v21_output 经它组装/校验,并入 V2.1 交付链路**;**2026-08-17 #116a 加对冲键 `TI_RADS_Probs`/`ETE_Probs`**:可选参数、`None` 时不写该键、长度错抛 `PredictionSchemaError`) | 72 | Phase 5 |
+| `test_v21_output.py` | **V2.1 单病例输出写盘入口**(2026-08-10 A3 新增)——`write_case_v21` 静/动两链路:静态把 case_pipeline 结果落成 `{case_dir}/{subdir_uid}/nodule_NNN.nii.gz` + `prediction.json`(StudyUID=PatientId、MaskFile 相对路径正斜杠、原子写、阴性空数组合法、缺 orig_hw 报 V21 错误);动态逐帧 resize 回原图 + scatter 回填全帧 3D mask + 3D 连通域跨帧关联。**🔴 2026-08-17 #116b 接线后语义变更**:原 `TestPlaceholderDims` 只断言"落在合法范围内"——接线后**仍会绿**但守的是已消失的语义(占位结构合规),对 off-by-one **零区分力**,已重写为 `TestOfficialHeadWiring`(逐项断言精确期望码,参数化**全部避开 idx0** —— 用 idx0 测等于没测:漏写 `+1` 时 idx0 恰好也"对")+ `TestHedgeKeys`(**从 `write_case_v21` 入口测到落盘 JSON**,只测单函数会漏掉"调用处没透传")+ `TestDynamicLesionLevelMean`(构造成"三帧均值 argmax ≠ 关键帧 argmax",否则沿用关键帧也能过) | 31 | Phase 5 |
 | `test_service_runner.py` | **runner 批量编排**(2026-08-10 A2 新增)——mock 掉 heavy 依赖只留编排逻辑:逐病例调 write_case_v21 且 case_dir={output}/{patient_id}、静/动 kind 分派、processing_ms 非负 int、gatekeeper 每病例照跑、**单病例失败隔离**(一例 diagnose 崩溃不影响其余 + 落结构合规 ERROR 占位)、loader 失败隔离、**模型只 build 一次**(跨病例 + 跨多次 build_service_runner 缓存)、空/无效/全非影像目录不崩 | 12 | Phase 5 |
 | `test_head_interfaces.py` | **三头接入接口契约**(2026-08-12 Phase2 阶段2.0 新增)——守四条「删掉就静默出错」的契约:① `stage4_spatial` 通道数是 `CLS_POOLED_DIM`(352) 而非 `CLS_STAGE4_CHANNELS`(208)，且自带 352≠208 反向锚点防断言失去区分力;② 命名即契约(`stage4_spatial` 有梯度、两个 `*_detached` 无梯度);③ 🔴 从 `stage4_spatial` 反传 `seg_backbone` 梯度**精确 0**(用 `!=0.0` 而非容差,对 NaN 敏感,同 Gate 8 论证)——保住 Gate 8 前提、防三头重开 Stage2 崩塌的物理先验回流;④ fp16 求和溢出反证(自带「反证失效」保护:先断言朴素 `.sum()==inf`,否则说明该测试已对 fp32 累加器失去区分力) | 14 | Phase 2 |
 | `test_location_head.py` | **位置头契约**(2026-08-12 Phase2 阶段2.1 新增)——守「错了不崩、只静默学错」那几条:① 因子分解**拼接顺序**必须对齐 `LOCATION_LABELS`(用非对称确定性输入逐格核对——顺序错了概率和仍为 1、JSON 仍合法,只是左叶预测填进右叶槽);② 7 维**严格**和为 1(数学恒等式非再归一化);③ 峡部 level 标签是 `-1`,须 clamp+validity 双保险(附反证:直接喂 `cross_entropy` 确实越界);④ 标签越界**正负不对称**(`idx=7` IndexError 而 `idx=-1` 走负索引静默取末元素)双向拦截;⑤ `[B,1]` validity 隐式广播成 `[B,B]` 静默放大 loss(附反证坐实该坑真实存在);⑥ 🔴 **CoordConv 必须先过非线性再池化**——三段反证(普通卷积不可分 → **裸 CoordConv 仍不可分** → 加 ReLU 才可分),卷积线性可拆使坐标贡献退化为常数偏置被 GAP 平均掉;⑦ 水平翻转联动翻标签 | 25 | Phase 2 |
@@ -101,8 +101,15 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 ## 测试总数(单一权威,2026-08-17 `Demo_D` 主环境实测)
 
-**`pytest --collect-only`=891 / 全套 890 passed + 1 skipped**(2026-08-17 快照)。
-演进链:**856**(2026-08-16)**+35 = `test_seg_guards.py`**(backlog #127 分割护栏,
+**`pytest --collect-only`=923 / 全套 922 passed + 1 skipped**(2026-08-17 #116b 后快照)。
+演进链:**891**(2026-08-17 #127 后)**+32 = #116b 四头接线**
+(`test_v21_output` 11→**31**:`TestOfficialHeadWiring` 编码映射钉子 + `TestHedgeKeys`
+对冲键端到端 + `TestDynamicLesionLevelMean` 病灶级均值;`test_probability_output` 33→**47**:
+四头 NaN 硬拦/键缺失 KeyError/不二次 softmax/不走 calibrator;
+`test_prediction_json` 69→**72**:对冲键长度校验与缺省不写)。
+⚠️ 净增 32 而非 33 —— 旧 `TestPlaceholderDims::test_ete_location_t_present_and_valid`
+被重写吸收(它守的"占位结构合规"语义已随接线消失)。
+上一段演进:**856**(2026-08-16)**+35 = `test_seg_guards.py`**(backlog #127 分割护栏,
 判据从 dice→概率 spread→预测 mask 前景占比两次改版的回归钉子,含 **9 路变异测试**
 与 `test_v2_hole_*` 两个反例——那两个把「有结构但 max=0.45 被放行而 mask 仍全零」
 和「常量图+4 个异常像素」钉死,勿删);

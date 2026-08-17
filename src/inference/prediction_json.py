@@ -38,12 +38,16 @@ Interpretation        object 推荐(Conclusion + KeyFindings)
 `_ETE_LABEL_TO_CODE` / `LOCATION_LABELS` 把这层转换固化下来,训练侧读 xlsx 与
 推理侧写 json 共用同一份定义,避免两边各写一套导致顺序悄悄分叉。
 
-## 占位值的定位
+## 占位值的定位（🔴 2026-08-17 起生产路径已无占位）
 
-三个新维度的分类头尚未训练(官方数据 2026-08-01 才可用)。`build_nodule_entry` 对
-未提供的维度填**保守占位**:ETE=1(无侵犯)、Location 均匀分布、T=0。占位保证 JSON
-结构合规不丢分,但这三项本身的得分等同随机 —— **这是已知缺口,不是可接受的终态**,
-分类头训好后必须由调用方显式传入真实预测。
+`build_nodule_entry` 对**未提供**的维度仍会填保守占位:ETE=1(无侵犯)、Location
+均匀分布、T=0 —— 这条兜底路径**保留不删**,供 CLI 调试等不产四头概率的调用方使用。
+
+但**生产路径已不再走它**:backlog #116b 于 2026-08-17 把四个官方头
+(位置/ETE/临床T/TI-RADS)的真实 softmax 接进了 `v21_output._shared_nodule_context`,
+每个字段都由调用方显式传入。**若在生产输出里看到 `ETE=1 / LocationProbs 均匀 /
+T=0 / T_conf=0.0` 这组值,那不是"占位正常",而是四头没接上的故障信号**
+(最可靠的单条判据:`LocationProbs` 是均匀分布 —— 真实预测几乎不可能均匀)。
 """
 
 import math
@@ -141,11 +145,10 @@ def uniform_location_probs():
     并入首位则退化为"左上叶",属常见分区,占位偏差最小。
 
     ⚠️ 该偏差是**刻意保留**的:占位输出必须明显有偏,避免被误认为真实预测。
-    位置分类头未训练前,调用方应显式传 `location=LOCATION_NONE`(0) 或文档化此
-    局限,而不是依赖均匀分布的"中性"假象。
-    ⚠️ 现状(v21_output.py `_shared_nodule_context` 实际传 `location=None`):此建议
-    路径尚未被生产调用方采纳,位置头未训前占位 Location 落"左上叶"(argmax 均匀+1)——
-    待位置头训练后由真实预测替代,见 #116/三头 Phase2。
+    🔴 **2026-08-17 起生产不再走本函数**(#116b:`v21_output._shared_nodule_context`
+    显式传真实 `location_probs`)。本函数只服务 CLI 调试等不产四头概率的调用方。
+    → 因此**在生产 prediction.json 里看到均匀 LocationProbs = 四头没接上的故障
+    信号**,不是"占位正常"。
     """
     p = 1.0 / NUM_LOCATIONS
     probs = [p] * NUM_LOCATIONS
@@ -240,6 +243,8 @@ def build_nodule_entry(
     location: Optional[int] = None,
     t_clin_sig: int = 0,
     t_confidence: float = 0.0,
+    tirads_probs=None,
+    ete_probs=None,
     malignancy_threshold: float = 0.5,
 ) -> dict:
     """组装单个结节条目,含全部必填字段的合规校验。
@@ -264,6 +269,19 @@ def build_nodule_entry(
             若分类头未训练,应显式传 `location=LOCATION_NONE`(0) 或文档化此局限。
         t_clin_sig: 0/1。
         t_confidence: [0,1]。
+        tirads_probs: 可选 5 维 TI-RADS 概率分布;`None` 时**不写出该键**。
+        ete_probs: 可选 4 维 ETE 概率分布;`None` 时**不写出该键**。
+            🔴 这两项是 **#116a 零成本对冲键**(`TI_RADS_Probs`/`ETE_Probs`),
+            **不在官方 schema 内**。背景:评审规则 `:185` 是无条件全称句
+            「所有分类/分级/分型任务必须输出概率分布,否则计 0 分」,而官方字段表
+            对这两项明写「该字段类型为整数(int)」、只给 int 位,两条明文互相打架。
+            ⚠️ 同文 `:251` 又正面强制「概率向量的键名必须与下表中的键名完全一致」,
+            而表里根本没有这两个概率键 → **我方自拟的键名必然对不上,拿分概率≈0,
+            这是纯防御性下注**,不是"官方读则拿分"。净收益仍 ≥0(int 字段照常合规、
+            零损失),故仍做。赛道七全文**无**"不得包含额外字段"条款(赛道八 `:540`
+            才有),故不会被判违规。决策见 `docs/待官方答复清单.md` Q4。
+            **默认 None 而非空列表**:现有直调本函数的调用方(CLI 调试、旧测试)
+            不传这两项,写出 `null` 会污染 JSON。
 
     Raises:
         PredictionSchemaError: 任一字段越界或类型不合规;`mask_file` 不是合法
@@ -298,7 +316,7 @@ def build_nodule_entry(
 
     mal_conf = _clamp01(malignancy_confidence, "Malignancy.confidence")
 
-    return {
+    entry = {
         "NoduleID": str(nodule_id),
         "MaskFile": str(mask_file),
         "Detection": {"confidence": _clamp01(detection_confidence, "Detection.confidence")},
@@ -315,6 +333,24 @@ def build_nodule_entry(
         "LocationProbs": probs,
         "T_ClinSig": {"T": t_clin_sig, "T_conf": _clamp01(t_confidence, "T_ClinSig.T_conf")},
     }
+
+    # --- #116a 对冲键:仅在调用方显式提供时写出(见 Args 说明) ---
+    # 长度按各自类别数硬校验:长度错说明上游取错了头(如把 5 维 TI-RADS 填进
+    # ETE 位),此时静默写出等于交一份自相矛盾的 JSON,不如当场炸。
+    if tirads_probs is not None:
+        vals = [float(x) for x in tirads_probs]
+        if len(vals) != len(TIRADS_CODES):
+            raise PredictionSchemaError(
+                f"TI_RADS_Probs 长度必须为 {len(TIRADS_CODES)},收到 {len(vals)}")
+        entry["TI_RADS_Probs"] = vals
+    if ete_probs is not None:
+        vals = [float(x) for x in ete_probs]
+        if len(vals) != len(ETE_CODES):
+            raise PredictionSchemaError(
+                f"ETE_Probs 长度必须为 {len(ETE_CODES)},收到 {len(vals)}")
+        entry["ETE_Probs"] = vals
+
+    return entry
 
 
 def build_prediction_json(

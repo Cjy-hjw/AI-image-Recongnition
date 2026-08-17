@@ -21,7 +21,11 @@ from src.inference.postprocess import decode_predictions
 
 
 def _fake_outputs(seed: int = 0) -> dict:
-    """构造一份各头 logits(模拟模型输出),形状与 MultiTaskThyroidModel 对齐。"""
+    """构造一份各头 logits(模拟模型输出),形状与 MultiTaskThyroidModel 对齐。
+
+    官方四头(#116b)输出的是**已 softmax 的概率**而非 logits,故此处造归一化分布。
+    它们不在 `CALIBRATED_TASKS` 内,温度缩放对其无效 —— 这正是本文件要守的契约之一。
+    """
     torch.manual_seed(seed)
     return {
         "mask": torch.randn(1, 1, 8, 8),
@@ -31,6 +35,11 @@ def _fake_outputs(seed: int = 0) -> dict:
         "margin": torch.randn(1, 4),
         "foci": torch.randn(1, 4),
         "malignancy": torch.randn(1, 2),
+        "ete_probs": torch.softmax(torch.randn(1, 4), dim=1),
+        "location_probs": torch.softmax(torch.randn(1, 7), dim=1),
+        "t_probs": torch.softmax(torch.randn(1, 2), dim=1),
+        "tirads_probs": torch.softmax(torch.randn(1, 5), dim=1),
+        "t_conf": torch.rand(1),
     }
 
 

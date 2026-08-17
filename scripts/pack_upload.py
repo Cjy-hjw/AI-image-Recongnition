@@ -181,26 +181,18 @@ def _emit(out_dir, items, label):
 def build_code():
     items = [(os.path.join(REPO, r.replace("/", os.sep)), r) for r in _CLOSURE]
     items += [(os.path.join(REPO, s.replace("/", os.sep)), d) for s, d in _CODE_EXTRA]
-    copied = _emit(os.path.join(OUT_DIR, "cloud_infer_code"), items, "推理代码包")
+    items += _WEIGHTS          # 权重与代码同包:少一次上传 + 少一次人工审核窗口
+    copied = _emit(os.path.join(OUT_DIR, "cloud_infer"), items, "推理包(代码+权重)")
     n_py = sum(1 for r in copied if r.endswith(".py"))
     print(f"  .py = {n_py}")
     print("\n  云端:")
-    print("    unzip -o cloud_infer_code.zip          # 🔴 必须 -o,别走「替换同名目录」")
+    print("    unzip -o cloud_infer.zip                   # 🔴 必须 -o,别走「替换同名目录」")
     print("    sha256sum -c SHA256SUMS.txt | grep -v OK   # 应无输出")
     print(f'    find src -name "*.py" | wc -l              # 期望 {n_py}')
     print('    python -c "import src.service.app; print(\'OK\')"')
-
-
-def build_weights():
-    _emit(os.path.join(OUT_DIR, "cloud_infer_weights"), _WEIGHTS, "推理权重包")
-    print("\n  🔴 云端放置规则:")
-    print("    checkpoints/*                → 项目根的 checkpoints/")
-    print("    torch_hub_checkpoints/*      → ~/.cache/torch/hub/checkpoints/")
-    print("    ⚠️ authenticity_model.pth 必须与**主权重同目录**")
-    print("       (gatekeeper_runner.py:110 取 dirname(AICOMP_WEIGHTS));")
-    print("       若主权重不在 checkpoints/,把它一并复制过去。")
-    print("\n  ⚠️ 主模型权重(official_heads_seg_best.pth)是云端训练产物,**不在本包内**,")
-    print("     由 AICOMP_WEIGHTS 指向云上那份;它决定四头是否真实输出。")
+    print("\n  🔴 解压后须手工搬一个文件(它要落在家目录,压缩包到不了那儿):")
+    print("    mkdir -p ~/.cache/torch/hub/checkpoints")
+    print("    cp torch_hub_checkpoints/resnet18-f37072fd.pth ~/.cache/torch/hub/checkpoints/")
 
 
 def build_train_weights():
@@ -213,9 +205,7 @@ def build_train_weights():
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if which in ("all", "code"):
+    if which in ("all", "infer", "code", "weights"):
         build_code()
-    if which in ("all", "weights"):
-        build_weights()
     if which in ("all", "train"):
         build_train_weights()

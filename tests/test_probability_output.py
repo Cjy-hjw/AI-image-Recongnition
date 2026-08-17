@@ -228,6 +228,49 @@ class TestNonFiniteProbabilityIsRejected:
         with pytest.raises(KeyError):
             decode_predictions(outputs)
 
+    @pytest.mark.parametrize("head,n_expect", [
+        ("ete_probs", 4), ("location_probs", 7), ("t_probs", 2), ("tirads_probs", 5),
+    ])
+    @pytest.mark.parametrize("delta", [-1, 1])
+    def test_official_head_wrong_length_raises(self, head, n_expect, delta):
+        """🔴 四头概率长度不符类别数必须当场炸,**不得**让 argmax 静默出错误编码。
+
+        下游 `v21_output._shared_nodule_context` 一律 `argmax+1`。长度错时若
+        argmax 恰好落在合法值域内,就会写出**结构完全合法但语义错误**的编码 ——
+        该维度按错值计分(Kappa/AUC 被污染),本地永远查不出来。
+
+        2026-08-17 第三轮 review lane4 L3 实测 8 个长度错场景:ETE/TI-RADS/
+        Location 各自被下游对冲键或 `LocationProbs` 的长度校验**侧面**拦下
+        (巧合非设计),**唯独 `t_probs` 全程无人校验** —— 4 维且 argmax=idx1 时
+        一路静默通过写出 T=1。故在 `decode_predictions` 源头统一硬校验,
+        不依赖下游的偶然拦截。
+
+        双向参数化(±1)防"只校验了下界"这类半拉子实现。
+        """
+        outputs = _fake_outputs()
+        n_bad = n_expect + delta
+        if n_bad < 1:
+            pytest.skip("长度不能小于 1")
+        outputs[head] = torch.rand(1, n_bad)
+        with pytest.raises(ValueError, match="维度契约"):
+            decode_predictions(outputs)
+
+    def test_official_head_length_constants_come_from_models(self):
+        """长度期望值必须来自 `src.models` 的单一权威,不得在推理侧另抄一份。
+
+        抄一份的后果:模型改类别数时两处分叉 —— 校验会把正确输出判成错误,
+        或(更糟)放行真正的维度错。
+        """
+        from src.inference import postprocess as pp
+        from src.models.heads.clinical_t import NUM_CLIN_T_CLASSES
+        from src.models.label_schema import (
+            ETE_CODES, NUM_LOCATIONS, NUM_TIRADS_CLASSES)
+
+        assert pp.NUM_CLIN_T_CLASSES is NUM_CLIN_T_CLASSES
+        assert pp.ETE_CODES is ETE_CODES
+        assert pp.NUM_LOCATIONS is NUM_LOCATIONS
+        assert pp.NUM_TIRADS_CLASSES is NUM_TIRADS_CLASSES
+
     def test_official_heads_not_re_softmaxed(self):
         """🔴 四头概率**原样透传**,不得二次 softmax。
 

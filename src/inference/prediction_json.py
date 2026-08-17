@@ -194,7 +194,7 @@ def _clamp01(x, field):
 
 
 def _validate_relative_mask_path(mask_file: str) -> None:
-    """校验 MaskFile 是「相对病例一级目录的路径」,符合官方 V2.1 契约。
+    r"""校验 MaskFile 是「相对病例一级目录的路径」,符合官方 V2.1 契约。
 
     官方硬约束(违反会被评测判违规):
       1. **禁绝对路径** —— 不以 `/`、`\` 或盘符(如 `C:`)开头。绝对路径让评测

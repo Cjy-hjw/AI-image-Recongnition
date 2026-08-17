@@ -514,6 +514,25 @@ class TestHedgeKeys:
                 detection_confidence=0.5, malignancy_confidence=0.5,
                 tirads_class=3, **kwargs)
 
+    @pytest.mark.parametrize("kwargs", [
+        {"tirads_probs": [0.2, 0.2, float("nan"), 0.2, 0.2]},
+        {"ete_probs": [0.25, float("inf"), 0.25, 0.25]},
+    ])
+    def test_non_finite_rejected(self, kwargs):
+        """🔴 对冲键含 NaN/Inf 必须拒(2026-08-17 终审 P2.4)。
+
+        `json.dumps` 把 NaN 写成裸字面量 `NaN` —— **非标准 JSON**,严格解析器
+        (Go/Rust/Jackson 默认)拒绝**整份** prediction.json,该病例所有指标不计分。
+        上游 `decode_predictions._assert_finite` 已拦,这是第二道防线:
+        直调本函数或未来头实现变更时仍然有效。
+        """
+        from src.inference import prediction_json as pj
+        with pytest.raises(PredictionSchemaError, match="非有限值"):
+            pj.build_nodule_entry(
+                nodule_id="N1", mask_file="S/nodule_001.nii.gz",
+                detection_confidence=0.5, malignancy_confidence=0.5,
+                tirads_class=3, **kwargs)
+
 
 class TestDynamicLesionLevelMean:
     """动态路径:四头按**病灶级均值**汇总(官方 :215),不是取关键帧。"""
@@ -543,6 +562,108 @@ class TestDynamicLesionLevelMean:
             "动态四头应取全帧均值,拿到的是关键帧值"
         # 对冲键写出的也必须是均值本身
         assert abs(n["ETE_Probs"][1] - (0.1 + 0.8 + 0.8) / 3) < 1e-9
+
+    def test_mal_prob_is_lesion_level_mean_not_keyframe(self, tmp_path):
+        """🔴 良恶性也走病灶级均值,**不是**关键帧(2026-08-17 终审 P0.1)。
+
+        官方 `:215` 把「良恶性AUC-PR」与四头**并列**写进同一个"病灶级汇总"清单;
+        训练侧 `metrics_official.py:8/26-29` 同样把良恶性列入按 lesion_id 取均值。
+        此前只均值四头、`mal_prob` 留关键帧口径 = 口径分裂,而关键帧是「最恶性帧」
+        (argmax),**系统性高于**病灶级均值 → 良恶性 AUC-PR(目标三最强的一项)失真。
+
+        构造成「均值 ≠ 关键帧值」才有区分力:关键帧 mal_prob=0.9(最高,故被选为
+        关键帧),三帧均值 = (0.9+0.3+0.3)/3 = 0.5。若代码沿用关键帧会写出 0.9。
+        """
+        heads = [_head_probs() for _ in range(3)]
+        cr = _dynamic_case_result(per_frame_heads=heads)
+        for f, mp in zip(cr["per_frame"], (0.9, 0.3, 0.3)):
+            f["mal_prob"] = mp
+            f["preds"]["mal_prob"] = mp
+            f["preds"]["mal_probs"] = np.array([1.0 - mp, mp])
+        cr["kf_preds"] = cr["per_frame"][0]["preds"]     # 关键帧 = 0.9 那帧
+        # 前提自检:关键帧值与期望均值必须不同,否则本测试零区分力
+        assert cr["kf_preds"]["mal_prob"] == 0.9
+
+        case_dir = str(tmp_path / "D_MAL")
+        v21_output.write_case_v21(case_dir, "D_MAL", "ACC", cr, "dynamic", 50)
+        n = _read_json(os.path.join(case_dir,
+                                    "prediction.json"))["Prediction"]["Nodules"][0]
+        assert abs(n["Malignancy"]["confidence"] - 0.5) < 1e-9, \
+            f"良恶性应取三帧均值 0.5,得到 {n['Malignancy']['confidence']}" \
+            "(0.9 说明仍沿用关键帧口径)"
+        # predicted 由 confidence 与阈值比较得出,须与均值自洽
+        assert n["Malignancy"]["predicted"] is True  # 0.5 >= 0.5
+
+    def test_static_mal_prob_unchanged(self, tmp_path):
+        """反向保护:静态路径**没有多帧**,`mal_prob` 必须原样直传,别被均值逻辑波及。"""
+        blob = np.zeros((_MODEL, _MODEL), np.uint8)
+        blob[2:5, 3:6] = 1
+        soft, binary = _soft_and_binary_single(blob)
+        cr = _static_case_result(soft, binary, mal_prob=0.83)
+        case_dir = str(tmp_path / "P_MAL")
+        v21_output.write_case_v21(case_dir, "P_MAL", "S", cr, "static", 30)
+        n = _read_json(os.path.join(case_dir,
+                                    "prediction.json"))["Prediction"]["Nodules"][0]
+        assert abs(n["Malignancy"]["confidence"] - 0.83) < 1e-9
+
+    def test_sampled_frames_do_not_fragment_one_nodule(self, tmp_path):
+        """🔴 抽样回填后,同一结节不得被时间维切成碎片(2026-08-17 终审 D 路 P1)。
+
+        `max_frames` 抽样 + scatter 回填后未抽中帧全 0,帧间隔 = n_total/抽样数。
+        `split_nodules` 的 `close_gap_frames` 若小于该间隔,26-邻域在时间维连不上,
+        一个结节被切成一串碎片,每片都带一份四头预测进 `Nodules` —— 而官方 `:215`
+        按「每个预测病灶仅贡献一个样本」计分 → 同一病灶重复计数、检测 AP 被稀释。
+
+        实测(修复前,默认 close_gap_frames=1):
+          原视频 100 帧/抽 32 → **7 个**实例;128 帧 → **20 个**(撞 max_nodules 上限)。
+        本例用 n_total=40、抽 8 帧(间隔 5),修复前必然拆碎,故有区分力。
+        """
+        n_total, sampled = 40, (0, 5, 10, 15, 20, 25, 30, 35)
+        heads = [_head_probs() for _ in sampled]
+        cr = _dynamic_case_result(n_total=n_total, sampled_idx=sampled,
+                                  per_frame_heads=heads)
+        # 让每个抽样帧的结节落在**同一位置**(默认 fixture 会逐帧位移,那是另一回事)
+        for f in cr["per_frame"]:
+            soft = np.full((_MODEL, _MODEL), 0.05, dtype=np.float32)
+            soft[2:5, 3:6] = 0.85
+            f["preds"]["pred_mask"] = soft
+            f["preds"]["mask_binary"] = (soft > 0.5).astype(np.uint8) * 255
+        cr["kf_preds"] = cr["per_frame"][0]["preds"]
+
+        case_dir = str(tmp_path / "D_FRAG")
+        v21_output.write_case_v21(case_dir, "D_FRAG", "ACC", cr, "dynamic", 60)
+        payload = _read_json(os.path.join(case_dir, "prediction.json"))
+        validate_prediction_json(payload)
+        n_nodules = len(payload["Prediction"]["Nodules"])
+        assert n_nodules == 1, (
+            f"同一结节被拆成 {n_nodules} 个实例 —— 缝合跨度没按抽样间隔"
+            f"({n_total}/{len(sampled)}=5)自适应")
+
+    def test_temporally_separate_nodules_not_merged(self, tmp_path):
+        """反向保护:调大缝合跨度**不得**把时空分离的两个结节粘连成一个。
+
+        闭运算是 3D 的,空间不重叠就连不上 —— 本测试钉住这个前提,防止将来有人
+        把缝合改成"只按时间维膨胀"而静默合并不同结节。
+        """
+        n_total, sampled = 40, (0, 5, 10, 15, 20, 25, 30, 35)
+        heads = [_head_probs() for _ in sampled]
+        cr = _dynamic_case_result(n_total=n_total, sampled_idx=sampled,
+                                  per_frame_heads=heads)
+        for f, fi in zip(cr["per_frame"], sampled):
+            soft = np.full((_MODEL, _MODEL), 0.05, dtype=np.float32)
+            if fi < 16:
+                soft[1:3, 1:3] = 0.85      # 结节 A:左上,仅前段
+            elif fi > 24:
+                soft[6:8, 6:8] = 0.85      # 结节 B:右下,仅后段
+            f["preds"]["pred_mask"] = soft
+            f["preds"]["mask_binary"] = (soft > 0.5).astype(np.uint8) * 255
+        cr["kf_preds"] = cr["per_frame"][0]["preds"]
+
+        case_dir = str(tmp_path / "D_SEP")
+        v21_output.write_case_v21(case_dir, "D_SEP", "ACC", cr, "dynamic", 60)
+        payload = _read_json(os.path.join(case_dir, "prediction.json"))
+        assert len(payload["Prediction"]["Nodules"]) == 2, \
+            "空间不重叠的两个结节被粘连了"
 
     def test_t_conf_is_mean(self, tmp_path):
         heads = [_head_probs(t_conf=c) for c in (0.2, 0.5, 0.8)]

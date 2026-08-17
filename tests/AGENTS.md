@@ -101,14 +101,13 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 ## 测试总数(单一权威,2026-08-17 `Demo_D` 主环境实测)
 
-**`pytest --collect-only`=923 / 全套 922 passed + 1 skipped**(2026-08-17 #116b 后快照)。
-演进链:**891**(2026-08-17 #127 后)**+32 = #116b 四头接线**
-(`test_v21_output` 11→**31**:`TestOfficialHeadWiring` 编码映射钉子 + `TestHedgeKeys`
-对冲键端到端 + `TestDynamicLesionLevelMean` 病灶级均值;`test_probability_output` 33→**47**:
-四头 NaN 硬拦/键缺失 KeyError/不二次 softmax/不走 calibrator;
-`test_prediction_json` 69→**72**:对冲键长度校验与缺省不写)。
-⚠️ 净增 32 而非 33 —— 旧 `TestPlaceholderDims::test_ete_location_t_present_and_valid`
-被重写吸收(它守的"占位结构合规"语义已随接线消失)。
+**`pytest --collect-only`=929 / 全套 928 passed + 1 skipped**(2026-08-17 #116b + 终审修复后)。
+演进链:**891**(#127 后)**+32 = #116b 四头接线** → **923** **+6 = 上云前终审修复** → **929**:
+`test_mal_prob_is_lesion_level_mean_not_keyframe`(P0.1 良恶性口径分裂)+
+`test_static_mal_prob_unchanged`(反向保护)+ `test_non_finite_rejected`×2(P2.4 对冲键 NaN)+
+`test_sampled_frames_do_not_fragment_one_nodule`(D 路 P1 动态碎片)+
+`test_temporally_separate_nodules_not_merged`(反向:不得粘连)。
+🔴 后两条**已做变异测试**:回退 `close_gap_frames` 自适应后两条都变红,证明有区分力。
 上一段演进:**856**(2026-08-16)**+35 = `test_seg_guards.py`**(backlog #127 分割护栏,
 判据从 dice→概率 spread→预测 mask 前景占比两次改版的回归钉子,含 **9 路变异测试**
 与 `test_v2_hole_*` 两个反例——那两个把「有结构但 max=0.45 被放行而 mask 仍全零」

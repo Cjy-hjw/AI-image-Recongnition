@@ -339,18 +339,26 @@ def build_nodule_entry(
     # --- #116a 对冲键:仅在调用方显式提供时写出(见 Args 说明) ---
     # 长度按各自类别数硬校验:长度错说明上游取错了头(如把 5 维 TI-RADS 填进
     # ETE 位),此时静默写出等于交一份自相矛盾的 JSON,不如当场炸。
+    # 🔴 **同时校验有限性**(2026-08-17 终审 P2.4):`json.dumps` 把 NaN 写成裸
+    # 字面量 `NaN`,这是**非标准 JSON**,严格解析器(Go/Rust/Jackson 默认)会拒绝
+    # **整份** prediction.json —— 该病例所有指标不予计分,比单字段错严重得多。
+    # 当前上游 `decode_predictions._assert_finite` 已硬拦 NaN,此处是**第二道
+    # 防线**:未来若头实现变更或有人绕过 decode 直调本函数,这道校验仍在。
+    def _finite_probs(vals, field, n_expect):
+        out = [float(x) for x in vals]
+        if len(out) != n_expect:
+            raise PredictionSchemaError(
+                f"{field} 长度必须为 {n_expect},收到 {len(out)}")
+        for v in out:
+            if not math.isfinite(v):
+                raise PredictionSchemaError(f"{field} 含非有限值(NaN/Inf): {out}")
+        return out
+
     if tirads_probs is not None:
-        vals = [float(x) for x in tirads_probs]
-        if len(vals) != len(TIRADS_CODES):
-            raise PredictionSchemaError(
-                f"TI_RADS_Probs 长度必须为 {len(TIRADS_CODES)},收到 {len(vals)}")
-        entry["TI_RADS_Probs"] = vals
+        entry["TI_RADS_Probs"] = _finite_probs(
+            tirads_probs, "TI_RADS_Probs", len(TIRADS_CODES))
     if ete_probs is not None:
-        vals = [float(x) for x in ete_probs]
-        if len(vals) != len(ETE_CODES):
-            raise PredictionSchemaError(
-                f"ETE_Probs 长度必须为 {len(ETE_CODES)},收到 {len(vals)}")
-        entry["ETE_Probs"] = vals
+        entry["ETE_Probs"] = _finite_probs(ete_probs, "ETE_Probs", len(ETE_CODES))
 
     return entry
 

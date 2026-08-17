@@ -338,9 +338,19 @@ def _lesion_level_head_preds(per_frame, kf_preds) -> dict:
             但此处不赌上游契约,除零会崩在离根因很远的地方)。
 
     Returns:
-        dict:四头键取均值,其余键(`mal_prob` 等)原样沿用 `kf_preds`。
-        🔴 `mal_prob`/`breakdown` **维持关键帧口径不动**(超出 #116b 范围);
-        本函数只改四头,别顺手把良恶性也改了 —— 那会动到已在生产拿分的路径。
+        dict:**全部分类概率**(四头 + 良恶性)取均值,其余键沿用 `kf_preds`。
+
+        🔴 **`mal_prob` 也必须均值,别只均值四头**(2026-08-17 终审 P0.1 修正):
+        官方 `:215` 那句话把「良恶性AUC-PR」和四头**并列**写在同一个"病灶级汇总"
+        清单里,不是只管四头;训练侧 `metrics_official.py:8/26-29` 同样把良恶性
+        列进按 `lesion_id` 取均值的范围。此前本函数只均值四头、`mal_prob` 留在
+        关键帧口径,构成**口径分裂** —— 关键帧是「最恶性帧」(argmax),系统性
+        高于病灶级均值,而良恶性 AUC-PR 是目标三里我方最强的一项(0.90),
+        偏差直接打在它上面。
+        ⚠️ 本 docstring 曾写「别顺手把良恶性也改了」,**那句是错的**,已删。
+
+        `breakdown`(TI-RADS 概念分项)仍用关键帧:它只喂 CBM 报告文本
+        (`Interpretation`),初赛不计分,且没有"多帧平均一份概念分项"的语义。
     """
     if not per_frame:
         return kf_preds
@@ -350,6 +360,12 @@ def _lesion_level_head_preds(per_frame, kf_preds) -> dict:
             np.stack([np.asarray(f["preds"][key], dtype=np.float64)
                       for f in per_frame]), axis=0)
     out["t_conf"] = float(np.mean([float(f["preds"]["t_conf"]) for f in per_frame]))
+    # 良恶性同口径:`mal_probs` 与 `mal_prob` 必须同源(prediction_json 只消费
+    # `mal_prob`,但两者不一致会让 CLI 调试路径与生产各说各话)。
+    out["mal_probs"] = np.mean(
+        np.stack([np.asarray(f["preds"]["mal_probs"], dtype=np.float64)
+                  for f in per_frame]), axis=0)
+    out["mal_prob"] = float(out["mal_probs"][1])
     return out
 
 
@@ -406,10 +422,29 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     binary_3d = scatter_frames_to_full_length(binary_frames, frame_indices, n_total)
     soft_3d = scatter_frames_to_full_length(soft_frames, frame_indices, n_total)
 
-    # 3D 连通域 = 跨帧实例关联(局限见模块 docstring @云TODO)。
-    instances = split_nodules(binary_3d)
-    # 四头走**病灶级均值**(官方 :215「每个预测病灶仅贡献一个样本」);
-    # mal_prob/breakdown 仍用关键帧口径(见 `_lesion_level_head_preds` docstring)。
+    # --- 3D 连通域 = 跨帧实例关联 ---
+    # 🔴 **缝合跨度必须按实际抽样间隔算,不能用默认的 1**(2026-08-17 终审 D 路 P1)。
+    # 我们默认 `max_frames=32` 均匀抽样后 scatter 回填,**未抽中的帧全是 0** ——
+    # 帧间隔 = ceil(n_total / 抽样帧数)。若 `close_gap_frames`(默认 1)小于该间隔,
+    # 26-邻域在时间维**根本连不上**,同一个结节会被沿时间轴切成一串碎片。
+    #
+    # 实测(`split_nodules` 默认参数,单个全程存在的结节):
+    #   原视频 50 帧(间隔1)→ 1 个实例 ✅
+    #   原视频 100 帧(间隔3)→ **7 个**
+    #   原视频 128/200/400 帧(间隔4/6/12)→ **各 20 个**(撞 DEFAULT_MAX_NODULES 上限)
+    # 真实超声 cine 普遍上百帧,所以这是**常态而非边缘情况**。
+    # 后果:每个碎片都带一份四头预测进 `Nodules`,而官方 `:215` 按「每个预测病灶
+    # 仅贡献一个样本」计分 → 同一病灶被重复计数 20 次,检测 AP 同时被稀释。
+    #
+    # 取 `间隔 + 1` 而非恰好等于间隔:留一帧余量,兼顾"某个抽样帧本身漏检"的情况
+    # (那会让实际空隙变成 2 倍间隔;+1 不足以覆盖全部但成本为零)。
+    # ⚠️ 副作用已实测排除:闭运算是 **3D** 的,时空分离的两个结节即使 gap 调到 20
+    # 仍正确保持 2 个实例(空间不重叠就连不上),不会把不同结节粘连。
+    n_sampled = len(frame_indices)
+    gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
+    instances = split_nodules(binary_3d, close_gap_frames=gap)
+    # 四头 + 良恶性走**病灶级均值**(官方 :215「每个预测病灶仅贡献一个样本」),
+    # 详见 `_lesion_level_head_preds` docstring。
     context = _shared_nodule_context(
         _lesion_level_head_preds(per_frame, kf_preds))
     entries = _build_entries_and_save_masks(

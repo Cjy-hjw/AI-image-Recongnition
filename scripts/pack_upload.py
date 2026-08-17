@@ -128,13 +128,12 @@ _WEIGHTS = [
 # 🔴 `best_model_mixtrain_xl_e40.pth` 是**分割 warm-start 底座**(公开集 Dice
 # 97.71%/87.15%),实测 793 张量 / 144 个 seg 键 / **四头 0 个** —— 它不含官方四头,
 # **不能当推理主权重**(装了四头就是随机初始化)。推理主权重只能是云端训练产出的那份。
+#
+# ImageNet 骨干(convnext_nano / efficientnet_b2 的 .safetensors)**不装**:
+# 云端已有(上一轮训练包传过),重传只是白等上传时间。
 _TRAIN_WEIGHTS = [
     (os.path.join(REPO, "checkpoints_a800", "best_model_mixtrain_xl_e40.pth"),
      "checkpoints/best_model_mixtrain_xl_e40.pth"),
-    (r"C:\Users\cjy\Desktop\上云训练包_py\checkpoints\convnext_nano_pretrained.safetensors",
-     "checkpoints/convnext_nano_pretrained.safetensors"),
-    (r"C:\Users\cjy\Desktop\上云训练包_py\checkpoints\efficientnet_b2_pretrained.safetensors",
-     "checkpoints/efficientnet_b2_pretrained.safetensors"),
 ]
 
 

@@ -99,16 +99,29 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 `OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
 
-## 测试总数(单一权威,2026-08-17 `Demo_D` 主环境实测)
+## 测试总数(单一权威,2026-08-17 实测)
 
-**`pytest --collect-only`=929 / 全套 928 passed + 1 skipped**(2026-08-17 #116b + 终审修复后)。
-演进链:**891**(#127 后)**+32 = #116b 四头接线** → **923** **+6 = 上云前终审修复** → **929**:
+**全套 940 passed + 1 skipped**(2026-08-17 第三轮 review 修复后)。
+⚠️ 罕见地**两个环境同数**:`Demo_D` 主环境与 `torch28` 预演环境本轮实测都是
+940+1 —— 这是巧合不是规律,别据此以为跨环境可比(见下方「跨环境不可比」条)。
+
+演进链:**891**(#127 后)**+32 = #116b 四头接线** → **923** **+6 = 上云前终审修复**
+→ **929** **+11 = 第三轮 review 修复** → **940**:
+- `test_missing_n_total_frames_raises_not_guesses`(改写:原 `..._falls_back` 钉的是
+  「回退猜 Z 长度」这个**已被判定为整例清零风险**的旧行为,现钉硬失败)
+- `test_invalid_n_total_frames_raises`×3(0 / 负数 / None 三种畸形值)
+- `test_official_head_wrong_length_raises`×8(四头 × ±1 双向参数化 —— 双向防
+  「只校验了下界」这类半拉子实现)
+- `test_official_head_length_constants_come_from_models`(常量必须来自 `src.models`
+  单一权威,不得在推理侧另抄一份)
+
+上一段演进 **923→929 = 上云前终审修复**:
 `test_mal_prob_is_lesion_level_mean_not_keyframe`(P0.1 良恶性口径分裂)+
 `test_static_mal_prob_unchanged`(反向保护)+ `test_non_finite_rejected`×2(P2.4 对冲键 NaN)+
 `test_sampled_frames_do_not_fragment_one_nodule`(D 路 P1 动态碎片)+
 `test_temporally_separate_nodules_not_merged`(反向:不得粘连)。
 🔴 后两条**已做变异测试**:回退 `close_gap_frames` 自适应后两条都变红,证明有区分力。
-上一段演进:**856**(2026-08-16)**+35 = `test_seg_guards.py`**(backlog #127 分割护栏,
+再上一段:**856**(2026-08-16)**+35 = `test_seg_guards.py`**(backlog #127 分割护栏,
 判据从 dice→概率 spread→预测 mask 前景占比两次改版的回归钉子,含 **9 路变异测试**
 与 `test_v2_hole_*` 两个反例——那两个把「有结构但 max=0.45 被放行而 mask 仍全零」
 和「常量图+4 个异常像素」钉死,勿删);

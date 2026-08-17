@@ -2,14 +2,12 @@
 
 用法:
     python scripts/pack_upload.py            # 三个包全打
-    python scripts/pack_upload.py code       # 推理代码
-    python scripts/pack_upload.py weights    # 推理权重
+    python scripts/pack_upload.py infer      # 推理包(代码+权重+手册)
     python scripts/pack_upload.py train      # 训练底座权重
 
 产出:
-    C:\\Users\\cjy\\Desktop\\cloud_infer_code.zip      推理代码(41 个 .py,约 180KB)
-    C:\\Users\\cjy\\Desktop\\cloud_infer_weights.zip   推理权重(约 45MB)
-    C:\\Users\\cjy\\Desktop\\cloud_train_weights.zip   训练底座(约 230MB,为下次训练准备)
+    C:\\Users\\cjy\\Desktop\\cloud_infer.zip           推理包:代码+权重+手册(约 42MB)
+    C:\\Users\\cjy\\Desktop\\cloud_train_weights.zip   训练底座(约 104MB,为下次训练准备)
 
 ## 代码包为什么是 41 个 .py 而不是 src/ 全树 88 个
 

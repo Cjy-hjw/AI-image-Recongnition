@@ -82,11 +82,14 @@ class V21OutputError(RuntimeError):
 def _tirads_class_from_breakdown(breakdown) -> int:
     """从 `build_tirads_breakdown` 的 `total_points` 推 1..5 的 TI_RADS_Class。
 
-    🔴 **2026-08-17 起已非生产路径**(backlog #116b):生产 `_shared_nodule_context`
+    🔴 **2026-08-17 起已无任何调用方**(backlog #116b):生产 `_shared_nodule_context`
     改用 `tirads_head` 的真实 softmax。本函数走的是 CBM 概念头的 ACR 积分反推,
     那条通路**没有专属训练监督**(概念头梯度对 TI-RADS 标签恒 0)、期望加权
-    Kappa≈0,而 `tirads_head` 实测 0.6887。保留本函数是因为 CLI 调试路径
-    (`predict.py` → `result.json`)仍在用,勿因"看着没人调"而删。
+    Kappa≈0,而 `tirads_head` 实测 0.6887。
+    ⚠️ **保留理由 = 可回退 + 最小 diff,不是"CLI 还在用"** —— 实测
+    `predict.py`/`video_predict.py` **都不调用它**(它们走 `build_probability_export`,
+    该函数不含 TI-RADS 类别);唯一引用来自 `tests/test_v21_output.py`。
+    (此处曾误写"CLI 调试路径仍在用",系未核实即写进注释,已由 Gate2 角度 7-8 实测纠正。)
 
     复刻 `report_generator.calculate_tirads_points` 内置的分级阈值(同一份 ACR 规则,
     单一事实源在那里的 tr_level 字符串里;此处只需 int 类别,故独立实现阈值映射,
@@ -270,7 +273,7 @@ def _shared_nodule_context(preds) -> dict:
 
     `breakdown` 参数已于 2026-08-17 **从签名移除**:TI-RADS 改由 `tirads_head` 直供后
     它在本函数体内零引用,留着只会让下一个改它的人以为还有用(Gate2 两路独立指出)。
-    ACR 反推路径见 `_tirads_class_from_breakdown`(仅 CLI 调试用)。
+    ACR 反推路径见 `_tirads_class_from_breakdown`(**现已无任何调用方**,保留理由见该函数)。
     """
     ete_probs = preds["ete_probs"]
     tirads_probs = preds["tirads_probs"]

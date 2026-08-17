@@ -165,7 +165,7 @@ Phase 1 给 `decode_predictions` 全部分类头加了 NaN/Inf 硬校验(`_asser
 
 ### `decode_predictions(outputs, calibrator=None)` → `dict`
 Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `comp_prob`, `echo_prob`, `shape_prob`, `margin_prob`, `foci_prob`, `mal_prob`, `mal_probs`, **`ete_probs`, `location_probs`, `t_probs`, `t_conf`, `tirads_probs`**(官方四头,#116b 2026-08-17 接入)。
-- **官方四头(位置/ETE/临床T/TI-RADS)**:**原样透传各头已算好的 fp32 softmax**(`heads/*.py` 内部已 softmax),`decode_predictions` **不再二次 softmax**(`softmax(softmax(x))≠softmax(x)`,argmax 不变但概率值全错,而"必须输出概率分布"正是官方计分项)。**不走 calibrator**(`CALIBRATED_TASKS` 不含四头,温度缩放对未标定的头是伪精度)。**键缺失即 KeyError 不兜底** —— 四头是 `MultiTaskThyroidModel.forward` 的无条件输出,缺席说明加载的是不含四头结构的旧模型(如 `thyroidxl_merged_v2.pth`),静默兜底会写出确定性占位值而目标四 40% 三项 + 目标三 TI-RADS 全部失分且 JSON 完全合法、本地看不出。
+- **官方四头(位置/ETE/临床T/TI-RADS)**:**原样透传各头已算好的 fp32 softmax**(`heads/*.py` 内部已 softmax),`decode_predictions` **不再二次 softmax**(`softmax(softmax(x))≠softmax(x)`,argmax 不变但概率值全错,而"必须输出概率分布"正是官方计分项)。**不走 calibrator**(`CALIBRATED_TASKS` 不含四头,温度缩放对未标定的头是伪精度)。**键缺失即 KeyError 不兜底** —— 四头是 `MultiTaskThyroidModel.forward` 的无条件输出,缺席说明加载的是不含四头结构的旧模型(如 `thyroidxl_merged_v2.pth`),静默兜底会写出确定性占位值而目标四 40% 三项 + 目标三 TI-RADS 全部失分且 JSON 完全合法、本地看不出。**长度也硬校验**(2026-08-17 第三轮 review lane4 L3):下游一律 `argmax+1`,长度错时若 argmax 落在合法值域内就静默产出错误编码 —— 实测唯独 `t_probs` 全程无人校验(4 维且 argmax=idx1 时静默写出 `T=1`),详见文末专条。
 - **`t_conf` 也过 `_assert_finite`**:官方《初赛评审规则》「置信度字段规范」明写 `Detection.confidence`/`Malignancy.confidence`/`T_conf` 若为 NaN/Inf/越界,**评估脚本统一按 0 处理、该样本在 AP/AUC-PR/AUC 中排最后** —— 不是崩溃而是静默垫底,比崩溃阴。
 - `calibrator`: 可选 `TemperatureScaler`。各分类头在 softmax/sigmoid **之前**先 `apply(task, logits)` 温度缩放;`None` 或全 T=1.0 时输出逐位等同无校准。各头统一 `.float()` 后再缩放(fp16 温度除法精度对齐),T>0 单调不改 argmax。mask 分割不走校准。
 - **`*_prob` = 完整概率分布**(2026-07-29 新增)。四个 softmax 头和为 1;`foci_prob` 是**多标签 sigmoid**,各元素独立、不求和。`mal_probs` = `[p_benign, p_malignant]`,`mal_prob` 恒等于 `mal_probs[1]`(同源,不允许两条计算路径)。
@@ -504,6 +504,29 @@ LocationProbs / T=0 / T_conf=0.0` 这组值,是"四头没接上"的故障信号,
 ⚠️ 副作用已实测排除:闭运算是 **3D** 的,时空分离的两个结节即使 gap 调到 20 仍保持
 2 个实例(空间不重叠连不上)。回归钉子 `test_sampled_frames_do_not_fragment_one_nodule`
 + `test_temporally_separate_nodules_not_merged`(已做变异测试:回退修复后两条都变红)。
+
+🔴 **`n_total_frames` 缺失是硬失败,不得回退猜测**(2026-08-17 第三轮 review lane3 P2-1):
+原实现回退 `max(frame_indices)+1`,**尾部若有未抽中帧则 Z 长度短于原视频** ——
+评审规则 `:205` 的罚则是「格式错误,该病例所有指标不予计分」(**整例清零**),而回退
+只打一条 warning、输出看着完全正常,本地永远发现不了。现改为抛 `V21OutputError`:
+宁可该病例 ERROR(日志可见)也不交一份注定被判格式错误的 mask。
+生产路径不可达(`runner.py:329` 恒注入,且 loader 失败时返回 0 → `runner.py:283` 提前
+raise),拦的是「未来新增调用方忘了注入」这类回归。钉子
+`test_missing_n_total_frames_raises_not_guesses`(原 `..._falls_back`,其 fixture 恰好
+演示旧行为的危害:6 帧原视频只写 5 帧 Z 轴)+ `test_invalid_n_total_frames_raises`(0/负/None)。
+
+🔴 **四头概率的长度契约在 `decode_predictions` 源头硬校验**(同轮 lane4 L3):
+下游 `_shared_nodule_context` 一律 `argmax+1`,**长度错时若 argmax 恰好落在合法值域内
+就静默产出错误编码** —— 该维度按错值计分(Kappa/AUC 污染),JSON 完全合法查不出来。
+实测 8 个长度错场景:ETE/TI-RADS/Location 各自被下游对冲键或 `LocationProbs` 的长度
+校验**侧面**拦下(**那是巧合不是设计**),**唯独 `t_probs` 全程无人校验** —— 4 维且
+argmax=idx1 时一路静默写出 `T=1`。故不依赖下游偶然拦截,在源头按类别数统一校验。
+⚠️ 期望值常量从 `src.models` 单一权威 import(`NUM_CLIN_T_CLASSES` 在
+`heads/clinical_t.py`,其余在 `label_schema.py`),**不得在推理侧另抄** —— 抄一份则
+模型改类别数时两处分叉,校验会把正确输出判成错误或放行真错误。依赖方向合规:
+`.importlinter` 禁的是 `src.models` 依赖 `src.inference`,反向可以。
+钉子 `test_official_head_wrong_length_raises`(四头 × ±1 双向参数化,双向防「只校验了
+下界」)+ `test_official_head_length_constants_come_from_models`。
 
 ### 两条不显眼但致命的校验
 

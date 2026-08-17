@@ -1,37 +1,48 @@
-"""打包上云权重 + 推理代码增量。
+"""打包上云包。
 
 用法:
-    python scripts/pack_upload.py            # 代码 + 权重两个包
-    python scripts/pack_upload.py code       # 只打代码包
-    python scripts/pack_upload.py weights    # 只打权重包
+    python scripts/pack_upload.py            # 三个包全打
+    python scripts/pack_upload.py code       # 推理代码
+    python scripts/pack_upload.py weights    # 推理权重
+    python scripts/pack_upload.py train      # 训练底座权重
 
 产出:
-    C:\\Users\\cjy\\Desktop\\cloud_infer_code.zip     推理代码(41 个 .py,约 180KB)
-    C:\\Users\\cjy\\Desktop\\cloud_infer_weights.zip  权重(约 160MB)
+    C:\\Users\\cjy\\Desktop\\cloud_infer_code.zip      推理代码(41 个 .py,约 180KB)
+    C:\\Users\\cjy\\Desktop\\cloud_infer_weights.zip   推理权重(约 45MB)
+    C:\\Users\\cjy\\Desktop\\cloud_train_weights.zip   训练底座(约 230MB,为下次训练准备)
 
 ## 代码包为什么是 41 个 .py 而不是 src/ 全树 88 个
 
-内容 = `python -m src.service.app` 的**静态 import 闭包**(实测 41)。
-`src/dataset`(11) / `src/training`(15) / `src/models/losses`(15) 等推理路径
-**永不触达**。
+内容 = `python -m src.service.app` 的**静态 import 闭包**(`scripts/verify_closure.py`
+实测 41)。`src/dataset`(11) / `src/training`(15) / `src/models/losses`(15) 等推理
+路径**永不触达**。
 
-🔴 判据用静态闭包不用运行时探针:运行时只覆盖本次实际走到的分支,而推理服务
-有大量条件路径(gatekeeper 降级 / 静动分发 / 坏帧兜底),某次没触发 ≠ 部署时
-不触发。静态闭包按 import 传递闭包算,只多留不少留。
-(实测差异:运行时 30 个 vs 静态 41 个,少的 11 个正是没走到的降级分支。)
+🔴 判据用静态闭包不用运行时探针:运行时只覆盖本次实际走到的分支,而推理服务有大量
+条件路径(gatekeeper 降级 / 静动分发 / 坏帧兜底),某次没触发 ≠ 部署时不触发。静态
+闭包按 import 传递闭包算,只多留不少留。(实测:运行时 30 个 vs 静态 41 个,少的 11 个
+正是没走到的降级分支。)
 
-新增 import 后须重算闭包更新 `_CLOSURE`,漏一个 = 云端 ImportError 起不来服务。
+新增 import 后须跑 `verify_closure.py` 更新 `_CLOSURE`,漏一个 = 云端 ImportError。
 
-## 权重包装什么
+## 三个包各装什么(按代码实测的加载点,非凭印象)
 
-按代码实测的加载点(不是凭印象):
+**推理代码包** —— 41 个 .py + `configs/` + `requirements.txt` + `README.md`(操作
+手册)+ `AGENTS.md`(目录地图)。
+
+**推理权重包**:
 
 | 文件 | 必需? | 缺了会怎样 |
 |---|---|---|
-| 主模型权重 | 🔴 必需 | **云端训练产物,不在本包内**,由 `AICOMP_WEIGHTS` 指定。它决定四头是真实输出还是随机数 |
+| 主模型权重 | 🔴 必需 | **云端训练产物,不在包内**,由 `AICOMP_WEIGHTS` 指定 |
 | `resnet18-f37072fd.pth` | 🔴 必需 | 去重后端兜底权重。SSCD 主后端权重我方没有 → 必然降级 resnet18;此时缓存也缺 → 尝试联网下载 → **云端禁联网必然 raise** → `build_service_runner` 崩 → 服务起不来 = 整场零分 |
-| `authenticity_model.pth` | 可选 | 只把真实性审计标 skipped、诊断照常,且该项零计分。4.7K,顺手带上 |
-| ImageNet 底座 `.safetensors` | ❌ 不装 | **训练用**。推理时先按它初始化、随后被主权重整体覆盖,缺失只少一条警告 |
+| `authenticity_model.pth` | 可选 | 只把真实性审计标 skipped、诊断照常,且该项零计分。4.7K 顺手带上 |
+
+**训练底座包**(为下次训练准备,与推理无关):
+
+| 文件 | 用途 |
+|---|---|
+| `best_model_mixtrain_xl_e40.pth` | 分割 warm-start 底座(公开集 Dice 97.71%/87.15%)。实测 793 张量 / 144 个 seg 键 / **四头 0 个** —— 纯分割底座,不能当推理主权重 |
+| `*_pretrained.safetensors` ×2 | ImageNet 骨干初始化 |
 
 ⚠️ `authenticity_model.pth` 要放**主权重同目录**(`gatekeeper_runner.py:110` 取
 `dirname(weights_path)`),不是固定的 `checkpoints/`。
@@ -93,13 +104,11 @@ src/utils/report_generator.py
 _CODE_EXTRA = [
     ("configs/thyroid_config.yaml", "configs/thyroid_config.yaml"),
     ("requirements.txt", "requirements.txt"),
-    ("docs/交付与部署/云端操作手册_推理服务.md", "README.md"),
+    ("docs/8.1赛事公开资料/云端手册/操作说明.md", "README.md"),
+    ("docs/8.1赛事公开资料/云端手册/速查表.md", "AGENTS.md"),
 ]
 
-# ── 权重:(本地绝对路径, 包内相对路径) ─────────────────────────────────────
-# 🔴 只装**推理**真正需要的。ImageNet 底座(convnext_nano / efficientnet_b2
-# 的 .safetensors)是**训练**用的 —— 推理时 `build_model` 先按它们初始化、
-# 随后被主权重 `load_state_dict` 整体覆盖,缺失只是少一条警告,不装。
+# ── 推理权重:(本地绝对路径, 包内相对路径) ─────────────────────────────────
 _WEIGHTS = [
     # 🔴 必需:去重后端的兜底权重。SSCD 主后端权重我方没有 → Deduplicator 必然
     # 降级到 resnet18(deduplication.py:80-86);此时若本地缓存也没有,代码会尝试
@@ -113,6 +122,19 @@ _WEIGHTS = [
     # 且真实性在赛道七零计分。才 4.7K,带上省一条启动警告。
     (os.path.join(REPO, "checkpoints_a800", "authenticity_model.pth"),
      "checkpoints/authenticity_model.pth"),
+]
+
+# ── 训练底座权重(为下次训练准备,推理用不上)────────────────────────────────
+# 🔴 `best_model_mixtrain_xl_e40.pth` 是**分割 warm-start 底座**(公开集 Dice
+# 97.71%/87.15%),实测 793 张量 / 144 个 seg 键 / **四头 0 个** —— 它不含官方四头,
+# **不能当推理主权重**(装了四头就是随机初始化)。推理主权重只能是云端训练产出的那份。
+_TRAIN_WEIGHTS = [
+    (os.path.join(REPO, "checkpoints_a800", "best_model_mixtrain_xl_e40.pth"),
+     "checkpoints/best_model_mixtrain_xl_e40.pth"),
+    (r"C:\Users\cjy\Desktop\上云训练包_py\checkpoints\convnext_nano_pretrained.safetensors",
+     "checkpoints/convnext_nano_pretrained.safetensors"),
+    (r"C:\Users\cjy\Desktop\上云训练包_py\checkpoints\efficientnet_b2_pretrained.safetensors",
+     "checkpoints/efficientnet_b2_pretrained.safetensors"),
 ]
 
 
@@ -182,9 +204,19 @@ def build_weights():
     print("     由 AICOMP_WEIGHTS 指向云上那份;它决定四头是否真实输出。")
 
 
+def build_train_weights():
+    _emit(os.path.join(OUT_DIR, "cloud_train_weights"), _TRAIN_WEIGHTS, "训练底座包")
+    print("\n  用途:**下次训练**的 warm-start 底座,推理用不上。")
+    print("    checkpoints/* → 项目根的 checkpoints/")
+    print("  🔴 `best_model_mixtrain_xl_e40.pth` 不含官方四头(实测 four_heads=0),")
+    print("     **不能当推理主权重** —— 装了四头就是随机初始化,输出随机数。")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("all", "code"):
         build_code()
     if which in ("all", "weights"):
         build_weights()
+    if which in ("all", "train"):
+        build_train_weights()

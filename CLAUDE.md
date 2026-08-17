@@ -28,11 +28,11 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 856 collected / 855 passed+1 skipped，2026-08-16 分割解冻契约改动
-# 回归测试（+15，改动前 841/840）：test_official_schedule.py +8、test_metrics_official.py +7。
+# 完整测试套件（本地可跑，实测 941 collected / 940 passed+1 skipped，2026-08-17 第三轮 review
+# 修完后 `Demo_D` 主环境实测。演进链 891→923→929→940，明细见 `tests/AGENTS.md`。
 # 精确计数以 pytest --collect-only 实跑为准；
 # ⚠️ 测试总数跨 Python 环境不可比，
-# torch2.8 预演环境待下次云端对拍重新确认（08-13 早些时候 TI-RADS 加入前为 789/6，collected 795 与主环境一致），判回归须同环境前后对拍）
+# torch2.8 预演环境待下次云端对拍重新确认，判回归须同环境前后对拍）
 pytest tests/ -v
 
 # 单文件测试

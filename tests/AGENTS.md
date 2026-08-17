@@ -49,7 +49,7 @@
 序列重置,**实测三个 epoch 翻转序列逐位相同**(增强白做,不报错、loss 照常降)。生产必须走全局
 `random`(由 `worker_init_fn` 按 `torch.initial_seed()` 播种,torch 每 epoch 重抽 base_seed)。
 
-## `test_official_schedule.py` — 官方三头 A/B/C 调度 + JSONL 日志(16 用例,2026-08-13 Phase E)
+## `test_official_schedule.py` — 官方三头 A/B/C 调度 + JSONL 日志(**26 用例**,2026-08-17 `--collect-only` 实测;原记 16 是 Phase E 初版数、已过时)
 
 `schedule_official.py` 的数值/契约锁定,与 `test_stage_schedule.py`(legacy 三阶段)**语义互补不重叠**:
 后者钉的是"已知缺陷 100 倍跳变确实存在",本文件钉的是"新调度**不许**出现这种跳变"。

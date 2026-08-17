@@ -3,6 +3,12 @@
 import numpy as np
 import torch
 
+# 四头的类别数常量:用于 `decode_predictions` 的维度契约硬校验。
+# 单一权威在 `src.models` 侧,此处只读不再抄一份 —— 若模型改类别数而这里抄了个
+# 旧数字,校验就会把正确输出judge成错误(或反过来放行真错误)。
+# 依赖方向合规:`.importlinter` 契约禁的是 `src.models` 依赖 `src.inference`,反向可以。
+from src.models.heads.clinical_t import NUM_CLIN_T_CLASSES
+from src.models.label_schema import ETE_CODES, NUM_LOCATIONS, NUM_TIRADS_CLASSES
 from src.utils.report_generator import calculate_tirads_points
 
 
@@ -113,14 +119,30 @@ def decode_predictions(outputs: dict, calibrator=None) -> dict:
     #    的无条件输出(multi_task_model.py:349-358)。若缺席,说明加载的是**不含四头
     #    结构的旧模型**——此时静默兜底会让 prediction.json 写出确定性占位值,而目标四
     #    40% 三项 + 目标三 TI-RADS 全部静默失分,且本地看不出来(JSON 完全合法)。
-    ete_probs = _assert_finite("ete", outputs["ete_probs"].float()[0]).cpu().numpy()
-    location_probs = _assert_finite(
-        "location", outputs["location_probs"].float()[0]).cpu().numpy()
-    t_probs = _assert_finite("t", outputs["t_probs"].float()[0]).cpu().numpy()
-    tirads_probs = _assert_finite(
-        "tirads", outputs["tirads_probs"].float()[0]).cpu().numpy()
-    # t_conf 是 [B] 标量(= P(T=1)),非分布;同样过有限性校验(NaN 会让
-    # `_clamp01` 抛 PredictionSchemaError,报错点离根因更远)。
+    # 🔴 **长度也要校验**(2026-08-17 第三轮 review lane4 L3,实测反例):
+    #    下游 `v21_output._shared_nodule_context` 一律 `argmax+1`,长度错时若 argmax
+    #    恰好落在合法值域内,就会**静默产出错误编码**——JSON 完全合法、该维度按错值
+    #    计分(Kappa/AUC 被污染),本地永远查不出来。
+    #    实测 8 个长度错场景:ETE/TI-RADS/Location 各自被下游的对冲键长度校验或
+    #    `LocationProbs` 长度校验**侧面**拦下(那是巧合不是设计),**唯独 `t_probs`
+    #    全程无人校验** —— 4 维且 argmax=idx1 时一路静默通过写出 T=1。
+    #    故在源头统一按类别数硬校验,不依赖下游的偶然拦截。
+    def _head_probs(key, n_expect):
+        v = _assert_finite(key, outputs[f"{key}_probs"].float()[0]).cpu().numpy()
+        if v.shape != (n_expect,):
+            raise ValueError(
+                f"{key}_probs 维度契约不符:期望 ({n_expect},),实得 {v.shape}。"
+                f"说明加载的模型类别数与交付 schema 不一致,或上游取错了头——"
+                f"继续下去会 argmax 出错误编码且不报错。"
+            )
+        return v
+
+    ete_probs = _head_probs("ete", len(ETE_CODES))
+    location_probs = _head_probs("location", NUM_LOCATIONS)
+    t_probs = _head_probs("t", NUM_CLIN_T_CLASSES)
+    tirads_probs = _head_probs("tirads", NUM_TIRADS_CLASSES)
+    # t_conf 是 [B] 标量(= P(T=1)),非分布,无长度可校验;仍过有限性校验。
+    # (NaN 会在此抛 NonFiniteProbabilityError —— 早于下游 `_clamp01`,报错点更靠近根因。)
     t_conf = float(_assert_finite("t_conf", outputs["t_conf"].float()[0]).item())
 
     return {

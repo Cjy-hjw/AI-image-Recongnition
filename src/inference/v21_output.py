@@ -47,8 +47,10 @@
 (tracking-by-detection / ReID)依赖官方数据校正,标 `@云TODO` 待训练阶段4后处理。
 
 `n_total_frames` 由调用方(runner)在 case_result 里提供(A1 已让 loader 返回并一路
-透传);取不到时回退为「最大帧号+1」并打 warning——此时若有未被抽到的尾部帧,3D
-mask 的 Z 长度会短于原体积,评测按 SliceIndex 取标注帧可能越界,故回退路径必须告警。
+透传);**取不到时硬失败(`V21OutputError`),不再回退猜测**——原回退是「最大帧号+1」,
+但尾部若有未抽中帧,Z 长度就短于原视频,而评审规则 `:205` 对此的罚则是「判定为格式
+错误,该病例所有指标不予计分」(整例清零),回退却只打一条 warning、输出看着正常。
+宁可该病例 ERROR(日志可见)也不交一份注定被判格式错误的 mask。
 """
 
 import json
@@ -405,11 +407,21 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     frame_indices = [int(f["frame_index"]) for f in per_frame]
     n_total = case_result.get("n_total_frames")
     if not n_total or int(n_total) <= 0:
-        # 回退:最大帧号+1。若尾部有未抽中帧,Z 长度会短于原体积(见模块 docstring)。
-        n_total = (max(frame_indices) + 1) if frame_indices else 0
-        print(f"[v21_output][WARNING] 动态 case_result 缺有效 n_total_frames,回退为 "
-              f"max(frame_indices)+1={n_total};尾部未抽中帧会导致 3D mask Z 长度"
-              f"不足 @云TODO", flush=True)
+        # 🔴 硬失败而非回退(2026-08-17 第三轮 review lane3 P2-1)。
+        # 原实现回退为 `max(frame_indices)+1`,但**尾部若有未抽中帧,Z 长度就会短于
+        # 原视频** —— 评审规则 :205 对此的罚则是「判定为格式错误,该病例所有指标
+        # 不予计分」,即**整例清零**,而回退只打一条 warning、输出看着完全正常。
+        # 宁可该病例 ERROR(至少能在日志里发现),也不交一份注定被判格式错误的 mask。
+        #
+        # 生产可达性:`runner.py:329` 恒注入本键,且 `load_nifti_frames` 失败时返回
+        # 0 → `runner.py:283-284` 提前 raise。故本分支在 service 路径不可达,
+        # 它拦的是「未来新增调用方忘了注入」这种回归。
+        raise V21OutputError(
+            f"动态 case_result 缺有效 n_total_frames(收到 {n_total!r})——无法确定 "
+            f"3D mask 的 Z 轴长度。官方要求 z 轴帧数必须与原视频完全一致,"
+            f"猜测长度会导致该病例所有指标不予计分(评审规则 :205)。"
+            f"调用方须从 loader 透传 n_total_frames。"
+        )
     n_total = int(n_total)
 
     binary_frames = []

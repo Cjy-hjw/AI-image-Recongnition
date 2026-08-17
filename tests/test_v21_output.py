@@ -338,18 +338,32 @@ class TestDynamic:
         assert payload["Prediction"]["Nodules"] == []
         assert payload["Prediction"]["MaskFiles"] == []
 
-    def test_missing_n_total_frames_falls_back(self, tmp_path):
-        """缺 n_total_frames 时回退 max(frame_indices)+1,不崩,Z 长度=回退值。"""
+    def test_missing_n_total_frames_raises_not_guesses(self, tmp_path):
+        """缺 n_total_frames 必须 raise,**不得回退猜测 Z 长度**。
+
+        🔴 这条守的是「整例清零」级红线(2026-08-17 第三轮 review lane3 P2-1)。
+        原实现回退为 `max(frame_indices)+1`,本 fixture 恰好演示其危害:
+        原视频 6 帧、抽样 (0,2,4) → 回退只写 **5** 帧 Z 轴,尾部第 5 帧丢失。
+        而评审规则 `:205` 明写「若3D掩码z轴帧数多于/少于原视频…判定为格式错误,
+        **该病例所有指标不予计分**」——回退却只打一条 warning,输出看着完全正常,
+        本地永远发现不了。
+
+        故改为硬失败:宁可该病例 ERROR(日志可见)也不交一份注定被判格式错误的 mask。
+        """
         cr = _dynamic_case_result(n_total=6, sampled_idx=(0, 2, 4))
         del cr["n_total_frames"]
         case_dir = str(tmp_path / "D_FB")
-        v21_output.write_case_v21(case_dir, "D_FB", "ACC_F", cr, "dynamic", 70)
-        payload = _read_json(os.path.join(case_dir, "prediction.json"))
-        validate_prediction_json(payload)
-        rel = payload["Prediction"]["MaskFiles"][0]
-        img = nib.load(os.path.join(case_dir, rel))
-        # 回退 Z = max(0,2,4)+1 = 5
-        assert img.shape[2] == 5, f"回退 Z 应为 max_idx+1=5,得 {img.shape[2]}"
+        with pytest.raises(v21_output.V21OutputError, match="n_total_frames"):
+            v21_output.write_case_v21(case_dir, "D_FB", "ACC_F", cr, "dynamic", 70)
+
+    @pytest.mark.parametrize("bad", [0, -1, None])
+    def test_invalid_n_total_frames_raises(self, tmp_path, bad):
+        """0 / 负数 / None 同样拒绝——都无法确定合法 Z 长度。"""
+        cr = _dynamic_case_result(n_total=6, sampled_idx=(0, 2, 4))
+        cr["n_total_frames"] = bad
+        case_dir = str(tmp_path / f"D_BAD_{bad}")
+        with pytest.raises(v21_output.V21OutputError, match="n_total_frames"):
+            v21_output.write_case_v21(case_dir, "D_BAD", "ACC_B", cr, "dynamic", 70)
 
 
 # --------------------------------------------------------------------------- #

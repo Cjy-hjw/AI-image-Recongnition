@@ -30,7 +30,9 @@ def decode_predictions(outputs: dict, calibrator=None) -> dict:
     Returns dict with keys:
         pred_mask, mask_binary, comp_idx, echo_idx, shape_idx, margin_idx,
         comp_prob, echo_prob, shape_prob, margin_prob, foci_prob,
-        mal_prob, mal_probs
+        mal_prob, mal_probs,
+        **ete_probs, location_probs, t_probs, t_conf, tirads_probs**(官方四头,
+        backlog #116b 于 2026-08-17 接入;各头概率均为模型内部已做过的 fp32 softmax)
 
     `*_prob` 为各头**完整概率分布**(softmax 头和为 1;foci 为多标签 sigmoid,不求和),
     `mal_probs` 为良恶性二类分布 `[p_benign, p_malignant]`。官方硬约束"所有分类/分级/
@@ -101,6 +103,26 @@ def decode_predictions(outputs: dict, calibrator=None) -> dict:
         torch.softmax(_cal("malignancy", outputs["malignancy"].float()), dim=1)[0]).cpu().numpy()
     mal_prob = float(mal_probs[1])
 
+    # --- 官方四头(位置/ETE/临床T/TI-RADS)真实输出,backlog #116b(2026-08-17) ---
+    # 🔴 **不再二次 softmax**:各头已在模型内部做过 fp32 softmax
+    #    (`heads/location.py:184-189` / `extension.py:192` / `clinical_t.py:230-236`
+    #     / `tirads.py:166`),这里重算会把分布压平(softmax(softmax(x)) ≠ softmax(x))。
+    # 🔴 **不走 calibrator**:`CALIBRATED_TASKS`(calibration.py:25-32)不含这四项,
+    #    温度缩放对未标定的头是伪精度。
+    # 🔴 **键缺失即硬报 KeyError,不给默认值**:四头是 `MultiTaskThyroidModel.forward`
+    #    的无条件输出(multi_task_model.py:349-358)。若缺席,说明加载的是**不含四头
+    #    结构的旧模型**——此时静默兜底会让 prediction.json 写出确定性占位值,而目标四
+    #    40% 三项 + 目标三 TI-RADS 全部静默失分,且本地看不出来(JSON 完全合法)。
+    ete_probs = _assert_finite("ete", outputs["ete_probs"].float()[0]).cpu().numpy()
+    location_probs = _assert_finite(
+        "location", outputs["location_probs"].float()[0]).cpu().numpy()
+    t_probs = _assert_finite("t", outputs["t_probs"].float()[0]).cpu().numpy()
+    tirads_probs = _assert_finite(
+        "tirads", outputs["tirads_probs"].float()[0]).cpu().numpy()
+    # t_conf 是 [B] 标量(= P(T=1)),非分布;同样过有限性校验(NaN 会让
+    # `_clamp01` 抛 PredictionSchemaError,报错点离根因更远)。
+    t_conf = float(_assert_finite("t_conf", outputs["t_conf"].float()[0]).item())
+
     return {
         "pred_mask": pred_mask,
         "mask_binary": mask_binary,
@@ -115,6 +137,12 @@ def decode_predictions(outputs: dict, calibrator=None) -> dict:
         "foci_prob": foci_prob,
         "mal_prob": mal_prob,
         "mal_probs": mal_probs,
+        # --- 官方四头(#116b),消费方 v21_output._shared_nodule_context ---
+        "ete_probs": ete_probs,
+        "location_probs": location_probs,
+        "t_probs": t_probs,
+        "t_conf": t_conf,
+        "tirads_probs": tirads_probs,
     }
 
 

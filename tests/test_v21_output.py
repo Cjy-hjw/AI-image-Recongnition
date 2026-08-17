@@ -52,8 +52,27 @@ def _soft_and_binary_single(blob_model):
     return soft, binary
 
 
+def _head_probs(ete=None, loc=None, t=None, tirads=None, t_conf=0.3):
+    """官方四头概率(#116b)。默认造**非均匀、argmax 非 idx0** 的分布。
+
+    🔴 默认值刻意避开 idx0:接线代码是 `argmax+1`,若某处漏写 `+1`,idx0 的
+    one-hot 恰好也能得到"看似正确"的码 1 —— 用 idx0 当默认等于零区分力。
+    默认 argmax:ETE→idx1(码2 包膜) / Location→idx4(码5 右中叶) /
+    T→idx1(T=1,**不 +1**) / TI-RADS→idx3(码4)。
+    """
+    return {
+        "ete_probs": np.array(ete if ete is not None else [0.1, 0.6, 0.2, 0.1]),
+        "location_probs": np.array(
+            loc if loc is not None else [0.05, 0.05, 0.1, 0.1, 0.5, 0.1, 0.1]),
+        "t_probs": np.array(t if t is not None else [0.3, 0.7]),
+        "tirads_probs": np.array(
+            tirads if tirads is not None else [0.05, 0.05, 0.1, 0.7, 0.1]),
+        "t_conf": float(t_conf),
+    }
+
+
 def _static_case_result(soft_model, binary_model, orig_hw=(_H, _W),
-                        mal_prob=0.72, total_points=5):
+                        mal_prob=0.72, total_points=5, head_probs=None):
     """合成静态 case_result。preds 的 key 严格对齐 `decode_predictions` 返回。"""
     preds = {
         "pred_mask": soft_model,
@@ -64,6 +83,7 @@ def _static_case_result(soft_model, binary_model, orig_hw=(_H, _W),
         "foci_prob": np.array([0.1, 0.9]),
         "mal_prob": float(mal_prob),
         "mal_probs": np.array([1.0 - mal_prob, mal_prob]),
+        **(head_probs if head_probs is not None else _head_probs()),
     }
     breakdown = {
         "composition": ("实性", 2), "echogenicity": ("低回声", 2),
@@ -85,9 +105,13 @@ def _static_case_result(soft_model, binary_model, orig_hw=(_H, _W),
 
 
 def _dynamic_case_result(n_total=6, sampled_idx=(0, 2, 4), orig_hw=(_H, _W),
-                         mal_prob=0.65, total_points=3):
+                         mal_prob=0.65, total_points=3, per_frame_heads=None):
     """合成动态 case_result:key 严格对齐 `diagnose_dynamic_case` 返回 + A2 注入的
-    `n_total_frames`/`gatekeeper_audit`。每帧 preds 带软/二值 mask。"""
+    `n_total_frames`/`gatekeeper_audit`。每帧 preds 带软/二值 mask。
+
+    `per_frame_heads`: 可选,与 `sampled_idx` 等长的 `_head_probs()` 列表,用于构造
+    "各帧四头概率不同"的场景(测病灶级均值)。缺省时各帧同一份默认分布。
+    """
     per_frame = []
     for i, fi in enumerate(sampled_idx):
         soft = np.full((_MODEL, _MODEL), 0.05, dtype=np.float32)
@@ -95,6 +119,8 @@ def _dynamic_case_result(n_total=6, sampled_idx=(0, 2, 4), orig_hw=(_H, _W),
         r = 2 + i
         soft[r:r + 3, 3:6] = 0.85
         binary = (soft > 0.5).astype(np.uint8) * 255
+        heads = (per_frame_heads[i] if per_frame_heads is not None
+                 else _head_probs())
         per_frame.append({
             "frame_index": int(fi),
             "mal_prob": float(mal_prob),
@@ -104,6 +130,7 @@ def _dynamic_case_result(n_total=6, sampled_idx=(0, 2, 4), orig_hw=(_H, _W),
                 "foci_prob": np.array([0.1]),
                 "mal_prob": float(mal_prob),
                 "mal_probs": np.array([1.0 - mal_prob, mal_prob]),
+                **heads,
             },
             "frame_np": np.zeros(orig_hw, np.uint8),
         })
@@ -326,26 +353,227 @@ class TestDynamic:
 
 
 # --------------------------------------------------------------------------- #
-# 占位维度契约(训练阶段4未训,结构合规即可)
+# 四头真实输出接线契约(backlog #116b,2026-08-17)
+#
+# 这些测试守的是**编码映射**,不是预测质量。历史上这里是 `TestPlaceholderDims`,
+# 只断言"落在合法范围内"——接线后那种断言**仍会绿**,但它守的是已消失的语义
+# (占位维度结构合规),对 off-by-one 零区分力。现改为逐项断言精确期望码。
 # --------------------------------------------------------------------------- #
 
-class TestPlaceholderDims:
-    def test_ete_location_t_present_and_valid(self, tmp_path):
-        """ETE/Location/T 三占位维度必须存在且落在合法编码内,LocationProbs 和为 1。"""
+class TestOfficialHeadWiring:
+    """四头真实概率 → prediction.json 的端到端映射。
+
+    🔴 **必须从 `write_case_v21` 入口测到落盘 JSON**,不能只测
+    `build_nodule_entry` 单函数 —— 本项目有过"修复没打到生产路径终点"的事故
+    (memory `fix-must-reach-production-path-not-just-function`),且改动三的
+    对冲键正是"单函数测试全绿、整链不通"的形态(调用处不透传即静默丢弃)。
+    """
+
+    def _write_and_read(self, tmp_path, name, head_probs=None):
         blob = np.zeros((_MODEL, _MODEL), np.uint8)
         blob[2:5, 3:6] = 1
         soft, binary = _soft_and_binary_single(blob)
-        cr = _static_case_result(soft, binary)
-        case_dir = str(tmp_path / "P_DIM")
-        v21_output.write_case_v21(case_dir, "P_DIM", "S", cr, "static", 30)
+        cr = _static_case_result(soft, binary, head_probs=head_probs)
+        case_dir = str(tmp_path / name)
+        v21_output.write_case_v21(case_dir, name, "S", cr, "static", 30)
         payload = _read_json(os.path.join(case_dir, "prediction.json"))
-        n = payload["Prediction"]["Nodules"][0]
+        validate_prediction_json(payload)
+        return payload["Prediction"]["Nodules"][0]
+
+    def test_schema_fields_present_and_valid(self, tmp_path):
+        """基础合规:四项字段存在、落在合法编码内、LocationProbs 和为 1。"""
+        n = self._write_and_read(tmp_path, "P_DIM")
         assert n["ExtrathyroidalExtension"] in (1, 2, 3, 4)
         assert 1 <= n["Location"] <= NUM_LOCATIONS
         assert len(n["LocationProbs"]) == NUM_LOCATIONS
         assert abs(sum(n["LocationProbs"]) - 1.0) < 1e-6
         assert n["T_ClinSig"]["T"] in (0, 1)
         assert 0.0 <= n["T_ClinSig"]["T_conf"] <= 1.0
-        # 占位下 Malignancy 用真实预测
         assert 0.0 <= n["Malignancy"]["confidence"] <= 1.0
         assert isinstance(n["Malignancy"]["predicted"], bool)
+
+    def test_not_placeholder_values(self, tmp_path):
+        """🔴 最可靠的"接上了没"单条判据:LocationProbs 不是均匀分布。
+
+        接线前生产恒输出 ETE=1 / 均匀 LocationProbs / T=0 / T_conf=0.0。
+        本测试用默认 fixture(argmax 全部避开 idx0)断言这四项都不再是那组值。
+        """
+        n = self._write_and_read(tmp_path, "P_REAL")
+        uniform = 1.0 / NUM_LOCATIONS
+        assert not all(abs(p - uniform) < 1e-6 for p in n["LocationProbs"]), \
+            "LocationProbs 仍是均匀分布 —— 四头没接上(与权重质量无关)"
+        assert n["ExtrathyroidalExtension"] == 2, "ETE 仍是占位恒 1"
+        assert n["Location"] == 5, "Location 仍是占位 argmax(uniform)+1=1"
+        assert n["T_ClinSig"]["T"] == 1, "T 仍是占位恒 0"
+        assert n["T_ClinSig"]["T_conf"] > 0.0, "T_conf 仍是占位恒 0.0"
+
+    @pytest.mark.parametrize("idx,expected", [(1, 2), (2, 3), (3, 4)])
+    def test_ete_code_is_argmax_plus_one(self, tmp_path, idx, expected):
+        """ETE:`code = argmax + 1`。参数化**全部避开 idx0** —— 用 idx0 测等于没测
+        (漏写 `+1` 时 idx0 恰好也"对",off-by-one 逃逸)。"""
+        probs = [0.05] * 4
+        probs[idx] = 0.85
+        n = self._write_and_read(tmp_path, f"P_ETE{idx}",
+                                 head_probs=_head_probs(ete=probs))
+        assert n["ExtrathyroidalExtension"] == expected
+
+    @pytest.mark.parametrize("idx,expected", [(1, 2), (3, 4), (4, 5)])
+    def test_tirads_class_is_argmax_plus_one(self, tmp_path, idx, expected):
+        """TI-RADS:`code = argmax + 1`,且**不再走 ACR 概念积分反推**。
+
+        fixture 的 `total_points=5` 按旧 `_tirads_class_from_breakdown` 会得 4;
+        本测试构造的期望码与之不同(idx1→2 / idx4→5),故能区分两条路径。
+        """
+        probs = [0.05] * 5
+        probs[idx] = 0.8
+        n = self._write_and_read(tmp_path, f"P_TR{idx}",
+                                 head_probs=_head_probs(tirads=probs))
+        assert n["TI_RADS_Class"] == expected
+
+    @pytest.mark.parametrize("idx,expected", [(1, 2), (4, 5), (6, 7)])
+    def test_location_is_argmax_plus_one(self, tmp_path, idx, expected):
+        """Location:`code = argmax + 1`;idx6 → 7(峡部)是上边界。"""
+        probs = [0.05] * NUM_LOCATIONS
+        probs[idx] = 0.7
+        n = self._write_and_read(tmp_path, f"P_LOC{idx}",
+                                 head_probs=_head_probs(loc=probs))
+        assert n["Location"] == expected
+        # 概率数组本身必须原样透传(归一化后 argmax 不变)
+        assert n["LocationProbs"].index(max(n["LocationProbs"])) == idx
+
+    def test_t_clinsig_is_argmax_without_plus_one(self, tmp_path):
+        """🔴 T 是唯一**不 +1** 的:官方 `T∈{0,1}` 与 0-based 下标同值。
+
+        双向钉子:`[0.3,0.7]`→1 且 `[0.7,0.3]`→0。正向防误写 `+1`
+        (会得 2,被 prediction_json 拦成整例 ERROR);反向防 argmax 取反。
+        """
+        n1 = self._write_and_read(tmp_path, "P_T1",
+                                  head_probs=_head_probs(t=[0.3, 0.7]))
+        assert n1["T_ClinSig"]["T"] == 1
+        n0 = self._write_and_read(tmp_path, "P_T0",
+                                  head_probs=_head_probs(t=[0.7, 0.3]))
+        assert n0["T_ClinSig"]["T"] == 0
+
+    def test_t_conf_passthrough(self, tmp_path):
+        """T_conf 直传 `preds["t_conf"]`(= P(T=1)),不重算、不取 max(t_probs)。"""
+        n = self._write_and_read(tmp_path, "P_TC",
+                                 head_probs=_head_probs(t=[0.3, 0.7], t_conf=0.42))
+        assert abs(n["T_ClinSig"]["T_conf"] - 0.42) < 1e-9
+
+
+class TestHedgeKeys:
+    """#116a 对冲键 `TI_RADS_Probs` / `ETE_Probs` 的三处联通(改动三)。
+
+    🔴 只测 `build_nodule_entry` 单函数会漏掉"调用处没透传"这一步 —— 那正是
+    审查抓到的缺陷形态:参数加了、写出逻辑也有,但 `_build_entries_and_save_masks`
+    不传,于是键静默消失,而 `validate_prediction_json` 只查缺失不查多余 → 不报错。
+    """
+
+    def test_hedge_keys_written_end_to_end(self, tmp_path):
+        blob = np.zeros((_MODEL, _MODEL), np.uint8)
+        blob[2:5, 3:6] = 1
+        soft, binary = _soft_and_binary_single(blob)
+        cr = _static_case_result(soft, binary)
+        case_dir = str(tmp_path / "P_HEDGE")
+        v21_output.write_case_v21(case_dir, "P_HEDGE", "S", cr, "static", 30)
+        payload = _read_json(os.path.join(case_dir, "prediction.json"))
+        # 含额外键时 validate 仍须放行(官方赛道七无"不得包含额外字段"条款)
+        validate_prediction_json(payload)
+        n = payload["Prediction"]["Nodules"][0]
+        assert "TI_RADS_Probs" in n, "对冲键 TI_RADS_Probs 未写出(调用处漏透传?)"
+        assert "ETE_Probs" in n, "对冲键 ETE_Probs 未写出(调用处漏透传?)"
+        assert len(n["TI_RADS_Probs"]) == 5
+        assert len(n["ETE_Probs"]) == 4
+        assert abs(sum(n["TI_RADS_Probs"]) - 1.0) < 1e-6
+        assert abs(sum(n["ETE_Probs"]) - 1.0) < 1e-6
+        # 与 int 字段自洽:argmax+1 必须等于写出的 int
+        assert n["ETE_Probs"].index(max(n["ETE_Probs"])) + 1 == \
+            n["ExtrathyroidalExtension"]
+        assert n["TI_RADS_Probs"].index(max(n["TI_RADS_Probs"])) + 1 == \
+            n["TI_RADS_Class"]
+
+    def test_absent_when_not_provided(self, tmp_path):
+        """不传时**不写出该键**(而非写 null)——CLI 调试等旧调用方零污染。"""
+        from src.inference import prediction_json as pj
+        entry = pj.build_nodule_entry(
+            nodule_id="N1", mask_file="S/nodule_001.nii.gz",
+            detection_confidence=0.5, malignancy_confidence=0.5, tirads_class=3)
+        assert "TI_RADS_Probs" not in entry
+        assert "ETE_Probs" not in entry
+
+    @pytest.mark.parametrize("kwargs", [
+        {"tirads_probs": [0.5, 0.5]},          # 应为 5 维
+        {"ete_probs": [0.2, 0.2, 0.2, 0.2, 0.2]},  # 应为 4 维
+    ])
+    def test_wrong_length_rejected(self, kwargs):
+        """长度错 = 上游取错了头,当场炸而非静默写出自相矛盾的 JSON。"""
+        from src.inference import prediction_json as pj
+        with pytest.raises(PredictionSchemaError):
+            pj.build_nodule_entry(
+                nodule_id="N1", mask_file="S/nodule_001.nii.gz",
+                detection_confidence=0.5, malignancy_confidence=0.5,
+                tirads_class=3, **kwargs)
+
+
+class TestDynamicLesionLevelMean:
+    """动态路径:四头按**病灶级均值**汇总(官方 :215),不是取关键帧。"""
+
+    def test_mean_differs_from_keyframe(self, tmp_path):
+        """🔴 构造成"三帧均值的 argmax ≠ 关键帧的 argmax",否则测试零区分力
+        (沿用关键帧也能过)。
+
+        关键帧 = per_frame[0](fixture 的 keyframe_index=0),其 ETE argmax=idx0(码1);
+        三帧均值 = ([0.7,0.1,0.1,0.1] + [0.1,0.8,0.05,0.05] + [0.1,0.8,0.05,0.05])/3
+                 = [0.30, 0.5667, 0.0667, 0.0667] → argmax=idx1(码2)。
+        """
+        heads = [
+            _head_probs(ete=[0.7, 0.1, 0.1, 0.1]),
+            _head_probs(ete=[0.1, 0.8, 0.05, 0.05]),
+            _head_probs(ete=[0.1, 0.8, 0.05, 0.05]),
+        ]
+        cr = _dynamic_case_result(per_frame_heads=heads)
+        # 前提自检:关键帧单独看是码 1,与期望的均值结果 2 不同
+        assert int(np.argmax(cr["kf_preds"]["ete_probs"])) + 1 == 1
+        case_dir = str(tmp_path / "D_MEAN")
+        v21_output.write_case_v21(case_dir, "D_MEAN", "ACC", cr, "dynamic", 50)
+        payload = _read_json(os.path.join(case_dir, "prediction.json"))
+        validate_prediction_json(payload)
+        n = payload["Prediction"]["Nodules"][0]
+        assert n["ExtrathyroidalExtension"] == 2, \
+            "动态四头应取全帧均值,拿到的是关键帧值"
+        # 对冲键写出的也必须是均值本身
+        assert abs(n["ETE_Probs"][1] - (0.1 + 0.8 + 0.8) / 3) < 1e-9
+
+    def test_t_conf_is_mean(self, tmp_path):
+        heads = [_head_probs(t_conf=c) for c in (0.2, 0.5, 0.8)]
+        cr = _dynamic_case_result(per_frame_heads=heads)
+        case_dir = str(tmp_path / "D_TCONF")
+        v21_output.write_case_v21(case_dir, "D_TCONF", "ACC", cr, "dynamic", 50)
+        n = _read_json(os.path.join(case_dir,
+                                    "prediction.json"))["Prediction"]["Nodules"][0]
+        assert abs(n["T_ClinSig"]["T_conf"] - 0.5) < 1e-9
+
+    def test_empty_per_frame_falls_back_to_keyframe(self):
+        """空 per_frame 不得除零。上游 `diagnose_dynamic_case` 已保证非空
+        (为空时抛 DynamicCaseError),但此处不赌上游契约。"""
+        kf = _head_probs()
+        out = v21_output._lesion_level_head_preds([], kf)
+        assert out is kf
+
+    def test_mean_denominator_excludes_failed_frames(self, tmp_path):
+        """🔴 钉住"`per_frame` 只含成功帧"这个前提。
+
+        `case_pipeline.py:144-163` 里异常帧走 `failed_frames.append` + `continue`,
+        **在 append 进 per_frame 之前** → 均值分母天然只算成功帧。若将来改成
+        "失败帧也进 per_frame",分母就错了且**静默**。此处构造 2 成功帧 +
+        `failed_frames` 非空,断言均值只按 2 帧算。
+        """
+        heads = [_head_probs(t_conf=0.2), _head_probs(t_conf=0.6)]
+        cr = _dynamic_case_result(sampled_idx=(0, 2), per_frame_heads=heads)
+        cr["failed_frames"] = [{"frame_index": 4, "reason": "NaN"}]
+        case_dir = str(tmp_path / "D_FAIL")
+        v21_output.write_case_v21(case_dir, "D_FAIL", "ACC", cr, "dynamic", 50)
+        n = _read_json(os.path.join(case_dir,
+                                    "prediction.json"))["Prediction"]["Nodules"][0]
+        # (0.2+0.6)/2 = 0.4;若把失败帧也算进分母(/3)会得 0.2667
+        assert abs(n["T_ClinSig"]["T_conf"] - 0.4) < 1e-9

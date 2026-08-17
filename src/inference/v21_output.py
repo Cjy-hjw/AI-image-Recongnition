@@ -11,9 +11,10 @@
      实例(2D 静态 / 3D 动态跨帧)。
   3. 每结节 `nifti_io.save_binary_mask` 落一个 `.nii.gz`(值域强制 {0,1});
      检测置信度用 `detection_confidence(软图, 实例 mask)`(区域内概率均值)。
-  4. 每结节 `build_nodule_entry`(良恶性/TI-RADS 用真实预测;ETE=1/Location 均匀/
-     T=0 为训练阶段4未训的保守占位)→ `build_prediction_json` →
-     `validate_prediction_json` → **原子写**(先 `.tmp` 再 `os.replace`)。
+  4. 每结节 `build_nodule_entry`(良恶性/TI-RADS/ETE/位置/临床T **全部为模型真实
+     预测**——四头已于 2026-08-17 由 backlog #116b 接线,此前是 ETE=1/Location 均匀/
+     T=0 的占位)→ `build_prediction_json` → `validate_prediction_json` →
+     **原子写**(先 `.tmp` 再 `os.replace`)。
 
 阴性病例(`split_nodules` 出 0 个结节)是合法输出:`Nodules`/`MaskFiles` 均为空数组,
 仍写一份结构合规的 `prediction.json`(规范:阴性输出空数组,不建空子目录)。
@@ -80,6 +81,12 @@ class V21OutputError(RuntimeError):
 
 def _tirads_class_from_breakdown(breakdown) -> int:
     """从 `build_tirads_breakdown` 的 `total_points` 推 1..5 的 TI_RADS_Class。
+
+    🔴 **2026-08-17 起已非生产路径**(backlog #116b):生产 `_shared_nodule_context`
+    改用 `tirads_head` 的真实 softmax。本函数走的是 CBM 概念头的 ACR 积分反推,
+    那条通路**没有专属训练监督**(概念头梯度对 TI-RADS 标签恒 0)、期望加权
+    Kappa≈0,而 `tirads_head` 实测 0.6887。保留本函数是因为 CLI 调试路径
+    (`predict.py` → `result.json`)仍在用,勿因"看着没人调"而删。
 
     复刻 `report_generator.calculate_tirads_points` 内置的分级阈值(同一份 ACR 规则,
     单一事实源在那里的 tr_level 字符串里;此处只需 int 类别,故独立实现阈值映射,
@@ -197,7 +204,8 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
         case_dir / subdir_uid: 落盘根与相对子目录。
         nodule_base_context: dict,含 `malignancy_confidence` / `tirads_class` /
             `ete_code` / `location_probs` / `location` / `t_clin_sig` / `t_confidence`
-            等每结节共享的预测值(真实预测 + 占位)。
+            等每结节共享的预测值(2026-08-17 起**全部为四头真实预测**,不再有占位);
+            另含可选的 #116a 对冲键 `tirads_probs` / `ete_probs`(缺席则不写出)。
 
     Returns:
         nodule_entries — 供 build_prediction_json;阴性时为空列表。
@@ -225,41 +233,133 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
             location=nodule_base_context.get("location"),
             t_clin_sig=nodule_base_context.get("t_clin_sig", 0),
             t_confidence=nodule_base_context.get("t_confidence", 0.0),
+            # #116a 对冲键。用 `.get()` 而非 `[]`:CLI 调试等不产四头概率的
+            # 调用方拿到 None → build_nodule_entry 不写出该键,向后兼容。
+            tirads_probs=nodule_base_context.get("tirads_probs"),
+            ete_probs=nodule_base_context.get("ete_probs"),
         )
         entries.append(entry)
     return entries
 
 
-def _shared_nodule_context(preds, breakdown) -> dict:
-    """从 preds/breakdown 提取每结节共享的预测上下文(真实预测 + 占位维度)。
+def _shared_nodule_context(preds) -> dict:
+    """从 preds 提取每结节共享的预测上下文(**四头已于 2026-08-17 接真实输出**)。
 
-    占位维度(训练阶段4未训,结构合规但数值等同随机,见 prediction_json docstring):
-    ETE=1(无侵犯)、Location=均匀分布(argmax→1 左上叶,刻意有偏)、T=0。
-    分类头训好后由调用方在 case_result 显式传真实值替换(此处读取可选覆盖键)。
+    backlog #116b:此前 ETE 恒 1 / Location 均匀分布 / T 恒 0 / TI-RADS 走 ACR 概念
+    积分反推,四项对官方评分等同随机(目标四 40% 三项 + 目标三 TI-RADS 一项)。
+    云端训练已把四头训出真实能力(loc_auc 0.7519 / t_auc 0.7441 /
+    tirads_kappa 0.6887 / ete_kappa 0.2086),此处直接消费其 softmax 概率。
+
+    ## 编码换算(本函数最易错处,错了**不报错**)
+
+    `code = argmax_idx + 1` 对 **ETE / TI-RADS / Location** 三项成立
+    (`label_schema.py`:ETE_CODES=(1,2,3,4) / TIRADS_CODES=(1..5) /
+     LOCATION_LABELS[0]="左上叶"→码 1)。
+    🔴 **`t_clin_sig` 是唯一不 +1 的** —— 官方 `T∈{0,1}` 与 0-based 下标同值
+    (`heads/clinical_t.py:110-112`)。写成 `+1` 会得 2,被
+    `prediction_json.py:296` 拦成整例 ERROR(至少会炸);而其余三项若漏 `+1`
+    得到的是**另一个合法码**(如把"包膜侵犯"写成"无侵犯"),越界校验放行、
+    JSON 完全合法、只是指标偏低,本地永远查不出根因。
+
+    ## 位置 7 维顺序不得重排
+
+    `label_schema.py:44-58` 明确警告:真实编码是"上→中→下"(实测 xlsx
+    `2左中叶`/`5右中叶`),照《数据格式说明》的列举次序写会**错 4/7 类**。
+    头输出顺序已由 `heads/location.py:65-76` 的 import 期断言锁死,直接透传即可;
+    2026-08-17 逐字读评审规则 `:325-340` 的官方表格,与该顺序**完全一致**。
+
+    `breakdown` 参数已于 2026-08-17 **从签名移除**:TI-RADS 改由 `tirads_head` 直供后
+    它在本函数体内零引用,留着只会让下一个改它的人以为还有用(Gate2 两路独立指出)。
+    ACR 反推路径见 `_tirads_class_from_breakdown`(仅 CLI 调试用)。
     """
+    ete_probs = preds["ete_probs"]
+    tirads_probs = preds["tirads_probs"]
+    loc_probs = [float(x) for x in preds["location_probs"]]
+    t_probs = preds["t_probs"]
     return {
         "malignancy_confidence": float(preds["mal_prob"]),
-        "tirads_class": _tirads_class_from_breakdown(breakdown),
-        # --- 占位维度(可被 case_result 的显式键覆盖,便于未来接真实三头) ---
-        "ete_code": pj.ETE_NONE,
-        "location_probs": None,   # None → build_nodule_entry 内部用 uniform_location_probs
-        "location": None,         # None → argmax(uniform)+1 = 1(左上叶,占位刻意有偏)
-        "t_clin_sig": 0,
-        "t_confidence": 0.0,
+        "tirads_class": int(np.argmax(tirads_probs)) + 1,   # idx0→码1(I类)
+        "ete_code": int(np.argmax(ete_probs)) + 1,          # idx0→码1(无侵犯)
+        "location_probs": loc_probs,
+        "location": int(np.argmax(loc_probs)) + 1,          # idx0→码1(左上叶)
+        "t_clin_sig": int(np.argmax(t_probs)),              # 🔴 0/1,**不 +1**
+        "t_confidence": float(preds["t_conf"]),             # = P(T=1)
+        # --- #116a 对冲键(官方 schema 无概率位,评审规则 :185 又要求"无概率计0分") ---
+        # ⚠️ 评审规则 :251 正面强制"概率键名必须与下表完全一致",而表里这两项
+        #    只有 int 位 → 自拟键名必然对不上,**拿分概率≈0,纯防御性下注**。
+        #    净收益仍 ≥0(int 字段照常合规、零损失),故做但别指望得分。
+        #    决策见 docs/待官方答复清单.md Q4。
+        "tirads_probs": [float(x) for x in tirads_probs],
+        "ete_probs": [float(x) for x in ete_probs],
     }
+
+
+def _lesion_level_head_preds(per_frame, kf_preds) -> dict:
+    """动态病例:把逐帧四头概率按**算术平均**汇总成病灶级的一份预测。
+
+    ## 为什么是均值而不是关键帧
+
+    官方评审规则 `:215` 原文:「结节检测AP、良恶性AUC-PR、TI-RADS加权Kappa、
+    侵犯分级加权Kappa、主病灶位置加权宏平均AUC、T分级AUC均采用**病灶级汇总,
+    每个预测病灶仅贡献一个样本**(Kappa在全测试集一次计算)。帧维度仅用于匹配
+    判定和Dice系列指标的计算。」
+    且**与训练侧验证口径一致** —— `metrics_official.aggregate_by_lesion`
+    (`src/training/metrics_official.py:43-50`)就是按 `lesion_id` 对 probs 取均值。
+    🔴 **该函数的 docstring 明写「若推理侧改用取最大/中位数,这里要同步改,否则
+    验证指标与交付表现脱节」—— 两侧算法互为约束,改一侧必须同步改另一侧。**
+    两边同口径才不会出现"本地指标好、线上差"的盲区。
+    (⚠️ 但**不该合并成一个函数**:训练侧要按 `lesion_id` 分桶聚合多病灶,推理侧
+     四头是整图级、单病例只有一份,数据形态不同。约束的是算法,不是实现。)
+
+    ## 一个必须知道的前提(不是本次引入的问题,但别误以为已解决)
+
+    官方只说"病灶级汇总",**没规定汇总方法**(均值/关键帧/最大置信帧都可能)。
+    严格说"帧均值 = 病灶级"只在"每帧恰好一个结节实例"时成立;多结节时这是
+    **帧粒度**汇总而非实例粒度。之所以只能这样做:四头输出本就是**整图级**
+    (`stage4_spatial` 全局池化,`heads/*.py` 无实例维度),当前架构下不存在
+    "每实例一份四头概率",实例级汇总无从谈起。这是既有架构性质,不是接线引入的。
+
+    ## 两个实现细节
+
+    - `per_frame` **只含成功帧**(`case_pipeline.py:144-163`:异常帧
+      `failed_frames.append` 后 `continue`,在 append 进 per_frame **之前**),
+      故均值分母天然就是成功帧数,此处不必再过滤。该前提有回归测试钉住。
+    - **不重归一化**:各帧概率各自和为 1,均值的和恒为 1(实测偏差 2.2e-16,
+      远小于 `validate_prediction_json` 的 1e-6 容差)。`location_probs` 仍会在
+      `build_nodule_entry` 内过 `normalize_location_probs`,是无害的防御。
+
+    Args:
+        per_frame: `diagnose_dynamic_case` 的逐帧列表,每项含 `preds`。
+        kf_preds: 关键帧解码结果。**空 per_frame 时的兜底**(理论不可达 ——
+            `diagnose_dynamic_case` 在 per_frame 为空时已抛 `DynamicCaseError` ——
+            但此处不赌上游契约,除零会崩在离根因很远的地方)。
+
+    Returns:
+        dict:四头键取均值,其余键(`mal_prob` 等)原样沿用 `kf_preds`。
+        🔴 `mal_prob`/`breakdown` **维持关键帧口径不动**(超出 #116b 范围);
+        本函数只改四头,别顺手把良恶性也改了 —— 那会动到已在生产拿分的路径。
+    """
+    if not per_frame:
+        return kf_preds
+    out = dict(kf_preds)
+    for key in ("ete_probs", "location_probs", "t_probs", "tirads_probs"):
+        out[key] = np.mean(
+            np.stack([np.asarray(f["preds"][key], dtype=np.float64)
+                      for f in per_frame]), axis=0)
+    out["t_conf"] = float(np.mean([float(f["preds"]["t_conf"]) for f in per_frame]))
+    return out
 
 
 def _write_static(case_dir, patient_id, subdir_uid, case_result,
                   processing_ms, interpretation):
     preds = case_result["preds"]
-    breakdown = case_result["breakdown"]
     hw = _static_orig_hw(case_result)
 
     soft_fullres = _resize_soft(preds["pred_mask"], hw)
     binary_fullres = _resize_binary(preds["mask_binary"], hw)
 
     instances = split_nodules(binary_fullres)
-    context = _shared_nodule_context(preds, breakdown)
+    context = _shared_nodule_context(preds)
     entries = _build_entries_and_save_masks(
         instances, soft_fullres, case_dir, subdir_uid, context)
 
@@ -278,7 +378,6 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     if not HAS_CV2:
         raise V21OutputError("动态 V2.1 落盘需要 cv2(resize),但 cv2 未安装")
 
-    breakdown = case_result["breakdown"]
     kf_preds = case_result["kf_preds"]
     per_frame = case_result["per_frame"]
     hw = _dynamic_orig_hw(case_result)
@@ -306,7 +405,10 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
 
     # 3D 连通域 = 跨帧实例关联(局限见模块 docstring @云TODO)。
     instances = split_nodules(binary_3d)
-    context = _shared_nodule_context(kf_preds, breakdown)
+    # 四头走**病灶级均值**(官方 :215「每个预测病灶仅贡献一个样本」);
+    # mal_prob/breakdown 仍用关键帧口径(见 `_lesion_level_head_preds` docstring)。
+    context = _shared_nodule_context(
+        _lesion_level_head_preds(per_frame, kf_preds))
     entries = _build_entries_and_save_masks(
         instances, soft_3d, case_dir, subdir_uid, context)
 

@@ -79,6 +79,19 @@ def build_official_head_config(config: dict) -> dict:
     ete_beta = float(tr.get("ete_cb_beta", 0.99))
     ete_la_tau = float(tr.get("ete_la_tau", 0.0))
     ete_qwk_weight = float(tr.get("ete_qwk_weight", 0.0))
+    # 🔴 负 τ 必须在入口拒绝(2026-08-20 Gate2 实测发现的口径裂缝):
+    # 本函数按 `la_tau > 0` 决定要不要造 log_prior,而 `compute_extension_loss`
+    # 的守卫是 `la_tau != 0.0` —— 两者对负值的判定相反,`la_tau=-0.5` 会走进
+    # LA 分支却拿到 log_prior=None,报一句与真实病因无关的
+    # "la_tau != 0 时必须提供 log_prior"(真实病因是"τ 不该是负数")。
+    # 且负 τ 在数学上是**放大**类别不平衡(LA 的符号方向见 extension.py
+    # 模块 docstring),与本项目踩过两次的符号反转坑同源(#113/#120),
+    # 属于宁可开不了工也不能静默跑歪的那一类。
+    assert ete_la_tau >= 0.0, (
+        f"ete_la_tau 必须 >= 0，got {ete_la_tau}"
+        " —— 负 τ 会放大类别不平衡而非校正(Logit Adjustment 的符号方向见"
+        " src/models/losses/components/extension.py 模块 docstring)"
+    )
     tirads_counts = tr.get("tirads_class_counts")
     cfg = {
         "loc_loss_weight": float(tr.get("loc_loss_weight", 1.0)),

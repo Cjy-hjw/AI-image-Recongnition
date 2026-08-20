@@ -101,12 +101,47 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 ## 测试总数(单一权威,2026-08-17 实测)
 
-**全套 940 passed + 1 skipped**(2026-08-17 第三轮 review 修复后)。
+**全套 940 passed + 1 skipped**(2026-08-17 第三轮 review 后,`Demo_D` 口径)。
 ⚠️ 罕见地**两个环境同数**:`Demo_D` 主环境与 `torch28` 预演环境本轮实测都是
 940+1 —— 这是巧合不是规律,别据此以为跨环境可比(见下方「跨环境不可比」条)。
 
+🔴 **2026-08-19 backlog #128 新增 19 项(损失 10 + 监控 9),但 `Demo_D` 未实跑,
+故上面的 940 未更新** —— 本轮开发在**系统 Python 3.14** 环境完成,实测
+**793 collected / 785 passed + 14 skipped**(改动前同环境 775 passed,+10 损失
++9 监控 = 794… 实际 785 是因该环境本就少收集若干模块,**与 `Demo_D` 的 940
+不是同一口径、不可相减**)。判本轮有无回归的依据是**同环境前后对拍**
+(775→785,全绿);`Demo_D` 的新基线待下次在该环境实跑后再更新此处,
+**不要凭 940+19 推算填数**(memory `test-count-not-comparable-across-envs`)。
+
 演进链:**891**(#127 后)**+32 = #116b 四头接线** → **923** **+6 = 上云前终审修复**
-→ **929** **+11 = 第三轮 review 修复** → **940**:
+→ **929** **+11 = 第三轮 review 修复** → **940**;
+之后 **+10 = backlog #128 LA-SoftQWK-OD 损失**、**+9 = 该 backlog 的 4 项 ETE
+诊断监控**(2026-08-19,系统 py3.14 环境实测 775→785,**`Demo_D` 未跑、故上方
+总数仍记 940**):
+
+**+9 = 4 项 ETE 监控**(`test_metrics_official.py` 22→**31**,DR §5 `:118-138`):
+`ete_pred_hist` / `ete_extreme_error_rate` / `ete_kappa_gap` /
+`ete_logit_mean_per_class`。钉的是「诊断量混进评分」与「静默降级」两类:
+① **监控子集必须与 `_ete_weighted_kappa` 同一口径**(主病灶+有标注+**恶性**)——
+塞入良性/次病灶/无标注三种应排除样本反证,否则会出现「监控说分布正常、kappa
+却在跌」的自相矛盾;② **诊断量不得进 composite**(`ete_pred_hist` 是 list,
+混进 `np.mean` 会报错或静默产出错误标量,而 composite 是选模判据);
+③ **`ete_logits` 键缺席时降级为 None,不得 KeyError、更不得拿 probs 顶替**
+(softmax 平移不变、反推不出绝对量级,而 DR 判据 `z̄3−z̄0>0` 要的正是绝对量级);
+④ **logits 必须与 probs 一起按病灶聚合**(漏了会停在首帧值、与已聚合的 probs 失同步);
+⑤ **任一 kappa 不可算 → gap 必须 None 不得填 0**(0 会被读成"soft 与 hard 完全一致",
+真相是"其中一个没算出来");⑥ 空 records 下四键仍须存在(否则 `.get(k)` 与
+`k in metrics` 两种写法行为不一致)。
+🔴 **JSONL 侧另有一条不在 pytest 里的硬约束**:`_epoch_metrics_extra` 必须**自行
+清理数组内的 NaN** —— `JsonlLogger._drop_nonfinite` 只判 `isinstance(v, float)`、
+**不遍历 list**,而这两项恰恰是数组;裸 `NaN` 会让严格解析器**拒读整行**,
+V2.1 对"日志读不到"的判罚是「可能被标记为可疑对象」。已用直调 `_epoch_metrics_extra`
++ `json.dumps(allow_nan=False)` 实测(正常写出 / NaN 数组整项丢弃且不影响同批其他项 /
+None 跳过),并经 `--mock-labels --smoke` 端到端确认四项真实落盘。
+
+**+10 = LA-SoftQWK-OD 损失**(`test_extension_head.py` 39→**49**),明细见上方该文件行。
+
+**+11 = 第三轮 review 修复**(929→940,2026-08-17):
 - `test_missing_n_total_frames_raises_not_guesses`(改写:原 `..._falls_back` 钉的是
   「回退猜 Z 长度」这个**已被判定为整例清零风险**的旧行为,现钉硬失败)
 - `test_invalid_n_total_frames_raises`×3(0 / 负数 / None 三种畸形值)

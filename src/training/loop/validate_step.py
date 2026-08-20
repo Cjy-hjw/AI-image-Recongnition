@@ -58,6 +58,11 @@ def collect_official_records(outputs, labels, targets):
 
     loc_probs = cpu_list(outputs["location_probs"])
     ete_probs = cpu_list(outputs["ete_probs"])
+    # 🔴 **logits 必须单独采集,不能从 probs 反推**(backlog #128 的 4 项监控之一
+    # `val_logit_mean_per_class` 要用):softmax 有**平移不变性**,`logits` 与
+    # `logits+c` 给出同一个 probs,故从 probs 反推不出 logits 的绝对量级 ——
+    # 而 DR 的预警判据恰恰是绝对量级(`z̄3 − z̄0 > 0` = 对稀有类过度偏移)。
+    ete_logits = cpu_list(outputs["ete_logits"])
     t_conf = cpu_list(outputs["t_conf"])
     tirads_probs = cpu_list(outputs["tirads_probs"])
     mal_p = cpu_list(mal_probs)
@@ -98,6 +103,7 @@ def collect_official_records(outputs, labels, targets):
             "gt_lesion_loc": int(gt_loc[i]),
             "valid_lesion_loc": int(v_loc[i]),
             "ete_probs": ete_probs[i],
+            "ete_logits": ete_logits[i],
             "gt_extrathy_ext": int(gt_ete[i]),
             "valid_extrathy_ext": int(v_ete[i]),
             "t_conf": t_conf[i],

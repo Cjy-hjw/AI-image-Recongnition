@@ -476,6 +476,28 @@ def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss) 
         if v is None:
             continue
         out[k] = int(v) if k == "n_lesions" else round(float(v), 6)
+
+    # ── backlog #128 的 4 项 ETE 诊断监控 ──────────────────────────────────
+    # 语义/阈值见 `metrics_official.ete_monitor_metrics` docstring(出自 DR §5)。
+    # 只写日志、不参与 composite、不触发 abort —— ETE 是目标四三项之一,不值得
+    # 为它停掉整轮(连带分割/良恶性/位置/T 全废)。
+    for k in ("ete_extreme_error_rate", "ete_kappa_gap"):
+        v = metrics.get(k)
+        if v is not None:
+            out[k] = round(float(v), 6)
+    # 🔴 **数组必须自行清 NaN**:`JsonlLogger._drop_nonfinite` 只判
+    # `isinstance(v, float)`、**不遍历 list**(实测 `[0.2, NaN, 0.4]` 原样写出,
+    # `json.dumps` 默认 `allow_nan=True` → 裸 `NaN` → 严格解析器**拒读整行**,
+    # 而 V2.1 对"日志读不到"的判罚是「可能被标记为可疑对象」)。这两项恰恰都是数组。
+    for k in ("ete_pred_hist", "ete_logit_mean_per_class"):
+        v = metrics.get(k)
+        if not isinstance(v, (list, tuple)):
+            continue
+        vals = [float(x) for x in v]
+        if not all(math.isfinite(x) for x in vals):
+            continue  # 整项丢弃(不填 0)—— 与 _drop_nonfinite 同一取舍:缺字段
+                      # 一眼看得出异常,填数字则永远发现不了
+        out[k] = [round(x, 6) for x in vals]
     return out
 
 

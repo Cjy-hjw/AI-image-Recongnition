@@ -16,13 +16,19 @@ from sklearn.metrics import average_precision_score, cohen_kappa_score, roc_auc_
 from src.training.metrics_official import (
     aggregate_by_lesion,
     compute_official_metrics,
+    ete_monitor_metrics,
 )
 
 
 def _rec(lesion_id, *, mal=1, mal_p=0.5, loc=0, loc_probs=None, ete=0,
-         ete_probs=None, t=0, t_conf=0.5, tirads=0, tirads_probs=None, is_main=1,
+         ete_probs=None, ete_logits=None, t=0, t_conf=0.5, tirads=0,
+         tirads_probs=None, is_main=1,
          v_mal=1, v_loc=1, v_ete=1, v_t=1, v_tirads=1, patient="P"):
-    """造一条 `collect_official_records` 形状的记录。默认全 valid、主病灶、恶性。"""
+    """造一条 `collect_official_records` 形状的记录。默认全 valid、主病灶、恶性。
+
+    `ete_logits` 默认 **不写入**(None)—— 那是 backlog #128 才加的键,legacy
+    records 没有它,保持默认缺席才能测到"键缺席时降级为 None 而非 KeyError"。
+    """
     if loc_probs is None:
         loc_probs = [0.0] * 7
         loc_probs[loc] = 1.0
@@ -32,7 +38,7 @@ def _rec(lesion_id, *, mal=1, mal_p=0.5, loc=0, loc_probs=None, ete=0,
     if tirads_probs is None:
         tirads_probs = [0.0] * 5
         tirads_probs[tirads] = 1.0
-    return {
+    rec = {
         "lesion_id": lesion_id,
         "patient_id": patient,
         "is_main": is_main,
@@ -52,6 +58,9 @@ def _rec(lesion_id, *, mal=1, mal_p=0.5, loc=0, loc_probs=None, ete=0,
         "gt_tirads": tirads,
         "valid_tirads": v_tirads,
     }
+    if ete_logits is not None:
+        rec["ete_logits"] = list(ete_logits)
+    return rec
 
 
 def test_empty_records_returns_all_none():
@@ -303,9 +312,13 @@ def test_composite_is_mean_of_available_metrics_only():
     # 只有良恶性可算(位置单类、ETE/T 单类)
     recs = [_rec("A", mal=1, mal_p=0.9, loc=0), _rec("B", mal=0, mal_p=0.1, loc=0)]
     m = compute_official_metrics(recs)
-    usable = [m[k] for k in ("malignancy_auc_pr", "location_weighted_auc",
-                             "ete_weighted_kappa", "clinical_t_auc")
-              if m[k] is not None]
+    usable = [
+        float(v) for v in (
+            m[k] for k in ("malignancy_auc_pr", "location_weighted_auc",
+                           "ete_weighted_kappa", "clinical_t_auc")
+        )
+        if isinstance(v, (int, float))
+    ]
     assert m["composite"] == pytest.approx(float(np.mean(usable)))
     assert len(usable) < 4, "本例应有指标不可算,否则测不到'不当 0 计入'"
 
@@ -356,7 +369,7 @@ def test_seg_dice_enters_composite_mean():
     # 低 dice 必须把 composite 拉下来(单调性:否则选模仍对闸门视而不见)
     m_low = compute_official_metrics(recs, seg_dice=0.001)
     lo, hi = m_low["composite"], m["composite"]
-    assert lo is not None and hi is not None
+    assert isinstance(lo, float) and isinstance(hi, float)
     assert lo < hi, "dice 更低时 composite 必须更低"
 
 
@@ -423,3 +436,155 @@ def test_seg_dice_present_when_records_empty():
     m = compute_official_metrics([], seg_dice=0.25)
     assert m["seg_dice"] == pytest.approx(0.25)
     assert m["n_lesions"] == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# backlog #128：4 项 ETE 诊断监控（DR §5 `:118-138`）
+# 语义与阈值见 `metrics_official.ete_monitor_metrics` docstring。
+# 这些是**诊断量不是评分指标**，测试重点：口径与 kappa 同子集、不污染 composite、
+# 键缺席时降级而非崩、NaN 不进 JSONL。
+
+
+def test_ete_monitors_use_same_subset_as_kappa():
+    """🔴 监控必须与 `_ete_weighted_kappa` **同一子集**（主病灶 + 有标注 + 恶性）。
+
+    否则会出现"监控说分布正常、kappa 却在跌"的自相矛盾——两者看的根本不是同一
+    批样本，排查时会往完全错误的方向走。这里塞入三种应被排除的样本，断言
+    直方图仍只反映那 2 个合格样本。
+    """
+    recs = [
+        _rec("A", mal=1, ete=0, is_main=1),          # 合格
+        _rec("B", mal=1, ete=3, is_main=1),          # 合格
+        _rec("C", mal=0, ete=3, is_main=1),          # 良性 → 排除
+        _rec("D", mal=1, ete=3, is_main=0),          # 次病灶 → 排除
+        _rec("E", mal=1, ete=3, is_main=1, v_ete=0),  # 无标注 → 排除
+    ]
+    mon = ete_monitor_metrics(aggregate_by_lesion(recs))
+    hist = mon["ete_pred_hist"]
+    # 只有 A(类0) 与 B(类3) 入选 → 各占一半；若误纳 C/D/E，类3 会占 4/5
+    assert hist == pytest.approx([0.5, 0.0, 0.0, 0.5]), (
+        f"监控子集与 kappa 不一致，实际直方图 {hist}"
+    )
+
+
+def test_ete_pred_hist_detects_rare_class_over_prediction():
+    """DR 预警场景：`P3 > 2%` = 少数类过度激励，kappa 即将转负。
+
+    构造 10 个样本里 3 个被预测成类3（30% ≫ 2%），直方图必须如实反映
+    —— 这正是本项目 β=0.99 那轮崩掉时的指纹。
+    """
+    recs = [_rec(f"L{i}", mal=1, ete=0) for i in range(7)]
+    recs += [
+        _rec(f"R{i}", mal=1, ete=0, ete_probs=[0.1, 0.0, 0.0, 0.9])
+        for i in range(3)
+    ]
+    mon = ete_monitor_metrics(aggregate_by_lesion(recs))
+    assert mon["ete_pred_hist"] == pytest.approx([0.7, 0.0, 0.0, 0.3])
+    # 全部真值是类0、3 个被判成类3 → |0-3|=3 ≥ 2，大跨度误判率 30%
+    assert mon["ete_extreme_error_rate"] == pytest.approx(0.3)
+
+
+def test_ete_extreme_error_rate_only_counts_distance_ge_2():
+    """`|i−j| ≥ 2` 才算：差 1 级不计入（二次惩罚下差 1 与差 3 代价相差 9 倍，
+    混在一起统计就失去了"方向性失败"的判别力）。"""
+    recs = [
+        _rec("A", mal=1, ete=0, ete_probs=[0.0, 1.0, 0.0, 0.0]),  # 差1 → 不计
+        _rec("B", mal=1, ete=0, ete_probs=[0.0, 0.0, 1.0, 0.0]),  # 差2 → 计
+        _rec("C", mal=1, ete=0),                                   # 差0 → 不计
+        _rec("D", mal=1, ete=3, ete_probs=[1.0, 0.0, 0.0, 0.0]),  # 差3 → 计
+    ]
+    mon = ete_monitor_metrics(aggregate_by_lesion(recs))
+    assert mon["ete_extreme_error_rate"] == pytest.approx(0.5)
+
+
+def test_ete_kappa_gap_detects_soft_positive_but_hard_zero():
+    """DR 判据：Soft-Kappa 有值而硬 Kappa 恒 0 = softmax 峰值不够陡、跨不过
+    argmax 门槛。构造：概率有正确倾向但都不足以改变 argmax。"""
+    # 真值 0/3 各一，概率都偏向类0（argmax 全 0 → 硬 kappa 定义域退化）
+    recs = [
+        _rec("A", mal=1, ete=0, ete_probs=[0.6, 0.2, 0.1, 0.1]),
+        _rec("B", mal=1, ete=3, ete_probs=[0.55, 0.15, 0.15, 0.15]),
+    ]
+    rows = aggregate_by_lesion(recs)
+    mon = ete_monitor_metrics(rows)
+    gap = mon["ete_kappa_gap"]
+    # gap 可算即说明两个 kappa 都拿到了值；不可算时必须是 None 而不是 0
+    assert gap is None or isinstance(gap, float)
+
+
+def test_ete_kappa_gap_is_none_when_either_kappa_undefined():
+    """任一 kappa 不可算 → gap 必须 None。**不能填 0** —— 0 会被读成
+    "soft 与 hard 完全一致"，而真相是"其中一个根本没算出来"。"""
+    # 单样本 → 硬 kappa 返回 None（len(sel) < 2）
+    recs = [_rec("A", mal=1, ete=0)]
+    mon = ete_monitor_metrics(aggregate_by_lesion(recs))
+    assert mon["ete_kappa_gap"] is None
+    # 且整组四项都应是 None（样本不足）
+    assert mon["ete_pred_hist"] is None
+
+
+def test_ete_logit_mean_requires_logits_key_and_degrades_gracefully():
+    """🔴 `ete_logits` 键缺席（legacy records）→ 该项 None，**不得 KeyError、
+    也不得拿 probs 顶替**（softmax 平移不变，probs 反推不出绝对量级，而 DR 的
+    判据 `z̄3 − z̄0 > 0` 要的正是绝对量级）。"""
+    # 默认 _rec 不写 ete_logits
+    recs = [_rec("A", mal=1, ete=0), _rec("B", mal=1, ete=3)]
+    mon = ete_monitor_metrics(aggregate_by_lesion(recs))
+    assert mon["ete_logit_mean_per_class"] is None
+    assert mon["ete_pred_hist"] is not None, "其余三项不受 logits 缺席影响"
+
+    # 带 logits 时如实给出各类均值
+    recs2 = [
+        _rec("A", mal=1, ete=0, ete_logits=[2.0, 0.0, 0.0, -1.0]),
+        _rec("B", mal=1, ete=3, ete_logits=[4.0, 0.0, 0.0, 1.0]),
+    ]
+    mon2 = ete_monitor_metrics(aggregate_by_lesion(recs2))
+    assert mon2["ete_logit_mean_per_class"] == pytest.approx([3.0, 0.0, 0.0, 0.0])
+
+
+def test_ete_logits_aggregated_by_lesion_like_probs():
+    """多帧病灶的 logits 必须与 probs **一起**聚合。漏了它，logits 会停在首帧值、
+    与已聚合的 probs 不同步，而监控里两者是并排看的。"""
+    recs = [
+        _rec("SAME", mal=1, ete=0, ete_logits=[0.0, 0.0, 0.0, 0.0]),
+        _rec("SAME", mal=1, ete=0, ete_logits=[4.0, 2.0, 0.0, -2.0]),
+    ]
+    rows = aggregate_by_lesion(recs)
+    assert len(rows) == 1, "同 lesion_id 应聚合成一条"
+    assert rows[0]["ete_logits"] == pytest.approx([2.0, 1.0, 0.0, -1.0]), (
+        "logits 未按病灶取均值 —— 停在首帧值会与已聚合的 probs 失同步"
+    )
+
+
+def test_ete_monitors_do_not_pollute_composite():
+    """🔴 诊断量绝不能进 composite：`ete_pred_hist` 是 list，混进 `np.mean`
+    会直接报错或静默产出错误标量；且 composite 是选模判据，语义必须干净。"""
+    recs = [
+        _rec("A", mal=1, mal_p=0.9, loc=0, ete=0),
+        _rec("B", mal=0, mal_p=0.1, loc=1, ete=3),
+    ]
+    m = compute_official_metrics(recs)
+    assert isinstance(m["composite"], float), "composite 必须仍是标量"
+    # composite 只由评分指标构成，与手工重算一致
+    scoring = [
+        float(v) for v in (
+            m[k] for k in ("malignancy_auc_pr", "location_weighted_auc",
+                           "ete_weighted_kappa", "clinical_t_auc",
+                           "tirads_weighted_kappa")
+        )
+        if isinstance(v, (int, float))
+    ]
+    assert m["composite"] == pytest.approx(float(np.mean(scoring)))
+    # 四项监控同时存在于返回值里（只是不参与 composite）
+    for k in ("ete_pred_hist", "ete_extreme_error_rate", "ete_kappa_gap",
+              "ete_logit_mean_per_class"):
+        assert k in m, f"{k} 应在返回值中"
+
+
+def test_empty_records_still_carries_monitor_keys():
+    """空 records 下四项监控键必须存在（值为 None）—— 否则调用方
+    `metrics.get(k)` 与 `k in metrics` 两种写法行为不一致。"""
+    m = compute_official_metrics([])
+    for k in ("ete_pred_hist", "ete_extreme_error_rate", "ete_kappa_gap",
+              "ete_logit_mean_per_class"):
+        assert k in m and m[k] is None

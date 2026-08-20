@@ -497,19 +497,54 @@ def test_ete_extreme_error_rate_only_counts_distance_ge_2():
     assert mon["ete_extreme_error_rate"] == pytest.approx(0.5)
 
 
-def test_ete_kappa_gap_detects_soft_positive_but_hard_zero():
-    """DR 判据：Soft-Kappa 有值而硬 Kappa 恒 0 = softmax 峰值不够陡、跨不过
-    argmax 门槛。构造：概率有正确倾向但都不足以改变 argmax。"""
-    # 真值 0/3 各一，概率都偏向类0（argmax 全 0 → 硬 kappa 定义域退化）
+def test_ete_kappa_gap_equals_soft_minus_hard_with_real_numbers():
+    """`ete_kappa_gap` 必须 **= Soft-Kappa − 硬 Argmax-Kappa**，用手算值钉死。
+
+    🔴 **本测试是重写版**（Gate2 自审发现原版是假测试）：原断言写的是
+    `gap is None or isinstance(gap, float)` —— **恒真**，任何实现都过，而测试名
+    却声称在验 DR 的"soft 正 hard 零"判据，零区分力。现改为与 sklearn 手算对拍。
+
+    构造：真值 0/3 各一，概率都偏向类0 → argmax 全 0（硬 Kappa 由 sklearn 算），
+    而概率分布仍保留了对类3 的部分质量（Soft-Kappa 与硬的不同）。这正是 DR
+    `:133` 描述的"softmax 峰值不够陡、跨不过 argmax 门槛"场景。
+    """
+    probs_a = [0.6, 0.2, 0.1, 0.1]
+    probs_b = [0.55, 0.15, 0.15, 0.15]
     recs = [
-        _rec("A", mal=1, ete=0, ete_probs=[0.6, 0.2, 0.1, 0.1]),
-        _rec("B", mal=1, ete=3, ete_probs=[0.55, 0.15, 0.15, 0.15]),
+        _rec("A", mal=1, ete=0, ete_probs=probs_a),
+        _rec("B", mal=1, ete=3, ete_probs=probs_b),
     ]
-    rows = aggregate_by_lesion(recs)
-    mon = ete_monitor_metrics(rows)
+    mon = ete_monitor_metrics(aggregate_by_lesion(recs))
     gap = mon["ete_kappa_gap"]
-    # gap 可算即说明两个 kappa 都拿到了值；不可算时必须是 None 而不是 0
-    assert gap is None or isinstance(gap, float)
+
+    # 手算硬 Kappa：argmax 都是 0，真值 [0,3]
+    y_true, y_pred = [0, 3], [0, 0]
+    hard = cohen_kappa_score(
+        y_true, y_pred, labels=list(range(4)), weights="quadratic"
+    )
+    # 手算 Soft-Kappa：κ = 1 − ΣW⊙O / ΣW⊙E（与实现同一套数学，此处独立重算）
+    C = 4
+    W = np.array([[(i - j) ** 2 / (C - 1) ** 2 for j in range(C)] for i in range(C)])
+    P = np.array([probs_a, probs_b])
+    oh = np.eye(C)[y_true]
+    n = len(y_true)
+    O = oh.T @ P / n
+    E = np.outer(oh.sum(axis=0) / n, P.sum(axis=0) / n)
+    den = (W * E).sum()
+    soft = 1.0 - (W * O).sum() / den
+
+    if np.isnan(hard):
+        # 硬 Kappa 未定义（真值/预测均退化）→ 实现必须返回 None，绝不填 0
+        assert gap is None, f"硬 Kappa 未定义时 gap 必须 None，got {gap}"
+    else:
+        assert gap == pytest.approx(soft - hard, abs=1e-5), (
+            f"gap 应 = soft({soft:.6f}) − hard({hard:.6f}) = {soft - hard:.6f}，"
+            f"实际 {gap}"
+        )
+    # 反证构造有效：soft 与 hard 必须真的不同，否则测不到"背离"
+    assert not np.isclose(soft, 0.0 if np.isnan(hard) else hard, atol=1e-6), (
+        "构造失效：soft 与 hard 恰好相同，本测试失去区分力"
+    )
 
 
 def test_ete_kappa_gap_is_none_when_either_kappa_undefined():

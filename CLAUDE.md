@@ -28,8 +28,8 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 941 collected / 940 passed+1 skipped，2026-08-17 第三轮 review
-# 修完后 `Demo_D` 主环境实测。演进链 891→923→929→940，明细见 `tests/AGENTS.md`。
+# 完整测试套件（本地可跑，实测 960 collected / 959 passed+1 skipped，2026-08-20
+# backlog #128 落地后 `Demo_D` 主环境实测。演进链 891→923→929→940→959，明细见 `tests/AGENTS.md`。
 # 精确计数以 pytest --collect-only 实跑为准；
 # ⚠️ 测试总数跨 Python 环境不可比，
 # torch2.8 预演环境待下次云端对拍重新确认，判回归须同环境前后对拍）

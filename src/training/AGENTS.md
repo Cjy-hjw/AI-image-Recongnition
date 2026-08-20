@@ -87,7 +87,7 @@ C=31-35(回到 A 的可训集,头部固定 lr_base×0.05;温度标定在推理�
 解码器(随机初始化)挂 `head_lr`、与四头同组;ImageNet 主干挂 `head_lr×backbone_lr_scale`,与 Stage B 的 blocks[6] **同档不新增**。
 param_groups 组数实测:**A/C 各 5 组、B 9 组**(stage 边界重建 optimizer,stage 内按位置 zip 更 lr —— 同 stage 内组数与各组参数数恒定,已实测)。
 四头(位置/侵犯/临床T/TI-RADS)在**所有** legacy stage 恒冻结(`OFFICIAL_HEAD_PREFIXES`,含 `tirads_head`),两条调度线互不干扰。
-入口是 `scripts/train_official.py`(**不动 `train.py`**),数值锁定见 `tests/test_official_schedule.py`(18 项)。官方四头 JSONL 计数另逐文件钉死于 `tests/AGENTS.md` 各头小节。
+入口是 `scripts/train_official.py`(**不动 `train.py`**),数值锁定见 `tests/test_official_schedule.py`(**26 项**,2026-08-20 `--collect-only` 实测;原记 18 是分割解冻轮的数、已过时)。官方四头 JSONL 计数另逐文件钉死于 `tests/AGENTS.md` 各头小节。
 
 
 ### `build_official_head_targets()`(train_step.py,阶段 2.4 提取为可单测模块级函数)

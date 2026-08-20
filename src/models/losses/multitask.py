@@ -88,6 +88,9 @@ class MultiTaskLoss(nn.Module):
         self.lambda_tirads = float(cfg.get("tirads_loss_weight", 1.0))
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
+        # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径,零回归。
+        self.ete_qwk_weight = float(cfg.get("ete_qwk_weight", 0.0))
+        self.ete_dist_weight = float(cfg.get("ete_dist_weight", 0.2))
         self.clin_t_label_smoothing = float(cfg.get("clin_t_label_smoothing", 0.0))
         self.tirads_label_smoothing = float(cfg.get("tirads_label_smoothing", 0.0))
         # 默认 0(关闭):见 `losses/components/tirads.py` docstring —— 没有真实数据
@@ -194,6 +197,8 @@ class MultiTaskLoss(nn.Module):
             ete_log_prior=self.ete_log_prior,
             ete_focal_gamma=self.ete_focal_gamma,
             ete_la_tau=self.ete_la_tau,
+            ete_qwk_weight=self.ete_qwk_weight,
+            ete_dist_weight=self.ete_dist_weight,
             clin_t_class_weights=self.clin_t_class_weights,
             clin_t_label_smoothing=self.clin_t_label_smoothing,
             tirads_class_weights=self.tirads_class_weights,

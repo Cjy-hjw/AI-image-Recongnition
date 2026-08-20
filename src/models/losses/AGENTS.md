@@ -34,6 +34,17 @@
      锁死（纯 CE gap≈3.0 / LA≈0 / 反号≈5.9，三者两两可分）。
   3. CB 加权与 LA 是同一问题的两种解法，**同时开满会过校正**，故 `la_tau` 默认 0。
      两个超参都在 `configs/thyroid_config.yaml: train.ete_*`。
+  4. 🔴 **backlog #128（2026-08-17，方案就绪未执行）**：CB-Focal/加权 CE 优化逐
+     样本似然，与官方真实指标（二次加权 Kappa）在本任务分布下**负相关**——已实测
+     两次转负/垫底（β=0.99 时 ep26 起转负；β=0.9 后本轮 kappa=0.2086 仍五项最低）。
+     `compute_extension_loss` 新增 `qwk_weight`/`dist_weight` 参数，`qwk_weight>0`
+     时切到 **LA-SoftQWK-OD**（`quadratic_weight_matrix`/`soft_qwk_loss`/
+     `ordinal_distance_loss`，DR 主方案）：`total = qwk_weight·SoftQWK + dist_weight·
+     OrdinalDistance`，常数预测下 SoftQWK 恒为 1.0（QWK=0，最强验收判据）。
+     🔴 **LA 必须与 SoftQWK 同时开**：实测单开 `la_tau` 会把稀有类概率推高 ×21
+     （τ0→0.5），而本项目已因过度预测稀有类让 Kappa 转负过一次；`la_tau` 只调整
+     决策边界，靠 SoftQWK 才能压住它。默认 `qwk_weight=0.0`（YAML），逐位走 CB-Focal
+     老路径，零回归。
   **`focal_gamma` 只接受 0 或 ≥1**：γ∈(0,1) 在 `p_t=1.0` 处梯度为 NaN 而 loss 值
   看不出异常（实跑 γ=0.5 → loss=0.0、grad=[nan,nan]），且 `p_t==1.0` 在 fp32 下
   真的可达（logit gap≥50 即精确 1.0）。

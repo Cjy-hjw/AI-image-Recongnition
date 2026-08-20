@@ -89,13 +89,23 @@ python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-si
 # （动态 mask 文件 0.2-0.3MB 是压缩后大小，解压后与影像同体素数，勿据文件大小判"小头"）。
 # JSONL 日志默认落 V2.1 强制路径 /2026aicompetition/workspace/logs（不传 --log-dir）
 # 默认保留 legacy 多任务损失守护旧任务不退化；纯头训练传 --freeze-legacy
+# 🔴 backlog #129（2026-08-17 实测定案）：--epochs 24 省 31% —— Stage C（ep31-35）
+# 5 个 epoch 的指标总跨度 composite 仅 0.00047，纯浪费；Stage A（ep1-10）经日志重解析
+# 证实三头真的在学（val_dice+0.334/tirads_kappa+0.179），不砍。24 epoch 下四道护栏
+# （epoch>=绝对值 形式，见 train_official.py 顶部 SEG_*/COMPOSITE_WARN 常量）逐位适用，
+# 无需改代码；--epochs 缺省仍是 STAGE_C_END=35，需显式传 24。
 python scripts/data/preextract_dynamic.py --data-root /2026aicompetition/datasets/training/annotation \
     --xlsx <标注.xlsx> --cache-dir /2026aicompetition/workspace/cache [--limit 3]  # 先 --limit 3 验管道，约 1 分钟，再全量约 35-45 分钟
 python scripts/train_official.py --data-root /2026aicompetition/datasets/training/annotation \
     --xlsx <标注.xlsx> --resume-from checkpoints/best_model_mixtrain_xl_e40.pth \
     --samples-pkl /2026aicompetition/workspace/cache/samples.pkl \
-    --out checkpoints/official_heads_best.pth
+    --epochs 24 \
+    --out checkpoints/official_heads_seg_r6_ep24.pth
+# 🔴 --out 必须显式传版本化文件名（不要用默认 official_heads_best.pth）：那是
+# --mock-labels --smoke 冒烟产物的默认路径，与真实产物同名同量级、文件系统分不出来
+# （memory: weights-inventory-where-each-checkpoint-lives 记过同类误判）。
 ```
+
 
 ## Git 规范（AI 无法从 git log 推断格式约定）
 

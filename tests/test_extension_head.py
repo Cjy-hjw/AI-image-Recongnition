@@ -24,6 +24,9 @@ from src.models.losses.components.extension import (
     class_balanced_weights,
     compute_extension_loss,
     log_class_prior,
+    ordinal_distance_loss,
+    quadratic_weight_matrix,
+    soft_qwk_loss,
 )
 from src.models.mask_features import boundary_band_from_mask
 
@@ -589,3 +592,231 @@ def test_end_to_end_ete_loss_leaves_seg_backbone_and_cbm_untouched():
     assert grad_sum("cls_backbone") > 0.0, (
         "cls_backbone 没有梯度 —— stage4_spatial 通路断了，上面两条断言失去区分力"
     )
+
+
+# ── SoftQWK（backlog #128，2026-08-17）──────────────────────────────────────
+# DR §6.4 给的本地验收清单，第 1/2 条可离线做（第 3 条需真实标签分布，留云端）：
+#   1. 梯度可微性：全零/随机 logits 下梯度无 NaN/Inf；常数预测下 soft_qwk_loss==1.0
+#   2. LA 边界方向：[2.0,0.0,0.0,2.1] 经 la_tau=0.5 调整后类别 0 重新占主导
+
+
+def test_quadratic_weight_matrix_matches_sklearn_definition():
+    """W[i,j] = (i-j)²/(C-1)²，与 metrics_official._ete_weighted_kappa 消费的
+    sklearn weights="quadratic" 同一定义 —— 损失优化目标与选模指标口径必须一致。
+    """
+    W = quadratic_weight_matrix(4)
+    assert W.shape == (4, 4)
+    assert torch.allclose(torch.diag(W), torch.zeros(4))
+    # (0,3): (0-3)^2 / 3^2 = 1.0（最大距离归一化到 1）
+    assert float(W[0, 3]) == pytest.approx(1.0)
+    # (0,1): 1/9
+    assert float(W[0, 1]) == pytest.approx(1.0 / 9.0)
+    assert torch.allclose(W, W.t()), "距离矩阵必须对称"
+
+
+def test_soft_qwk_loss_is_exactly_one_for_constant_prediction():
+    """🔴 DR §6.4 第1条判据：常数预测（所有概率质量压在同一类）→ QWK=0 → loss=1.0。
+
+    构造：全部样本真实标签为类 0，模型对**全部**样本都输出"确定预测类 0"
+    （one-hot 概率）。此时 O 的对角线全部质量落在 (0,0)，E 同理（hist_true=
+    hist_pred=[1,0,0,0]），W 在对角线为 0 → num=0；但 den 同样为 0（W[0,0]=0）
+    ——这个构造反而会撞上 0/0，用它验证不了"精确 1.0"。
+
+    真正能触发"QWK=0"的常数预测是**预测分布与真实分布独立**（E 完全解释了 O）：
+    真实标签均匀分布在 4 类，模型对**所有类**都给出同一个概率向量（预测与真实
+    标签无关，即"模型没学到任何东西"的极限情况）。此时 O = hist_true ⊗ pred_const
+    = E（因为 pred 对每个真实类都相同），num == den 精确成立。
+    """
+    num_classes = 4
+    idx = torch.tensor([0, 1, 2, 3])  # 每类各一个样本,真实分布均匀
+    # 模型输出与真实标签无关的同一个概率向量(常数预测)
+    const_probs = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    probs = const_probs.unsqueeze(0).expand(4, -1).clone()
+    W = quadratic_weight_matrix(num_classes)
+    loss = soft_qwk_loss(probs, idx, W)
+    assert float(loss) == pytest.approx(1.0, abs=1e-5), (
+        f"常数预测(与真实标签无关)下 SoftQWK 损失应精确为 1.0(QWK=0),got {float(loss)}"
+    )
+
+
+def test_soft_qwk_loss_below_one_for_perfect_prediction():
+    """完美预测(概率 one-hot 且全部命中)时 QWK=1 → loss 应远小于常数预测的 1.0。"""
+    num_classes = 4
+    idx = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+    probs = torch.nn.functional.one_hot(idx, num_classes).float()
+    W = quadratic_weight_matrix(num_classes)
+    loss = soft_qwk_loss(probs, idx, W)
+    assert float(loss) < 0.5, f"完美预测下 SoftQWK 损失应远小于 1.0,got {float(loss)}"
+
+
+def test_compute_extension_loss_qwk_branch_gradients_are_finite():
+    """DR §6.4 第1条:全零/随机 logits 下梯度无 NaN/Inf(极端不平衡场景)。"""
+    torch.manual_seed(0)
+    lp = log_class_prior(OFFICIAL_ETE_COUNTS)
+    idx = torch.cat([
+        torch.zeros(6, dtype=torch.long), torch.tensor([1, 2, 3], dtype=torch.long)
+    ])
+    v = torch.ones(9)
+
+    for logits in (
+        torch.zeros(9, 4, requires_grad=True),
+        (torch.randn(9, 4) * 10).requires_grad_(True),
+    ):
+        total, detail = compute_extension_loss(
+            logits, idx, v, log_prior=lp, la_tau=0.5, qwk_weight=1.0, dist_weight=0.2,
+        )
+        assert torch.isfinite(total), f"total 非有限: {total}"
+        for k, val in detail.items():
+            assert torch.isfinite(val), f"{k} 非有限: {val}"
+        total.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all(), "梯度含 NaN/Inf"
+
+
+def test_compute_extension_loss_qwk_branch_constant_prediction_equals_one():
+    """DR §6.4 第1条钉在 compute_extension_loss 这一层(不只在 soft_qwk_loss 裸函数)。
+
+    dist_weight=0 隔离掉有序距离项,使 total 精确等于 qwk_weight * 1.0。
+
+    🔴 **用均匀先验隔离 LA**:`qwk_weight>0` 时函数强制要求 `la_tau>0`(两者是同一
+    方案的两半,见 extension.py 的 assert),但均匀先验下 `log π` 是常数向量,加到
+    logits 上不改变 softmax(平移不变性) —— 既满足约束又不干扰本测试要验的数值。
+    """
+    idx = torch.tensor([0, 1, 2, 3])
+    v = torch.ones(4)
+    const_probs = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    # 反推 logits: log(probs) 即可(softmax 后还原同一分布,忽略常数偏移)
+    logits = torch.log(const_probs).unsqueeze(0).expand(4, -1).clone()
+    uniform_prior = log_class_prior([1, 1, 1, 1])
+    total, detail = compute_extension_loss(
+        logits, idx, v, log_prior=uniform_prior, la_tau=0.5,
+        qwk_weight=1.0, dist_weight=0.0,
+    )
+    assert float(total) == pytest.approx(1.0, abs=1e-4)
+    assert float(detail["ete_qwk"]) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_compute_extension_loss_qwk_branch_respects_validity_mask():
+    """无效样本不得混进 SoftQWK 的 O/E 统计(注释里强调过的坑:mask 均值范式在
+    这里不适用,必须先过滤)。构造:2 个有效样本(完美预测) + 2 个无效样本
+    (标签/预测故意拉垮),若无效样本被算进去,loss 会明显偏离"只看 2 个有效样本"
+    的结果。
+
+    同上用均匀先验隔离 LA(平移不变,不改 softmax)。
+    """
+    idx_valid = torch.tensor([0, 3])
+    probs_valid = torch.nn.functional.one_hot(idx_valid, 4).float()
+
+    idx_all = torch.tensor([0, 3, 1, 2])
+    probs_all = torch.cat([
+        probs_valid,
+        torch.tensor([[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]]),
+    ])
+    validity_all = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    logits_all = torch.log(probs_all.clamp_min(1e-8))
+
+    W = quadratic_weight_matrix(4)
+    only_valid_loss = soft_qwk_loss(probs_valid, idx_valid, W)
+
+    uniform_prior = log_class_prior([1, 1, 1, 1])
+    _, detail = compute_extension_loss(
+        logits_all, idx_all, validity_all, log_prior=uniform_prior, la_tau=0.5,
+        qwk_weight=1.0, dist_weight=0.0,
+    )
+    assert float(detail["ete_qwk"]) == pytest.approx(float(only_valid_loss), abs=1e-4), (
+        "无效样本混进了 O/E 统计 —— compute_extension_loss 必须先按 validity 过滤"
+        "再算 SoftQWK,不能用逐样本 masked-mean 范式"
+    )
+
+
+def test_qwk_weight_requires_la_tau_to_be_enabled():
+    """🔴 `qwk_weight>0` 必须同时 `la_tau>0` —— 只开一半会静默白跑一轮云端训练。
+
+    LA 与 SoftQWK 是 DR 主方案的两半（LA 平移决策边界让稀有类可达、SoftQWK 直接
+    优化 Kappa 压住过度预测）。只开 SoftQWK 时损失照常下降、日志一切正常，但稀有
+    类边界仍被先验压死 —— 与本项目「符号反了损失照常下降」那类事故同源，必须硬拦
+    而不是只写在 docstring 里（Gate2 lane1 指出：文档声称的约束代码没强制）。
+
+    反向（只开 LA 不开 SoftQWK）是既有合法配置，**不得**被这条 assert 误伤。
+    """
+    idx = torch.tensor([0, 1, 2, 3])
+    v = torch.ones(4)
+    logits = torch.randn(4, 4)
+    lp = log_class_prior(OFFICIAL_ETE_COUNTS)
+
+    with pytest.raises(AssertionError, match="la_tau"):
+        compute_extension_loss(logits, idx, v, qwk_weight=1.0, la_tau=0.0)
+
+    # 反向不得误伤：CB-Focal 分支 + LA 是 2026-08-12 就存在的合法组合
+    total, detail = compute_extension_loss(
+        logits, idx, v, log_prior=lp, la_tau=0.5, qwk_weight=0.0, focal_gamma=0.0,
+    )
+    assert torch.isfinite(total)
+    assert "ete_focal" in detail, "qwk_weight=0 必须仍走 CB-Focal 老路径"
+
+
+def test_compute_extension_loss_qwk_branch_all_invalid_returns_zero_no_nan():
+    """整批无有效样本 → 精确 0,不产生 NaN(与 CB-Focal 分支的既有约定一致)。"""
+    idx = torch.tensor([0, 1, 2, 3])
+    v = torch.zeros(4)
+    logits = torch.randn(4, 4)
+    lp = log_class_prior(OFFICIAL_ETE_COUNTS)
+    total, detail = compute_extension_loss(
+        logits, idx, v, log_prior=lp, la_tau=0.5, qwk_weight=1.0, dist_weight=0.2,
+    )
+    assert float(total) == 0.0
+    for val in detail.values():
+        assert torch.isfinite(val) and float(val) == 0.0
+
+
+def test_ordinal_distance_loss_penalizes_distance_from_true_class():
+    """预测分布越集中在真值上，有序距离损失越小。"""
+    idx = torch.tensor([0])
+    near = torch.tensor([[0.7, 0.3, 0.0, 0.0]])   # 质量集中在 0/1(近真值)
+    far = torch.tensor([[0.0, 0.0, 0.3, 0.7]])    # 质量集中在 2/3(远真值)
+    loss_near = ordinal_distance_loss(near, idx)
+    loss_far = ordinal_distance_loss(far, idx)
+    assert float(loss_near) < float(loss_far)
+
+
+def test_qwk_branch_la_boundary_direction_matches_dr_example():
+    """🔴 DR §6.4 第2条判据:构造 [2.0,0.0,0.0,2.1] 这种类0/类3 近乎打平的 logits，
+    经 la_tau=0.5 的 log_prior 调整后，类别 0 应重新占据绝对主导。
+
+    这与既有的 `test_logit_adjustment_sign_pushes_toward_rare_class`（收敛实验）
+    互补：那条测的是"训练到收敛后"的方向，这条测的是 DR 给出的**具体数值实例**。
+
+    🔴 **必须真的走 `compute_extension_loss`,不能手算 `logits + tau*lp` 再断言** ——
+    手算等于把被测逻辑在测试里抄一遍,抄错了两边一起错、断言恒过(自证式测试,
+    零区分力)。这里的做法是:用 `qwk_weight=0` 走 CB-Focal 分支,喂**同一个样本
+    两次**、只改标签(类0 vs 类3),比较两者的损失 —— LA 生效时类0 应比类3 损失更低
+    (因为调整后类0 概率占绝对主导),方向反了这条断言立刻变红。
+    """
+    lp = log_class_prior(OFFICIAL_ETE_COUNTS)
+    logits = torch.tensor([[2.0, 0.0, 0.0, 2.1]])
+    v = torch.ones(1)
+
+    def loss_for_label(label: int, tau: float) -> float:
+        total, _ = compute_extension_loss(
+            logits, torch.tensor([label]), v,
+            log_prior=lp, la_tau=tau, focal_gamma=0.0,
+        )
+        return float(total)
+
+    # LA 关闭时:原始 logits 里类3(2.1) 略高于类0(2.0),故标类3 的损失更低
+    assert loss_for_label(3, 0.0) < loss_for_label(0, 0.0), (
+        "基线不成立:未加 LA 时 logits[3]=2.1 > logits[0]=2.0,标类3 应损失更低"
+        " —— 若此条不过,说明构造本身有问题,下面的对照失去意义"
+    )
+    # LA 开启后方向翻转:类0 先验远高(3906 vs 5),调整后类0 重新占绝对主导
+    assert loss_for_label(0, 0.5) < loss_for_label(3, 0.5), (
+        f"LA(tau=0.5) 未能让类0 重新占主导:标类0 损失 {loss_for_label(0, 0.5):.4f}"
+        f" 应 < 标类3 损失 {loss_for_label(3, 0.5):.4f}。符号反了(减而非加)会得到"
+        f"相反结果,而损失本身照常下降、看不出异常(见模块 docstring)"
+    )
+    # 定量:DR 原文要求"重新占据绝对主导",实测调整后类0 概率应 > 0.9
+    probs = torch.softmax(logits + 0.5 * lp.unsqueeze(0), dim=-1)
+    assert float(probs[0, 0]) > 0.9, (
+        f"DR 原文要求「重新占据绝对主导」，概率应显著 > 类3，实际 {probs.tolist()}"
+    )
+

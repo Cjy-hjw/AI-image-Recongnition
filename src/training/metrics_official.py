@@ -68,6 +68,14 @@ def aggregate_by_lesion(records: List[Dict]) -> List[Dict]:
             [g["location_probs"] for g in group], axis=0
         ).tolist()
         head["ete_probs"] = np.mean([g["ete_probs"] for g in group], axis=0).tolist()
+        # backlog #128 的 `val_logit_mean_per_class` 监控用。**必须与 probs 一起
+        # 聚合**:漏了它,多帧病灶的 logits 会停在首帧值、与已聚合的 probs 不同步,
+        # 而两者在监控里是并排看的(probs 看预测分布、logits 看绝对偏移量级)。
+        # 键缺席时跳过 —— legacy 数据集/旧 records 不带这个键,不能 KeyError。
+        if "ete_logits" in head:
+            head["ete_logits"] = np.mean(
+                [g["ete_logits"] for g in group], axis=0
+            ).tolist()
         head["tirads_probs"] = np.mean(
             [g["tirads_probs"] for g in group], axis=0
         ).tolist()
@@ -125,13 +133,23 @@ def _location_weighted_auc(rows: List[Dict]) -> Optional[float]:
     )
 
 
-def _ete_weighted_kappa(rows: List[Dict]) -> Optional[float]:
-    """ETE = 加权 Kappa,**仅恶性主病灶**。Kappa 吃硬预测,故对概率取 argmax。"""
-    sel = [
+def _ete_selection(rows: List[Dict]) -> List[Dict]:
+    """ETE 评价子集:主病灶 + 有 ETE 标注 + **金标准为恶性**。
+
+    抽成函数供 `_ete_weighted_kappa` 与 backlog #128 的 4 项监控共用 ——
+    监控必须与被监控的指标**同一子集**,否则"监控说预测分布正常、kappa 却在跌"
+    这种自相矛盾无从排查(两者看的根本不是同一批样本)。
+    """
+    return [
         r
         for r in rows
         if r["is_main"] == 1 and r["valid_extrathy_ext"] == 1 and r["gt_malignancy"] == 1
     ]
+
+
+def _ete_weighted_kappa(rows: List[Dict]) -> Optional[float]:
+    """ETE = 加权 Kappa,**仅恶性主病灶**。Kappa 吃硬预测,故对概率取 argmax。"""
+    sel = _ete_selection(rows)
     if len(sel) < 2:
         return None
     y_true = [r["gt_extrathy_ext"] for r in sel]
@@ -143,6 +161,106 @@ def _ete_weighted_kappa(rows: List[Dict]) -> Optional[float]:
         y_true, y_pred, labels=list(range(NUM_ETE_CLASSES)), weights="quadratic"
     )
     return None if np.isnan(k) else float(k)
+
+
+def ete_monitor_metrics(rows: List[Dict]) -> Dict[str, Optional[object]]:
+    """backlog #128 的 4 项 ETE 诊断监控 —— **只告警不 abort**。
+
+    出处:`reference/2026-08月调研/极端不平衡四类有序标签下的加权 Kappa 优化与
+    ETE 预测策略研究报告.md` §5(`:118-138`)。DR 设计这四项是为了「在单轮训练中
+    同时改善输入质量与损失驱动方向,**并精准区分两者的贡献**」——2-①(只关 CB)
+    与 2-②(开 LA+SoftQWK)的 A/B 归因全靠它们,没有这四项就只能看一个 kappa
+    标量猜原因。
+
+    🔴 **不做 abort**:DR 全文无 "abort"/"early stop",最强用词是「必须立即判定
+    ETE 优化方向失败」(`:128`)。ETE 只是目标四三项之一,为它停掉整轮训练
+    (连带分割/良恶性/位置/T 全部作废)不划算 —— 判断留给人看日志。
+
+    Returns:
+        dict,四个键各自可为 None(样本不足时):
+        - `ete_pred_hist` [P0,P1,P2,P3]:argmax 后各类占比。DR 预警阈值:
+          正常 `P0` 应在 85-95%;`P3 > 2%` 或 `P0 < 80%` = **少数类过度激励**,
+          kappa 即将转负(本项目 β=0.99 那轮就是这么崩的)。
+        - `ete_extreme_error_rate`:混淆矩阵中 `|i−j| ≥ 2` 的样本比例。DR 阈值:
+          上升超 1.5% → 无论 loss 是否下降,判定优化方向失败(二次距离惩罚
+          `W_ij` 正在迅速积聚)。
+        - `ete_kappa_gap`:Soft-Kappa(概率矩阵算)− 硬 Argmax-Kappa。DR 判据:
+          Soft 升到 0.4 但 Argmax 恒 0 = softmax 峰值不够陡、跨不过 argmax 门槛;
+          Soft 正而 Argmax 负 = 长尾不确定性严重,需提高 `la_tau`。
+        - `ete_logit_mean_per_class` [z̄0..z̄3]:各类 **logits** 均值。DR 预警:
+          `z̄3 − z̄0 > 0` = 对稀有类过度偏移。**必须用 logits 不能用 probs** ——
+          softmax 平移不变,probs 反推不出绝对量级(见 `validate_step` 采集处注释)。
+
+    ⚠️ **Soft-Kappa 的口径**:DR 定义是逐样本概率矩阵算,而这里的 `rows` 已是
+    **病灶级聚合**后的(动态数据同一病灶多帧已取均值)。选定按病灶级算 ——
+    与 `_ete_weighted_kappa` 同口径,两者的差(`kappa_gap`)才有意义;若一个按帧
+    一个按病灶,差值会掺进"聚合方式不同"这个无关变量。
+    """
+    empty: Dict[str, Optional[object]] = {
+        "ete_pred_hist": None,
+        "ete_extreme_error_rate": None,
+        "ete_kappa_gap": None,
+        "ete_logit_mean_per_class": None,
+    }
+    sel = _ete_selection(rows)
+    if len(sel) < 2:
+        return empty
+
+    y_true = np.asarray([r["gt_extrathy_ext"] for r in sel], dtype=np.int64)
+    probs = np.asarray([r["ete_probs"] for r in sel], dtype=np.float64)  # [N,C]
+    y_pred = probs.argmax(axis=1)
+    n = len(sel)
+    out: Dict[str, Optional[object]] = {}
+
+    # ① 硬预测分布直方图
+    hist = np.bincount(y_pred, minlength=NUM_ETE_CLASSES)[:NUM_ETE_CLASSES] / n
+    out["ete_pred_hist"] = [round(float(v), 6) for v in hist]
+
+    # ② 大跨度误判率 |i−j| >= 2
+    out["ete_extreme_error_rate"] = round(
+        float(np.mean(np.abs(y_true - y_pred) >= 2)), 6
+    )
+
+    # ③ Soft-Kappa − 硬 Kappa。两者都可能不可算(全体一致 → nan),任一不可算即
+    #    整项 None ——「一个有值一个没有」算不出差,填 0 会伪装成"没有背离"。
+    hard_k = _ete_weighted_kappa(rows)
+    soft_k = _soft_kappa(y_true, probs)
+    out["ete_kappa_gap"] = (
+        None if (hard_k is None or soft_k is None) else round(soft_k - hard_k, 6)
+    )
+
+    # ④ 各类 logits 均值。键缺席(legacy records)→ None,不猜、不拿 probs 顶替。
+    if all("ete_logits" in r for r in sel):
+        logits = np.asarray([r["ete_logits"] for r in sel], dtype=np.float64)
+        out["ete_logit_mean_per_class"] = [
+            round(float(v), 6) for v in logits.mean(axis=0)
+        ]
+    else:
+        out["ete_logit_mean_per_class"] = None
+    return out
+
+
+def _soft_kappa(y_true: np.ndarray, probs: np.ndarray) -> Optional[float]:
+    """连续 Soft-Kappa:用概率矩阵替代硬预测算二次加权 Kappa。
+
+    与 `soft_qwk_loss`(`losses/components/extension.py`)**同一套 O/E 数学**,
+    但那边返回 `1−κ`(损失,越小越好)、这里返回 `κ` 本身(指标,越大越好),
+    便于与 `_ete_weighted_kappa` 的硬 Kappa 直接相减。
+
+    `den == 0`(期望一致度为 0,如真值只有一类且预测也集中在同一类)时 Kappa
+    未定义 → None,与硬 Kappa 的 nan 处理对齐。
+    """
+    c = probs.shape[1]
+    idx = np.arange(c, dtype=np.float64)
+    W = (idx[None, :] - idx[:, None]) ** 2 / max(c - 1, 1) ** 2
+    one_hot = np.eye(c, dtype=np.float64)[y_true]
+    n = len(y_true)
+    O = one_hot.T @ probs / n
+    E = np.outer(one_hot.sum(axis=0) / n, probs.sum(axis=0) / n)
+    den = float((W * E).sum())
+    if den <= 0:
+        return None
+    return float(1.0 - (W * O).sum() / den)
 
 
 def _clinical_t_auc(rows: List[Dict]) -> Optional[float]:
@@ -201,7 +319,7 @@ def _sanitize_seg_dice(seg_dice) -> Optional[float]:
 
 def compute_official_metrics(
     records: List[Dict], seg_dice=None
-) -> Dict[str, Optional[float]]:
+) -> Dict[str, Optional[object]]:
     """从 `collect_official_records` 的逐样本记录算全部官方口径指标。
 
     Args:
@@ -236,17 +354,27 @@ def compute_official_metrics(
             "seg_dice": _sanitize_seg_dice(seg_dice),
             "composite": None,
             "n_lesions": 0,
+            # 四项诊断监控在空 records 下同样返回 None(键必须在,否则调用方
+            # `metrics.get(k)` 与 `k in metrics` 两种写法行为不一致)。
+            "ete_pred_hist": None,
+            "ete_extreme_error_rate": None,
+            "ete_kappa_gap": None,
+            "ete_logit_mean_per_class": None,
         }
 
     rows = aggregate_by_lesion(records)
-    metrics: Dict[str, Optional[float]] = {
+    # 值类型是 `object`(不是 `float`):除评分指标外还要并入 backlog #128 的诊断
+    # 监控,其中 `ete_pred_hist`/`ete_logit_mean_per_class` 是 list[float]。
+    metrics: Dict[str, Optional[object]] = {
         "malignancy_auc_pr": _malignancy_auc_pr(rows),
         "location_weighted_auc": _location_weighted_auc(rows),
         "ete_weighted_kappa": _ete_weighted_kappa(rows),
         "clinical_t_auc": _clinical_t_auc(rows),
         "tirads_weighted_kappa": _tirads_weighted_kappa(rows),
     }
-    usable = [v for v in metrics.values() if v is not None]
+    usable: List[float] = [
+        float(v) for v in metrics.values() if isinstance(v, (int, float))
+    ]
     # seg_dice 单独加在 usable 之后(而非放进 metrics 再统一筛):它不是"官方口径分类
     # 指标",放进 metrics 字典参与上面的 dict 遍历会让含义混淆;但它必须参与均值。
     # 值域/有限性校验统一在 `_sanitize_seg_dice`(两个 return 分支共用同一份判据)。
@@ -256,4 +384,9 @@ def compute_official_metrics(
     metrics["seg_dice"] = seg_val
     metrics["composite"] = float(np.mean(usable)) if usable else None
     metrics["n_lesions"] = len(rows)
+    # 🔴 backlog #128 的 4 项 ETE 诊断监控 **必须加在 composite 算完之后**:
+    # 它们是诊断量(直方图/误判率/logits 均值),不是"越大越好"的评分指标 ——
+    # 混进 usable 会让 composite 变成一个语义不明的数(选模判据被诊断量污染,
+    # 且 `ete_pred_hist` 是 list、`np.mean` 会直接报错或静默产出错误标量)。
+    metrics.update(ete_monitor_metrics(rows))
     return metrics

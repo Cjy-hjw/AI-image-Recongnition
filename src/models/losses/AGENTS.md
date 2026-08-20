@@ -40,7 +40,8 @@
      `compute_extension_loss` 新增 `qwk_weight`/`dist_weight` 参数，`qwk_weight>0`
      时切到 **LA-SoftQWK-OD**（`quadratic_weight_matrix`/`soft_qwk_loss`/
      `ordinal_distance_loss`，DR 主方案）：`total = qwk_weight·SoftQWK + dist_weight·
-     OrdinalDistance`，常数预测下 SoftQWK 恒为 1.0（QWK=0，最强验收判据）。
+     OrdinalDistance`，常数预测下 SoftQWK 收敛到 1.0（QWK=0，最强验收判据；
+     ⚠️ 实测 **0.999999762** 而非严格 1.0，`_QWK_EPS` 所致，断言须带 1e-6 容差）。
      🔴 **LA 必须与 SoftQWK 同时开**：实测单开 `la_tau` 会把稀有类概率推高 ×21
      （τ0→0.5），而本项目已因过度预测稀有类让 Kappa 转负过一次；`la_tau` 只调整
      决策边界，靠 SoftQWK 才能压住它。默认 `qwk_weight=0.0`（YAML），逐位走 CB-Focal

@@ -508,3 +508,65 @@ def test_jsonl_logger_drops_nonfinite_extra(tmp_path):
     assert len(raw) == 1
     assert "NaN" not in raw[0] and "Infinity" not in raw[0], f"落盘含非法常量: {raw[0]}"
     _strict(raw[0])  # 抛异常即测试失败
+
+
+# ---------------------------------------------------------------------------
+# backlog #128:`build_official_head_config` 的 ETE 超参守卫
+# ---------------------------------------------------------------------------
+# 🔴 2026-08-20 Gate2 发现的口径裂缝(此前 `build_official_head_config` 全仓
+# **零测试覆盖**,故没人挡得住):该函数按 `la_tau > 0` 决定造不造 log_prior,
+# 而 `compute_extension_loss` 的守卫是 `la_tau != 0.0` —— 两者对**负值**判定
+# 相反。`la_tau=-0.5` 会走进 LA 分支却拿到 log_prior=None,报出的
+# "la_tau != 0 时必须提供 log_prior" 与真实病因(τ 不该为负)无关,极易误导排查。
+# 且负 τ 数学上是**放大**不平衡(LA 符号方向见 extension.py 模块 docstring),
+# 与本项目踩过两次的符号反转坑同源(#113 FAMO / #120 拉格朗日项)。
+
+
+def _base_train_cfg(**overrides):
+    """构造 `build_official_head_config` 所需的最小 train 段。"""
+    cfg = {
+        "ete_class_counts": [3906, 267, 67, 5],
+        "ete_cb_beta": 0.9,
+        "ete_focal_gamma": 0.0,
+        "ete_la_tau": 0.0,
+        "ete_qwk_weight": 0.0,
+        "ete_dist_weight": 0.2,
+    }
+    cfg.update(overrides)
+    return {"train": cfg}
+
+
+@pytest.mark.parametrize("bad_tau", [-0.5, -1.0, -1e-6])
+def test_negative_la_tau_rejected_at_config_build(bad_tau):
+    """负 τ 必须在入口被拒,不得漏到损失函数里报无关错误。"""
+    from scripts.train_official import build_official_head_config
+
+    with pytest.raises(AssertionError, match=r"ete_la_tau"):
+        build_official_head_config(_base_train_cfg(ete_la_tau=bad_tau))
+
+
+@pytest.mark.parametrize(
+    "la_tau,qwk_weight,expect_prior",
+    [
+        (0.0, 0.0, False),   # 默认:CB-Focal 老路径,不需要先验
+        (0.5, 0.0, True),    # 仅 LA:CB-Focal 叠加 LA 的既有合法配置
+        (0.5, 1.0, True),    # LA + SoftQWK:DR 主方案
+    ],
+)
+def test_log_prior_built_exactly_when_needed(la_tau, qwk_weight, expect_prior):
+    """log_prior 的构造条件与损失函数的消费条件必须一一对齐。
+
+    漏造 → `assert log_prior is not None` 崩;多造 → 无害但说明条件写宽了。
+    这三组合覆盖了 `--epochs 24` 那轮云端 A/B(2-①/2-②)会真实用到的全部配置。
+    """
+    from scripts.train_official import build_official_head_config
+
+    cfg = build_official_head_config(
+        _base_train_cfg(ete_la_tau=la_tau, ete_qwk_weight=qwk_weight)
+    )
+    assert (cfg["ete_log_prior"] is not None) is expect_prior, (
+        f"la_tau={la_tau}, qwk_weight={qwk_weight} 时 log_prior 应"
+        f"{'存在' if expect_prior else '为 None'}"
+    )
+    assert cfg["ete_la_tau"] == la_tau
+    assert cfg["ete_qwk_weight"] == qwk_weight

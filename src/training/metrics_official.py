@@ -71,11 +71,21 @@ def aggregate_by_lesion(records: List[Dict]) -> List[Dict]:
         # backlog #128 的 `val_logit_mean_per_class` 监控用。**必须与 probs 一起
         # 聚合**:漏了它,多帧病灶的 logits 会停在首帧值、与已聚合的 probs 不同步,
         # 而两者在监控里是并排看的(probs 看预测分布、logits 看绝对偏移量级)。
-        # 键缺席时跳过 —— legacy 数据集/旧 records 不带这个键,不能 KeyError。
-        if "ete_logits" in head:
+        # 🔴 判据是**组内全部帧都有**,不是"首帧有"(2026-08-20 Gate2 抓到):
+        # 原写法 `if "ete_logits" in head` 只看首帧(`head = dict(group[0])`),
+        # 首帧有而后续帧无时 `[g["ete_logits"] for g in group]` 直接 KeyError。
+        # 生产路径不可达(`validate_step.collect_official_records:106` 无条件采集,
+        # 同批 records 结构齐一),拦的是**混合来源**——legacy records 与新 records
+        # 拼进同一 lesion_id。与 `ete_monitor_metrics` 的 `all("ete_logits" in r ...)`
+        # 同一判据(那处本就写对了,此处是漏了)。
+        if all("ete_logits" in g for g in group):
             head["ete_logits"] = np.mean(
                 [g["ete_logits"] for g in group], axis=0
             ).tolist()
+        else:
+            # 部分帧缺失 → 整个病灶不给该键,让下游监控走 None 分支(不猜、不填零:
+            # 填零会被 `ete_logit_mean_per_class` 当成真实 logits 均值报出去)。
+            head.pop("ete_logits", None)
         head["tirads_probs"] = np.mean(
             [g["tirads_probs"] for g in group], axis=0
         ).tolist()
@@ -208,6 +218,17 @@ def ete_monitor_metrics(rows: List[Dict]) -> Dict[str, Optional[object]]:
 
     y_true = np.asarray([r["gt_extrathy_ext"] for r in sel], dtype=np.int64)
     probs = np.asarray([r["ete_probs"] for r in sel], dtype=np.float64)  # [N,C]
+    # 🔴 长度契约必须硬校验(2026-08-20 Gate2 抓到,与推理侧 `decode_predictions`
+    # 同款):`y_pred = probs.argmax(axis=1)` 的上界由**概率向量长度**决定,而
+    # `np.bincount(...)[:NUM_ETE_CLASSES]` 会把 idx >= 4 的样本**静默切掉** ——
+    # 实测 ete_probs 给 5 列时,直方图占比和变成 **0.750** 而不是 1.0,不报错、
+    # 数字只是悄悄不对(比崩溃阴)。而 `ete_pred_hist` 的判读全靠 "P0 应在 85-95%"
+    # 这类阈值,分母被静默改小会让预警阈值整体失真、误判"少数类过度激励"。
+    # 生产路径不可达(`ExtensionHead` 输出恒 4 类),拦的是未来改类别数时的漏改。
+    assert probs.shape[1] == NUM_ETE_CLASSES, (
+        f"ete_probs 长度应为 {NUM_ETE_CLASSES}，got {probs.shape[1]}"
+        " —— bincount 切片会静默丢弃越界预测，直方图占比和不再为 1"
+    )
     y_pred = probs.argmax(axis=1)
     n = len(sel)
     out: Dict[str, Optional[object]] = {}

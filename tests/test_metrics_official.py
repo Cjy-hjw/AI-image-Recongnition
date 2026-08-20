@@ -623,3 +623,83 @@ def test_empty_records_still_carries_monitor_keys():
     for k in ("ete_pred_hist", "ete_extreme_error_rate", "ete_kappa_gap",
               "ete_logit_mean_per_class"):
         assert k in m and m[k] is None
+
+
+def test_aggregate_by_lesion_partial_ete_logits_does_not_crash():
+    """同一 lesion 内**部分帧**带 `ete_logits` 时不得 KeyError,且不得伪造均值。
+
+    🔴 2026-08-20 Gate2 抓到:原实现判据是 `if "ete_logits" in head`,而
+    `head = dict(group[0])` 只是**首帧**——首帧有、后续帧无时,
+    `[g["ete_logits"] for g in group]` 直接 KeyError。
+    生产路径不可达(`collect_official_records` 无条件采集),拦的是**混合来源**
+    (legacy records 与新 records 拼进同一 lesion_id)。
+    正确行为:整个病灶不给该键 → 下游监控走 None 分支。**不能填零**——
+    零会被 `ete_logit_mean_per_class` 当成真实 logits 均值报出去。
+    """
+    from src.training.metrics_official import aggregate_by_lesion, ete_monitor_metrics
+
+    def frame(with_logits):
+        r = {
+            "lesion_id": "SAME", "is_main": 1,
+            "valid_malignancy": 1, "gt_malignancy": 1, "mal_prob": 0.6,
+            "valid_lesion_loc": 1, "gt_lesion_loc": 0, "location_probs": [1 / 7] * 7,
+            "valid_extrathy_ext": 1, "gt_extrathy_ext": 1,
+            "ete_probs": [0.7, 0.2, 0.07, 0.03],
+            "valid_clin_t_stage": 1, "gt_clin_t_stage": 1, "t_conf": 0.5,
+            "valid_tirads": 1, "gt_tirads": 2, "tirads_probs": [0.2] * 5,
+        }
+        if with_logits:
+            r["ete_logits"] = [1.0, 0.5, 0.2, -0.3]
+        return r
+
+    # 首帧有、后帧无(原实现在此 KeyError)
+    rows = aggregate_by_lesion([frame(True), frame(False)])
+    assert "ete_logits" not in rows[0], (
+        "部分帧缺失时不得保留 logits —— 首帧值会被误当成整个病灶的均值"
+    )
+    # 反向:首帧无、后帧有(原实现侥幸不崩,但同样必须整体丢弃)
+    rows2 = aggregate_by_lesion([frame(False), frame(True)])
+    assert "ete_logits" not in rows2[0]
+    # 全部都有 → 正常聚合
+    rows3 = aggregate_by_lesion([frame(True), frame(True)])
+    assert rows3[0]["ete_logits"] == pytest.approx([1.0, 0.5, 0.2, -0.3])
+    # 下游监控在缺键时给 None,不填零
+    m = ete_monitor_metrics(aggregate_by_lesion([frame(True), frame(False)]))
+    assert m["ete_logit_mean_per_class"] is None
+
+
+def test_ete_monitor_rejects_wrong_probs_length():
+    """`ete_probs` 长度错时必须硬失败,不得静默丢样本。
+
+    🔴 2026-08-20 Gate2 抓到:`y_pred = probs.argmax(axis=1)` 的上界由概率向量
+    长度决定,而 `np.bincount(...)[:NUM_ETE_CLASSES]` 会把 idx >= 4 的预测**静默
+    切掉** —— 实测 5 列时直方图占比和变成 **0.750** 而非 1.0,不报错。
+    `ete_pred_hist` 的判读全靠「P0 应在 85-95%」这类阈值,分母被悄悄改小会让
+    预警整体失真。与推理侧 `decode_predictions` 的四头长度契约校验同款
+    (那处三轮 review 时已补,训练侧监控这边当时漏了)。
+    """
+    from src.models.heads import NUM_ETE_CLASSES
+    from src.training.metrics_official import ete_monitor_metrics
+
+    def row(i, n_cls):
+        # 让 argmax 落在最后一列:长度超标时该预测会被 bincount 切片丢掉
+        probs = [0.1] * n_cls
+        probs[-1] = 0.9
+        return {
+            "lesion_id": f"L{i}", "is_main": 1,
+            "valid_malignancy": 1, "gt_malignancy": 1, "mal_prob": 0.6,
+            "valid_lesion_loc": 1, "gt_lesion_loc": 0, "location_probs": [1 / 7] * 7,
+            "valid_extrathy_ext": 1, "gt_extrathy_ext": i % NUM_ETE_CLASSES,
+            "ete_probs": probs,
+            "valid_clin_t_stage": 1, "gt_clin_t_stage": 1, "t_conf": 0.5,
+            "valid_tirads": 1, "gt_tirads": 2, "tirads_probs": [0.2] * 5,
+        }
+
+    # 正常长度 → 直方图占比和为 1
+    ok = ete_monitor_metrics([row(i, NUM_ETE_CLASSES) for i in range(6)])
+    assert sum(ok["ete_pred_hist"]) == pytest.approx(1.0)
+
+    # 长度超标 → 必须抛,而不是产出占比和 < 1 的直方图
+    for bad_len in (NUM_ETE_CLASSES + 1, NUM_ETE_CLASSES + 3):
+        with pytest.raises(AssertionError, match=r"ete_probs 长度"):
+            ete_monitor_metrics([row(i, bad_len) for i in range(6)])

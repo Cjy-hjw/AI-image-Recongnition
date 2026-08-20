@@ -36,6 +36,8 @@ def compute_official_head_losses(
     ete_log_prior: Optional[torch.Tensor] = None,
     ete_focal_gamma: float = 2.0,
     ete_la_tau: float = 0.0,
+    ete_qwk_weight: float = 0.0,
+    ete_dist_weight: float = 0.2,
     clin_t_class_weights: Optional[torch.Tensor] = None,
     clin_t_label_smoothing: float = 0.0,
     tirads_class_weights: Optional[torch.Tensor] = None,
@@ -56,9 +58,13 @@ def compute_official_head_losses(
             invalid 样本的垃圾标签当真监督,且不报错。
         lambda_*: 各头的固定权重。
         ete_*/clin_t_*/tirads_*: 透传给各自损失的不平衡校正参数,语义见对应模块 docstring。
+            `ete_qwk_weight>0` 时 ETE 切到 LA-SoftQWK-OD（backlog #128），此时
+            `ete_focal_gamma`/`ete_class_weights` 不参与计算，detail 键随之从
+            `ete_focal` 变为 `ete_qwk`/`ete_dist`（`ete_ce` 两分支都有）。
     Returns:
         `(weighted_total, detail)`。detail 键:`location`/`location_side`/
-        `location_level`/`ete`/`ete_ce`/`clin_t`/`clin_t_ce`/`tirads`/`tirads_ce`/
+        `location_level`/`ete`/`ete_ce`(+ `ete_focal` 或 `ete_qwk`/`ete_dist`,
+        取决于 `ete_qwk_weight`)/`clin_t`/`clin_t_ce`/`tirads`/`tirads_ce`/
         `tirads_ordinal`,**均为未乘 λ 的原始损失值**(监控要看任务本身的量级,
         乘了 λ 就分不清"损失降了"和"权重小")。
         任一头的键不在 targets 里 → 该头整组 detail 键缺席、不计入 total。
@@ -89,6 +95,8 @@ def compute_official_head_losses(
             log_prior=ete_log_prior,
             focal_gamma=ete_focal_gamma,
             la_tau=ete_la_tau,
+            qwk_weight=ete_qwk_weight,
+            dist_weight=ete_dist_weight,
         )
         total = total + lambda_ete * ete_total
         detail["ete"] = ete_total

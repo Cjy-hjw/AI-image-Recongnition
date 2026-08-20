@@ -133,6 +133,21 @@ train:
                             # 不平衡且损失照常下降）。推理侧不得再调一次。
                             # 待官方验证集到手后再调——官方数据只在云端，本地无从验证。
 
+  # 🔴 backlog #128 LA-SoftQWK-OD（2026-08-17，方案就绪未执行，见
+  # docs/项目现状总纲.md §7 #128 与 src/models/losses/components/extension.py
+  # 模块 docstring「Soft-QWK」节）。加权 CE/CB-Focal 优化逐样本似然，与官方
+  # 二次加权 Kappa 指标在本任务分布下**负相关**——已实测两次转负/垫底。
+  # `ete_qwk_weight=0`（当前默认）时逐位走上面的 CB-Focal 老路径，零回归。
+  # 🔴 **`la_tau` 必须与 `qwk_weight` 同时开，绝不能单独开**：LA 是推高稀有类
+  # 概率（实测 τ0→0.5 使类3 概率 ×21），单开会重演"过度预测稀有类→Kappa
+  # 转负"（见上面 ete_cb_beta 注释里 ep26 那次事故）；SoftQWK 才是压住它的那半。
+  # 计划分两跑验证（plan `sunny-shimmying-popcorn.md` 第2层）：
+  #   2-① 只关 CB（ete_cb_beta: 0.9→0，其余不动）—— 验 CB 的净贡献；
+  #   2-② 在①基础上开 la_tau=0.5 + ete_qwk_weight=1.0 —— 验 DR 主方案整体效果。
+  # 每层跑完看 JSONL 的 4 项监控（val_pred_hist 等，backlog #128 待补）再决定回滚。
+  ete_qwk_weight: 0.0       # SoftQWK 项权重，0=关（默认，CB-Focal 老路径）
+  ete_dist_weight: 0.2      # 有序距离正则权重，仅 ete_qwk_weight>0 时生效（DR 值，未调）
+
   # ── 临床 T 头（Phase2 阶段 2.3）超参 ────────────────────────────────────
   # 实现见 src/models/heads/clinical_t.py + losses/components/clinical_t.py。
   clin_t_class_counts: [2410, 1831]  # 0无 / 1有，阳性率 35.7%（docs/训练与架构/训练数据定稿.md:87）

@@ -78,6 +78,7 @@ def build_official_head_config(config: dict) -> dict:
     ete_counts = tr["ete_class_counts"]
     ete_beta = float(tr.get("ete_cb_beta", 0.99))
     ete_la_tau = float(tr.get("ete_la_tau", 0.0))
+    ete_qwk_weight = float(tr.get("ete_qwk_weight", 0.0))
     tirads_counts = tr.get("tirads_class_counts")
     cfg = {
         "loc_loss_weight": float(tr.get("loc_loss_weight", 1.0)),
@@ -86,15 +87,24 @@ def build_official_head_config(config: dict) -> dict:
         "tirads_loss_weight": float(tr.get("tirads_loss_weight", 1.0)),
         "ete_focal_gamma": float(tr.get("ete_focal_gamma", 2.0)),
         "ete_la_tau": ete_la_tau,
+        # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径。
+        "ete_qwk_weight": ete_qwk_weight,
+        "ete_dist_weight": float(tr.get("ete_dist_weight", 0.2)),
         "clin_t_label_smoothing": float(tr.get("clin_t_label_smoothing", 0.0)),
         "tirads_label_smoothing": float(tr.get("tirads_label_smoothing", 0.0)),
         "tirads_ordinal_weight": float(tr.get("tirads_ordinal_weight", 0.0)),
-        # β=0 → 不加权(None);>0 → CB 权重。
+        # β=0 → 不加权(None);>0 → CB 权重。**qwk_weight>0 时 CB-Focal 分支不参与
+        # 计算,但权重张量仍按配置构造并传入**——不加特判是有意的:compute_extension_loss
+        # 内部按 qwk_weight 短路分支,传入未使用的 class_weights 不产生副作用,
+        # 而加特判反而多一条"两处判断条件必须同步"的隐性耦合。
         "ete_class_weights": (
             class_balanced_weights(ete_counts, ete_beta) if ete_beta > 0 else None
         ),
-        # log_prior 仅 Logit Adjustment(la_tau>0)时需要,否则 None。
-        "ete_log_prior": log_class_prior(ete_counts) if ete_la_tau > 0 else None,
+        # log_prior 供 Logit Adjustment 消费:la_tau>0(CB-Focal 分支叠加 LA)或
+        # qwk_weight>0(LA-SoftQWK-OD 方案,LA 调整发生在两分支之前)时均需要。
+        "ete_log_prior": (
+            log_class_prior(ete_counts) if (ete_la_tau > 0 or ete_qwk_weight > 0) else None
+        ),
         "clin_t_class_weights": (
             inverse_frequency_weights(tr["clin_t_class_counts"])
             if tr.get("clin_t_use_class_weights", False)

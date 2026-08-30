@@ -31,7 +31,7 @@
 | `test_service_runner.py` | **runner 批量编排**(2026-08-10 A2 新增)——mock 掉 heavy 依赖只留编排逻辑:逐病例调 write_case_v21 且 case_dir={output}/{patient_id}、静/动 kind 分派、processing_ms 非负 int、gatekeeper 每病例照跑、**单病例失败隔离**(一例 diagnose 崩溃不影响其余 + 落结构合规 ERROR 占位)、loader 失败隔离、**模型只 build 一次**(跨病例 + 跨多次 build_service_runner 缓存)、空/无效/全非影像目录不崩 | 12 | Phase 5 |
 | `test_head_interfaces.py` | **三头接入接口契约**(2026-08-12 Phase2 阶段2.0 新增)——守四条「删掉就静默出错」的契约:① `stage4_spatial` 通道数是 `CLS_POOLED_DIM`(352) 而非 `CLS_STAGE4_CHANNELS`(208)，且自带 352≠208 反向锚点防断言失去区分力;② 命名即契约(`stage4_spatial` 有梯度、两个 `*_detached` 无梯度);③ 🔴 从 `stage4_spatial` 反传 `seg_backbone` 梯度**精确 0**(用 `!=0.0` 而非容差,对 NaN 敏感,同 Gate 8 论证)——保住 Gate 8 前提、防三头重开 Stage2 崩塌的物理先验回流;④ fp16 求和溢出反证(自带「反证失效」保护:先断言朴素 `.sum()==inf`,否则说明该测试已对 fp32 累加器失去区分力) | 14 | Phase 2 |
 | `test_location_head.py` | **位置头契约**(2026-08-12 Phase2 阶段2.1 新增)——守「错了不崩、只静默学错」那几条:① 因子分解**拼接顺序**必须对齐 `LOCATION_LABELS`(用非对称确定性输入逐格核对——顺序错了概率和仍为 1、JSON 仍合法,只是左叶预测填进右叶槽);② 7 维**严格**和为 1(数学恒等式非再归一化);③ 峡部 level 标签是 `-1`,须 clamp+validity 双保险(附反证:直接喂 `cross_entropy` 确实越界);④ 标签越界**正负不对称**(`idx=7` IndexError 而 `idx=-1` 走负索引静默取末元素)双向拦截;⑤ `[B,1]` validity 隐式广播成 `[B,B]` 静默放大 loss(附反证坐实该坑真实存在);⑥ 🔴 **CoordConv 必须先过非线性再池化**——三段反证(普通卷积不可分 → **裸 CoordConv 仍不可分** → 加 ReLU 才可分),卷积线性可拆使坐标贡献退化为常数偏置被 GAP 平均掉;⑦ 水平翻转联动翻标签 | 25 | Phase 2 |
-| `test_extension_head.py` | **ETE 侵犯头契约**(2026-08-12 Phase2 阶段2.2 新增)——守「稀有类静默学错 + CB 保护失效」那几条:① 4 类 ETE 概率**严格**和为 1、argmax 与分布自洽;② 类别顺序对齐 `ET4 码`(无/甲状腺包膜/毗邻软组织/血管,计数 3906/267/67/5);③ `class_balanced_weights` 乘性加权数值(β=0.99 默认 → 血管:无=20.4:1,β=0.9→2.4:1 / 0.999→196.4:1 / 0.9999→646.9:1 全表锁定);④ CB-Focal γ 聚焦 + Logit-Adjustment 先验补偿存在且不翻转方向;⑤ `boundary_band_from_mask` 带宽 = `kernel_size−1`(k=3→2px / 5→4px / 7→6px 实测,实现取 k=5 → 4px);⑥ 头/损失同名不同职责(`heads/extension.py` vs `losses/components/extension.py`)不致误导;⑦ 参数量 0.063M。**2026-08-17 backlog #128 +10 = LA-SoftQWK-OD**(`quadratic_weight_matrix` 与 sklearn quadratic 权重定义对齐 / SoftQWK 常数预测恒 1.0 与完美预测 <0.5 / QWK 分支梯度有限 / **validity 先过滤不掺 O-E 统计**(masked-mean 范式在此不适用) / 全无效返 0 无 NaN / 有序距离随距离单调 / 🔴 **`qwk_weight>0` 必须 `la_tau>0`** 的双向断言(拦只开 QWK、放行只开 LA 的既有配置) / LA 边界方向的 DR 数值实例。**后两条已做变异测试**:LA 符号 `+`→`-` 后方向断言变红(3.5098 vs 0.0794),证明有区分力、非自证式) | 49 | Phase 2 |
+| `test_extension_head.py` | **ETE 侵犯头契约**(2026-08-12 Phase2 阶段2.2 新增)——守「稀有类静默学错 + CB 保护失效」那几条:① 4 类 ETE 概率**严格**和为 1、argmax 与分布自洽;② 类别顺序对齐 `ET4 码`(无/甲状腺包膜/毗邻软组织/血管,计数 3906/267/67/5);③ `class_balanced_weights` 乘性加权数值(β=0.99 默认 → 血管:无=20.4:1,β=0.9→2.4:1 / 0.999→196.4:1 / 0.9999→646.9:1 全表锁定);④ CB-Focal γ 聚焦 + Logit-Adjustment 先验补偿存在且不翻转方向;⑤ `boundary_band_from_mask` 带宽 = `kernel_size−1`(k=3→2px / 5→4px / 7→6px 实测,实现取 k=5 → 4px);⑥ 头/损失同名不同职责(`heads/extension.py` vs `losses/components/extension.py`)不致误导;⑦ 参数量 0.063M。**2026-08-17 backlog #128 +10 = LA-SoftQWK-OD**(`quadratic_weight_matrix` 与 sklearn quadratic 权重定义对齐 / SoftQWK 常数预测恒 1.0 与完美预测 <0.5 / QWK 分支梯度有限 / **validity 先过滤不掺 O-E 统计**(masked-mean 范式在此不适用) / 全无效返 0 无 NaN / 有序距离随距离单调 / 🔴 **`qwk_weight>0` 必须 `la_tau>0`** 的双向断言(拦只开 QWK、放行只开 LA 的既有配置) / LA 边界方向的 DR 数值实例。**后两条已做变异测试**:LA 符号 `+`→`-` 后方向断言变红(3.5098 vs 0.0794),证明有区分力、非自证式)。**2026-08-30 +2 = 变异审计补测**(ordinal 距离 `/(C-1)²` 归一化的逐项手算数值断言 + `total = qwkW·qwk + distW·dist` 的数值分解断言——系统变异审计证明此前这两处无区分力:丢 dist 项 / 归一化指数 `**2`→`**1` 两个变异在旧测试下全绿,补测后均被杀死) | 51 | Phase 2 |
 | `test_clinical_t_head.py` | **T 临床显著性头契约**(2026-08-12 Phase2 阶段2.3 新增)——守「统计门控 + 尺度 log 通道 + 梯度隔离」那几条:① `t_conf` 是 **P(T=1) 不是 max prob**(填成 max prob 强阴性样本置信度≈1.0 即失败,反构造强 T=0/T=1 常数 logits 双向验证);② `T_conf` 一维 `[B]`(`[B,1]` 隐式广播 QA_VP §2.2);③ 🔴 ETE 旁路 `detach`+softmax——ETE logits 平移不变、**不反灌 ETE/侵犯头梯度**(ETA 是官方独立计分维度,含反证:改 ETE 分布必须改输出);④ `nodule_scale` 同样 detach 不回流分割主干;⑤ scale=0(空 mask 阴性)→log0=-inf 经 `clamp(min=1e-4)` 兜住不 NaN;⑥ 🔴 scale 的 **log 通道白盒 hook 验证**(等倍数 scale 对在 log 通道上间距恒 ln2≈0.6931,线性通道 40 倍差作反证——黑盒"输出不同"零区分力已实证,把 log 通道换第二份线性 s 照样全绿);⑦ 禁 BN1d(train+batch=1 实测 ValueError,结构检查+实跑双断言);⑧ 类权重:临床 T 千级计数下**抄侵犯头的 β=0.99 = 权重比恒 1.0 静默失效**(钉死实测防"统一一下超参",β=0.9999→1.28 仍弱于逆频率 1.3162,反证同函数在 ETE 长尾 3906/267/67/5 确实 20.4:1);⑨ 损失:validity 一维拒广播、标签越界正负双向拒、全无效零损失零梯度、分母只数有效样本、类权重按**标签**索引非 argmax、无权重时退化为裸 CE、label_smoothing 越界拒 + **LS 把 P(T=1) 上界钳死在 1−ls/2**(ls=0.05→0.975/0.1→0.95,训到收敛实测钉住)、±1000 logits 下损失梯度有限、bf16 autocast 有限值;⑩ 🔴 端到端参数级梯度隔离(真 `MultiTaskThyroidModel`+真 `ExtensionHead`):seg_backbone/cbm_head/**ExtensionHead 参数** 均零梯度,cls_backbone **必须**有梯度作反证 | 26 | Phase 2 |
 | `test_case_discovery.py` | **病例发现**(2026-08-10 A2 新增)——`discover_cases` 递归遍历 + 静/动分派(.dcm→static,.nii.gz/.nii→dynamic)、静态读 DICOM 头取 PatientID/SeriesUID、动态按组委会口径取直接父目录名(PatientId=AccessionNumber)、路径推断兜底、空/不存在目录返回 []、**跨文件系统确定性顺序契约**(monkeypatch 反转 `os.scandir` 返回序,断言发现顺序仍为字典序 DFS——2026-08-12 CI run 31512732898 因 `os.walk` 未排子目录、Linux 走 hash 序而 flaky,`dirs.sort()` 修复后由本用例钉死);依赖 pydicom/nibabel 缺则 skip | 40 | Phase 5 |
 | `test_mixup_label_dominance.py` | **四头监督闸门 lam 阈值分派 + 软 lam 反向保护**(2026-08-15 新增)——详见下方专节 | 12 | Phase 2 |
@@ -101,10 +101,15 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 ## 测试总数(单一权威,2026-08-17 实测)
 
-**全套 967 passed + 1 skipped**(2026-08-20 backlog #128 + Gate2 修复后,`Demo_D` 口径,
-`--collect-only` 实测 **968 collected**)。演进链 940 **+19 = backlog #128**
+**全套 969 passed + 1 skipped**(2026-08-30 变异审计补 2 条数值断言后,`Demo_D` 口径,
+`--collect-only` 实测 **970 collected**)。演进链 940 **+19 = backlog #128**
 (损失 10 + 监控 9)→ 959 **+8 = Gate2 三处修复**(负 la_tau 守卫 6 项 /
-`ete_logits` 部分帧缺失 1 项 / `ete_probs` 长度契约 1 项)。
+`ete_logits` 部分帧缺失 1 项 / `ete_probs` 长度契约 1 项)→ **967 +2 = 变异审计补测**
+(2026-08-30 系统变异审计发现「丢 dist 项」「ordinal 归一化指数错」两个变异在既有
+测试下存活——`total` 的数值构成与 `/(C-1)²` 归一化此前无任何数值断言,补
+`test_ordinal_distance_loss_exact_value_with_normalization` /
+`test_compute_extension_loss_total_decomposes_into_qwk_and_dist` 后两变异均被杀死,
+10 变异 8 KILLED / 2 存活且存活者已全部补测覆盖)。
 ⚠️ 上一段(940+1)时曾罕见地**两个环境同数**:`Demo_D` 与 `torch28` 预演环境都是
 940+1 —— 那是巧合不是规律,别据此以为跨环境可比(见下方「跨环境不可比」条)。
 
@@ -139,7 +144,9 @@ V2.1 对"日志读不到"的判罚是「可能被标记为可疑对象」。已�
 + `json.dumps(allow_nan=False)` 实测(正常写出 / NaN 数组整项丢弃且不影响同批其他项 /
 None 跳过),并经 `--mock-labels --smoke` 端到端确认四项真实落盘。
 
-**+10 = LA-SoftQWK-OD 损失**(`test_extension_head.py` 39→**49**),明细见上方该文件行。
+**+10 = LA-SoftQWK-OD 损失**(`test_extension_head.py` 39→49),明细见上方该文件行。
+**+2 = 变异审计补测**(2026-08-30,`test_extension_head.py` 49→**51**):见上方
+「测试总数」节——两个存活变异(dist 项丢失 / ordinal 归一化指数)的数值断言。
 
 **+11 = 第三轮 review 修复**(929→940,2026-08-17):
 - `test_missing_n_total_frames_raises_not_guesses`(改写:原 `..._falls_back` 钉的是
@@ -170,7 +177,7 @@ numpy标量/空 records);再往前 +9 = `test_dynamic_frame_cache.py`(动态帧�
 (含规范字段防覆盖的 5 个撞名子断言)与 `test_jsonl_logger_drops_nonfinite_extra`
 (NaN/Inf 丢弃 + 严格 JSON 解析)。
 
-- **四头(位置/侵犯/临床T/TI-RADS)相关单测合计 152**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` **49**(含 backlog #128 LA-SoftQWK-OD +10) + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12 + backlog #124 `test_tirads_head.py` 15),Demo_D 实测通过;A800(torch2.6)/torch2.8 预演环境覆盖 TI-RADS 头待下次云端对拍确认(本轮仅 Windows+CPU 与真 CUDA `probe_heads_cuda.py` 双路验证)。
+- **四头(位置/侵犯/临床T/TI-RADS)相关单测合计 154**(阶段2.0 `test_head_interfaces.py` 14 + 阶段2.1 `test_location_head.py` 25 + 阶段2.2 `test_extension_head.py` **51**(含 backlog #128 LA-SoftQWK-OD +10、2026-08-30 变异审计补测 +2) + 阶段2.3 `test_clinical_t_head.py` 27 + 阶段2.4 `test_official_head_losses.py` 10 + `test_train_step_head_targets.py` 12 + backlog #124 `test_tirads_head.py` 15),Demo_D 实测通过;A800(torch2.6)/torch2.8 预演环境覆盖 TI-RADS 头待下次云端对拍确认(本轮仅 Windows+CPU 与真 CUDA `probe_heads_cuda.py` 双路验证)。
 - ⚠️ **跨环境不可比**:同代码 torch2.8 预演环境(`C:\Users\cjy\envs\torch28`)为 **789 passed + 6 skipped**(2026-08-13 实测,**collected 795 与主环境一致**);旧记的 620 是 08-12 快照、已失效,且 08-13 补装 pandas+openpyxl 之前该环境只能收集 782 —— `tests/test_official_loader.py` 整模块被 `pytest.importorskip("pandas")` 跳过,预演对 `official_loader` 覆盖率为 0。skip 数随依赖集与 `os.name` 平台门浮动,**判「有无回归」必须同环境前后对拍**,详见 memory `test-count-not-comparable-across-envs`。
 - **下方分模块明细数字为历史演进累积、可能有偏差**——精确值一律以 `pytest --collect-only tests/` 实跑为准,不逐一核对旧数。
 - Phase5(2026-08-10)交付四模块:`test_nifti_io`(24) + `test_nodule_split`(28) + `test_prediction_json`(45) + `test_v21_output`(11) + `test_service_runner`(12) + `test_case_discovery`(40) + `test_service_api`(20)(含 pydicom/nibabel 依赖的 file 在无依赖 CI 上 skip)。

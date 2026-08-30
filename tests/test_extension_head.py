@@ -779,6 +779,55 @@ def test_ordinal_distance_loss_penalizes_distance_from_true_class():
     assert float(loss_near) < float(loss_far)
 
 
+def test_ordinal_distance_loss_exact_value_with_normalization():
+    """🔴 数值断言:`/(C-1)²` 归一化 + 按概率加权 + batch 均值,逐项手算对拍。
+
+    2026-08-30 变异审计发现既有测试只有方向断言(near<far),归一化指数写错
+    (`**2` → `**1`)测试照绿 —— 损失量级静默差 (C-1) 倍,云端 A/B 的
+    `dist_weight=0.2` 配置就不再是 DR 推荐的那个数。
+    """
+    C = 4  # noqa: F841 —— 归一化分母 (C-1)²=9 在下方手算里显式展开
+    idx = torch.tensor([0, 3])
+    # 样本0(idx=0): 0.7*0²/9 + 0.3*1²/9 = 0.0333...
+    # 样本1(idx=3): 0.5*(2-3)²/9 + 0.5*(3-3)²/9 = 0.0556(最近类 k=2 距离只有 1)
+    probs = torch.tensor([[0.7, 0.3, 0.0, 0.0], [0.0, 0.0, 0.5, 0.5]])
+    loss = ordinal_distance_loss(probs, idx)
+    expected = (0.3 * 1 / 9 + 0.5 * 1 / 9) / 2
+    assert float(loss) == pytest.approx(expected, abs=1e-6), (
+        f"有序距离损失数值错: got {float(loss)}, expect {expected}"
+        " —— 归一化应为 (i-j)²/(C-1)²"
+    )
+
+
+def test_compute_extension_loss_total_decomposes_into_qwk_and_dist():
+    """🔴 total 的数值分解:`qwW*qwk + distW*dist`,两项系数各就各位。
+
+    2026-08-30 变异审计发现"丢掉 dist 项"(`total = qwk_weight * qwk_total`)的
+    变异测试全绿 —— 没有任何测试断言 total 的数值构成。若 dist 项被漏加,
+    损失照常下降、日志正常,云端 A/B 对 `dist_weight` 的归因全部作废。
+    """
+    idx = torch.tensor([0, 1, 2, 3])
+    v = torch.ones(4)
+    const_probs = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    logits = torch.log(const_probs).unsqueeze(0).expand(4, -1).clone()
+    uniform_prior = log_class_prior([1, 1, 1, 1])  # 平移不变,隔离 LA
+
+    qwk_w, dist_w = 1.0, 0.2
+    total, detail = compute_extension_loss(
+        logits, idx, v, log_prior=uniform_prior, la_tau=0.5,
+        qwk_weight=qwk_w, dist_weight=dist_w,
+    )
+    # detail 的两项是 .detach() 的标量,与 total 的构成独立可验
+    qwk_part = float(detail["ete_qwk"]) * qwk_w
+    dist_part = float(detail["ete_dist"]) * dist_w
+    assert float(total) == pytest.approx(qwk_part + dist_part, abs=1e-5), (
+        f"total={float(total)} != qwk_part({qwk_part}) + dist_part({dist_part})"
+        " —— total 的构成必须逐项等于 detail 分解,漏项/错系数会被此条钉死"
+    )
+    # dist 项必须非零贡献:常数预测下 dist 有真实非零值(概率分散在 4 类)
+    assert float(detail["ete_dist"]) > 0.0, "dist 项为 0 时上面的等式退化为不可区分"
+
+
 def test_qwk_branch_la_boundary_direction_matches_dr_example():
     """🔴 DR §6.4 第2条判据:构造 [2.0,0.0,0.0,2.1] 这种类0/类3 近乎打平的 logits，
     经 la_tau=0.5 的 log_prior 调整后，类别 0 应重新占据绝对主导。

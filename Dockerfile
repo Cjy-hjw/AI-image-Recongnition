@@ -1,5 +1,8 @@
-# 使用带 CUDA 12.1 和 Python 3.10 的官方 PyTorch 基础镜像
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+# 🔴 2026-08-30 对齐云端实际部署镜像(此前是 pytorch:2.1.0,与云端官方镜像
+# pytorch:2.8.0-cuda12.8 脱节 —— requirements 的 numpy<2 旧约束正是因此
+# 在云端把 numpy2 降级到 1.26.4 造成部署隐患,CI 又只在 2.1.0 下跑测不出)。
+# 本 Dockerfile 仅供 CI 冒烟,云上直接用官方镜像 + pip install,但环境必须一致。
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 # 设置容器工作目录
 WORKDIR /workspace

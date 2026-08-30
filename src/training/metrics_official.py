@@ -200,6 +200,11 @@ def ete_monitor_metrics(rows: List[Dict]) -> Dict[str, Optional[object]]:
         - `ete_logit_mean_per_class` [z̄0..z̄3]:各类 **logits** 均值。DR 预警:
           `z̄3 − z̄0 > 0` = 对稀有类过度偏移。**必须用 logits 不能用 probs** ——
           softmax 平移不变,probs 反推不出绝对量级(见 `validate_step` 采集处注释)。
+          🔴 **只能当绝对阈值报警,不能跨轮对拍**(2026-08-30 审查实测):开 LA 后
+          原始 logits 的 gap 会被**结构性推高**约 `τ·(logπ0−logπ3)`(τ=0.5 时
+          ≈ +3.33 nats,收敛实验实测 +3.378),即 2-② 轮的 z̄ 差值天然比 2-①
+          高一截——**2-①/2-② 归因看阈值报警(P3>2%/P0<80%、extreme>1.5%、
+          gap>0),别看两轮 z̄ 的差值**,否则会被这 3.3 nats 的结构性位移误导。
 
     ⚠️ **Soft-Kappa 的口径**:DR 定义是逐样本概率矩阵算,而这里的 `rows` 已是
     **病灶级聚合**后的(动态数据同一病灶多帧已取均值)。选定按病灶级算 ——
@@ -252,7 +257,13 @@ def ete_monitor_metrics(rows: List[Dict]) -> Dict[str, Optional[object]]:
 
     # ④ 各类 logits 均值。键缺席(legacy records)→ None,不猜、不拿 probs 顶替。
     if all("ete_logits" in r for r in sel):
+        # 长度契约与上方 probs 侧同款(防御性,生产不可达——ExtensionHead 输出恒 4 类):
+        # ragged/超长 logits 会让 np.asarray 抛 ValueError **崩整个验证循环**(不是
+        # 静默错,但代价是一轮训练中断,比 probs 侧 assert 拦得晚)。
         logits = np.asarray([r["ete_logits"] for r in sel], dtype=np.float64)
+        assert logits.shape[1] == NUM_ETE_CLASSES, (
+            f"ete_logits 长度应为 {NUM_ETE_CLASSES}，got {logits.shape[1]}"
+        )
         out["ete_logit_mean_per_class"] = [
             round(float(v), 6) for v in logits.mean(axis=0)
         ]

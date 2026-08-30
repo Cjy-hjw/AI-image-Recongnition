@@ -1,9 +1,12 @@
 # === 离线推理容器运行时依赖 ===
-# 基础镜像 pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime 已自带 torch/torchvision,
-# 这里仍显式声明并 pin 下限,防止镜像漂移导致版本不可控(API/权重加载行为变化)。
-torch>=2.1.0
-torchvision>=0.16.0
-numpy>=1.24.0,<2          # 必须封顶 <2:torch 2.1.0 用 numpy 1.x C-ABI 编译,装 numpy 2.x 会 RuntimeError: Numpy is not available
+# 🟢 2026-08-30 对齐云端实际 base(pytorch:2.8.0-cuda12.8,torch 按 numpy2 ABI 编译):
+# numpy 放开 <2 封顶(旧封顶是给已废弃的本地 Dockerfile base pytorch:2.1.0 写的),
+# torch2.8+numpy2.4.4 已在预演 venv 全套 pytest 零崩溃(torch2.8迁移方案.md §2)。
+# 🔴 不放开会在云端把镜像自带 numpy2 降级到 1.26.4,torch2.8 C 扩展在 numpy1 下
+# 有 RuntimeError: Numpy is not available 风险(2026-08-30 云端实测部署时发现)。
+torch>=2.8.0
+torchvision>=0.23.0
+numpy>=2.0,<3          # torch2.8 按 numpy2 ABI 编译,必须 numpy2;预演实测 2.4.4 全绿
 safetensors>=0.4.0          # load_local_safetensors 加载离线骨干权重
 
 timm>=0.9.0                 # EfficientNet-B2 / ConvNeXt-Nano 骨干
@@ -17,29 +20,22 @@ pydicom>=3.0.0               # DICOM/cine 解码 + PHI 脱敏
 # DICOM 绝大多数是 JPEG/JPEG2000/RLE 压缩,此前只有 pydicom 裸装,ds.pixel_array
 # 遇压缩像素数据必抛 NotImplementedError(被 video_io._load_dicom_cine 的
 # except Exception 兜成 status=ERROR 不崩溃,但等于该动态图样本 100% 丢失预测)。
-# RLE Lossless(1.2.840.10008.1.2.5)pydicom 自带 rle_handler 已支持,无需额外包;
-# JPEG/JPEG2000 需要下方两个插件。版本上限锁 <2.2.0/<2.3.0——从这两个版本起
-# 上游把 numpy 依赖改成 >=2.0,与本项目 numpy<2(torch 2.1.0 C-ABI 要求)冲突,
-# 锁定版本仍要求 numpy>=1.24,<2.0,且均有 manylinux2014_x86_64 cp310 wheel,
-# 与交付基镜像(pytorch/pytorch:2.1.0,Python 3.10)匹配。
-pylibjpeg>=2.1.0,<2.2.0            # 核心包:与两后端插件同源封顶。当前 2.1.0 的 numpy
-                                  # 依赖无版本约束(pip 解析仍受本文件 numpy<2 约束,安全),
-                                  # <2.2.0 挡未来版本可能把 numpy 依赖抬到 >=2.0 与本项目冲突。
-pylibjpeg-libjpeg>=2.0.0,<2.2.0    # JPEG baseline/extended/lossless
-pylibjpeg-openjpeg>=2.0.0,<2.3.0   # JPEG2000
+# RLE Lossless(1.2.840.10008.1.2.5)pydicom 自带 rle_handler 已支持,无需额外包。
+# 🔴 2026-08-30 放开原 <2.2.0/<2.3.0 封顶:那两个封顶是为躲 numpy>=2 冲突而设,
+# 而 torch2.8 base 现在恰恰要求 numpy2 —— 封顶会把 pylibjpeg 锁在旧版。
+# 预演 venv(numpy 2.4.4)实测 2.1.0/2.4.0/2.5.0 组合全绿(torch2.8迁移方案.md)。
+pylibjpeg>=2.1.0
+pylibjpeg-libjpeg>=2.0.0
+pylibjpeg-openjpeg>=2.0.0
 # ⚠️ 上限 <5 是硬约束(2026-08-11 双环境对拍实测,勿放开):
 # OpenCV 5.0 改了 cv2.HoughLinesP 的返回值形状,导致 src/gatekeeper/ 的 detect_splicing
 # 内部解包抛 `TypeError: cannot unpack non-iterable numpy.int32 object`——
 # 同一 torch2.8 环境下 cv2 5.0.0 → tests/test_gatekeeper.py 7 failed;降到 4.14.0 → 54 passed。
 #
-# 🔴 **别因为"当前 CI 装的是 4.x、看起来没事"就删掉这个上限**(pip dry-run 实测,py3.10):
-#   ① 本文件现有 numpy<2 + opencv 不封顶 → 解析出 numpy-1.26.4 + **opencv 4.11.0.86**(安全);
-#   ② 本文件现有 numpy<2 + opencv <5     → 同上,opencv 4.11.0.86(安全);
-#   ③ **放开 numpy 到 >=2 + opencv 不封顶 → numpy-2.2.6 + opencv 5.0.0.93,当场踩雷**。
-# 即:今天挡住 5.0 的其实是 `numpy<2` 的连带效果,**不是**谁主动挡的。而 numpy<2 只对旧交付
-# base(pytorch:2.1.0)成立——**上云换官方 torch2.8 base 时 numpy 必须放开到 >=2**(见
-# docs/交付与部署/torch2.8迁移方案.md §2),那一刻本行若没有 <5,pip 就会径直装 5.0。
-# 官方禁联网 + 模型只提交一次,构建那一刻装错版本零补救余地。**这个上限就是为那一刻准备的。**
+# 🔴 2026-08-30 numpy 已放开到 >=2(对齐 torch2.8 base),本行 <5 上限从"备用保险"
+# 变为**现役防线**(当初 pip dry-run 实测:numpy>=2 + opencv 不封顶 → opencv 5.0.0.93
+# 当场踩雷)。预演 venv 实测 numpy2.4.4 + opencv 4.14.0 全绿,即本行目标组合。
+# 官方禁联网 + 模型只提交一次,构建那一刻装错版本零补救余地。
 opencv-python-headless>=4.8.0,<5
 # NIfTI 读写(2026-08-01 官方《赛事开发规范 V1.0》§五.2 硬约束):预测结节 mask
 # **必须**为 .nii/.nii.gz,且《数据格式说明》确认动图原始数据同为 .nii.gz(静态图
@@ -48,9 +44,8 @@ opencv-python-headless>=4.8.0,<5
 nibabel>=5.0.0
 # Pillow 由 torchvision/albumentations/scikit-image 间接依赖,此前从未显式锁定,
 # 版本完全由 pip 解析器决定。Pillow 10.x 移除 Image.ANTIALIAS 等 API 曾造成上游
-# 静默破坏;显式声明并封顶防漂移。基镜像(pytorch 2.1.0/py3.10)实测兼容 9.x-10.x,
-# <11 挡未来大版本 API 突变(若 CI 报解析冲突则放宽为仅下限 >=9.5.0,见 commit 说明)。
-Pillow>=9.5.0,<11
+# 静默破坏;显式声明下限防漂移。预演 venv(torch2.8)实测 12.2.0 可用,不设上限。
+Pillow>=9.5.0
 pyyaml>=6.0
 # scipy 此前只是 scikit-learn/scikit-image 的**间接**依赖,从未显式声明。
 # 2026-08-01 起 src/inference/nodule_split.py 直接 import scipy.ndimage 做 3D

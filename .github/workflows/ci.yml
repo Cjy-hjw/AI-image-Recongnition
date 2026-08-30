@@ -31,28 +31,31 @@ jobs:
         run: lint-imports
 
   # 铁律 2:Gate 1(verify_model.py 八门)+ 全套 pytest 回归。
-  # 直接跑在交付基镜像内 —— torch 2.1.0 / Python 3.10 / weights_only 默认 False,
-  # 与离线推理容器完全一致。避免 GitHub runner 临时拼装的 torch 版本漂移
-  # (如 torch≥2.6 翻转 weights_only 默认值)导致测出非交付环境的假故障。
+  # 🔴 2026-08-30 换成与云端实际部署一致的镜像:云端跑官方基础镜像
+  # pytorch:2.8.0(torch 按 numpy2 ABI 编译),此前 CI 用 pytorch:2.1.0 容器,
+  # requirements 的 numpy<2 旧约束在 2.1.0 下是对的、CI 全绿,却在云端把
+  # 镜像自带 numpy2 降级到 1.26.4(torch2.8 C 扩展在 numpy1 下有崩险)——
+  # CI 环境 ≠ 交付环境 = 永远测不出这类错(2026-08-30 云端部署实测暴露)。
+  # requirements 已同步修(numpy>=2 / torch>=2.8 / pylibjpeg 解封,对齐
+  # torch2.8迁移方案.md §2 的既定结论 + 预演 venv 实测版本集)。
   test:
     runs-on: ubuntu-latest
-    container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+    container: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (file — entrypoint.sh 内容嗅探依赖,与 Dockerfile 保持一致)
         run: apt-get update && apt-get install -y --no-install-recommends file && rm -rf /var/lib/apt/lists/*
       - name: Install runtime + test deps
         run: |
-          # 镜像已自带 torch/torchvision 2.1.0,requirements 里的 torch>=2.1.0 已满足
-          # (无 --upgrade,pip 跳过不重装)。faiss-cpu 在 py3.10 有 wheel,正常安装。
+          # 镜像已自带 torch/torchvision 2.8.0,requirements 里的 torch>=2.8.0 已满足
+          # (无 --upgrade,pip 跳过不重装)。faiss-cpu 在镜像 py3.11 有 wheel,正常安装。
           pip install -r requirements.txt
           # pandas/openpyxl 仅 official_loader(训练侧数据加载器,src/dataset)单测需要:
           # **不进 requirements.txt**——离线推理容器从不 import 该模块(它只被训练脚本用),
           # 加进容器只会白白变肥,同 paramiko 的处置逻辑(见 requirements.txt 尾注)。
           # 缺它们时 tests/test_official_loader.py 顶部的 importorskip 会静默 skip 掉 8 个
           # 用例,CI 从未真验过本会话新增的 official_loader;在此补上让它们真跑。
-          # pandas 封顶 <2.3:2.2.x 有 cp310 manylinux wheel 且兼容 numpy 1.x(requirements
-          # 已锁 numpy<2,torch 2.1.0 C-ABI 要求);不封顶恐被未来 pandas 拖 numpy>=2 上来冲突。
+          # pandas 封顶 <2.3:2.2.x 兼容 numpy 2.x;不封顶恐被未来 pandas 拖不兼容版本上来。
           pip install pytest "pandas>=2.0,<2.3" "openpyxl>=3.1"
       - name: Gate 1 - verify_model (8 gates)
         run: python scripts/verify_model.py

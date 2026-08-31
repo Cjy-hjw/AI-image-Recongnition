@@ -78,13 +78,23 @@ class FeatureExtractor:
             self.model.eval()
             resize = 288  # SSCD disc 官方推荐输入边长
         else:
-            # 降级:torchvision ResNet18(ImageNet),去分类头取 512 维 pooled 特征
+            # 降级:torchvision ResNet18(ImageNet),去分类头取 512 维 pooled 特征。
+            # 权重查找顺序:① 环境变量 AICOMP_RESNET18_WEIGHTS(云端持久盘部署用,
+            # 2026-08-31 补:平台容器重建会清容器层,~/.cache 下的拷贝/软链接都会
+            # 丢 —— 让权重直接从 workspace 挂载盘读,免疫重建);② 官方 torchvision
+            # 缓存位(本地开发/CI 默认);③ 项目 checkpoints/(与 SSCD 候选位一致)。
+            # 三处都找不到才走下面的联网下载分支。
             self.backend_name = "resnet18"
             self.model = models.resnet18(pretrained=False)
-            local_weights = os.path.expanduser(
-                "~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth"
+            _resnet18_candidates = [
+                os.environ.get("AICOMP_RESNET18_WEIGHTS"),
+                os.path.expanduser("~/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth"),
+                os.path.join("checkpoints", "resnet18-f37072fd.pth"),
+            ]
+            local_weights = next(
+                (p for p in _resnet18_candidates if p and os.path.exists(p)), None
             )
-            if os.path.exists(local_weights):
+            if local_weights:
                 # weights_only=True:纯张量 state_dict,torch≥2.6 下安全加载(拒绝
                 # 任意代码执行)且消除 FutureWarning;旧版 torch 同样支持该参数。
                 self.model.load_state_dict(

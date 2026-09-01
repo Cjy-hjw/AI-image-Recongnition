@@ -185,6 +185,76 @@ class TestColorDicomSingleFrame:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 🔴 零落盘红线(2026-09-01 事故回归锁):
+# 官方 V2.1 评分器对预测目录做白名单校验(只允许 .nii/.nii.gz/.json),此前
+# load_input_image/_load_dicom_cine 会把 PHI 匿名化副本(anonymized_image.dcm/
+# anonymized_cine.dcm)写进输出目录,云端实测一个 .dcm 即「预测文件格式错误」
+# 整批判零。此处钉死:DICOM 读取路径完成后 output_dir 必须零文件。未来任何人
+# "顺手加回 save_as 存中间产物"会让这条测试当场变红。
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestZeroFileLeakRedline:
+    def test_static_dicom_read_leaves_output_dir_empty(self, tmp_path, monkeypatch):
+        """load_input_image 走 DICOM 分支后 output_dir 零落盘(V2.1 白名单红线)。"""
+        import src.inference.io as io_mod
+
+        gray = (np.random.rand(32, 48) * 255).astype(np.uint8)
+
+        class _FakeDS:
+            pixel_array = gray
+
+            def __contains__(self, tag):  # PHI 字段一律不存在 → 跳过匿名化赋值
+                return False
+
+            def save_as(self, path):  # 🔴 若落盘代码回归,这里让测试显式变红
+                raise AssertionError(
+                    f"load_input_image 不得再往预测目录写盘(V2.1 白名单): {path}")
+
+        class _FakePydicom:
+            @staticmethod
+            def dcmread(path):
+                return _FakeDS()
+
+        monkeypatch.setattr(io_mod, "pydicom", _FakePydicom, raising=False)
+        monkeypatch.setattr(io_mod, "HAS_PYDICOM", True, raising=False)
+
+        dcm_path = tmp_path / "input.dcm"
+        dcm_path.write_bytes(b"placeholder")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        img, is_dicom, err = io_mod.load_input_image(str(dcm_path), str(out_dir))
+        assert err is None and img is not None
+        assert os.listdir(str(out_dir)) == [], (
+            f"预测目录混入非白名单文件(官方判格式错误整批判零): {os.listdir(str(out_dir))}")
+
+    def test_cine_dicom_read_leaves_output_dir_empty(self, tmp_path):
+        """_load_dicom_cine 走 DICOM 分支后 output_dir 零落盘(V2.1 白名单红线)。"""
+        from src.inference.video_io import _load_dicom_cine
+
+        # 真 pydicom 造 4 帧 cine(本测试模块所在 CI/本地环境装 pydicom);
+        # 造不出来则 skip(该红线另有 monkeypatch 版静态路径守卫,双保险)。
+        try:
+            from scripts.verify.gen_synthetic_dicom import build_dicom
+        except Exception:
+            pytest.skip("gen_synthetic_dicom 不可导入")
+        dcm_path = tmp_path / "cine.dcm"
+        try:
+            build_dicom(rows=32, cols=32, n_frames=4).save_as(
+                str(dcm_path), enforce_file_format=True)
+        except Exception:
+            pytest.skip("cine DICOM 构造失败")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        frames, idxs, is_dcm, err, n_total = _load_dicom_cine(
+            str(dcm_path), str(out_dir), 32)
+        assert err is None and frames is not None and len(frames) == 4
+        assert os.listdir(str(out_dir)) == [], (
+            f"预测目录混入非白名单文件(官方判格式错误整批判零): {os.listdir(str(out_dir))}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 视频解码往返(codec 缺失则跳过)+ 格式守卫
 # ═════════════════════════════════════════════════════════════════════════════
 

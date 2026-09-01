@@ -13,7 +13,8 @@ CLI 的 `if __name__=="__main__"` 主函数。故把两个 CLI `main()` 里「�
 **留在调用方(main/runner)**:
 - `build_model` / `TemperatureScaler` 构造 —— 有构建成本,service 要跨病例复用一次;
 - 输入加载(`load_input_image`/`load_video_frames`/`load_nifti_frames`)—— 含 DICOM
-  匿名化写盘副作用,且失败要落 rejection JSON(控制流属调用方);
+  内存 PHI 匿名化(2026-09-01 起不写盘,见 io.py docstring),且失败要落 rejection
+  JSON(控制流属调用方);
 - gatekeeper 审计 —— 有副作用(逐帧审计、写 rejection),且 hard 模式的一票否决
   return 语义属调用方控制流;
 - 落盘(V2.0 `save_prediction_artifacts` / V2.1 `write_case_v21`)与 Grad-CAM(CLI 专属)。

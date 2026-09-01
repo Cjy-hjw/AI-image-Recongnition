@@ -1,6 +1,5 @@
 """Image I/O with DICOM PHI anonymization (HIPAA Safe Harbor fields)."""
 
-import os
 import cv2
 import numpy as np
 
@@ -9,7 +8,9 @@ import numpy as np
 # 注意:此字典只放**标量 VR**(PN/LO/SH/DA/TM/AS 等)可 setattr 字符串的字段;
 # 序列类(SQ)或应整体删除的字段放 _PHI_DELETE_TAGS,不能给 SQ setattr 字符串
 # (会破坏数据结构)。补全依据:R2 审查 + HIPAA Safe Harbor 18 类标识符——
-# 原清单只列 21 项,`save_as` 序列化整个 ds,清单外 PHI 标签会原样写进匿名副本。
+# 原清单只列 21 项。🔴 2026-09-01 起匿名化副本不再落盘(save_as 已删,见
+# load_input_image docstring),此清单仅作内存清洗防御性保留:若未来重新引入
+# 落盘,清单外 PHI 标签会原样写进副本——故保持完整,勿裁剪。
 _PHI_FIELDS = {
     "PatientName": "ANONYMIZED",
     "PatientID": "ANONYMIZED",
@@ -146,8 +147,11 @@ def _to_gray(frame: np.ndarray, channel_order: str = "rgb") -> np.ndarray:
 def load_input_image(path: str, output_dir: str):
     """Load a B-mode ultrasound image (PNG/JPG/DCM).
 
-    For DICOM inputs, anonymizes HIPAA Safe Harbor PHI fields (see _anonymize_phi)
-    and saves the sanitized copy.
+    For DICOM inputs, anonymizes HIPAA Safe Harbor PHI fields in memory
+    (see _anonymize_phi). 🔴 2026-09-01 起不再把匿名化副本落盘:官方 V2.1 评分器
+    对预测目录做白名单校验(只允许 .nii/.nii.gz/.json),写入 .dcm 即整批判零。
+    `output_dir` 参数仅为调用方签名兼容保留,本函数不再向其写任何文件
+    (回归锁见 tests/test_video.py::TestZeroFileLeakRedline)。
 
     Returns:
         (img_np, is_dicom, error_msg) — img_np is None on failure.
@@ -169,11 +173,6 @@ def load_input_image(path: str, output_dir: str):
             # PHI metadata anonymization (HIPAA Safe Harbor) — 标量匿名 + 序列删除,
             # 见 _anonymize_phi(静/动共用,只碰已存在的 PHI 标签,不动成像参数)。
             _anonymize_phi(ds)
-
-            # Save anonymized dicom to output
-            anon_dicom_path = os.path.join(output_dir, "anonymized_image.dcm")
-            ds.save_as(anon_dicom_path)
-            print(f"--> Saved anonymized DICOM to {anon_dicom_path}")
         except Exception as e:
             return None, True, f"Error reading/anonymizing DICOM file: {e}"
     else:

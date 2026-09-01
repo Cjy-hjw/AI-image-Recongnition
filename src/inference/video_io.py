@@ -85,7 +85,11 @@ def _load_cv_video(path: str, max_frames: int):
 def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
     """多帧 DICOM(cine)。pixel_array 3D=(frames,H,W);2D 视作单帧。
 
-    复用 _PHI_FIELDS 做 HIPAA 脱敏并存匿名化副本(与 io.load_input_image 一致)。
+    复用 _PHI_FIELDS 做 HIPAA 脱敏(内存清洗,与 io.load_input_image 一致)。
+    🔴 2026-09-01 起不再落盘匿名化副本:官方 V2.1 评分器对预测目录做白名单
+    校验(只允许 .nii/.nii.gz/.json),写入 .dcm 即整批判零。`output_dir`
+    仅为签名兼容保留(load_video_frames 三参契约被 test_nifti_io 钉死),
+    本函数不再向其写任何文件。回归锁见 tests/test_video.py::TestZeroFileLeakRedline。
     """
     if not HAS_PYDICOM:
         return None, [], True, "DICOM cine provided but pydicom is not installed.", 0
@@ -106,9 +110,6 @@ def _load_dicom_cine(path: str, output_dir: str, max_frames: int):
         # PHI 匿名化:与 io.load_input_image 共用 _anonymize_phi(标量匿名+序列删除),
         # 单一事实源,静/动口径一致(标签清单变更只需改 io.py 一处)。
         _anonymize_phi(ds)
-        anon_path = os.path.join(output_dir, "anonymized_cine.dcm")
-        ds.save_as(anon_path)
-        print(f"--> Saved anonymized DICOM cine to {anon_path}")
         return frames, idxs, True, None, n_total
     except Exception as e:  # noqa: BLE001 — 守卫契约,失败返回错误信息
         return None, [], True, f"Error reading/anonymizing DICOM cine: {e}", 0

@@ -30,7 +30,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 
 - Supports DICOM (`.dcm`/`.dicom`) via `pydicom` and standard formats via `cv2.imread(..., IMREAD_GRAYSCALE)`.
 - **PHI Anonymization** (HIPAA Safe Harbor): 仅覆盖 DICOM 中**已存在**的 PHI 标签(完整清单见 `io.py` 的 `_PHI_FIELDS`),涵盖患者身份(Name/ID/BirthDate/Sex/Age/Address/Telephone/OtherIDs)、就诊(AccessionNumber/StudyID/各类 Date)、机构与设备(InstitutionName/Address/StationName/DeviceSerialNumber)、医师与操作者(Referring/Performing/Operators)。日期类置 `"00000101"`,其余置 `"ANONYMIZED"` 或空串。
-- Anonymized DICOM saved to `output_dir/anonymized_image.dcm`.
+- 🔴 2026-09-01 起**不再落盘匿名化副本**(原 `output_dir/anonymized_image.dcm` 已删):官方 V2.1 评分器对预测目录做白名单校验(只允许 .nii/.nii.gz/.json),混入 .dcm 即「预测文件格式错误」整批判零(云端实测)。PHI 匿名化仅内存清洗;`output_dir` 参数为签名兼容保留、不再写任何文件。回归锁:`tests/test_video.py::TestZeroFileLeakRedline`。
 - Returns `(None, False, error_msg)` on failure — caller must check `img_np is None`,
   print the error **并调用 `export.save_rejection_json` 落 `status="ERROR"` 的
   `result.json`**（2026-07-11 修复：此前只 print 不落盘，容器 exit code 仍为 0 但
@@ -246,7 +246,7 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 纯核心:`preprocess → run_forward → decode → mask resize → tirads breakdown`(静态)+
 逐帧诊断(坏帧隔离)/聚合/关键帧选择(动态)。留在调用方:**`build_model`/`TemperatureScaler`
 构造**(有构建成本,service 要跨病例复用)、**输入加载**(`load_input_image`/
-`load_video_frames`/`load_nifti_frames`,含 DICOM 匿名化写盘副作用)、**gatekeeper 审计**
+`load_video_frames`/`load_nifti_frames`,含 DICOM 内存 PHI 匿名化,2026-09-01 起不写盘)、**gatekeeper 审计**
 (有副作用 + hard 一票否决 return 属调用方控制流)、**落盘与 Grad-CAM**。
 
 ### `diagnose_static_case(model, img_np, config, calibrator, precision, device)` → `dict`

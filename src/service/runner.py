@@ -20,7 +20,7 @@
 
     discover_cases(dataset_path)          # case_discovery:静/动分派 + PatientId/subdir_uid
       └ 逐病例(每病例独立 try/except):
-          static  → load_input_image(含 DICOM 匿名化落盘) → gatekeeper → diagnose_static_case
+          static  → load_input_image(DICOM 内存 PHI 匿名化,不落盘) → gatekeeper → diagnose_static_case
           dynamic → load_nifti_frames → 逐帧 gatekeeper → diagnose_dynamic_case
           ↓
           case_dir = {output_dir}/{patient_id} →  write_case_v21(..., kind, processing_ms)

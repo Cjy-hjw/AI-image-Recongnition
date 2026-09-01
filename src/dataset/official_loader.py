@@ -42,8 +42,10 @@ from src.models.heads import flip_location_index
 
 # 复用:患者分组切分(防同患者跨集泄漏,rules.md §5 铁律)
 from src.dataset.pathology_dataset import patient_grouped_split
-# 复用:DICOM/位深→uint8 灰度(不整段调 load_input_image——那含 PHI 匿名化写盘副作用,
-#       每样本写盘不可接受;只借 _to_gray 的通道/位深收敛,与推理侧口径一致)
+# 复用:DICOM/位深→uint8 灰度(不整段调 load_input_image——训练路径无需其 PHI 匿名化
+#       语义,且函数签名带 output_dir(现仅占位);只借 _to_gray 的通道/位深收敛,
+#       与推理侧口径一致。2026-09-01 起该函数已不写盘,本处不复用的理由收窄为
+#       "训练无需匿名化开销",设计不变。)
 from src.inference.io import _to_gray
 # 复用:NIfTI 读取(动图 + mask),内含 (X,Y,Z)↔(H,W) 转置约定(定稿最易错处,勿另抄)
 from src.inference.nifti_io import load_nifti_frames

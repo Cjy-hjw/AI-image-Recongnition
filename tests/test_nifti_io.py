@@ -30,11 +30,16 @@ def _make_2d_mask(fill=1):
 
 
 class TestDimensionConvention:
-    """写出的 NIfTI header 必须是 (W,H[,n]),读入必须还原成 (H,W)。"""
+    """写出的 NIfTI header 必须是 (W,H[,n]),读入必须还原成 (H,W)。
+    🔴 2026-09-01 起 2D 输入写出 (W,H,1):官方 GT 静态 mask 实测为 3D 带单帧
+    (训练集 0030d3c5 GT=(1068,726,1)),纯 2D 会被官方 shape 校验整批判零
+    (第 5 次跑分破案)。"""
 
-    def test_2d_header_is_width_height(self, tmp_path):
+    def test_2d_header_is_width_height_with_single_frame_z(self, tmp_path):
         out = save_binary_mask(_make_2d_mask(), str(tmp_path / "m.nii.gz"))
-        assert nib.load(out).shape == (_W, _H), "header dim 应为 (X,Y)=(W,H),漏转置会得到 (H,W)"
+        assert nib.load(out).shape == (_W, _H, 1), (
+            "2D 输入的 header dim 应为 (X,Y,Z)=(W,H,1)——官方 GT 静态 mask 带"
+            "单帧 Z=1,纯 2D (W,H) 会被 shape 校验判格式错误整批判零")
 
     def test_3d_frame_axis_lands_on_z(self, tmp_path):
         n = 4
@@ -120,7 +125,7 @@ class TestSaveGuards:
         (规范 §二.2 明写 evaluation_id 目录须由参赛者代码创建),父目录不存在必须自建。"""
         out = save_binary_mask(
             _make_2d_mask(), str(tmp_path / "a" / "b" / "c" / "m.nii.gz"))
-        assert nib.load(out).shape == (_W, _H)
+        assert nib.load(out).shape == (_W, _H, 1)
 
 
 class TestLoadGuards:

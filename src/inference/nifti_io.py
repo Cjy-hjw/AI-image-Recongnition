@@ -2,10 +2,13 @@
 
 两个方向都是官方规范硬约束(2026-08-01《赛事开发规范 V1.0》§五.2 +《数据格式说明》):
 
-**写出** — 每个预测结节输出一个 NIfTI 二值 mask,`1` 表示结节、`0` 表示背景,
-Height × Width **必须与对应原始输入超声图像严格一致**。静态图为 2D,动态图为 3D
-且 Z 轴对应**全视频帧序列**(必须预测并输出所有帧,评测只抽标注帧计分但缺帧的
-帧无法计分)。
+**写出** — 每个预测结节输出一个 NIfTI 二值 mask,`1` 表示结节、`0` 为背景,
+Height × Width **必须与对应原始输入超声图像严格一致**。🔴 2026-09-01 实测(第 5 次
+跑分破案):官方 GT **静态 mask 也是 3D**——(Columns, Rows, 1) 单帧 Z=1(训练集
+病例 0030d3c5:Rows=726/Columns=1068 → GT=(1068,726,1)),纯 2D 输出会被官方
+shape 校验判「differs from every GT mask」整批判零。故 2D 输入也统一写出
+(1, W, H)。动态图为 3D 且 Z 轴对应**全视频帧序列**(必须预测并输出所有帧,
+评测只抽标注帧计分但缺帧的帧无法计分)。
 
 **读入** — 《数据格式说明》明确动图"影像原始数据为.nii.gz格式"(静态图才是 DICOM),
 而 `video_io.load_video_frames` 只认 `.mp4/.avi/.mov/.mkv` + DICOM,遇 `.nii.gz`
@@ -56,6 +59,9 @@ def save_binary_mask(mask: np.ndarray, out_path: str, affine=None) -> str:
             非零表示前景**(含内部惯用的 0/255 `mask_binary`),内部统一二值化——
             规范要求的是 `1` 而非 `255`,直接写 255 会让评测按 `== 1` 取前景时
             得到全空 mask,而文件本身完全合法、看不出错。
+            🔴 2026-09-01 起 2D 输入也写出 **3D (1, W, H)**(单帧 Z=1):官方 GT
+            静态 mask 实测为 3D 带单帧(见函数体注释),纯 2D 会被官方 shape
+            校验整批判零。
         out_path: 目标路径,`.nii.gz` 按扩展名自动 gzip 压缩(nibabel 内部处理)。
         affine: 可选 4x4 仿射矩阵。超声无标准空间信息,默认单位阵——评测按体素
             重叠度匹配主病灶,不依赖世界坐标,单位阵是安全且明确的选择。
@@ -79,10 +85,17 @@ def save_binary_mask(mask: np.ndarray, out_path: str, affine=None) -> str:
 
     binary = (arr != 0).astype(np.uint8)
 
-    # (H,W) → (W,H) / (n,H,W) → (W,H,n):见模块 docstring 的维度约定。
-    # 3D 时帧轴必须落到 NIfTI 的 Z(第三轴),故用 transpose(2,1,0) 而非简单 .T。
+    # (H,W) → (1,W,H) / (n,H,W) → (W,H,n):见模块 docstring 的维度约定。
+    # 🔴 2026-09-01 修复(第 5 次跑分破案):静态 mask 必须带 Z=1 单帧维。
+    # 官方 GT 静态 mask 实测为 3D (Columns, Rows, 1)(云端训练集病例 0030d3c5:
+    # Rows=726/Columns=1068 → GT shape=(1068,726,1)),此前 2D 路径写纯 2D
+    # (W,H),官方校验 mask shape 与 GT 逐维比对 → 「shape differs from every
+    # GT mask」整批判零(2026-09-01 跑分回报)。转置方向本身是对的(前两维
+    # =(W,H) 与 GT 一致),缺的只有单帧 Z 维。
+    # 训练侧读回不受影响:load_nifti_frames 对 ndim==3 走 transpose(2,1,0)
+    # → (1,H,W),binf[0] 取帧口径不变。
     if binary.ndim == 2:
-        data = binary.T
+        data = binary.T[..., None]
     else:
         data = np.transpose(binary, (2, 1, 0))
 

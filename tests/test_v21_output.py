@@ -200,8 +200,10 @@ class TestStatic:
             abs_path = os.path.join(case_dir, rel)
             assert os.path.isfile(abs_path), f"mask 文件未生成: {abs_path}"
             img = nib.load(abs_path)
-            assert img.shape == (_W, _H), (
-                f"mask header 应为 (W,H)=({_W},{_H}),得 {img.shape}(漏转置会得到 (H,W))")
+            assert img.shape == (_W, _H, 1), (
+                f"mask header 应为 (W,H,1)=({_W},{_H},1),得 {img.shape}"
+                "(官方 GT 静态 mask 为 3D 带单帧 Z=1,纯 2D 被官方 shape 校验判零;"
+                "漏转置会得到 (H,W,1))")
             data = np.asarray(img.dataobj)
             assert set(np.unique(data).tolist()) <= {0, 1}, (
                 f"mask 值域须 {{0,1}},得 {np.unique(data).tolist()}")

@@ -361,13 +361,20 @@ exit code、零输出，与本节修复的"图像/视频加载失败"是同一�
 NIfTI header 的 `dim` 是 **(X,Y,Z) 列主序**,numpy 图像是 **(H,W) 行主序**,前两轴
 **互为转置**。漏转置时"本地写出→读回"用同一套错误约定**看不出任何异常**(转置两次
 等于没转),但评测按 header 读形状即判定与原图不符 → 整例失分且本地永远复现不了。
-故 `save_binary_mask` 统一 `(H,W)→(W,H)` / `(n,H,W)→(W,H,n)`,`load_nifti_frames`
+故 `save_binary_mask` 统一 `(H,W)→(W,H,1)` / `(n,H,W)→(W,H,n)`,`load_nifti_frames`
 反向还原。所有相关测试一律用**非方阵**(H≠W),方阵会让转置错误完全隐形。
+🔴 **2026-09-01 第 5 次跑分破案**:官方 GT **静态 mask 也是 3D 带单帧**
+(云端实测训练集 0030d3c5:Rows=726/Columns=1068 → GT=(1068,726,1))。此前 2D 路径
+写纯 (W,H) → 官方 shape 校验「differs from every GT mask」**整批判零**。此约束
+官方文档无记载(V2.1 只写"尺寸 H×W 一致"),且本地永测不出(自己写自己读抵消;
+训练侧 loader 走 ndim==3 分支天然消化 GT 的 Z=1,训练侧从未暴露差异)。修复
+commit 559b306:`binary.T[..., None]`。
 
 ### `save_binary_mask(mask, out_path, affine=None)` → `str`
 
 - 接受 2D `(H,W)` 或 3D `(n_frames,H,W)`;**任意非零视作前景**(兼容内部 0/255 的
-  `mask_binary`),内部统一二值化为 `{0,1}` uint8。
+  `mask_binary`),内部统一二值化为 `{0,1}` uint8。🔴 **2D 输入也写出 3D
+  (W,H,1)**(2026-09-01 起,官方 GT 静态 mask 为单帧 3D,见维度约定节)。
 - **写 255 是静默零分路径**:文件完全合法,但评测按 `== 1` 取前景会得到全空 mask。
 - 父目录自动创建(官方 `answer/{eval_id}/{StudyUid}/{SeriesUid}/` 是推理时动态建的)。
 - `affine` 默认单位阵:超声无标准空间信息,评测按体素重叠度匹配主病灶,不依赖世界坐标。

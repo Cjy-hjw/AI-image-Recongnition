@@ -222,9 +222,9 @@ def _run_cases(cases, output_dir, state, precision, max_frames):
     按 patient_id 分组:**组间并发**(ThreadPoolExecutor,worker 数取
     config.INFERENCE_WORKERS,**上界 2**)、**组内串行**——组内串行是硬契约:
     同 PatientId 多序列的 prediction.json 落同一路径(case_dir = {output}/{pid}),
-    组内并发会让两线程同时写同一 tmp 文件(`{path}.tmp.{pid}` 只含 pid 不含
-    tid)交错出损坏 JSON → 官方评分器读不进 → 整例失分(#117 的并发恶化形态)。
-    组间不同 pid 的写路径互不相交,并发安全。
+    组内并发会让两线程同时写同一 tmp 文件(原子写后缀只有 `os.getpid()` **进程** id,
+    同进程所有线程共享、不含线程 id)交错出损坏 JSON → 官方评分器读不进 → 整例失分
+    (#117 的并发恶化形态)。组间不同 pid 的写路径互不相交,并发安全。
 
     ⚠️ 上界锁死 2 不放开的理由(与 config.INFERENCE_WORKERS 注释一致):
     ① 单大动态病例内存峰值 ~16G,×4 > 64G 有 OOM 尾险;② 共享 tamper_detector

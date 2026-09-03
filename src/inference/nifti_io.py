@@ -7,7 +7,7 @@ Height × Width **必须与对应原始输入超声图像严格一致**。🔴 2
 跑分破案):官方 GT **静态 mask 也是 3D**——(Columns, Rows, 1) 单帧 Z=1(训练集
 病例 0030d3c5:Rows=726/Columns=1068 → GT=(1068,726,1)),纯 2D 输出会被官方
 shape 校验判「differs from every GT mask」整批判零。故 2D 输入也统一写出
-(1, W, H)。动态图为 3D 且 Z 轴对应**全视频帧序列**(必须预测并输出所有帧,
+(W, H, 1)。动态图为 3D 且 Z 轴对应**全视频帧序列**(必须预测并输出所有帧,
 评测只抽标注帧计分但缺帧的帧无法计分)。
 
 **读入** — 《数据格式说明》明确动图"影像原始数据为.nii.gz格式"(静态图才是 DICOM),
@@ -59,7 +59,7 @@ def save_binary_mask(mask: np.ndarray, out_path: str, affine=None) -> str:
             非零表示前景**(含内部惯用的 0/255 `mask_binary`),内部统一二值化——
             规范要求的是 `1` 而非 `255`,直接写 255 会让评测按 `== 1` 取前景时
             得到全空 mask,而文件本身完全合法、看不出错。
-            🔴 2026-09-01 起 2D 输入也写出 **3D (1, W, H)**(单帧 Z=1):官方 GT
+            🔴 2026-09-01 起 2D 输入也写出 **3D (W, H, 1)**(单帧 Z=1):官方 GT
             静态 mask 实测为 3D 带单帧(见函数体注释),纯 2D 会被官方 shape
             校验整批判零。
         out_path: 目标路径,`.nii.gz` 按扩展名自动 gzip 压缩(nibabel 内部处理)。
@@ -85,7 +85,7 @@ def save_binary_mask(mask: np.ndarray, out_path: str, affine=None) -> str:
 
     binary = (arr != 0).astype(np.uint8)
 
-    # (H,W) → (1,W,H) / (n,H,W) → (W,H,n):见模块 docstring 的维度约定。
+    # (H,W) → (W,H,1) / (n,H,W) → (W,H,n):见模块 docstring 的维度约定。
     # 🔴 2026-09-01 修复(第 5 次跑分破案):静态 mask 必须带 Z=1 单帧维。
     # 官方 GT 静态 mask 实测为 3D (Columns, Rows, 1)(云端训练集病例 0030d3c5:
     # Rows=726/Columns=1068 → GT shape=(1068,726,1)),此前 2D 路径写纯 2D

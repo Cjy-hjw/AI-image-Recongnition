@@ -288,10 +288,14 @@ class TestConfigPaths:
         _, config_mod, _ = svc
         assert config_mod.SERVICE_PORT == 8000
 
-    def test_single_inference_worker(self, svc):
-        """单卡 14~16G 显存(平台实际约 16G/容器、当前分配 14G,2026-08-11 修正口径)并发推理会 OOM,且模型非线程安全。"""
+    def test_default_two_inference_workers(self, svc):
+        """2026-09-03 提速:worker 默认 1→2(1060 病例串行 3 小时→~2 倍吞吐)。
+        前提:Deduplicator 已加线程锁(共享 hashes/embeddings/FAISS 不再竞态);
+        模型前向走 inference_mode 无参数更新,多线程 call 安全。显存口径按
+        官方实测 32G(2026-08-12),2×单例峰值 ~16G×2 < 32G;更高 worker 因
+        内存尾险(64G)不上,详见 config.py 注释。"""
         _, config_mod, _ = svc
-        assert config_mod.INFERENCE_WORKERS == 1
+        assert config_mod.INFERENCE_WORKERS == 2
 
 
 class TestPlaceholderRunner:

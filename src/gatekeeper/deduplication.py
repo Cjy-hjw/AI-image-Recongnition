@@ -1,6 +1,7 @@
 import cv2
 import os
 import numpy as np
+import threading
 import torch
 import torchvision.models as models
 import torchvision.transforms as transforms
@@ -166,10 +167,23 @@ class Deduplicator:
     Main deduplication module.
     Performs fast dHash screening first, then verifies using cosine similarity of deep embeddings.
     特征后端可插拔(SSCD 优先,降级 ResNet18);均为 512 维,支持 FAISS / NumPy 双路。
+
+    线程安全(2026-09-03):`_lock` 串行化 `add_image`/`is_duplicate` 对共享库
+    (hashes / embeddings / FAISS index)的读写。背景:推理服务 worker 1→2
+    (config.INFERENCE_WORKERS + runner 病例级并行)后,两个线程共享同一
+    Deduplicator 实例(runner 闭包 state["dedup"] 跨病例复用),无锁时两方法并发
+    会竞态——`add_image` 是「append list + index.add」两步非原子,is_duplicate
+    并发读时 NumPy 回退路径 `np.array(self.embeddings)` 可能读到与 FAISS index
+    不同步的撕裂状态,search 结果不可预测。**锁只圈共享结构的读写**:dHash 与
+    深度特征提取(~0.3-0.5s torch 前向)在锁外——只读输入不碰共享状态,圈进
+    等于把两线程的审计全程序串行化、提速归零。宁可串行写库、不可并发互踩
+    (「宁可漏检不可误杀」红线在去重语义上同样成立——误判重复在 hard 模式
+    会硬拒真图)。
     """
     def __init__(self, device='cpu', phash_threshold=5, cosine_threshold=None,
                  sscd_weights=None):
         self.phash_threshold = phash_threshold
+        self._lock = threading.Lock()
         self.extractor = FeatureExtractor(device=device, sscd_weights=sscd_weights)
         # 阈值解析(按激活后端选值,守红线):
         #   None         → 取后端推荐(SSCD 0.86 / ResNet18 0.95);
@@ -203,42 +217,50 @@ class Deduplicator:
     def add_image(self, img_np):
         dhash = compute_dhash(img_np)
         feat = self.extractor.extract(img_np)
-        
-        self.hashes.append(dhash)
-        self.embeddings.append(feat)
-        
-        if self.use_faiss:
-            # FAISS IndexFlatIP expects float32 array
-            self.index.add(np.expand_dims(feat, axis=0).astype(np.float32))
-            
+
+        # 锁内完成「append + index.add」两步,保证 embeddings 与 FAISS index
+        # 始终同步(见类 docstring 的线程安全说明)。
+        with self._lock:
+            self.hashes.append(dhash)
+            self.embeddings.append(feat)
+
+            if self.use_faiss:
+                # FAISS IndexFlatIP expects float32 array
+                self.index.add(np.expand_dims(feat, axis=0).astype(np.float32))
+
     def is_duplicate(self, img_np):
-        if not self.hashes:
-            return False, None
-            
+        # 线程安全:重活(dHash + 深度特征提取,~0.3-0.5s 的 torch 前向)在**锁外**
+        # 算——只读输入不触碰共享状态;锁只圈住对 hashes/embeddings/index 的读。
+        # 若把 extract 圈进锁,worker=2 的两病例审计会全程序串行化,提速归零
+        # (2026-09-03 审查 P1-2)。add_image 同款策略:extract 锁外、写库锁内。
         query_hash = compute_dhash(img_np)
         query_feat = self.extractor.extract(img_np)
-        
-        # 1. Fast dHash screen
-        for idx, stored_hash in enumerate(self.hashes):
-            dist = hamming_distance(query_hash, stored_hash)
-            if dist <= self.phash_threshold:
-                return True, f"dHash match (distance: {dist})"
-                
-        # 2. ResNet feature screening
-        if self.use_faiss:
-            # Query FAISS
-            distances, indices = self.index.search(np.expand_dims(query_feat, axis=0).astype(np.float32), 1)
-            best_sim = distances[0][0]
-            best_idx = indices[0][0]
-            if best_sim >= self.cosine_threshold and best_idx != -1:
-                return True, f"Deep feature match (Cosine Similarity: {best_sim:.4f})"
-        else:
-            # NumPy fallback
-            embeddings_matrix = np.array(self.embeddings)
-            similarities = np.dot(embeddings_matrix, query_feat)
-            best_idx = np.argmax(similarities)
-            best_sim = similarities[best_idx]
-            if best_sim >= self.cosine_threshold:
-                return True, f"Deep feature match (Cosine Similarity: {best_sim:.4f})"
-                
-        return False, None
+        with self._lock:
+            if not self.hashes:
+                return False, None
+
+            # 1. Fast dHash screen
+            for idx, stored_hash in enumerate(self.hashes):
+                dist = hamming_distance(query_hash, stored_hash)
+                if dist <= self.phash_threshold:
+                    return True, f"dHash match (distance: {dist})"
+
+            # 2. ResNet feature screening
+            if self.use_faiss:
+                # Query FAISS
+                distances, indices = self.index.search(
+                    np.expand_dims(query_feat, axis=0).astype(np.float32), 1)
+                best_sim = distances[0][0]
+                best_idx = indices[0][0]
+                if best_sim >= self.cosine_threshold and best_idx != -1:
+                    return True, f"Deep feature match (Cosine Similarity: {best_sim:.4f})"
+            else:
+                # NumPy fallback
+                embeddings_matrix = np.array(self.embeddings)
+                similarities = np.dot(embeddings_matrix, query_feat)
+                best_idx = np.argmax(similarities)
+                best_sim = similarities[best_idx]
+                if best_sim >= self.cosine_threshold:
+                    return True, f"Deep feature match (Cosine Similarity: {best_sim:.4f})"
+
+            return False, None

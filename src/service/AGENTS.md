@@ -18,8 +18,8 @@ V2.1《赛事开发规范》§二/§三 的 HTTP 交互层。与旧的离线 CLI
 | File | Responsibility |
 |:---|:---|
 | `app.py` | FastAPI 路由(`/call` `/health` `/task/{request_id}`)+ runner 注入(`set_runner`/`_placeholder_runner`/全局 `_runner`)+ `_extract_fields` 入参容错 + `main()` uvicorn 前台启动(启动时 `set_runner(build_service_runner(...))` 注入真实 runner) |
-| `config.py` | 端口/路径/回调常量(均可环境变量覆盖):`SERVICE_PORT=8000`、`INFERENCE_WORKERS=1`、`WORKSPACE_ROOT`/`ANSWER_ROOT`/`LOGS_ROOT`、`callback_url()`/`answer_dir()`/`pred_path()`、`CALLBACK_MAX_RETRIES=3`/`CALLBACK_TIMEOUT_S=10` |
-| `tasks.py` | 单例 `ThreadPoolExecutor(max_workers=1)` + `submit_inference` + `post_callback`(指数退避重试)+ `_write_task_error`(原子写)+ `_tasks` 状态表 + `task_summary`/`get_task_status`/`shutdown` |
+| `config.py` | 端口/路径/回调常量(均可环境变量覆盖):`SERVICE_PORT=8000`、`INFERENCE_WORKERS=2`(2026-09-03 提速,见 §3.1)、`WORKSPACE_ROOT`/`ANSWER_ROOT`/`LOGS_ROOT`、`callback_url()`/`answer_dir()`/`pred_path()`、`CALLBACK_MAX_RETRIES=3`/`CALLBACK_TIMEOUT_S=10` |
+| `tasks.py` | 单例 `ThreadPoolExecutor(max_workers=config.INFERENCE_WORKERS)` + `submit_inference` + `post_callback`(指数退避重试)+ `_write_task_error`(原子写)+ `_tasks` 状态表 + `task_summary`/`get_task_status`/`shutdown` |
 | `case_discovery.py` | **A2 新增** `discover_cases(dataset_path)` 纯函数:递归遍历目录,静/动分派(`.dcm`→static,`.nii.gz`/`.nii`→dynamic)+ 取 PatientId/subdir_uid(静态读 DICOM 头,动态按组委会口径取直接父目录名)。只做发现不接推理,无重依赖 |
 | `runner.py` | **A2 新增** 真实推理 runner:模型只 build 一次跨病例复用 + 单病例失败隔离 + V2.1 落盘。见 §4.1 |
 
@@ -35,10 +35,21 @@ V2.1《赛事开发规范》§二/§三 的 HTTP 交互层。与旧的离线 CLI
 
 ## 3. 关键约束与"为什么"
 
-### 3.1 worker=1 串行(`config.INFERENCE_WORKERS=1`)
-单卡 32G 显存(2026-08-12 云 agent 实测,见总纲 §3;2026-08-11 的"14~16G"误判已作废)下并发推理仍可能吃紧(模型非线程安全)。串行执行、
-队列排队是唯一安全解。**线程池必须模块级单例**:worker=1 的排队语义要求所有任务
-共用同一个池,各自新建等于并发,直接违背串行前提。
+### 3.1 worker=2 病例级并行(2026-09-03 提速,原 worker=1 串行已作废)
+实测 1060 病例纯串行 3 小时、GPU 占用极低 → `config.INFERENCE_WORKERS` 默认 1→2。
+**两层并行的分工**(勿混淆):
+- `tasks._executor` worker 数:只在外层——平台**同时下发多个 /call** 时才有并发;
+- `runner._run_cases`:**真正的病例级并行**(按 patient_id 分组、组间 ThreadPool
+  上界 2、**组内串行**——同 pid 多序列落同一 prediction.json 路径,组内并发会
+  交错写同一 tmp 文件产出损坏 JSON,#117 的并发恶化形态)。
+
+并发安全配套(全部 2026-09-03 落地):Deduplicator `_lock`(共享
+hashes/embeddings/FAISS 串行化,torch 提取在锁外防全程序串行)、`runner._ensure_built`
+构建锁(check-then-act 双重建竞态)、`inference_mode` 前向只读。已知残留:共享
+tamper_detector 的 `last_soft_flags` 并发下可能跨病例串台(soft 模式仅污染不计分
+审计字段,官方已豁免真实性考核,可接受)。**上界锁死 2**:内存单大动态病例峰值
+~16G,×4>64G 有 OOM 尾险(`runner._run_cases` 内 `min(workers,2)` 与 config 双保险)。
+线程池仍须**模块级单例**:各自新建等于无界并发。
 
 ### 3.2 /health 必须极轻不阻塞
 平台探活探针每 30 秒打一次 `/health`,**连续失败 3 次就重启测评容器**;启动探针
@@ -100,7 +111,8 @@ runner(dataset_path: str, output_dir: str) -> None
    CUDA OOM/NIfTI 损坏/数值 NaN)只落该例的 `prediction.json` ERROR 占位 + 记日志,**绝不 raise
    拖垮整批**(平台只有一次评测机会,一例崩掉整批 = 全部零输出)。
 3. **匿名化/gatekeeper 不因批量而跳过**:每病例照跑 `load_input_image` 的 DICOM PHI 匿名化与
-   逐帧 gatekeeper 审计,与 CLI 同语义。gatekeeper 默认 soft(赛道七豁免),`passed` 恒 True;
+   gatekeeper 审计(动态只审抽样帧,CLI 保持全帧——两条链路有意不同,见 runner `_run_dynamic_case`
+   提速注释)。gatekeeper 默认 soft(赛道七豁免),`passed` 恒 True;
    仅显式 `enforcement_mode: hard` 且命中硬判据才走拒绝分支(`_rejection_result`,落 REJECTED
    占位不产诊断)。
 
@@ -135,7 +147,7 @@ ERROR/REJECTED 原因)。**该函数自身绝不抛**(写盘失败只记日志),
 |:--|:--|:--|:--|
 | `SERVICE_PORT` | `8000` | `AICOMP_PORT` | 规范 §三 硬约束,健康检查必须在 8000 |
 | `SERVICE_HOST` | `0.0.0.0` | `AICOMP_HOST` | 容器须监听 0.0.0.0 |
-| `INFERENCE_WORKERS` | `1` | `AICOMP_INFERENCE_WORKERS` | **必须为 1**(见 §3.1) |
+| `INFERENCE_WORKERS` | `2` | `AICOMP_INFERENCE_WORKERS` | 病例级并行上界 2(见 §3.1;诊断需单线程时设 1) |
 | `WORKSPACE_ROOT` | `/2026aicompetition/workspace` | `AICOMP_WORKSPACE` | 平台挂载的工作区根 |
 | `ANSWER_ROOT` | `{WORKSPACE_ROOT}/answer` | `AICOMP_ANSWER_ROOT` | 推理结果根;`{eval_id}` 子目录由代码动态建 |
 | `LOGS_ROOT` | `{WORKSPACE_ROOT}/logs` | `AICOMP_LOGS_ROOT` | 平台读不到指定日志"可能被标记可疑" |
@@ -159,7 +171,7 @@ ERROR/REJECTED 原因)。**该函数自身绝不抛**(写盘失败只记日志),
 | 测试文件 | 覆盖点 | 例数 |
 |:--|:--|:--|
 | `tests/test_service_api.py` | 服务层 HTTP 路由/回调/容错(见 src/service/AGENTS.md 正文) | 20 |
-| `tests/test_service_runner.py` | runner 批量编排:逐病例调 write_case_v21、单病例失败隔离落 ERROR 占位、模型只 build 一次(跨病例 + 跨多次 build_service_runner 缓存)、空/无效数据集不崩 | 12 |
+| `tests/test_service_runner.py` | runner 批量编排:逐病例调 write_case_v21、单病例失败隔离落 ERROR 占位、模型只 build 一次(跨病例 + 跨多次 build_service_runner 缓存)、空/无效数据集不崩、动态审计帧抽样(默认 3/环境变量覆盖/非法值兜底) | 15 |
 | `tests/test_case_discovery.py` | `discover_cases` 静/动分派、静态 DICOM 头读取、动态按组委会口径取直接父目录名、路径推断、空目录不崩、**跨文件系统确定性顺序契约**(反转 os.scandir 序仍恒为字典序 DFS,钉死 `dirs.sort()`;2026-08-12 CI flaky 修复) | 40 |
 
 `TestPlaceholderRunner` 用例(占位 runner 明确标注输出为空)仍在 `test_service_api.py` 中,

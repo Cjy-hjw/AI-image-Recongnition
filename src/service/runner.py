@@ -356,12 +356,11 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
     #   ② 实测动态 9-25s 的大头就是 32 帧×每帧 auth+dedup+tamper 0.3-0.5s;
     #   ③ 审计帧只是采样,不影响 diagnose_dynamic_case 消费的全部 frames —— 推理
     #      输入/输出与减审前逐位相同。
-    # n_frames_audited 如实记实际审计帧数;audit_frames<=0 时回退全帧审计(旧行为)。
+    # n_frames_audited 如实记实际审计帧数;audit_frames<=0 时 uniform_sample_indices
+    # 自身语义即返回全帧下标(审查 130 格边界矩阵实测与显式 else 分支逐位等价,
+    # 故不再单独分支,消除两处全帧语义的漂移面)。
     audit_frames = _resolve_audit_frames()
-    if 0 < audit_frames < len(frames):
-        audit_positions = uniform_sample_indices(len(frames), audit_frames)
-    else:
-        audit_positions = list(range(len(frames)))
+    audit_positions = uniform_sample_indices(len(frames), audit_frames)
     frame_audits = []
     any_auth_skipped = False  # 任一幕 auth_skipped 即聚合 True(见下)
     for pos in audit_positions:

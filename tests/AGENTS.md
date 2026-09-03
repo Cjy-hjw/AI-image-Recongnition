@@ -99,17 +99,19 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 `OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
 
-## 测试总数(单一权威,2026-08-17 实测)
+## 测试总数(单一权威,2026-09-03 实测)
 
-**全套 969 passed + 1 skipped**(2026-08-30 变异审计补 2 条数值断言后,`Demo_D` 口径,
-`--collect-only` 实测 **970 collected**)。演进链 940 **+19 = backlog #128**
+**全套 975 passed + 1 skipped**(2026-09-03 推理提速三件套后,`Demo_D` 口径,
+`--collect-only` 实测 **976 collected**)。演进链 940 **+19 = backlog #128**
 (损失 10 + 监控 9)→ 959 **+8 = Gate2 三处修复**(负 la_tau 守卫 6 项 /
-`ete_logits` 部分帧缺失 1 项 / `ete_probs` 长度契约 1 项)→ **967 +2 = 变异审计补测**
+`ete_probs` 长度契约 1 项)→ **967 +2 = 变异审计补测**
 (2026-08-30 系统变异审计发现「丢 dist 项」「ordinal 归一化指数错」两个变异在既有
 测试下存活——`total` 的数值构成与 `/(C-1)²` 归一化此前无任何数值断言,补
 `test_ordinal_distance_loss_exact_value_with_normalization` /
 `test_compute_extension_loss_total_decomposes_into_qwk_and_dist` 后两变异均被杀死,
 10 变异 8 KILLED / 2 存活且存活者已全部补测覆盖)。
+**969 +6 = 推理提速三件套**(2026-09-03:审计帧抽样 3 项 + Dedup 并发加锁 1 项 +
+worker 默认值改名 1 项 + api fixture 隔离 1 项)。
 ⚠️ 上一段(940+1)时曾罕见地**两个环境同数**:`Demo_D` 与 `torch28` 预演环境都是
 940+1 —— 那是巧合不是规律,别据此以为跨环境可比(见下方「跨环境不可比」条)。
 

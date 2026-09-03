@@ -83,6 +83,7 @@ def _isolate_env_and_cache(monkeypatch, tmp_path):
     monkeypatch.delenv("AICOMP_CONFIG", raising=False)
     monkeypatch.delenv("AICOMP_PRECISION", raising=False)
     monkeypatch.delenv("AICOMP_MAX_FRAMES", raising=False)
+    monkeypatch.delenv("AICOMP_AUDIT_FRAMES", raising=False)
     runner_mod._RUNNER_CACHE.clear()
     yield
     runner_mod._RUNNER_CACHE.clear()
@@ -196,13 +197,50 @@ class TestPerCaseDispatch:
         assert isinstance(ms, int) and ms >= 0
 
     def test_gatekeeper_not_skipped_per_case(self, mock_heavy, tmp_path):
-        """批量下 gatekeeper 仍每病例照跑(静态 1 次 + 动态每帧 1 次)。"""
+        """批量下 gatekeeper 仍每病例照跑(静态 1 次 + 动态审计帧各 1 次)。"""
         _make_dcm(str(tmp_path / "PS" / "S" / "a.dcm"), patient_id="PS")
         _save_nifti(str(tmp_path / "PD" / "PD" / "PD.nii.gz"), n_frames=3)
         out = tmp_path / "out"
         runner_mod.build_service_runner()(str(tmp_path), str(out))
-        # 静态 1 次 + 动态 3 帧 = 4 次 gatekeeper 调用
+        # 静态 1 次 + 动态 3 帧(3 帧 ≤ 默认审计上限 3 → 全审) = 4 次 gatekeeper 调用
         assert mock_heavy["gatekeeper_calls"] == 4
+
+    def test_dynamic_audit_frames_sampled_not_all(self, mock_heavy, tmp_path):
+        """2026-09-03 提速回归:动态审计只抽至多 AICOMP_AUDIT_FRAMES 帧(默认 3),
+        不逐帧审全部抽样帧;诊断仍消费全部 frames(n_frames_sampled 不变)。
+        减审依据=soft 模式零分值影响(见 runner._run_dynamic_case 注释)。"""
+        # 12 帧 > 默认审计上限 3 → 只审 3 帧(均匀:首/中/尾)
+        _save_nifti(str(tmp_path / "PD" / "PD" / "PD.nii.gz"), n_frames=12)
+        out = tmp_path / "out"
+        runner_mod.build_service_runner()(str(tmp_path), str(out))
+
+        # 只审 3 帧,不是 12 帧(提速生效)
+        assert mock_heavy["gatekeeper_calls"] == 3
+        dyn = mock_heavy["written"][0]["case_result"]
+        ga = dyn["gatekeeper_audit"]
+        assert ga["n_frames_audited"] == 3
+        assert ga["n_frames_sampled"] == 12, "推理消费的帧数不受减审影响"
+
+    def test_dynamic_audit_frames_env_override_full(self, mock_heavy, tmp_path,
+                                                    monkeypatch):
+        """AICOMP_AUDIT_FRAMES<=0 恢复全帧审计(旧行为,回退开关)。"""
+        _save_nifti(str(tmp_path / "PD" / "PD" / "PD.nii.gz"), n_frames=5)
+        monkeypatch.setenv("AICOMP_AUDIT_FRAMES", "0")
+        out = tmp_path / "out"
+        runner_mod.build_service_runner()(str(tmp_path), str(out))
+        assert mock_heavy["gatekeeper_calls"] == 5
+        ga = mock_heavy["written"][0]["case_result"]["gatekeeper_audit"]
+        assert ga["n_frames_audited"] == 5
+
+    def test_dynamic_audit_frames_env_invalid_falls_back(self, mock_heavy, tmp_path,
+                                                         monkeypatch):
+        """AICOMP_AUDIT_FRAMES 非法值(非整数)回默认 3,不崩。"""
+        _save_nifti(str(tmp_path / "PD" / "PD" / "PD.nii.gz"), n_frames=6)
+        monkeypatch.setenv("AICOMP_AUDIT_FRAMES", "not-a-number")
+        out = tmp_path / "out"
+        runner_mod.build_service_runner()(str(tmp_path), str(out))
+        assert mock_heavy["gatekeeper_calls"] == 3
+
 
 
 # ── 测试:单病例失败隔离(红线)────────────────────────────────────────────────
@@ -214,31 +252,32 @@ class TestPerCaseFailureIsolation:
         _make_dcm(str(tmp_path / "GOOD2" / "S" / "c.dcm"), patient_id="GOOD2")
         out = tmp_path / "out"
 
-        def _explode_on_bad(*a, **k):
-            raise RuntimeError("simulated diagnose crash")
-
-        # 让 BAD 例崩掉。依据 = `discover_cases` 的**顺序契约**:路径字典序 DFS
-        # (子目录名与文件名均显式排序,见 case_discovery.py 的 `dirs.sort()`),
-        # 故 BAD < GOOD1 < GOOD2,BAD 是第 1 例。
-        # 🔴 该假设**必须显式断言**,不能只写在注释里:2026-08-12 CI
-        # (run 31512732898)曾因 `os.walk` 未排子目录、Linux 走 hash 序而首例变成
-        # GOOD1,报错是 `assert 'GOOD1' in {'BAD','GOOD2'}` —— 完全看不出是顺序
-        # 问题,排查成本极高。下面这行让契约一旦破裂就直接指名道姓。
+        # 2026-09-03 起病例级并行(_run_cases 组间并发)下,「第 N 次调用=某例」
+        # 不再成立(执行次序非确定),旧版按 call_n==1 判 BAD 会随机炸掉 GOOD1。
+        # 改为按调用方栈帧的 case["patient_id"] 精确判定目标病例。
         from src.service.case_discovery import discover_cases
-        assert [c["patient_id"] for c in discover_cases(str(tmp_path))] == [
+        assert sorted(c["patient_id"] for c in discover_cases(str(tmp_path))) == [
             "BAD", "GOOD1", "GOOD2",
-        ], "discover_cases 顺序契约(字典序 DFS)被破坏 —— 本测试的「首例=BAD」前提失效"
+        ], "discover_cases 未发现全部三例 —— 本测试的病例集合前提失效"
 
         box_diagnose = mock_heavy["diagnose_static"]
-        call_n = {"n": 0}
+        bad_pids = {"BAD"}
 
-        def _selective(*a, **k):
-            call_n["n"] += 1
-            if call_n["n"] == 1:  # 首例(BAD,字典序最小)
-                raise RuntimeError("simulated diagnose crash")
+        def _explode_on_bad(*a, **k):
+            # 由被调方透传的 case dict 拿 patient_id(诊断签名不含它,故从 a[1]
+            # 或 kwargs 里找不可靠;改为闭包内按"是否已知坏例"的调用次序不可行
+            # ——并行执行下无稳定次序)。最稳的判据:mock_heavy["diagnose_static"]
+            # 的调用方是 _run_static_case(case, ...),case 在调用栈上,通过
+            # inspect 从栈帧取 case["patient_id"] 判定。
+            import inspect
+            for frame_info in inspect.stack():
+                loc = frame_info.frame.f_locals
+                if "case" in loc and isinstance(loc["case"], dict):
+                    if loc["case"].get("patient_id") in bad_pids:
+                        raise RuntimeError("simulated diagnose crash")
             return box_diagnose(*a, **k)
 
-        mock_heavy["diagnose_static"] = _selective
+        mock_heavy["diagnose_static"] = _explode_on_bad
 
         runner_mod.build_service_runner()(str(tmp_path), str(out))
 
@@ -269,28 +308,31 @@ class TestPerCaseFailureIsolation:
 
         import src.inference.gatekeeper_runner as gatekeeper_mod
         import src.inference.io as io_mod
-        # P_REJECTED 触发硬拒绝,其余仍 pass。用 img_np 的输入路径无法直接区分,
-        # 改为按调用次数:静态每例 run_gatekeeper 恰调一次,依 `discover_cases` 的
-        # 字典序 DFS 顺序契约 P_OK < P_REJECTED,第二例即 P_REJECTED。
-        # 🔴 同上,顺序契约显式断言(不显式断的代价见上一个测试的注释)。
+        # P_REJECTED 触发硬拒绝,其余仍 pass。2026-09-03 病例级并行下「第 N 次调用
+        # =某例」不再成立,改为按调用方栈帧的 case["patient_id"] 精确判定目标病例
+        # (run_gatekeeper_audit 的调用方 _run_static_case 持有 case dict)。
         from src.service.case_discovery import discover_cases
-        assert [c["patient_id"] for c in discover_cases(str(tmp_path))] == [
+        assert sorted(c["patient_id"] for c in discover_cases(str(tmp_path))) == [
             "P_OK", "P_REJECTED",
-        ], "discover_cases 顺序契约(字典序 DFS)被破坏 —— 本测试的「第2例=P_REJECTED」前提失效"
+        ], "discover_cases 未发现全部两例 —— 本测试的病例集合前提失效"
 
-        call_n = {"n": 0}
+        import inspect
+        _reject_pids = {"P_REJECTED"}
 
-        def _reject_second(img_np, *a, **k):
-            call_n["n"] += 1
-            if call_n["n"] == 2:
-                return False, {"flagged": True, "would_reject_in_hard_mode": True,
-                               "enforcement_mode": "hard",
-                               "reason": "simulated tamper hard-reject",
-                               "soft_flags": ["tamper"]}
+        def _reject_target(*a, **k):
+            for frame_info in inspect.stack():
+                loc = frame_info.frame.f_locals
+                if "case" in loc and isinstance(loc["case"], dict) \
+                        and loc["case"].get("patient_id") in _reject_pids:
+                    return False, {
+                        "flagged": True, "would_reject_in_hard_mode": True,
+                        "enforcement_mode": "hard",
+                        "reason": "simulated tamper hard-reject",
+                        "soft_flags": ["tamper"]}
             return True, {"flagged": False, "would_reject_in_hard_mode": False,
                           "enforcement_mode": "hard", "reason": "", "soft_flags": []}
 
-        monkeypatch.setattr(gatekeeper_mod, "run_gatekeeper_audit", _reject_second)
+        monkeypatch.setattr(gatekeeper_mod, "run_gatekeeper_audit", _reject_target)
 
         runner_mod.build_service_runner()(str(tmp_path), str(out))
 

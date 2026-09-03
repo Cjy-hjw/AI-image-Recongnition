@@ -19,9 +19,9 @@
 ## 批处理流水线
 
     discover_cases(dataset_path)          # case_discovery:静/动分派 + PatientId/subdir_uid
-      └ 逐病例(每病例独立 try/except):
+      └ 按 patient_id 分组 → 组间病例级并发(见 _run_cases)/组内串行:
           static  → load_input_image(DICOM 内存 PHI 匿名化,不落盘) → gatekeeper → diagnose_static_case
-          dynamic → load_nifti_frames → 逐帧 gatekeeper → diagnose_dynamic_case
+          dynamic → load_nifti_frames → 抽样帧 gatekeeper → diagnose_dynamic_case
           ↓
           case_dir = {output_dir}/{patient_id} →  write_case_v21(..., kind, processing_ms)
           (一级 case_dir;write_case_v21 内部建 {patient_id}/{subdir_uid}/ 放 mask,
@@ -39,10 +39,12 @@
    **绝不 raise 拖垮整批** —— 平台只有一次评测机会,一例崩掉整批 = 全部零输出。
    与逐帧坏帧隔离(case_pipeline)同一哲学,粒度提到病例级。
 3. **匿名化/gatekeeper 不因批量而跳过**:每病例照跑 `load_input_image` 的 DICOM
-   PHI 匿名化与逐帧 gatekeeper 审计,与 CLI(`predict.py`/`video_predict.py`)同语义。
-   gatekeeper 默认 soft(赛道七豁免,误拒一次白丢该病例全部临床得分),故 soft 下 `passed`
+   PHI 匿名化与 gatekeeper 审计(动态只审抽样帧,CLI 保持全帧——两条链路有意
+   不同,见 `_run_dynamic_case` 的提速注释)。gatekeeper 默认 soft(赛道七豁免,
+   误拒一次白丢该病例全部临床得分),故 soft 下 `passed`
    恒 True;仅当配置显式 `enforcement_mode: hard` 且命中硬判据时才走拒绝分支
-   (落 `prediction.json` REJECTED 占位,不产诊断)。
+   (落 `prediction.json` REJECTED 占位,不产诊断)。⚠️ hard 误配下动态审计覆盖
+   会从全帧衰减至抽样帧数——交付配置是 soft,且 `AICOMP_AUDIT_FRAMES<=0` 可回退。
 
 ## 加载失败/无有效诊断/被拒绝的病例落盘语义
 
@@ -60,7 +62,8 @@
 @云TODO(云端首跑校正):
 - 权重/config 路径来自环境变量 `AICOMP_WEIGHTS`/`AICOMP_CONFIG`/`AICOMP_PRECISION`
   (缺省回落 predict.py 同款路径),容器内若挂载点不同须云端首跑核对;
-- gatekeeper 在批量下的耗时(逐帧审计 × 病例数)未实测,云端首跑观察是否需降采样;
+- gatekeeper 批量耗时:动态默认只审均匀抽样的 3 帧(AICOMP_AUDIT_FRAMES 可覆盖,<=0 恢复
+  全帧);soft 模式下减审不影响诊断与计分(2026-09-03 提速落地);
 - 动态 AccessionNumber(=subdir_uid)来源已明确(组委会口径=直接父目录名,见 case_discovery),
   但推理输入目录层级仍须云端首跑核对。
 """
@@ -69,9 +72,11 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from src.service.case_discovery import discover_cases
 from src.inference import prediction_json
+from src.inference.video_aggregate import uniform_sample_indices
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,10 @@ _ENV_CONFIG = "AICOMP_CONFIG"
 _ENV_PRECISION = "AICOMP_PRECISION"
 # 动态 loader 的 max_frames(均匀抽样上限),<=0 取全帧。与 video_predict.py 默认 32 对齐。
 _ENV_MAX_FRAMES = "AICOMP_MAX_FRAMES"
+# 动态 gatekeeper 审计帧数上限(2026-09-03 提速:逐帧审计 32 帧×每帧 0.3-0.5s 是动态
+# 9-25s 耗时的大头)。<=0 = 全帧审计(旧行为)。
+_ENV_AUDIT_FRAMES = "AICOMP_AUDIT_FRAMES"
+_DEFAULT_AUDIT_FRAMES = 3
 
 _DEFAULT_CONFIG = "configs/thyroid_config.yaml"
 _DEFAULT_WEIGHTS = "checkpoints/thyroidxl_merged_v2.pth"
@@ -93,8 +102,8 @@ _VALID_PRECISIONS = ("fp32", "fp16", "bf16")
 
 # ── 模块级 runner 缓存(同参数只 build 一次)────────────────────────────────
 # key = (config_path, weights, precision, max_frames);value = runner 闭包。
-# 线程池 worker=1(tasks.INFERENCE_WORKERS)下天然串行,但 /call 的 event loop 线程
-# 可能并发调 build_service_runner,故加锁防「双检查」竞态重复 build。
+# /call 的 event loop 线程可能并发调 build_service_runner,故加锁防「双检查」
+# 竞态重复注册;_ensure_built 的构建竞态另由 per-runner build_lock 防护(见下)。
 _RUNNER_CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
@@ -145,40 +154,47 @@ def build_service_runner(config_path=None, weights=None, precision=None, max_fra
         return cached
 
     # 惰性构建:真正的 build_model/load_config 推迟到 runner 首次被调用(见 docstring)。
+    # _BUILD_LOCK 串行化 _ensure_built:check-then-act(`if state["built"]: return` →
+    # 秒级慢构建 → `state.update(built=True)`)无锁时两线程并发首调会双重建(两份模型
+    # + 两份 200 图播种,瞬时显存翻倍)。worker≥2(tasks.INFERENCE_WORKERS)下两
+    # worker 可并发接任务,该竞态真实可达(2026-09-03 审查实测 build_count=2);
+    # _CACHE_LOCK 只护缓存查表、护不到这里,故另设 per-runner 构建锁。
     state = {"built": False, "model": None, "config": None, "calibrator": None,
              "device": None, "weights": None, "dedup": None, "auth": None,
              "tamper": None}
+    build_lock = threading.Lock()
 
     def _ensure_built():
         """首次调用时建模型 + gatekeeper 三件重型对象,后续幂等复用。"""
-        if state["built"]:
-            return
-        import torch
-        from src.inference.model_runner import build_model, load_config
-        from src.inference.calibration import TemperatureScaler
-        from src.inference.gatekeeper_runner import (
-            build_seeded_deduplicator, build_auth_module, build_tamper_detector)
+        with build_lock:
+            if state["built"]:
+                return
+            import torch
+            from src.inference.model_runner import build_model, load_config
+            from src.inference.calibration import TemperatureScaler
+            from src.inference.gatekeeper_runner import (
+                build_seeded_deduplicator, build_auth_module, build_tamper_detector)
 
-        config = load_config(config_path)
-        device = torch.device(
-            config["environment"]["device"] if torch.cuda.is_available() else "cpu")
-        model = build_model(config, weights, device)
-        cal_path = config.get("calibration", {}).get(
-            "param_file", "checkpoints/calibration.json")
-        calibrator = TemperatureScaler.from_file(cal_path)
-        # gatekeeper 三件重型对象建一次跨病例/跨帧复用(与 video_predict 同款:
-        # dedup 播种 200 张训练图、auth 加载 authenticity 权重、tamper 探 CAT-Net 权重,
-        # 每病例/每帧重建会把批量延迟打爆)。
-        state.update(
-            model=model, config=config, calibrator=calibrator, device=device,
-            weights=weights,
-            dedup=build_seeded_deduplicator(config, device),
-            auth=build_auth_module(weights),
-            tamper=build_tamper_detector(config),
-            built=True)
-        logger.info(
-            "[runner] 模型已构建并缓存:config=%s weights=%s precision=%s device=%s",
-            config_path, weights, precision, device)
+            config = load_config(config_path)
+            device = torch.device(
+                config["environment"]["device"] if torch.cuda.is_available() else "cpu")
+            model = build_model(config, weights, device)
+            cal_path = config.get("calibration", {}).get(
+                "param_file", "checkpoints/calibration.json")
+            calibrator = TemperatureScaler.from_file(cal_path)
+            # gatekeeper 三件重型对象建一次跨病例/跨帧复用(与 video_predict 同款:
+            # dedup 播种 200 张训练图、auth 加载 authenticity 权重、tamper 探 CAT-Net 权重,
+            # 每病例/每帧重建会把批量延迟打爆)。
+            state.update(
+                model=model, config=config, calibrator=calibrator, device=device,
+                weights=weights,
+                dedup=build_seeded_deduplicator(config, device),
+                auth=build_auth_module(weights),
+                tamper=build_tamper_detector(config),
+                built=True)
+            logger.info(
+                "[runner] 模型已构建并缓存:config=%s weights=%s precision=%s device=%s",
+                config_path, weights, precision, device)
 
     def runner(dataset_path, output_dir):
         """生产推理入口(tasks.submit_inference 的 runner 契约)。"""
@@ -193,12 +209,59 @@ def build_service_runner(config_path=None, weights=None, precision=None, max_fra
             logger.warning(
                 "[runner] 未发现任何病例(dataset_path=%s)。整批无输出,"
                 "若平台期望非空须核对目录结构(@云TODO)", dataset_path)
-        for case in cases:
-            _process_case(case, output_dir, state, precision, max_frames)
+        _run_cases(cases, output_dir, state, precision, max_frames)
 
     with _CACHE_LOCK:
         _RUNNER_CACHE[cache_key] = runner
     return runner
+
+
+def _run_cases(cases, output_dir, state, precision, max_frames):
+    """病例级并行执行(2026-09-03 提速,响应 worker 1→2)。
+
+    按 patient_id 分组:**组间并发**(ThreadPoolExecutor,worker 数取
+    config.INFERENCE_WORKERS,**上界 2**)、**组内串行**——组内串行是硬契约:
+    同 PatientId 多序列的 prediction.json 落同一路径(case_dir = {output}/{pid}),
+    组内并发会让两线程同时写同一 tmp 文件(`{path}.tmp.{pid}` 只含 pid 不含
+    tid)交错出损坏 JSON → 官方评分器读不进 → 整例失分(#117 的并发恶化形态)。
+    组间不同 pid 的写路径互不相交,并发安全。
+
+    ⚠️ 上界锁死 2 不放开的理由(与 config.INFERENCE_WORKERS 注释一致):
+    ① 单大动态病例内存峰值 ~16G,×4 > 64G 有 OOM 尾险;② 共享 tamper_detector
+    的 `last_soft_flags` 是逐次 detect 重置的实例属性,并发 detect 会让两病例的
+    软 flag 互相覆盖(审查实测 40 次并发 1 次错位;soft 模式仅污染不计分的审计
+    字段,可接受,但并发度越高错位越频繁);③ GPU 前向在 2 路并发下已接近饱和。
+    """
+    # discover_cases 的顺序契约(字典序 DFS)保证同 pid 的序列相邻,分组保序。
+    groups = []
+    by_pid = {}
+    for case in cases:
+        pid = str(case["patient_id"])
+        if pid not in by_pid:
+            by_pid[pid] = []
+            groups.append(by_pid[pid])
+        by_pid[pid].append(case)
+
+    workers = min(_inference_workers(), 2, max(len(groups), 1))
+    if workers <= 1 or len(groups) <= 1:
+        for group in groups:
+            for case in group:
+                _process_case(case, output_dir, state, precision, max_frames)
+        return
+
+    def _run_group(group):
+        for case in group:
+            _process_case(case, output_dir, state, precision, max_frames)
+
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="case") as pool:
+        list(pool.map(_run_group, groups))
+
+
+def _inference_workers():
+    """读 config.INFERENCE_WORKERS(延迟 import 避免测试循环导入)。"""
+    from src.service import config as _config
+    return max(1, int(_config.INFERENCE_WORKERS))
 
 
 def _process_case(case, output_dir, state, precision, max_frames):
@@ -283,30 +346,49 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
     if frames is None:
         raise RuntimeError(f"输入加载失败: {error_msg}")
 
-    # 逐帧 gatekeeper(复用跨病例已建的重型对象;与 video_predict 逐帧同款)。
+    # 逐帧 gatekeeper(复用跨病例已建的重型对象)。⚠️ CLI video_predict.py 仍全帧
+    # 审计(调试旁路,保留全帧保真语义);service 部署策略不同,见下方提速注释。
+    # 2026-09-03 提速:只审均匀抽样的至多 N 帧(默认 3,首/中/尾),不逐帧审全部 32 帧。
+    # 依据(三重,缺一不可):
+    #   ① 生产 enforcement_mode=soft 下 gatekeeper 从不 REJECT(run_gatekeeper_audit
+    #      仅 hard+命中才返 False),audit 结论只落 gatekeeper_audit 软字段,无任何计分
+    #      消费方;官方 2026-07-28 已豁免赛道七真实性考核 → 减审**零分值影响**;
+    #   ② 实测动态 9-25s 的大头就是 32 帧×每帧 auth+dedup+tamper 0.3-0.5s;
+    #   ③ 审计帧只是采样,不影响 diagnose_dynamic_case 消费的全部 frames —— 推理
+    #      输入/输出与减审前逐位相同。
+    # n_frames_audited 如实记实际审计帧数;audit_frames<=0 时回退全帧审计(旧行为)。
+    audit_frames = _resolve_audit_frames()
+    if 0 < audit_frames < len(frames):
+        audit_positions = uniform_sample_indices(len(frames), audit_frames)
+    else:
+        audit_positions = list(range(len(frames)))
     frame_audits = []
     any_auth_skipped = False  # 任一幕 auth_skipped 即聚合 True(见下)
-    for pos, frame_np in zip(frame_indices, frames):
+    for pos in audit_positions:
+        frame_np = frames[pos]
         passed, audit = run_gatekeeper_audit(
             frame_np, state["config"], state["device"], state["weights"],
             case_dir, deduplicator=state["dedup"], auth_module=state["auth"],
             tamper_detector=state["tamper"])
         if not passed:  # 仅 hard 模式可达
-            audit["rejected_frame_index"] = int(pos)
+            audit["rejected_frame_index"] = int(frame_indices[pos])
             return _rejection_result(audit)
         if audit.get("auth_skipped"):
             any_auth_skipped = True
         if audit["flagged"]:
-            frame_audits.append({"frame_index": int(pos), **audit})
+            frame_audits.append({"frame_index": int(frame_indices[pos]), **audit})
     # 动态图聚合层 audit:R3 的 auth_skipped 必须透传——静态链路用 {"skipped":False,**audit}
     # 保留了该键,动态聚合层若漏掉,运维在视频链路看不到 authenticity 项被跳过(Gate2 finding)。
     # 判据取自逐帧 audit 的 auth_skipped(任一幕 True 即聚合 True),覆盖两种跳过原因:
     # ①权重缺失降级(state["auth"] is None)②权重存在但 predict 在帧上崩溃。不能用
     # `state["auth"] is None` 单独判——那只覆盖①,漏了②(终审 P2),与静态链路判据不一致。
+    # 2026-09-03 提速后 n_frames_audited 是**实际审计帧数**(≤len(frames)),n_frames_sampled
+    # 单独记推理消费的全部抽样帧数,两个口径并存勿混。
     gatekeeper_audit = {
         "skipped": False,
         "enforcement_mode": resolve_enforcement_mode(state["config"]),
-        "n_frames_audited": len(frames),
+        "n_frames_audited": len(audit_positions),
+        "n_frames_sampled": len(frames),
         "n_frames_flagged": len(frame_audits),
         "flagged_frame_indices": [a["frame_index"] for a in frame_audits],
         "flagged": bool(frame_audits),
@@ -328,6 +410,15 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
     result["gatekeeper_audit"] = gatekeeper_audit
     result["n_total_frames"] = n_total_frames
     return result
+
+
+def _resolve_audit_frames():
+    """解析 AICOMP_AUDIT_FRAMES 环境变量(带畸形兜底,非法值回默认 3)。"""
+    raw = os.environ.get(_ENV_AUDIT_FRAMES, str(_DEFAULT_AUDIT_FRAMES))
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_AUDIT_FRAMES
 
 
 def _rejection_result(audit):

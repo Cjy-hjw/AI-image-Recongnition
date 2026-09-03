@@ -42,6 +42,12 @@ opencv-python-headless>=4.8.0,<5
 # 才是 DICOM)。缺此依赖 = 合规 mask 产不出 + 动图读不进来,两条路都零分。
 # 纯 Python + numpy,无额外系统库依赖,离线 wheel 可直接装。
 nibabel>=5.0.0
+# indexed_gzip:nibabel 5.x 读 .nii.gz 时若可用自动走 IndexedGzipFile。
+# ⚠️ 2026-09-03 审查实测:其收益场景是**随机访问/切片**读取,而当前
+# load_nifti_frames 是全量顺序读(np.asarray(img.dataobj)),收益近零——
+# 保留仅为 #126(坏文件容错降级需按帧读取)与未来切片式读取铺路。
+# 纯可选:未安装时 nibabel 自动回退 DeterministicGzipFile,行为不变。
+indexed_gzip>=1.6.0
 # Pillow 由 torchvision/albumentations/scikit-image 间接依赖,此前从未显式锁定,
 # 版本完全由 pip 解析器决定。Pillow 10.x 移除 Image.ANTIALIAS 等 API 曾造成上游
 # 静默破坏;显式声明下限防漂移。预演 venv(torch2.8)实测 12.2.0 可用,不设上限。

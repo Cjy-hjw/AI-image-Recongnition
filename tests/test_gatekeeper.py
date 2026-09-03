@@ -285,6 +285,50 @@ class TestDeduplication:
         dedup = Deduplicator(device="cpu", sscd_weights="/nonexistent/sscd.pt")
         assert dedup.extractor.feat_dim == 512
 
+    def test_add_and_query_concurrent_threadsafe(self):
+        """2026-09-03 回归(worker 1→2 前提):多线程并发 add_image/is_duplicate
+        不崩、不撕裂——hashes/embeddings/FAISS index 三者长度必须始终一致,
+        且并发后自查询(已入库的图)必须命中(锁不能把正确性锁丢)。"""
+        import threading
+        from src.gatekeeper.deduplication import Deduplicator
+
+        dedup = Deduplicator(device="cpu", sscd_weights="/nonexistent/sscd.pt")
+        n_seed, n_query = 8, 16
+        errors = []
+
+        def _seeder():
+            try:
+                for i in range(n_seed):
+                    dedup.add_image(_structured_ultrasound(seed=100 + i))
+            except Exception as e:  # noqa: BLE001
+                errors.append(("seed", e))
+
+        def _queryer():
+            try:
+                for i in range(n_query):
+                    # 空库时 is_duplicate 必须安全返回 False(早退分支在锁内)
+                    dedup.is_duplicate(_structured_ultrasound(seed=200 + i))
+            except Exception as e:  # noqa: BLE001
+                errors.append(("query", e))
+
+        threads = [threading.Thread(target=_seeder) for _ in range(2)] + \
+                  [threading.Thread(target=_queryer) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert not errors, f"并发 add/query 抛异常: {errors}"
+        # 三个共享结构长度一致(撕裂=FAISS 与 embeddings 不同步)
+        assert len(dedup.hashes) == len(dedup.embeddings) == 2 * n_seed
+        if dedup.use_faiss:
+            assert dedup.index.ntotal == 2 * n_seed, (
+                f"FAISS ntotal={dedup.index.ntotal} != embeddings {len(dedup.embeddings)}"
+                " —— 锁内两步不同步")
+        # 已入库的图自查询必须命中 dHash(确定性;锁不能丢正确性)
+        is_dup, reason = dedup.is_duplicate(_structured_ultrasound(seed=100))
+        assert is_dup and "dHash" in reason, f"自查询未命中: {reason}"
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ② 规范性 - copy-move 篡改:可检出但召回不稳定(锁定有效区间)

@@ -7,12 +7,18 @@ torch 推理是同步阻塞的 CPU/GPU 代码 —— 若用 `asyncio.create_task
 跑,单张图的推理就会把整个 event loop 堵住,`/health` 无法响应,90 秒后容器被平台
 强制重启,**整场评测的进度全部作废且不可恢复**。
 
-故推理一律丢进 `ThreadPoolExecutor`(worker=1,见 `config.INFERENCE_WORKERS`),
-event loop 只负责收请求和回调,永远不阻塞。worker 应为 1 的理由:显存虽为官方
-实测 32G(2026-08-12 nvidia-smi,控制台"14"是 vCPU 数),"单 GPU/容器 + 模型非线程安全"
-仍使并发推理有 OOM/争用风险 —— 排队串行是唯一安全解。⚠️ 实际
-`config.INFERENCE_WORKERS` 可由环境变量 `AICOMP_INFERENCE_WORKERS` 覆盖,运维注入 >1 即
-破坏此串行/防 OOM 前提——交付容器勿设该变量。
+故推理一律丢进 `ThreadPoolExecutor`(worker 见 `config.INFERENCE_WORKERS`,2026-09-03
+起默认 2),event loop 只负责收请求和回调,永远不阻塞。
+
+⚠️ **线程池 worker 数 ≠ 病例级并行度**(2026-09-03 审查 P1):平台一批评测 =
+一个 /call = 一个任务,1060 病例在**同一个任务的 runner for 循环**里——本池的
+worker=2 只在平台同时下发多个 /call 时才并发。真正的病例级并行由
+`runner._run_cases` 实现(按 patient_id 分组、组间 ThreadPool、组内串行、上界 2),
+本池 worker 数只是它的外层上限之一。并发安全的配套前提(2026-09-03 已齐):
+Deduplicator 加锁、`_ensure_built` 构建锁、`inference_mode` 前向只读;已知残留:
+共享 tamper_detector 的 last_soft_flags 并发下可能跨病例串台(soft 模式仅污染
+不计分审计字段,可接受)。`AICOMP_INFERENCE_WORKERS` 环境变量仍可覆盖(诊断
+需要单线程行为时设 1)。
 """
 
 import json
@@ -26,8 +32,8 @@ from src.service import config
 
 logger = logging.getLogger(__name__)
 
-# 单例线程池。模块级而非每请求新建:线程池创建有成本,且 worker=1 的排队语义要求
-# 所有任务共用同一个池(各自新建等于并发,直接违背串行前提)。
+# 单例线程池。模块级而非每请求新建:线程池创建有成本,且多个 /call 的任务须共用
+# 同一个池才有确定的上限语义(各自新建等于无界并发)。
 _executor = ThreadPoolExecutor(
     max_workers=config.INFERENCE_WORKERS, thread_name_prefix="infer")
 

@@ -1,0 +1,411 @@
+"""diagnose_detection.py 单测:端到端 mock(monkeypatch 推理)+ 与 write_case_v21
+的等价回归(防实例抽取与生产漂移的安全桩)。
+
+合成 mini 官方数据集(复用 test_official_loader.py 的 mock 先例写法,复制而非
+跨文件 import——tests/ 无 __init__.py)。依赖 pydicom/nibabel/pandas/openpyxl,
+缺任一整文件 skip(与 test_official_loader.py 同口径)。
+"""
+import json
+import os
+
+import numpy as np
+import pytest
+
+pydicom = pytest.importorskip("pydicom")
+nib = pytest.importorskip("nibabel")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("openpyxl")
+
+import scripts.diagnose_detection as DD  # noqa: E402
+from src.dataset import official_loader as O  # noqa: E402
+from src.inference.nifti_io import save_binary_mask  # noqa: E402
+
+H = W = 64
+
+
+# ── mock fixture 生成器(复制自 test_official_loader.py,勿跨文件 import)────
+
+def _make_dcm(path: str, arr: np.ndarray):
+    """写最小可读 MONOCHROME2 8bit DICOM(pixel_array 能读回)。"""
+    from pydicom.dataset import Dataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+
+    ds = Dataset()
+    ds.Rows, ds.Columns = int(arr.shape[0]), int(arr.shape[1])
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.PixelRepresentation = 0
+    ds.PixelData = arr.astype(np.uint8).tobytes()
+
+    fm = FileMetaDataset()
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    fm.MediaStorageSOPClassUID = generate_uid()
+    fm.MediaStorageSOPInstanceUID = generate_uid()
+    ds.file_meta = fm
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        ds.save_as(path, write_like_original=False)          # pydicom 2.x
+    except TypeError:                                        # pydicom 3.x
+        ds.save_as(path, enforce_file_format=True)
+
+
+def _save_image_nifti_3d(path: str, vol_nhw: np.ndarray):
+    """(n_frames,H,W) 存 NIfTI,使 load_nifti_frames 读回同形(转置互逆)。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = np.transpose(vol_nhw.astype(np.uint8), (2, 1, 0))
+    nib.save(nib.Nifti1Image(np.ascontiguousarray(data), np.eye(4)), path)
+
+
+@pytest.fixture
+def diag_root(tmp_path):
+    """P1 静态单 GT / P2 静态一图两 GT(M+病灶1) / P3 动态 5 帧 mask 帧1/3 非零。"""
+    root = tmp_path / "annotation"
+
+    p1 = root / "P1" / "S1"
+    _make_dcm(str(p1 / "img1.dcm"), np.full((H, W), 120, np.uint8))
+    m1 = np.zeros((H, W), np.uint8); m1[20:40, 20:40] = 1
+    save_binary_mask(m1, str(p1 / "M_1_mask.nii.gz"))
+
+    # P2:同一张图、两个 GT 病灶(一图两 GT,钉死"只推理一次 + 一起进匈牙利")
+    p2 = root / "P2" / "S2"
+    _make_dcm(str(p2 / "img2.dcm"), np.full((H, W), 90, np.uint8))
+    m2 = np.zeros((H, W), np.uint8); m2[10:24, 10:24] = 1
+    save_binary_mask(m2, str(p2 / "M_1_mask.nii.gz"))
+    m3 = np.zeros((H, W), np.uint8); m3[40:54, 40:54] = 1
+    save_binary_mask(m3, str(p2 / "病灶1_1_mask.nii.gz"))
+
+    p3 = root / "P3" / "P3"
+    vol = np.stack([np.full((H, W), 40 + 20 * i, np.uint8) for i in range(5)])
+    _save_image_nifti_3d(str(p3 / "P3.nii.gz"), vol)
+    dmask = np.zeros((5, H, W), np.uint8)
+    dmask[1, 15:35, 15:35] = 1
+    dmask[3, 15:35, 15:35] = 1
+    save_binary_mask(dmask, str(p3 / "M_1_mask.nii.gz"))
+
+    rows = [
+        ["P1", "S1", "1", "M", "2左中叶", "2甲状腺包膜", "1有", "恶", "", "V类"],
+        ["P2", "S2", "1", "M", "5右中叶", "1无", "0无", "良", "", "IV类"],
+        ["P2", "S2", "1", "病灶1", "4右上叶", "1无", "0无", "良", "", "III类"],
+        ["P3", "", "2", "M", "7峡部", "1无", "1有", "恶", "", ""],
+    ]
+    df = pd.DataFrame(rows, columns=[
+        "PatientId", "SeriesUid", "图像性质", "RoiName", "主病灶位置",
+        "甲状腺外侵犯", "临床T分期", "ROI良恶性", "ANNOTATION->SliceIndex", "ROI-TIRADS",
+    ])
+    xlsx = tmp_path / "labels.xlsx"
+    df.to_excel(xlsx, sheet_name="ROI级别", index=False, startrow=1)
+    return str(root), str(xlsx)
+
+
+# fake 预测图的模型分辨率(≠原图 64×64,让 resize 真跑而非恒等映射——
+# B 路 2026-09-05 变异注入实测:fake 与原图同尺寸时,插值方式错误/尺寸错误
+# 全被恒等映射吞掉,等价回归对静态 resize 漂移零区分力)。
+MODEL_HW = (32, 32)
+
+
+# ── fake 推理产物(monkeypatch diagnose_*_case 的返回)──────────────────────
+
+def _fake_static_result(img_hw, boxes):
+    """构造 diagnose_static_case 的返回。boxes = [(y0,y1,x0,x1)](**原图坐标**)。
+
+    🔴 契约对齐 B 路审查的教训:fake 的返回键必须与真实
+    `diagnose_static_case`(case_pipeline.py:67-78)逐键一致,不得多键——
+    首版 fake 多给了 `n_total_frames` 那样的"自证键",恰好把 P0(动态链
+    漏注入 n_total_frames)藏在测试之外。
+
+    pred_mask/mask_binary 按 **MODEL_HW(32×32)** 生成(模拟模型输出分辨率),
+    框坐标是原图 64×64 的,内部线性缩到 32×32 —— 诊断脚本的
+    `_resize_soft/_resize_binary` 会把它 resize 回 64×64,resize 是**非平凡
+    映射**,插值/尺寸漂移会被等价回归抓住。
+    """
+    soft = np.full(MODEL_HW, 0.1, np.float32)
+    binary = np.zeros(MODEL_HW, np.uint8)
+    sy = MODEL_HW[0] / img_hw[0]
+    sx = MODEL_HW[1] / img_hw[1]
+    for (y0, y1, x0, x1) in boxes:
+        my0, my1 = int(y0 * sy), max(int(y0 * sy) + 1, int(y1 * sy))
+        mx0, mx1 = int(x0 * sx), max(int(x0 * sx) + 1, int(x1 * sx))
+        soft[my0:my1, mx0:mx1] = 0.9
+        binary[my0:my1, mx0:mx1] = 255
+    preds = {"pred_mask": soft, "mask_binary": binary,
+             "mal_prob": 0.7, "mal_probs": np.array([0.3, 0.7]),
+             "ete_probs": np.array([0.7, 0.2, 0.1, 0.0]),
+             "location_probs": np.full(7, 1 / 7),
+             "t_probs": np.array([0.4, 0.6]), "t_conf": 0.6,
+             "tirads_probs": np.array([0.1, 0.2, 0.4, 0.2, 0.1])}
+    return {"preds": preds, "orig_hw": img_hw}
+
+
+def _fake_dynamic_result(n_frames, boxes_by_frame, frame_hw=(H, W)):
+    """构造 diagnose_dynamic_case 的返回。
+
+    🔴 契约对齐真实返回(case_pipeline.py:210-219):**无 `n_total_frames` 键**
+    ——生产链由 runner.py:410 注入,诊断脚本 `run_dynamic_inference` 负责同样
+    的注入(B 路 P0 的回归钉死:fake 若多给此键,注入缺失就测不出来)。
+    模拟"抽样后"的 per_frame:keys of boxes_by_frame = 抽中的原始帧号。
+    每帧预测图按 MODEL_HW 生成,frame_np 按真实 frame_hw。
+    """
+    per_frame = []
+    for f in sorted(boxes_by_frame):
+        boxes = boxes_by_frame[f]
+        soft = np.full(MODEL_HW, 0.1, np.float32)
+        binary = np.zeros(MODEL_HW, np.uint8)
+        sy = MODEL_HW[0] / frame_hw[0]
+        sx = MODEL_HW[1] / frame_hw[1]
+        for (y0, y1, x0, x1) in boxes:
+            my0, my1 = int(y0 * sy), max(int(y0 * sy) + 1, int(y1 * sy))
+            mx0, mx1 = int(x0 * sx), max(int(x0 * sx) + 1, int(x1 * sx))
+            soft[my0:my1, mx0:mx1] = 0.9
+            binary[my0:my1, mx0:mx1] = 255
+        preds = {"pred_mask": soft, "mask_binary": binary,
+                 "mal_prob": 0.7, "mal_probs": np.array([0.3, 0.7]),
+                 "ete_probs": np.array([0.7, 0.2, 0.1, 0.0]),
+                 "location_probs": np.full(7, 1 / 7),
+                 "t_probs": np.array([0.4, 0.6]), "t_conf": 0.6,
+                 "tirads_probs": np.array([0.1, 0.2, 0.4, 0.2, 0.1])}
+        per_frame.append({"frame_index": int(f), "mal_prob": 0.7,
+                          "preds": preds,
+                          "frame_np": np.full(frame_hw, 100, np.uint8)})
+    kf = per_frame[0]
+    return {"per_frame": per_frame, "kf_preds": dict(kf["preds"]),
+            "kf_frame_np": kf["frame_np"]}
+
+
+class _Args:
+    def __init__(self, root, xlsx, log_dir, limit=None, max_frames=32,
+                 weights=None):
+        self.data_root = root
+        self.xlsx = xlsx
+        # 指向真实存在的临时文件(run_diagnosis 的权重存在性 assert 只认路径
+        # 存在与否,建模本身已被 monkeypatch;绝不能 patch 全局 os.path.exists)。
+        self.weights = weights or __import__("tempfile").mktemp(suffix=".pth")
+        open(self.weights, "wb").close()
+        self.config = "configs/thyroid_config.yaml"
+        self.samples_pkl = None
+        self.max_frames = max_frames
+        self.precision = "fp32"
+        self.val_frac = 0.9                     # 让 P1/P2/P3 全进 val
+        self.seed = 42
+        self.limit = limit
+        self.log_dir = str(log_dir)
+
+
+@pytest.fixture
+def patched_pipeline(diag_root, tmp_path, monkeypatch):
+    """monkeypatch 建模三件套 + diagnose_*_case,记录每个 img_path 的调用次数。
+
+    建模路径整体 patch 成"已构建"(run_diagnosis 里的 weights assert 也一并绕过
+    —— 测的是诊断逻辑不是权重加载)。
+    """
+    root, xlsx = diag_root
+    calls = {"static": [], "dynamic": []}
+
+    def fake_static(model, img_np, config, calibrator, precision, device):
+        # 用图内容区分病例(全 120=P1 / 全 90=P2)
+        mean = float(np.mean(img_np))
+        calls["static"].append(int(mean))
+        if mean > 100:      # P1:预测 = GT 完全重合(1 实例)
+            boxes = [(20, 40, 20, 40)]
+        else:               # P2:两个预测,分别与 M/病灶1 高重叠
+            boxes = [(11, 24, 11, 24), (40, 55, 40, 55)]
+        return _fake_static_result(tuple(img_np.shape[:2]), boxes)
+
+    def fake_dynamic(model, frames, frame_indices, config, calibrator,
+                     precision, device):
+        calls["dynamic"].append(list(frame_indices))
+        # 预测放在**两个 GT 标注帧**(1 和 3)同一空间块 → 病灶级 IoU =
+        # 单帧 IoU(resize 后 ≈0.8,不再精确 1——MODEL_HW 非 64 同尺寸后插值
+        # 有边界损耗)→ ≥0.5 匹配。"未覆盖标注帧记 0"的精确口径由
+        # test_detection_match.iou_dynamic 钉死(那里不经 resize、数值可手算)。
+        # 🔴 别用 frame_indices[0]:5 帧全抽样时它是 0,而 GT 非零帧是 1/3——
+        # 放帧 0 会得 IoU=0、匹配失败(首版测试就栽在这)。
+        return _fake_dynamic_result(5, {1: [(15, 35, 15, 35)],
+                                        3: [(15, 35, 15, 35)]})
+
+    import torch
+    monkeypatch.setattr(DD, "diagnose_static_case", fake_static)
+    monkeypatch.setattr(DD, "diagnose_dynamic_case", fake_dynamic)
+    fake_cfg = {"data": {"img_size": 512},
+                "environment": {"device": "cpu", "seed": 42},
+                "calibration": {"param_file": "none.json"}}
+    import src.inference.model_runner as MR
+    monkeypatch.setattr(MR, "build_model",
+                        lambda config, weights, device: object())
+    monkeypatch.setattr(MR, "load_config", lambda path: fake_cfg)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    import src.inference.calibration as CAL
+    monkeypatch.setattr(
+        CAL, "TemperatureScaler",
+        type("T", (), {"from_file": staticmethod(lambda p: None)}))
+
+    # 绕过患者分组切分:patient_grouped_split 每层至少留 1 患者给 train
+    # (n_val ≤ len-1),3 患者 fixture 永远凑不齐"全员 val"。测试要覆盖
+    # P1/P2/P3 三个 case,直接把全量样本当 val。
+    def fake_build(root, xlsx, **kw):
+        samples = O.build_official_samples(root, xlsx)
+        return None, type("DS", (), {"samples": samples})()
+    monkeypatch.setattr(DD, "build_official_datasets", fake_build)
+    return calls
+
+
+# ── 测试 ────────────────────────────────────────────────────────────────────
+
+def test_end_to_end_group_and_match(diag_root, patched_pipeline, tmp_path):
+    """case 聚合 + 匹配 + AP 全链路:P2 一图两 GT 只推理一次;动态帧3 无预测→0.5。"""
+    root, xlsx = diag_root
+    calls = patched_pipeline
+    report = DD.run_diagnosis(_Args(root, xlsx, tmp_path / "logs"))
+
+    # P1/P2/P3 各推理一次(P2 一图两 GT 只推理 1 次——高危对齐点 3)。
+    assert len(calls["static"]) == 2
+    assert len(calls["dynamic"]) == 1
+
+    # P1:预测与 GT 完全重合 → matched,max_iou=1。
+    # P2:两预测 vs 两 GT,各 IoU≈(14²−重叠)/并集 高于 0.5 → 双匹配。
+    # P3:帧1 完美、帧3 无预测 → 病灶级 IoU = (1+0)/2 = 0.5 → 恰好达阈值。
+    rows = {}
+    with open(report["meta"]["sidecar"], encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            rows[os.path.basename(r["case_key"])] = r
+    assert not report["anomalies"], report["anomalies"]
+
+    p1 = rows["img1.dcm"]
+    assert p1["n_pred"] == 1 and p1["gts"][0]["matched"]
+    assert p1["gts"][0]["max_iou"] >= 0.5   # resize 边界损耗后不再精确 1
+
+    p2 = rows["img2.dcm"]
+    assert p2["n_gt"] == 2 and p2["n_pred"] == 2
+    assert all(g["matched"] for g in p2["gts"])          # 一对一各配一个
+
+    p3 = rows["P3.nii.gz"]
+    assert p3["n_pred"] == 1
+    assert p3["gts"][0]["matched"] and p3["gts"][0]["max_iou"] >= 0.5
+
+    # 池级:静态 n_gt=3 全匹配;动态 n_gt=1 匹配。
+    assert report["static"]["n_gt"] == 3
+    assert report["static"]["match_rate"] == 1.0
+    assert report["dynamic"]["n_gt"] == 1
+    assert report["dynamic"]["ap_oracle"] == 1.0
+    # 全命中 + conf 有区分度 → ap_current 也应为 1(单 TP 排首位)。
+    assert report["combined"]["ap_current"] == pytest.approx(1.0)
+    # sidecar 的 dedup_keep 字段存在且全 True(单实例无碎裂)。
+    assert all(p.get("dedup_keep") for p in p1["preds"])
+    # 报告 JSON 可解析、meta 齐全。
+    with open(report["_report_path"], encoding="utf-8") as f:
+        full = json.load(f)
+    assert full["meta"]["n_cases"] == 3
+    assert full["stats_static"]["n_gt"] == 3
+    assert full["stats_dynamic"]["n_gt"] == 1
+
+
+def test_mask_none_sample_filtered(diag_root, patched_pipeline, tmp_path):
+    """mask_path=None 的样本不进 GT 也不算漏检分母(单独计数)。"""
+    root, xlsx = diag_root
+    # 直接验证 group_cases 的过滤逻辑(不经 run_diagnosis,快)。
+    samples = O.build_official_samples(root, xlsx)
+    cases, n_no_mask = DD.group_cases(samples)
+    assert n_no_mask == 0                # 本 fixture 全部有 mask
+    assert len(cases) == 3
+
+
+def test_equivalence_dynamic_with_write_case_v21(diag_root, patched_pipeline,
+                                                 tmp_path):
+    """等价回归(动态):同一 fake case_result 分别走 write_case_v21 与本脚本
+    的实例抽取,断言实例数/area/confidence 逐位一致。
+
+    🔴 fixture 参数选择(B 路 2026-09-05 变异注入实证:首版"5 帧全抽样"的
+    fixture 让 n_sampled=32 与 gap 去掉 +1 的变异**全漏检**——数值恰同):
+    n_total=100、抽中帧 {0, 70, 99}(3 帧,间隔 70/29)同一空间块:
+      正确 n_sampled=len(per_frame)=3 → gap=ceil(100/3)+1=35 → 缝合跨度
+      2×35=70 ≥ 70 → 跨帧缝合成 **1 个实例**;若 gap 去掉 +1(=34)→
+      跨度 68 < 70 → 帧 0/70 断开 → **2 个实例**(+1 的区分窗口);
+      若 n_sampled 错取 max_frames=32 → gap=4 → 跨度 8 → **3 个实例**。
+    变异注入实测:三种漂移(A/C)现在全部 RED。
+    """
+    from src.inference.v21_output import write_case_v21
+
+    case_result = _fake_dynamic_result(
+        100, {0: [(15, 35, 15, 35)], 70: [(15, 35, 15, 35)],
+              99: [(15, 35, 15, 35)]})
+    # 生产链等价注入(runner.py:410 同款——write_case_v21 硬需此键)。
+    case_result["n_total_frames"] = 100
+
+    # 生产侧:write_case_v21 落盘后读回 prediction.json。
+    # case_dir 已含 patient_id 层(生产调用是 output/{pid}),prediction.json 在其顶层。
+    out_dir = tmp_path / "v21" / "PX"
+    write_case_v21(str(out_dir), "PX", "S1", dict(case_result), "dynamic",
+                   123, {"conclusion": "test"})
+    pj_path = out_dir / "prediction.json"
+    assert pj_path.exists()
+    payload = json.load(open(pj_path, encoding="utf-8"))
+    nodules = payload["Prediction"]["Nodules"]
+    assert len(nodules) == 1                       # gap=35 缝合成 1 实例
+    prod_conf = float(nodules[0]["Detection"]["confidence"])
+
+    # 诊断侧:同一 case_result 的实例抽取(直接调内部函数,绕过 load 环节)。
+    preds, n_total = DD.run_dynamic_inference_from_result(case_result)
+    assert n_total == 100
+    assert len(preds) == 1                         # 与生产同实例数(gap 口径一致)
+    # area = 三个抽样帧的块面积和(resize 后 ≈20×20×3,插值边界有半像素差,
+    # 实例数与 conf 才是逐位断言点,area 用区间断言)。
+    assert 3 * 20 * 20 * 0.8 < preds[0]["area"] < 3 * 20 * 20 * 1.2
+    # 🔴 动态 conf 的"帧覆盖率语义"钉死:soft 0.9 经 scatter 二值化后
+    # 实例区域内均值 = 1.0(全覆盖),与生产 write_case_v21 逐位一致。
+    assert preds[0]["confidence"] == pytest.approx(prod_conf)
+    assert preds[0]["confidence"] == pytest.approx(1.0)
+
+
+def test_equivalence_static_with_write_case_v21(diag_root, patched_pipeline,
+                                                tmp_path):
+    """等价回归(静态):同一 fake case_result 分别走 write_case_v21("static")
+    与 run_static_inference_from_result,断言实例数/confidence 逐位一致。
+
+    B 路 2026-09-05 审查:首版只有动态等价测试,静态链(插值方式/hw 来源/
+    conf 来源)零桩——变异注入实测"静态 conf 换常量 0.5"与"_resize_binary
+    换 _resize_soft"均漏检。本测试补上:fake 用 MODEL_HW(32×32)预测图 →
+    resize 到 64×64 是非平凡映射,插值漂移会改变 conf 数值(0.9/0.1 的混合
+    比例随插值变化),常量 conf 则直接不等。
+    """
+    from src.inference.v21_output import write_case_v21
+
+    img_hw = (H, W)
+    case_result = _fake_static_result(img_hw, [(20, 40, 20, 40)])
+
+    out_dir = tmp_path / "v21s" / "PY"
+    write_case_v21(str(out_dir), "PY", "S1", dict(case_result), "static",
+                   123, {"conclusion": "test"})
+    payload = json.load(open(out_dir / "prediction.json", encoding="utf-8"))
+    nodules = payload["Prediction"]["Nodules"]
+    assert len(nodules) == 1
+    prod_conf = float(nodules[0]["Detection"]["confidence"])
+
+    # 诊断侧:同一 case_result 的实例抽取。
+    preds = DD.run_static_inference_from_result(case_result)
+    assert len(preds) == 1
+    assert preds[0]["confidence"] == pytest.approx(prod_conf)
+    # 静态 conf ≠ 常量:resize(INTER_LINEAR)混合 0.9/0.1 边界 → conf 在
+    # (0.1, 0.9) 开区间内,既排除"换常量"漂移,也排除"二值化后恒 1"漂移。
+    assert 0.1 < preds[0]["confidence"] < 0.9
+
+
+def test_dynamic_gt_frame_mismatch_anomaly(diag_root, patched_pipeline, tmp_path):
+    """GT 帧 mask 数 ≠ n_total → 该 case 记 anomaly 跳过,其余照常。"""
+    root, xlsx = diag_root
+    # 篡改 P3 的 GT:重写成 4 帧(mask 与影像 5 帧不齐)。
+    p3_mask = os.path.join(root, "P3", "P3", "M_1_mask.nii.gz")
+    bad = np.zeros((4, H, W), np.uint8)
+    bad[1, 15:35, 15:35] = 1
+    save_binary_mask(bad, p3_mask)
+
+    report = DD.run_diagnosis(_Args(root, xlsx, tmp_path / "logs"))
+    assert len(report["anomalies"]) == 1
+    assert "动态 shape 不齐" in report["anomalies"][0]["reason"]
+    # 其余两个静态 case 照常统计。
+    assert report["static"]["n_gt"] == 3
+    assert report["static"]["match_rate"] == 1.0

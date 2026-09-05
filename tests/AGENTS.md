@@ -36,6 +36,8 @@
 | `test_case_discovery.py` | **病例发现**(2026-08-10 A2 新增)——`discover_cases` 递归遍历 + 静/动分派(.dcm→static,.nii.gz/.nii→dynamic)、静态读 DICOM 头取 PatientID/SeriesUID、动态按组委会口径取直接父目录名(PatientId=AccessionNumber)、路径推断兜底、空/不存在目录返回 []、**跨文件系统确定性顺序契约**(monkeypatch 反转 `os.scandir` 返回序,断言发现顺序仍为字典序 DFS——2026-08-12 CI run 31512732898 因 `os.walk` 未排子目录、Linux 走 hash 序而 flaky,`dirs.sort()` 修复后由本用例钉死);依赖 pydicom/nibabel 缺则 skip | 40 | Phase 5 |
 | `test_mixup_label_dominance.py` | **四头监督闸门 lam 阈值分派 + 软 lam 反向保护**(2026-08-15 新增)——详见下方专节 | 12 | Phase 2 |
 | `test_dynamic_frame_cache.py` | **预抽取 PNG 缓存契约**(2026-08-15 新增)——详见下方专节 | 9 | Phase 1 |
+| `test_detection_match.py` | **检测诊断仪表盘·纯逻辑层**(2026-09-05 新增,检测 AP 3.05 主战场第一步)——官方匹配口径逐条:iou_2d 已知值/双空(「切片全0记0」)/形状不齐拒;iou_dynamic 只遍历标注帧+未覆盖帧记0(官方两条限定)+空标注帧;匈牙利一对一最优+**阈值丢弃**(解里 IoU<0.5 的对双方回未匹配)+空矩阵不崩;**手写 step-wise AP 的 n_gt 分母**(sklearn 虚高口径对拍钉死:单TP+99漏检 sklearn=1.0 vs 真值0.01)+同分合并用**组末下标**(首版用组首下标,同分 FP 被挤出分母 AP 虚高,A路审查实测[1,0]/[0.8,0.8]给1.0真值0.5)+手算PR曲线+TP≤n_gt护栏(A路:无护栏时 n_gt=1 两 TP 静默返回2.0);dedup「各GT最优并集」语义+多GT冲突不误删他GT最优(A路P1:逐列淘汰法`[[0.9,0.2],[0.0,0.8]]`误删gt0最优,级联ap_dedup语义反转);ap_breakdown四件套(oracle==匹配率/碎裂场景手算)+桶边界(0.1/0.35/0.5名实一致)+NaN落invalid桶(A路:NaN曾静默落">=0.5"命中桶)+anomaly行跳过+主/次病灶匹配率+临界带占比 | 22 | — |
+| `test_diagnose_detection.py` | **检测诊断仪表盘·端到端**(2026-09-05 新增)——合成 P1静态单GT/P2静态一图两GT(钉死只推理一次+一起进匈牙利)/P3动态5帧mask帧1/3非零;fake与真实`diagnose_*_case`返回**逐键一致**(B路P0教训:fake多给`n_total_frames`自证键,把「动态链漏注入」藏在测试外);fake预测图用**MODEL_HW=32×32**≠原图64×64(B路变异注入实证:同尺寸resize恒等映射,插值/尺寸漂移全被吞);**等价回归双桩**(动:write_case_v21 vs run_dynamic_inference_from_result,n_total=100抽帧{0,70,99}使gap±1落在区分窗口——n_sampled=32/gap去+1/静态conf常量/插值错误四个变异注入全RED;静:write_case_v21("static") vs run_static_inference_from_result,conf∈(0.1,0.9)开区间排除常量与二值化漂移);GT帧数≠n_total记anomaly跳过;mask_path=None过滤;动态conf「帧覆盖率语义」钉死(scatter二值化后=1.0,与生产逐位一致) | 5 | — |
 
 ---
 
@@ -99,9 +101,16 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 `OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
 
-## 测试总数(单一权威,2026-09-03 实测)
+## 测试总数(单一权威,2026-09-05 实测)
 
-**全套 975 passed + 1 skipped**(2026-09-03 推理提速三件套后,`Demo_D` 口径,
+**全套 1002 passed + 1 skipped**(2026-09-05 检测诊断仪表盘后,`torch28` 预演环境
+实测,含修复后重跑)。演进链 975 **+27 = 检测诊断仪表盘**(2026-09-05:
+`test_detection_match.py` 22 + `test_diagnose_detection.py` 5;
+三路 Gate2 审查 A/B/C 后修复 B-P0(动态链漏注入 n_total_frames)×1 +
+A-P1/C-P1(dedup 语义双向失真)×2 + P2 若干并补测试;
+**变异注入四连 RED 验证**:`n_sampled=32` 替代 `len(per_frame)` / gap 去掉 `+1` /
+静态 conf 换常量 / 静态插值方式错误——四个镜像漂移全部被等价回归拦住)。
+此前口径:**975 passed + 1 skipped**(2026-09-03 推理提速三件套后,`Demo_D` 口径,
 `--collect-only` 实测 **976 collected**)。演进链 940 **+19 = backlog #128**
 (损失 10 + 监控 9)→ 959 **+8 = Gate2 三处修复**(负 la_tau 守卫 6 项 /
 `ete_probs` 长度契约 1 项)→ **967 +2 = 变异审计补测**

@@ -28,7 +28,7 @@ sklearn 值仅作对照并须在报告里注明其虚高口径。
 | `ap_current` | `detection_confidence` | 真实表现 |
 | `ap_oracle` | TP→1.0,FP→0.0 | **= 匹配率**(召回上限) |
 | `ap_iou_ranked` | 每预测对其 case 全部 GT 的 max-IoU | 排序可挖掘空间 |
-| `ap_dedup` | confidence(每 GT 只留 max-IoU 候选) | 碎裂损失 |
+| `ap_dedup` | confidence(每 GT 留 max-IoU 候选 ∪ 匈牙利 TP) | 碎裂损失 |
 
 静/动**分开各出一套**(另出合并池总览)——动态 `detection_confidence` 经
 `scatter_frames_to_full_length` 二值化后语义退化为"帧覆盖率"(详见
@@ -109,15 +109,14 @@ def match_instances(iou_matrix: np.ndarray,
     `linear_sum_assignment(-iou)` 求全局最优;解中 IoU < threshold 的对**丢弃**
     (双方都回到未匹配)——官方是一对一 + 阈值判定,低于阈值的配对不算命中。
 
-    ⚠️ 口径假设(A 路 2026-09-05 审查指出):本实现优化目标是 **max ΣIoU**
-    (scipy 默认加权匈牙利)。评审规则只写「匈牙利算法一对一最优匹配,
-    IoU≥0.5 判定成功」,未指明目标函数——若官方实现按「IoU≥0.5 二值化后
-    最大化匹配基数」,两者在临界带(IoU 聚在 0.5 附近)可能给不同结果:
-    实测 `[[0.85,0.50],[0.50,0.49]]` max-ΣIoU 得 1 TP(0.85),基数最大化
-    可得 2 TP(两对恰 0.50)。此差异会使 `critical_band_frac` 的读数偏低。
-    采用 max-ΣIoU 的理由:它是「匈牙利匹配」的标准形态,且对非临界场景
-    两者一致。报告 meta 已注明本假设;若官方口径后续明确不同,补一版
-    二部图基数匹配对照即可(接口不变)。
+    ⚠️ 口径假设(A 路 2026-09-05 审查指出 + 2 万随机矩阵实测):评审规则只写
+    「匈牙利算法一对一最优匹配,IoU≥0.5 判定成功」,未指明目标函数。本实现为
+    **两阶段**:先 max ΣIoU 加权匈牙利求高质量配对,再在 ≥threshold 子图上二次
+    分配(保留 max-Σ 配对作 tie-break)——最终匹配**数量**等价于「IoU≥threshold
+    二值化后的最大匹配基数」。单独的「max-Σ + 阈值丢弃」实测会少算 TP(2 万随机
+    矩阵 531 例 free-free 残余 + 473 例需重排,合计 5%),若官方按最大基数实现,
+    本实现与之对齐;若官方真按 max-Σ+丢弃,pair 选择略有不同但数量不会更少。
+    pair 级选择仍是实现选择,报告 meta 注明。
 
     空矩阵((0,N)/(N,0)/(0,0))实测不崩,返回空索引 → 全未匹配。
 
@@ -139,6 +138,35 @@ def match_instances(iou_matrix: np.ndarray,
             gt_to_pred[c] = r
             pairs.append((int(r), int(c), float(m[r, c])))
         # 低于阈值的对:不进 pairs,双方保持 -1(未匹配)。
+    # 🔴 ≥threshold 子图二次分配(A 路 F2 修复,2026-09-05):「max-Σ 指派 + 丢弃」
+    # 可能比「≥thr 子图最大匹配」少 TP——两种形态:A 路实测的 free-free 残余边
+    # (2 万随机矩阵 531 例),以及 max-Σ 配对本身与最大匹配不兼容需**重排**
+    # (同实验 473 例,只补 free-free 救不回)。彻底修法:在 ≥thr 子图上重跑一次
+    # 分配,代价=非法边 10 / 合法且保留 max-Σ 已配对 0 / 合法新边 0.5−0.1·IoU
+    # (高 IoU 优先)——匹配**数量**对齐最大匹配,pair 选择以 max-Σ 结果为
+    # tie-break。修复后 2 万随机矩阵与纯二分图最大匹配 0 差异(修复前 531+473)。
+    # 代价一次 O(n³),case 级(实例数 ≤ 几十)可忽略。
+    n = max(n_pred, n_gt)
+    big = m >= threshold
+    pad_big = np.zeros((n, n), dtype=bool)
+    pad_big[:n_pred, :n_gt] = big
+    if pad_big.any():
+        kept = {(p, g) for p, g, _ in pairs}
+        cost = np.where(pad_big, 0.0, 10.0)
+        for i in range(n_pred):
+            for j in range(n_gt):
+                if big[i, j] and (i, j) not in kept:
+                    cost[i, j] = 0.5 - 0.1 * m[i, j]
+        # 初始化 pair 列表为空,由二次分配统一产出(保证与代价模型一致)
+        pairs = []
+        pred_to_gt = np.full(n_pred, -1, dtype=np.int64)
+        gt_to_pred = np.full(n_gt, -1, dtype=np.int64)
+        rr, cc = linear_sum_assignment(cost)
+        for r, c in zip(rr, cc):
+            if pad_big[r, c]:
+                pred_to_gt[r] = c
+                gt_to_pred[c] = r
+                pairs.append((int(r), int(c), float(m[r, c])))
     return {"pairs": pairs, "pred_to_gt": pred_to_gt, "gt_to_pred": gt_to_pred}
 
 
@@ -188,8 +216,10 @@ def average_precision(labels: list, scores: list, n_gt: int) -> float:
 # ── oracle AP 分解 ─────────────────────────────────────────────────────────
 
 def dedup_keep_mask(iou_matrix: np.ndarray,
-                    overlap_thr: float = DEDUP_OVERLAP_THRESHOLD) -> list:
-    """碎裂去重:每 GT 在 IoU>overlap_thr 的候选中只留 max-IoU 一个。
+                    overlap_thr: float = DEDUP_OVERLAP_THRESHOLD,
+                    match: dict | None = None) -> list:
+    """碎裂去重:每 GT 在 IoU>overlap_thr 的候选中只留 max-IoU 一个,
+    **并集上再并入匈牙利 TP**(A 路 F3 修复,2026-09-05)。
 
     与所有 GT 重叠 ≤ thr 的纯 FP **保留**(它们是真实假阳性,去重只针对
     "同一 GT 被多个碎片预测覆盖"的情形——那是 AP 的重复 TP 稀释,不是 FP)。
@@ -200,6 +230,15 @@ def dedup_keep_mask(iou_matrix: np.ndarray,
     循环会把 A 误删,违反本函数自己的语义。实测 `[[0.9,0.2],[0.0,0.8]]`
     逐列法得 keep=[False,True](正确值 [True,True]),级联 ap_dedup 反转成
     "负碎裂损失"误导归因。
+
+    🔴 并集必须**并入匈牙利 TP**(A 路 F3,同轮实测):只取"各 GT max-IoU 候选"
+    会把真实 TP 删掉——`[[0.75,0.70],[0.60,0.0],[0.0,0.55]]` 匈牙利 2 TP 全中
+    (p0→g0、p2→g1),但 p2 不是任何 GT 的 max-IoU 候选(它是 g1 的次优,g1 的
+    最优是 p0)→ 只留 p0 → 无任何碎裂却读出 ap_current−ap_dedup=0.33 的
+    "碎裂损失"。根因:dedup 的"每 GT 留最优"与匈牙利的一对一最优指派是两套
+    语义,一个 pred 可以是某 GT 的 max-IoU 候选却实际被指派给另一 GT。修法:
+    keep = 各 GT max-IoU 候选 ∪ 全部匈牙利 TP(调用方传 `match=`;不传则
+    只做候选并集,保留旧接口供纯逻辑测试)。
 
     Returns: list[bool],len = n_pred,True=保留。
     """
@@ -214,6 +253,11 @@ def dedup_keep_mask(iou_matrix: np.ndarray,
         if len(cand) > 0:
             best = cand[np.argmax(col[cand])]
             keep[int(best)] = True      # 是任一 GT 的最优即保留(并集)
+    # 匈牙利 TP 并入(F3):已成功匹配的 pred 无论是否为某 GT 的 max-IoU 候选都保留。
+    if match is not None:
+        for i in range(n_pred):
+            if match["pred_to_gt"][i] >= 0:
+                keep[i] = True
     # 纯 FP(与所有 GT 重叠 ≤ thr):未被任何 GT 标记,按语义保留。
     for i in range(n_pred):
         if m[i].max() <= overlap_thr:
@@ -228,8 +272,9 @@ def ap_breakdown(preds: list, iou_matrix: np.ndarray, match: dict, n_gt: int) ->
     - `ap_oracle`:TP→1.0 / FP→0.0 —— 数学上恒等于匹配率(召回上限)。
     - `ap_iou_ranked`:每预测对其 case 全部 GT 的 max-IoU 当分数 —— 若它显著高于
       current,说明"重叠质量信息就在那但 conf 没用它",排序校准有空间。
-    - `ap_dedup`:conf 排序但每 GT 只留 max-IoU 候选(纯 FP 保留) —— 与 current
-      的差 = 碎裂 FP 的 AP 稀释量。
+    - `ap_dedup`:conf 排序但每 GT 只留 max-IoU 候选 ∪ 匈牙利 TP(纯 FP 保留)
+      —— 与 current 的差 = 碎裂 FP 的 AP 稀释量(A-F3:TP 并入是防"非列 argmax
+      的真 TP"被删、无碎裂却读出碎裂损失)。
     - `ap_sklearn_predonly`:sklearn 对照(只喂预测实例、无 FN 行的虚高口径,
       仅供并排参考,勿当回归锚;见模块 docstring)。
     """
@@ -241,7 +286,7 @@ def ap_breakdown(preds: list, iou_matrix: np.ndarray, match: dict, n_gt: int) ->
     oracle = [1.0 if l else 0.0 for l in labels]
     max_iou = ([float(iou_matrix[i].max()) for i in range(n_pred)]
                if iou_matrix.shape[1] > 0 else [0.0] * n_pred)
-    keep = dedup_keep_mask(iou_matrix)
+    keep = dedup_keep_mask(iou_matrix, match=match)
 
     # sklearn 对照:同批实例、同标签,只体现"漏检不在分母"的口径差。
     try:
@@ -282,7 +327,12 @@ def _bucket(v: float, buckets) -> str:
     # 非有限值单独拦截(A 路审查实测:NaN 落空全部比较后走兜底、静默计入
     # "命中"桶——上游坏数据会虚增匹配表现,与"NaN 令数值门静默失效"的既有
     # 教训同型)。计入 invalid 桶暴露它,不猜。
-    if not np.isfinite(v):
+    # 🔴 同轮 A-F1:负值同理落空比较后走兜底进">=0.5"命中桶(兜底写反),
+    # 与 NaN 一起归入 invalid。**消费方(aggregate_case_rows)的 dict 初始化
+    # 必须含 "invalid" 键**,否则这里返回的桶名会 KeyError 崩整份报告
+    # (A 路实测:含 NaN max_iou 的 case row 令 aggregate_case_rows 抛
+    # KeyError('invalid')——声称"计入 invalid 桶暴露"实为崩溃,防御写成地雷)。
+    if not np.isfinite(v) or v < 0.0:
         return "invalid"
     for lo, hi, name in buckets:
         # 闭开约定:下界含、上界不含;miss 桶单独处理(精确 =0)。
@@ -312,10 +362,14 @@ def aggregate_case_rows(case_rows: list) -> dict:
         "n_cases": len(case_rows),
         "n_anomaly": sum(1 for r in case_rows if r.get("anomaly")),
         "n_gt": 0, "n_pred": 0, "n_tp": 0,
-        "gt_iou_hist": {name: 0 for _, _, name in IOU_BUCKETS},
-        "gt_area_hist": {name: 0 for _, _, name in AREA_BUCKETS},
-        "gt_iou_area_cross": {name: {a: 0 for _, _, a in AREA_BUCKETS}
-                              for _, _, name in IOU_BUCKETS},
+        # 🔴 含 "invalid" 键(A-F1):_bucket 对 NaN/负值返回 "invalid",
+        # dict 无此键会 KeyError 崩整份报告——防御必须与消费方对齐。
+        "gt_iou_hist": {**{name: 0 for _, _, name in IOU_BUCKETS}, "invalid": 0},
+        "gt_area_hist": {**{name: 0 for _, _, name in AREA_BUCKETS}, "invalid": 0},
+        "gt_iou_area_cross": {
+            **{name: {**{a: 0 for _, _, a in AREA_BUCKETS}, "invalid": 0}
+               for _, _, name in IOU_BUCKETS},
+            "invalid": {**{a: 0 for _, _, a in AREA_BUCKETS}, "invalid": 0}},
         "n_gt_main": 0, "n_matched_main": 0,
         "n_gt_secondary": 0, "n_matched_secondary": 0,
         "preds_per_case": {"0": 0, "1": 0, "2": 0, "3-5": 0, "6+": 0},

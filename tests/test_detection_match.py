@@ -294,3 +294,85 @@ def test_aggregate_critical_band_fraction():
     rows = [_case_row(n_gt=4, preds=[], gts=gts)]
     s = aggregate_case_rows(rows)
     assert s["critical_band_frac"] == 1.0          # 4/4 落 [0.35,0.5)
+
+
+# ── 2026-09-05 三路审查(A/B/C)修复的回归钉死 ─────────────────────────────
+
+def test_aggregate_nan_and_negative_bucketed_not_crash():
+    """A-F1/C-F3:NaN 与负值的 max_iou/area_ratio 进 invalid 桶,不 KeyError 崩报告。
+
+    首版防御只拦了 NaN 返回 "invalid" 桶名,但消费方 dict 初始化无该键 →
+    整份报告聚合崩溃(声称"计数暴露"实为地雷)。A-F4:负值同理曾落
+    ">=0.5"命中桶(兜底写反)。
+    """
+    rows = [_case_row(preds=[{"confidence": 0.9, "area": 10, "best_iou": 0.6,
+                              "matched": True}],
+                      gts=[{"is_main": True, "area_ratio": float("nan"),
+                            "max_iou": float("nan"), "matched": True,
+                            "n_candidates": 1},
+                           {"is_main": False, "area_ratio": -0.01,
+                            "max_iou": -0.3, "matched": False,
+                            "n_candidates": 0}])]
+    s = aggregate_case_rows(rows)
+    assert s["gt_iou_hist"]["invalid"] == 2
+    assert s["gt_area_hist"]["invalid"] == 2
+    assert s["gt_iou_area_cross"]["invalid"]["invalid"] == 2
+    # 正常桶不被污染
+    assert s["n_gt"] == 2
+
+
+def test_match_residual_edges_augmented_to_max_cardinality():
+    """A-F2:max-Σ+阈值丢弃后,残余 ≥0.5 合法对补上(两形态:free-free 与重排)。
+
+    2 万随机矩阵实测:修复前 531 例 free-free 残余 + 473 例需重排,合计 5%
+    的 case 比官方"≥0.5 子图最大匹配"少算 TP。此处钉死一个重排形态
+    (free-free 形态已被随机对拍覆盖,不再单列)。
+    """
+    # max-Σ 会把 gt0 指派给 p1(0.45,sub-thr)以换取 Σ 更大 → 丢弃后 gt0 空置;
+    # 但 p2-gt0=0.9 的合法对可救回(需要"允许重排"的增广)。
+    m = np.array([[0.467, 0.785, 0.018, 0.109, 0.829],
+                  [0.797, 0.233, 0.531, 0.606, 0.868],
+                  [0.603, 0.413, 0.374, 0.426, 0.652],
+                  [0.867, 0.454, 0.248, 0.237, 0.746]])
+    r = match_instances(m)
+    # ≥0.5 子图最大匹配 = 4(A 路 2 万矩阵实验的实测形态之一)
+    assert len(r["pairs"]) == 4
+    # 一对一与阈值合法性
+    ps = [p for p, g, _ in r["pairs"]]
+    gs = [g for p, g, _ in r["pairs"]]
+    assert len(set(ps)) == len(ps) and len(set(gs)) == len(gs)
+    assert all(iou >= 0.5 for _, _, iou in r["pairs"])
+
+
+def test_dedup_keeps_hungarian_tps():
+    """A-F3:匈牙利 TP 即使不是任何 GT 的 max-IoU 候选也保留(并入 keep 集)。
+
+    `[[0.75,0.70],[0.60,0.0],[0.0,0.55]]`:匈牙利 2 TP 全中(p0→g0、p2→g1),
+    但 p2 是 g1 的次优(g1 最优是 p0)→ 旧 keep 集删掉真 TP、无碎裂却读出
+    0.33 的"碎裂损失"。
+    """
+    m = np.array([[0.75, 0.70],
+                  [0.60, 0.0],
+                  [0.0, 0.55]])
+    match = match_instances(m)
+    assert len(match["pairs"]) == 2                    # 全中
+    keep = dedup_keep_mask(m, match=match)
+    assert keep == [True, False, True]                 # p2(真 TP)保留
+    preds = [{"confidence": 0.9}, {"confidence": 0.8}, {"confidence": 0.7}]
+    bd = ap_breakdown(preds, m, match, n_gt=2)
+    # 无碎裂 → dedup 与 current 的差只能来自删掉的 FP p1,TP 全保留。
+    assert bd["ap_dedup"] >= bd["ap_current"]
+
+
+def test_dedup_without_match_keeps_old_semantics():
+    """不传 match 时保持旧接口语义(纯候选并集),供纯逻辑测试/旧调用方。"""
+    m = np.array([[0.75, 0.70],
+                  [0.60, 0.0],
+                  [0.0, 0.55]])
+    assert dedup_keep_mask(m) == [True, False, False]  # p0 是两 GT 的最优
+
+
+def test_match_threshold_boundary_locked():
+    """C-F5:IoU 恰 0.5 匹配 / 0.4999 不匹配(MATCH_IOU_THRESHOLD=0.5 官方口径)。"""
+    assert len(match_instances(np.array([[0.5]]))["pairs"]) == 1
+    assert len(match_instances(np.array([[0.4999]]))["pairs"]) == 0

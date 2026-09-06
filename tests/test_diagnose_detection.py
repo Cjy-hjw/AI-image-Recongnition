@@ -113,10 +113,12 @@ MODEL_HW = (32, 32)
 def _fake_static_result(img_hw, boxes):
     """构造 diagnose_static_case 的返回。boxes = [(y0,y1,x0,x1)](**原图坐标**)。
 
-    🔴 契约对齐 B 路审查的教训:fake 的返回键必须与真实
-    `diagnose_static_case`(case_pipeline.py:67-78)逐键一致,不得多键——
-    首版 fake 多给了 `n_total_frames` 那样的"自证键",恰好把 P0(动态链
-    漏注入 n_total_frames)藏在测试之外。
+    🔴 契约对齐教训(C 路 2026-09-05 P0 复验坐实):fake 的返回键必须与真实
+    `diagnose_static_case`(case_pipeline.py 真实返回 = preds/img_tensor/
+    mask_resized/breakdown)逐键一致,不得多键——**`orig_hw` 不在真实返回里**
+    (它是 runner.py 调用方注入的键,诊断脚本 `run_static_inference` 负责镜像
+    注入)。首版 fake 多给了 `orig_hw` 自证键,变异注入实测:删掉镜像的注入行
+    测试依然全绿——与首版动态 fake 多给 `n_total_frames` 是同型事故。
 
     pred_mask/mask_binary 按 **MODEL_HW(32×32)** 生成(模拟模型输出分辨率),
     框坐标是原图 64×64 的,内部线性缩到 32×32 —— 诊断脚本的
@@ -138,7 +140,8 @@ def _fake_static_result(img_hw, boxes):
              "location_probs": np.full(7, 1 / 7),
              "t_probs": np.array([0.4, 0.6]), "t_conf": 0.6,
              "tirads_probs": np.array([0.1, 0.2, 0.4, 0.2, 0.1])}
-    return {"preds": preds, "orig_hw": img_hw}
+    # 🔴 无 orig_hw:该键由被测的 run_static_inference 注入(镜像 runner.py:333)
+    return {"preds": preds}
 
 
 def _fake_dynamic_result(n_frames, boxes_by_frame, frame_hw=(H, W)):
@@ -211,8 +214,12 @@ def patched_pipeline(diag_root, tmp_path, monkeypatch):
         calls["static"].append(int(mean))
         if mean > 100:      # P1:预测 = GT 完全重合(1 实例)
             boxes = [(20, 40, 20, 40)]
-        else:               # P2:两个预测,分别与 M/病灶1 高重叠
-            boxes = [(11, 24, 11, 24), (40, 55, 40, 55)]
+        else:               # P2:三个预测——M 的主预测 + 近失碎片 + 病灶1 一个
+            # (C-F2:碎片 (16,30,20,28) 与 M GT 的 IoU≈0.116 ∈ (0.1,0.5),是 M 的
+            # 候选但输给主预测(IoU≈0.57)→ dedup_keep=False;与主预测在 MODEL_HW
+            # 上不连通(实测 3 实例)。首版碎片框完全落在主框内,split_nodules
+            # 8 连通合并成 1 个实例,断言失败——连通域分离是构造前提。)
+            boxes = [(10, 24, 10, 18), (40, 55, 40, 55), (16, 30, 20, 28)]
         return _fake_static_result(tuple(img_np.shape[:2]), boxes)
 
     def fake_dynamic(model, frames, frame_indices, config, calibrator,
@@ -280,8 +287,16 @@ def test_end_to_end_group_and_match(diag_root, patched_pipeline, tmp_path):
     assert p1["gts"][0]["max_iou"] >= 0.5   # resize 边界损耗后不再精确 1
 
     p2 = rows["img2.dcm"]
-    assert p2["n_gt"] == 2 and p2["n_pred"] == 2
+    assert p2["n_gt"] == 2 and p2["n_pred"] == 3
     assert all(g["matched"] for g in p2["gts"])          # 一对一各配一个
+    # C-F2:近失碎片(M 的高重叠次优、conf 更高)→ dedup_keep=False;
+    # 两个真 TP 即使非列 argmax 也保留(A-F3:匈牙利 TP 并入 keep 集)。
+    keeps = [p["dedup_keep"] for p in p2["preds"]]
+    assert keeps.count(False) == 1, keeps
+    matched_keeps = [p["dedup_keep"] for p in p2["preds"] if p["matched"]]
+    assert all(matched_keeps), matched_keeps
+    # 池级碎裂语义:ap_dedup 用 sidecar 的 dedup_keep(删高 conf 碎片)。
+    assert report["static"]["ap_dedup"] >= report["static"]["ap_current"]
 
     p3 = rows["P3.nii.gz"]
     assert p3["n_pred"] == 1
@@ -292,8 +307,12 @@ def test_end_to_end_group_and_match(diag_root, patched_pipeline, tmp_path):
     assert report["static"]["match_rate"] == 1.0
     assert report["dynamic"]["n_gt"] == 1
     assert report["dynamic"]["ap_oracle"] == 1.0
-    # 全命中 + conf 有区分度 → ap_current 也应为 1(单 TP 排首位)。
-    assert report["combined"]["ap_current"] == pytest.approx(1.0)
+    # 全命中 + conf 有区分度 → ap_current 高(P2 碎片 FP conf≈TP,轻微稀释;
+    # 实测 0.95:4 TP 全部排在碎片 FP 前/后的均值)。手算:TP conf≈0.823/0.844,
+    # 碎片 conf≈0.823 与 M 主预测同分——碎片以 FP 身份挤在 TP 之间,AP=0.95。
+    assert report["combined"]["ap_current"] >= 0.9
+    # 碎片删除后 dedup 通道回到 1.0(碎裂稀释被剥离)。
+    assert report["combined"]["ap_dedup"] == pytest.approx(1.0)
     # sidecar 的 dedup_keep 字段存在且全 True(单实例无碎裂)。
     assert all(p.get("dedup_keep") for p in p1["preds"])
     # 报告 JSON 可解析、meta 齐全。
@@ -305,13 +324,23 @@ def test_end_to_end_group_and_match(diag_root, patched_pipeline, tmp_path):
 
 
 def test_mask_none_sample_filtered(diag_root, patched_pipeline, tmp_path):
-    """mask_path=None 的样本不进 GT 也不算漏检分母(单独计数)。"""
+    """mask_path=None 的样本不进 GT 也不算漏检分母(单独计数)。
+
+    C-F4 修复:真实删掉一个 GT 的 mask 文件再让 xlsx 指向不存在的 mask,
+    走 `group_cases` 的 `continue` + `n_no_mask += 1` 分支(首版 fixture 全有
+    mask,被测分支零覆盖)。
+    """
     root, xlsx = diag_root
-    # 直接验证 group_cases 的过滤逻辑(不经 run_diagnosis,快)。
+    # 删 P2 的次病灶 mask + xlsx 对应行的 mask 由 loader 按 RoiName 推导,
+    # 文件不存在 → 样本 mask_path=None
+    os.remove(os.path.join(root, "P2", "S2", "病灶1_1_mask.nii.gz"))
     samples = O.build_official_samples(root, xlsx)
     cases, n_no_mask = DD.group_cases(samples)
-    assert n_no_mask == 0                # 本 fixture 全部有 mask
+    assert n_no_mask >= 1                # 病灶1 行的样本 mask 缺失被过滤
     assert len(cases) == 3
+    # P2 case 只剩 1 个 GT(病灶1 不进 GT 也不算漏检分母)
+    p2 = [c for c in cases if c["img_path"].endswith("img2.dcm")][0]
+    assert len(p2["gts"]) == 1
 
 
 def test_equivalence_dynamic_with_write_case_v21(diag_root, patched_pipeline,
@@ -375,7 +404,10 @@ def test_equivalence_static_with_write_case_v21(diag_root, patched_pipeline,
     from src.inference.v21_output import write_case_v21
 
     img_hw = (H, W)
+    # fake 无 orig_hw(契约对齐);等价回归两侧各自补上该键再对拍
+    # (write_case_v21 与 run_static_inference_from_result 都消费它)。
     case_result = _fake_static_result(img_hw, [(20, 40, 20, 40)])
+    case_result["orig_hw"] = img_hw
 
     out_dir = tmp_path / "v21s" / "PY"
     write_case_v21(str(out_dir), "PY", "S1", dict(case_result), "static",

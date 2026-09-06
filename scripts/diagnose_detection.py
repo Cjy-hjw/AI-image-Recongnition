@@ -62,8 +62,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.detection_match import (  # noqa: E402
-    MATCH_IOU_THRESHOLD, aggregate_case_rows, build_iou_matrix,
-    dedup_keep_mask, match_instances)
+    DEDUP_OVERLAP_THRESHOLD, MATCH_IOU_THRESHOLD, aggregate_case_rows,
+    build_iou_matrix, dedup_keep_mask, match_instances)
 
 # ── 生产模块(全部只读复用,口径单一权威)──────────────────────────────────
 from src.dataset.official_loader import (  # noqa: E402
@@ -95,6 +95,12 @@ def group_cases(samples: list) -> tuple:
         if key not in by_img:
             by_img[key] = {"img_path": key, "is_dynamic": bool(s["is_dynamic"]),
                            "gts": {}}
+        # B-P2-3 防御:同 img_path 混合 is_dynamic 说明 loader 路径空间不再
+        # 互斥(当前静态 *.dcm / 动态 *.nii.gz 不相交,不可达),静默错分派
+        # 比崩更危险。
+        if bool(s["is_dynamic"]) != by_img[key]["is_dynamic"]:
+            raise ValueError(
+                f"group_cases: 同 img_path 混合静/动样本 {key} —— loader 契约破坏")
         if s.get("mask_path") is None:
             n_no_mask += 1
             continue
@@ -299,7 +305,9 @@ def diagnose_one_case(model, config, calibrator, precision, device,
         # 分叉A(独苗近失碎片 best_iou∈(0.1,0.5) 未匹配)会被误删 → 高估碎裂损失;
         # 分叉B(matched 但非该 GT 列 argmax 的 TP)按库语义本该删 → 低估。
         # 现算 = 单一权威,池化零语义漂移。
-        keep = dedup_keep_mask(iou_m)
+        # A 路 F3 修复(2026-09-05):必须传 match —— 匈牙利 TP 并入 keep 集,
+        # 否则"非列 argmax 的真 TP"被删、无碎裂却读出碎裂损失。
+        keep = dedup_keep_mask(iou_m, match=match)
     except ValueError as e:
         row["anomaly"] = f"匹配失败(shape 不齐): {e}"
         return row
@@ -320,7 +328,10 @@ def diagnose_one_case(model, config, calibrator, precision, device,
             "area_ratio": round(float(g["area_ratio"]), 8),
             "max_iou": round(max_iou, 6),
             "matched": bool(match["gt_to_pred"][j] >= 0),
-            "n_candidates": int((iou_m[:, j] > 0.1).sum()) if len(preds) else 0,
+            # B-P2-2:阈值必须与 dedup_keep_mask 同源(DEDUP_OVERLAP_THRESHOLD),
+            # 字面量 0.1 会在常量调整后静默分叉。
+            "n_candidates": (int((iou_m[:, j] > DEDUP_OVERLAP_THRESHOLD).sum())
+                             if len(preds) else 0),
         })
     return row
 
@@ -444,8 +455,11 @@ def run_diagnosis(args) -> dict:
                 "只做相对分解不对齐绝对值",
                 "动态 detection_confidence 经 scatter 二值化,语义=帧覆盖率,"
                 "静/动必须分开解读",
-                "匹配目标函数假设 = max ΣIoU 加权匈牙利;若官方按'IoU≥0.5 二值化"
-                "后最大化匹配基数',临界带([0.35,0.5))的匹配数可能比本报告高",
+                "匹配目标函数 = max-ΣIoU 后在 ≥0.5 子图二次分配(匹配数对齐最大"
+                "基数匹配,pair 选择以 max-Σ 为 tie-break);pair 级选择仍是实现选择",
+                "anomaly 行(推理失败/shape 不齐)整 case 剔除、GT 不进 AP 分母 —— "
+                "官方口径下推理失败病例 = 全部 GT 漏检、进分母,故 anomaly 率非零时"
+                "本报告 ap_current/match_rate 偏乐观,读数需按 anomalies 明细折算",
             ],
         },
         "anomalies": [{"case": r["case_key"], "reason": r["anomaly"]}

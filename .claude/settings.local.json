@@ -15,5 +15,6 @@
       "Bash(rmdir \"C:/2026aicompetition/workspace/logs\" \"C:/2026aicompetition/workspace\" \"C:/2026aicompetition\")",
       "Read(//c/2026aicompetition/**)"
     ]
-  }
+  },
+  "outputStyle": "Concise"
 }

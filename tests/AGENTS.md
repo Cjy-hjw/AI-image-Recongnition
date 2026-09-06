@@ -101,10 +101,16 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 `OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
 
-## 测试总数(单一权威,2026-09-05 实测)
+## 测试总数(单一权威,2026-09-06 实测)
 
-**全套 1002 passed + 1 skipped**(2026-09-05 检测诊断仪表盘后,`torch28` 预演环境
-实测,含修复后重跑)。演进链 975 **+27 = 检测诊断仪表盘**(2026-09-05:
+**全套 1007 passed + 1 skipped**(2026-09-06 二轮三路复审+D 路修复后,`torch28` 预演
+环境实测)。演进链 1002 **+5 = 二轮复审修复**(2026-09-06:第二轮 A/B/C 审查挖出
+4×P0/P1——A-F1 invalid 桶 KeyError/A-F2 匈牙利少算 TP/A-F3 dedup 删真 TP/
+C-F1 静态 fake 自证键——修复时 `test_detection_match.py` 22+5=27、
+`test_diagnose_detection.py` 5 不变但 P2 fixture 加近失碎片;D 路复核 7 处修复
+全对、5 变异注入 4 RED)。
+此前口径:**1002 passed + 1 skipped**(2026-09-05 检测诊断仪表盘后,`torch28`
+预演环境实测,含修复后重跑)。演进链 975 **+27 = 检测诊断仪表盘**(2026-09-05:
 `test_detection_match.py` 22 + `test_diagnose_detection.py` 5;
 三路 Gate2 审查 A/B/C 后修复 B-P0(动态链漏注入 n_total_frames)×1 +
 A-P1/C-P1(dedup 语义双向失真)×2 + P2 若干并补测试;

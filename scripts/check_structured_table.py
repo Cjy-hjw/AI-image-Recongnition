@@ -18,13 +18,13 @@ import pandas as pd
 
 # 与 official_loader._FIELD_ALIASES 同源的核心列候选名(别名取自 src/dataset/official_loader.py)
 HEAD_FIELDS = {
-    "malignancy": ["良恶性", "恶性", "ROI良恶性"],
-    "tirads": ["TI-RADS", "TIRADS", "TI-RADS分级", "甲状腺影像报告和数据系统"],
-    "ete": ["甲状腺外侵犯", "甲状腺 外侵犯", "外侵犯"],
-    "location": ["病灶位置", "位置", "病灶部位"],
-    "t_clinical": ["T分期", "T分级", "临床T"],
+    "malignancy": ["ROI->CLINICAL->良恶性", "ROI良恶性", "良恶性", "恶性"],
+    "tirads": ["ROI->CLINICAL->TI-RADS", "TI-RADS", "TIRADS", "TI_RADS", "ROI-TIRADS"],
+    "ete": ["甲状腺外侵犯", "甲状腺 外侵犯", "ETE", "extrathy_ext"],
+    "location": ["主病灶位置", "病灶位置", "位置", "lesion_loc"],
+    "t_clinical": ["临床T分期", "T分期", "临床T", "clin_t_stage"],
     "pathology": ["病理结果-组织学", "病理"],
-    "roi_name": ["RoiName", "ROI名称"],
+    "roi_name": ["RoiName", "ROI名称", "roi_name"],
     "patient": ["PatientId", "患者ID"],
 }
 OLD_VALUES = {  # 旧表口径,供对拍
@@ -60,15 +60,18 @@ def _value_counts_series(series):
 
 
 def analyze_xlsx(path):
-    # header=1:官方 xlsx 合并单元格表头,真实列名在第2行(2026-08-13 云端核实)
-    df = pd.read_excel(path, header=1)
+    # 多 sheet:关键数据在 "ROI级别" sheet(2026-09-06 云端实测,共 3 个 sheet);
+    # 该 sheet 内表头仍在第2行(0-based row=1,与 official_loader header=1 同源)。
+    xl = pd.ExcelFile(path)
+    sheet_name = "ROI级别" if "ROI级别" in xl.sheet_names else xl.sheet_names[0]
+    df = pd.read_excel(path, header=1, sheet_name=sheet_name)
     resolved = _resolve_columns(df.columns)
-    out = {
-        "xlsx": os.path.basename(path),
-        "n_rows": len(df),
-        "resolved_columns": {k: str(v) for k, v in resolved.items()},
-        "unresolved_fields": [f for f in HEAD_FIELDS if f not in resolved],
-    }
+    out = {"xlsx": os.path.basename(path), "sheet": sheet_name,
+           "all_sheets": list(xl.sheet_names),
+           "n_rows": len(df),
+           "resolved_columns": {k: str(v) for k, v in resolved.items()},
+           "unresolved_fields": [f for f in HEAD_FIELDS if f not in resolved],
+           }
 
     def col(name):
         return resolved.get(name)

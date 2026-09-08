@@ -59,9 +59,9 @@ To prevent wasting GPU hours on diverging models, we enforce a training gatekeep
   - **过时文档三态处置(改动后必判)**:代码改动后,对受影响文档(`docs/`、各级 `AGENTS.md`、`reference/` 等)逐份判定并执行三选一——① **该改则改**:仍有价值但叙述/数值过时(如测试数、能力描述、主结论被新结论推翻),原地更新使其与现状一致(遵循「细节优先」不丢硬约束);② **该删则删**:整份内容已被取代且无独立历史价值(如已落地功能的临时提示词、被新报告完全覆盖的旧调研),连同其全仓引用一并删除;③ **不该动则保持**:官方原文(赛题/答疑)、自带「旧口径警告」的历史记录、与本次改动无关的文档,一律不动。**判定有疑则归为「改」或「保持」,不轻易删**——删除是不可逆动作,宁可留过时标注也不误删有用历史。
 * **Rule (Phased Refactoring)**: 涉及多项复杂 ML 改动(CEM/KAN/损失重构/路径门控等)时**禁止单体重写**。必须拆成顺序、低风险、可独立验证的阶段(如 Phase 1 移除一致性损失 → Phase 2 门控优化 → Phase 3 CEM/MLP 瓶颈),每阶段跑 `verify_model.py` + Holdout 评估通过后方可进入下一阶段。
 * **Rule (Detail-Preserving Edits 细节优先)**: 精简或重构任何文档(`rules.md`/`AGENTS.md`/`QA_VP.md`/`docs/`)时,**最大限度保留技术细节**——命令、数值阈值(如 FP16 上限 65504、clamp ±15、泄漏阈值 1e-7)、assert 代码、字段清单、以及规则背后的「为什么」均不得为求简洁而删除。只允许删:① 确定的跨文件重复;② 已落地的过时叙述;③ 纯修辞性赘语。**有疑则保留**,宁可冗长不可丢失硬约束。
-* **Rule (Git Push 走代理端口)**: 本机访问 GitHub **必须经本地代理 `127.0.0.1:1203`**,否则 `git push`/`git fetch`/`gh` 会卡住或超时。代理通过**临时环境变量**传入（git config 保持不变，不写入仓库）：
+* **Rule (Git Push 走代理端口)**: 本机访问 GitHub **必须经本地代理 `127.0.0.1:7897`**,否则 `git push`/`git fetch`/`gh` 会卡住或超时。代理通过**临时环境变量**传入（git config 保持不变，不写入仓库）：
   ```bash
-  HTTP_PROXY=http://127.0.0.1:1203 HTTPS_PROXY=http://127.0.0.1:1203 git push origin <branch>
+  HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 git push origin <branch>
   ```
   仅访问外网(push/fetch/clone/gh)时加;本地 commit/diff/log 无需代理。
 

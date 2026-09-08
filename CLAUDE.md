@@ -139,8 +139,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 - **环境**:**训练在云端官方容器**(A800 自 2026-08-12 起不再承担训练,仅作 Linux+真 CUDA 契约验证);**模拟云环境用本地 venv `C:\Users\cjy\envs\torch28`**(py3.12+torch2.8,A800 因 glibc 2.23 装不了 torch2.7+);本地常规 Python 见全局 `~/.claude/CLAUDE.md`。
 - **代理配置(本地访问外网必需)**:访问 HuggingFace/GitHub/外网资源时,**PowerShell 必须先设置代理环境变量**:
   ```powershell
-  $env:http_proxy="http://127.0.0.1:1203"
-  $env:https_proxy="http://127.0.0.1:1203"
+  $env:http_proxy="http://127.0.0.1:7897"
+  $env:https_proxy="http://127.0.0.1:7897"
   $env:NODE_OPTIONS="--dns-result-order=ipv4first"
   ```
   适用场景:`pip install`、`huggingface_hub` 下载、`git push/fetch`(见 `rules.md` §5 已有临时环境变量规则)、`curl`/`wget` 等。

@@ -31,15 +31,15 @@
 gatekeeper 在生产里是调用方(runner)的守门环节,soft 模式从不 REJECT、审计帧
 不改像素(提速三件套已证输出逐位相同),对检测 AP 的镜像零影响。
 
-## 动态 detection_confidence 的语义分叉(被诊断对象的真实缺陷,不是本脚本 bug)
+## 动态 detection_confidence 的语义分叉(🔴 2026-09-08 生产已修,本脚本已同步镜像)
 
-生产 `v21_output._write_dynamic` 把 float `soft_frames` 喂进
+生产 `v21_output._write_dynamic` 曾把 float `soft_frames` 喂进
 `scatter_frames_to_full_length`,其内部 `out=(m!=0)` **二值化成 uint8**
-(`nifti_io.py:234/246`)→ `detection_confidence(soft_3d, inst)` 实际度量的是
+(`nifti_io.py`)→ `detection_confidence(soft_3d, inst)` 实际度量的是
 "实例体素落在抽样帧的比例"(帧覆盖率),对全程存在的结节恒趋近 1.0、排序能力
-近零。本脚本**镜像生产**(诊断的就是官方看到的量),故四件套与置信度直方图
-**必须静/动分开读**——动态 conf 挤在 ~1.0 本身就是首要病因信号
-(判读表见云端任务书)。
+近零。**2026-09-08 生产改 `_dynamic_det_conf`(实例出现帧的逐帧 float 概率
+均值),本脚本同日同步镜像** —— 动态 conf 直方图不再预期挤 ~1.0;若新报告仍
+挤 ~1.0,说明修复未生效(先查生产改的是否被部署)。
 
 ## 口径声明(写进报告 meta)
 
@@ -75,7 +75,8 @@ from src.inference.nifti_io import (  # noqa: E402
     load_nifti_frames, scatter_frames_to_full_length)
 from src.inference.nodule_split import (  # noqa: E402
     detection_confidence, split_nodules)
-from src.inference.v21_output import _resize_binary, _resize_soft  # noqa: E402
+from src.inference.v21_output import (  # noqa: E402
+    _dynamic_det_conf, _resize_binary, _resize_soft)
 
 
 # ── case 聚合 ───────────────────────────────────────────────────────────────
@@ -199,20 +200,25 @@ def run_dynamic_inference_from_result(case_result):
         binary_frames.append(_resize_binary(p["mask_binary"], hw))
         soft_frames.append(_resize_soft(p["pred_mask"], hw))
     binary_3d = scatter_frames_to_full_length(binary_frames, frame_idx, n_total)
-    soft_3d = scatter_frames_to_full_length(soft_frames, frame_idx, n_total)
+    # 镜像生产 2026-09-08 修复:soft_3d 死分配删除(生产不再 scatter float soft,
+    # conf 走 soft_by_frame 逐帧概率均值)。此处同样不分配。
     # 🔴 高危对齐点 2:n_sampled = len(per_frame)(坏帧隔离后的幸存帧),
-    # 非 max_frames。生产 v21_output.py:455 同口径,取错碎裂数漂移。
+    # 非 max_frames。生产 v21_output.py 同口径,取错碎裂数漂移。
     n_sampled = len(frame_idx)
     gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
     instances = split_nodules(binary_3d, close_gap_frames=gap)
+    # 直接复用生产 `_dynamic_det_conf` 保口径(A 路 F4:共享实现使等价测试退化为
+    # 同函数两次调用,公式级回归仅靠 fixture 数值断言兜底——生产侧若改公式,
+    # 本镜像自动跟随,等价性永真但绝对值无独立桩,这是已知取舍)。
+    soft_by_frame = {int(fi): sf for fi, sf in zip(frame_idx, soft_frames)}
     out = []
     for inst in instances:
         out.append({
             "mask": inst["mask"],
             "area": int(inst["area"]),
-            "confidence": detection_confidence(soft_3d, inst["mask"]),
+            "confidence": _dynamic_det_conf(inst, soft_by_frame),
         })
-    del binary_3d, soft_3d, binary_frames, soft_frames
+    del binary_3d, binary_frames, soft_frames
     return out, n_total
 
 
@@ -453,8 +459,11 @@ def run_diagnosis(args) -> dict:
             "caveats": [
                 "val 只含有 ROI 标注患者,阴性 FP 不在池 → AP 相对官方偏高,"
                 "只做相对分解不对齐绝对值",
-                "动态 detection_confidence 经 scatter 二值化,语义=帧覆盖率,"
-                "静/动必须分开解读",
+                "动态 detection_confidence 2026-09-08 起为逐帧 float 概率均值"
+                "(旧帧覆盖率语义已修);若动态 conf 直方图仍挤 ~1.0 = 修复未生效",
+                f"动态抽样 max_frames={args.max_frames}(2026-09-08 起生产与"
+                "本脚本默认均为 0=全帧;若为 32 属旧口径回退,动态匹配率会因"
+                "漏标注帧被系统性低估)",
                 "匹配目标函数 = max-ΣIoU 后在 ≥0.5 子图二次分配(匹配数对齐最大"
                 "基数匹配,pair 选择以 max-Σ 为 tie-break);pair 级选择仍是实现选择",
                 "anomaly 行(推理失败/shape 不齐)整 case 剔除、GT 不进 AP 分母 —— "
@@ -509,7 +518,9 @@ def main():
     ap.add_argument("--weights", default="checkpoints/official_heads_seg_best.pth")
     ap.add_argument("--config", default="configs/thyroid_config.yaml")
     ap.add_argument("--samples-pkl", default=None)
-    ap.add_argument("--max-frames", type=int, default=32)
+    # 缺省 0(全帧)与生产 runner._DEFAULT_MAX_FRAMES 同步(2026-09-08 conf 修复
+    # + 全帧前向同轮落地;A 路审查 F1:半截镜像会让云端忘传参数时跑回旧抽样世界)。
+    ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--precision", default="fp16",
                     choices=["fp32", "fp16", "bf16"])
     ap.add_argument("--val-frac", type=float, default=0.2)

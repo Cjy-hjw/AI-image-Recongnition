@@ -87,7 +87,8 @@ logger = logging.getLogger(__name__)
 _ENV_WEIGHTS = "AICOMP_WEIGHTS"
 _ENV_CONFIG = "AICOMP_CONFIG"
 _ENV_PRECISION = "AICOMP_PRECISION"
-# 动态 loader 的 max_frames(均匀抽样上限),<=0 取全帧。与 video_predict.py 默认 32 对齐。
+# 动态 loader 的 max_frames(均匀抽样上限),<=0 取全帧。2026-09-08 起默认 0(全帧),
+# 见 _DEFAULT_MAX_FRAMES 处的诊断定案注释;与 video_predict.py 的 32 为不同部署形态。
 _ENV_MAX_FRAMES = "AICOMP_MAX_FRAMES"
 # 动态 gatekeeper 审计帧数上限(2026-09-03 提速:逐帧审计 32 帧×每帧 0.3-0.5s 是动态
 # 9-25s 耗时的大头)。<=0 = 全帧审计(旧行为)。
@@ -97,7 +98,17 @@ _DEFAULT_AUDIT_FRAMES = 3
 _DEFAULT_CONFIG = "configs/thyroid_config.yaml"
 _DEFAULT_WEIGHTS = "checkpoints/thyroidxl_merged_v2.pth"
 _DEFAULT_PRECISION = "fp16"
-_DEFAULT_MAX_FRAMES = 32
+# 🔴 2026-09-08 起默认全帧(0),不再 32 帧均匀抽样 —— 检测诊断全量(1042例)定案:
+# 动态池 72 GT TP=0 全灭,根因=GT 标注仅 3-5 帧,32 帧抽样命中 0.2-0.5 帧,官方口径
+# "漏帧 IoU 记 0"→病灶级平均 IoU 数学天花板 <0.5 匹配线,必死(与模型质量无关,
+# 静态同模型匹配率 82%)。全帧后标注帧 100% 有预测。
+# ⚠️ 耗时代价(B 路 2026-09-08 实测核正,勿按"~20s"旧估):750 帧最坏例单例
+# 35-65s(前向 ~20s + split_nodules 3D 闭运算/label ~9s + 实例 centroid 等),
+# 典型例(200-350 帧)12-25s;动态占比 ~17.6% → 整批 +30-80 分钟。官方**无单例
+# 时限**(唯一硬时限 = /call 5s 内 200,异步已合规),第 6 次跑分 3 小时闭环证明
+# 平台容忍 ≥3h。首跑后按 prediction.json 的 ProcessingTime_ms 回收实测。
+# 回退开关:AICOMP_MAX_FRAMES=32 恢复旧抽样(勿用——动态检测会回到全灭)。
+_DEFAULT_MAX_FRAMES = 0
 _VALID_PRECISIONS = ("fp32", "fp16", "bf16")
 
 # ── 模块级 runner 缓存(同参数只 build 一次)────────────────────────────────
@@ -348,14 +359,16 @@ def _run_dynamic_case(case, case_dir, state, precision, max_frames):
 
     # 逐帧 gatekeeper(复用跨病例已建的重型对象)。⚠️ CLI video_predict.py 仍全帧
     # 审计(调试旁路,保留全帧保真语义);service 部署策略不同,见下方提速注释。
-    # 2026-09-03 提速:只审均匀抽样的至多 N 帧(默认 3,首/中/尾),不逐帧审全部 32 帧。
+    # 2026-09-03 提速:只审均匀抽样的至多 N 帧(默认 3,首/中/尾),不逐帧审全部帧。
     # 依据(三重,缺一不可):
     #   ① 生产 enforcement_mode=soft 下 gatekeeper 从不 REJECT(run_gatekeeper_audit
     #      仅 hard+命中才返 False),audit 结论只落 gatekeeper_audit 软字段,无任何计分
     #      消费方;官方 2026-07-28 已豁免赛道七真实性考核 → 减审**零分值影响**;
-    #   ② 实测动态 9-25s 的大头就是 32 帧×每帧 auth+dedup+tamper 0.3-0.5s;
+    #   ② 实测动态耗时的大头就是逐帧 auth+dedup+tamper 0.3-0.5s;
     #   ③ 审计帧只是采样,不影响 diagnose_dynamic_case 消费的全部 frames —— 推理
     #      输入/输出与减审前逐位相同。
+    # 🔴 2026-09-08 全帧前向后此审计策略**更加必要**:frames 可能是数百帧,
+    # 若逐帧审计会把全帧前向省下的检测 AP 又赔进耗时里;audit 仍只抽 3 帧。
     # n_frames_audited 如实记实际审计帧数;audit_frames<=0 时 uniform_sample_indices
     # 自身语义即返回全帧下标(审查 130 格边界矩阵实测与显式 else 分支逐位等价,
     # 故不再单独分支,消除两处全帧语义的漂移面)。

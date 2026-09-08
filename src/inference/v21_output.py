@@ -10,7 +10,9 @@
   2. `nodule_split.split_nodules` 在原图尺寸的二值 mask 上做连通域分析,得到逐结节
      实例(2D 静态 / 3D 动态跨帧)。
   3. 每结节 `nifti_io.save_binary_mask` 落一个 `.nii.gz`(值域强制 {0,1});
-     检测置信度用 `detection_confidence(软图, 实例 mask)`(区域内概率均值)。
+     检测置信度:静态 `detection_confidence(软图, 实例 mask)`(区域内概率均值);
+     动态 2026-09-08 起走 `_dynamic_det_conf`(实例出现帧的逐帧概率均值,旧口径
+     是 scatter 二值化后的帧覆盖率、恒≈1.0 无排序能力,已废弃)。
   4. 每结节 `build_nodule_entry`(良恶性/TI-RADS/ETE/位置/临床T **全部为模型真实
      预测**——四头已于 2026-08-17 由 backlog #116b 接线,此前是 ETE=1/Location 均匀/
      T=0 的占位)→ `build_prediction_json` → `validate_prediction_json` →
@@ -198,14 +200,56 @@ def _atomic_write_json(path: str, payload: dict) -> None:
         raise
 
 
+def _dynamic_det_conf(inst: dict, soft_by_frame: dict) -> float:
+    """动态实例的检测置信度(2026-09-08 conf 语义修复)。
+
+    = 实例**实际出现的帧**上,区域内 float 概率均值的算术平均。与旧口径
+    (scatter 后 uint8 上的 detection_confidence = "实例体素落在有预测帧的比例")
+    的区别:旧值对全程存在的结节恒趋近 1.0、排序能力近零(检测诊断报告实锤
+    动态 conf 直方图挤 ~1.0);新值保留连续概率的区分度。
+
+    数值契约与 `detection_confidence` 对齐:非有限值 raise(同源 NaN 硬拦理由,
+    见其 docstring);实例帧全部缺概率图(理论上不可达,实例帧来自抽样帧)时
+    回退 0.0。
+    """
+    frame_indices = inst.get("frame_indices") or []
+    probs = []
+    mask3d = np.asarray(inst["mask"])
+    for fi in frame_indices:
+        soft = soft_by_frame.get(int(fi))
+        if soft is None:
+            # 部分缺帧静默少平均(生产构造下不可达:实例帧来自有预测的抽样帧,
+            # 见 A 路审查 V3c;若未来构造变化让缺帧可达,应改 raise 而非 continue)。
+            continue
+        m = mask3d[int(fi)] != 0
+        if m.any():
+            # B 路审查 B-P2(实测 5.8×):先掩膜后 mean(子集 ≤ 万级像素,float32
+            # 精度足够),不做整帧 float64 拷贝——750 帧病态例该项从 ~30s 降到 ~5s。
+            probs.append(float(np.asarray(soft)[m].mean()))
+    if not probs:
+        return 0.0
+    mean = float(np.mean(probs))
+    if not np.isfinite(mean):
+        raise ValueError(
+            "_dynamic_det_conf: 实例逐帧概率均值非有限(NaN/Inf)——"
+            "分割头数值异常,拒绝导出无效置信度(与 detection_confidence 同判)")
+    return float(np.clip(mean, 0.0, 1.0))
+
+
 def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
-                                  nodule_base_context):
+                                  nodule_base_context, soft_by_frame=None):
     """公共尾段:逐结节落 mask + 组装 build_nodule_entry。
 
     Args:
-        instances: `split_nodules` 的实例列表(每项含 `mask`,2D 或 3D)。
+        instances: `split_nodules` 的实例列表(每项含 `mask`,2D 或 3D;3D 另含
+            `frame_indices`,2026-09-08 conf 修复起被消费)。
         soft_fullres: 与实例 mask 同 shape 的软概率图(2D 原图 / 3D 全帧),供
-            `detection_confidence` 取区域内概率均值。
+            `detection_confidence` 取区域内概率均值。🔴 3D 时它是 scatter 后的
+            uint8 二值图(帧覆盖率语义,排序能力近零),仅当 `soft_by_frame` 缺席
+            时才作为回退消费(静态路径不受影响,soft_fullres 本就是 float)。
+        soft_by_frame: 2026-09-08 conf 修复新增。动态路径的 **{原始帧号: float
+            概率图}**,优先于 soft_fullres —— det_conf 改为"实例出现帧的逐帧
+            概率均值再平均",保留连续概率区分度。静态调用方不传(缺省 None)。
         case_dir / subdir_uid: 落盘根与相对子目录。
         nodule_base_context: dict,含 `malignancy_confidence` / `tirads_class` /
             `ete_code` / `location_probs` / `location` / `t_clin_sig` / `t_confidence`
@@ -225,7 +269,10 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
         # 落盘:实例 mask(2D/3D,值域 {0,1})。save_binary_mask 内部做 NIfTI 转置。
         save_binary_mask(inst["mask"], abs_path)
 
-        det_conf = detection_confidence(soft_fullres, inst["mask"])
+        if soft_by_frame is not None:
+            det_conf = _dynamic_det_conf(inst, soft_by_frame)
+        else:
+            det_conf = detection_confidence(soft_fullres, inst["mask"])
 
         entry = pj.build_nodule_entry(
             nodule_id=f"N{i}",
@@ -432,22 +479,33 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
         soft_frames.append(_resize_soft(p["pred_mask"], hw))
 
     binary_3d = scatter_frames_to_full_length(binary_frames, frame_indices, n_total)
-    soft_3d = scatter_frames_to_full_length(soft_frames, frame_indices, n_total)
+
+    # 🔴 2026-09-08 conf 语义修复 + soft_3d 死分配删除(B 路审查 B-P3):
+    # 旧实现把 float soft_frames 也 scatter 成 soft_3d——但 scatter 内部
+    # `out=(m!=0).astype(uint8)` 二值化,在其上算 detection_confidence 得到的是
+    # "实例体素落在有预测帧的比例"(帧覆盖率,恒≈1.0 无排序能力,检测诊断报告
+    # 实锤动态 conf 挤 ~1.0)。现 conf 走下方 soft_by_frame(逐帧 float 概率
+    # 均值),soft_3d 已无消费者 → **不再分配**(全帧 750×原图尺寸 ≈0.87GB/例,
+    # worker=2 并发翻倍)。`_build_entries_and_save_masks` 的 soft_fullres 形参
+    # 传 None;其回退分支(soft_by_frame 缺席才消费 soft_fullres)在动态路径
+    # 不可达,静态路径不受影响。
+    soft_by_frame = {int(fi): sf for fi, sf in zip(frame_indices, soft_frames)}
 
     # --- 3D 连通域 = 跨帧实例关联 ---
     # 🔴 **缝合跨度必须按实际抽样间隔算,不能用默认的 1**(2026-08-17 终审 D 路 P1)。
-    # 我们默认 `max_frames=32` 均匀抽样后 scatter 回填,**未抽中的帧全是 0** ——
-    # 帧间隔 = ceil(n_total / 抽样帧数)。若 `close_gap_frames`(默认 1)小于该间隔,
-    # 26-邻域在时间维**根本连不上**,同一个结节会被沿时间轴切成一串碎片。
+    # 抽样后 scatter 回填,**未抽中的帧全是 0** —— 帧间隔 = ceil(n_total / 抽样帧数)。
+    # 若 `close_gap_frames`(默认 1)小于该间隔,26-邻域在时间维**根本连不上**,
+    # 同一个结节会被沿时间轴切成一串碎片。
     #
     # 实测(`split_nodules` 默认参数,单个全程存在的结节):
     #   原视频 50 帧(间隔1)→ 1 个实例 ✅
     #   原视频 100 帧(间隔3)→ **7 个**
     #   原视频 128/200/400 帧(间隔4/6/12)→ **各 20 个**(撞 DEFAULT_MAX_NODULES 上限)
-    # 真实超声 cine 普遍上百帧,所以这是**常态而非边缘情况**。
-    # 后果:每个碎片都带一份四头预测进 `Nodules`,而官方 `:215` 按「每个预测病灶
-    # 仅贡献一个样本」计分 → 同一病灶被重复计数 20 次,检测 AP 同时被稀释。
     #
+    # 2026-09-08 动态默认改全帧后(`_DEFAULT_MAX_FRAMES=0`),间隔恒 1、gap 恒 2,
+    # 下方公式自然退化,无需分支;但 AICOMP_MAX_FRAMES 回退抽样时本公式仍必要,
+    # 故保留原样(对全帧输入 n_sampled==n_total → gap=2,闭运算仅弥合单帧漏检,
+    # 语义正确:全帧下"某帧漏检"就是真实的单帧空隙)。
     # 取 `间隔 + 1` 而非恰好等于间隔:留一帧余量,兼顾"某个抽样帧本身漏检"的情况
     # (那会让实际空隙变成 2 倍间隔;+1 不足以覆盖全部但成本为零)。
     # ⚠️ 副作用已实测排除:闭运算是 **3D** 的,时空分离的两个结节即使 gap 调到 20
@@ -455,12 +513,18 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     n_sampled = len(frame_indices)
     gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
     instances = split_nodules(binary_3d, close_gap_frames=gap)
+    # B 路审查 B-P3:3D 连通域已消费完 binary_3d,后续只有 mask 写盘(逐实例
+    # 自持数据),全帧下该数组 ≈0.87GB/例,尽早释放(worker=2 双动态并发时
+    # 峰值 -1.7GB)。诊断脚本 run_dynamic_inference_from_result 早有同款 del,
+    # 生产此前没有。
+    del binary_3d
     # 四头 + 良恶性走**病灶级均值**(官方 :215「每个预测病灶仅贡献一个样本」),
     # 详见 `_lesion_level_head_preds` docstring。
     context = _shared_nodule_context(
         _lesion_level_head_preds(per_frame, kf_preds))
     entries = _build_entries_and_save_masks(
-        instances, soft_3d, case_dir, subdir_uid, context)
+        instances, None, case_dir, subdir_uid, context,
+        soft_by_frame=soft_by_frame)
 
     payload = pj.build_prediction_json(
         study_uid=patient_id,

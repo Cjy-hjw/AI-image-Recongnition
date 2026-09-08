@@ -389,6 +389,12 @@ commit 559b306:`binary.T[..., None]`。
 且报错与"参数错位"毫无关联极难定位。`tests/test_nifti_io.py::TestLoaderSignatureAlignment`
 用 `inspect.signature` 锁死这一对齐。
 
+⚠️ **max_frames 的调用方分歧(2026-09-08)**:本函数签名缺省仍是 32,但**service
+生产链(`runner._DEFAULT_MAX_FRAMES`)已改 0=全帧**——检测诊断定案:GT 标注仅 3-5 帧,
+32 帧抽样命中 0.2-0.5 帧,官方"漏帧 IoU 记 0"→动态病灶级 IoU 天花板 <0.5 必死
+(TP=0 全灭)。CLI `video_predict.py` 与本函数缺省保留 32 属**调试旁路旧口径**,
+勿以其推断生产行为。`AICOMP_MAX_FRAMES=32` 可回退(勿用,动态检测回全灭)。
+
 返回 `(frames, frame_indices, is_dicom=False, error_msg, n_total_frames)`,错误契约与
 `video_io` 一致(失败返回错误信息而非抛异常,`n_total_frames` 失败分支为 0)。`frame_indices`
 是 **0-based 原始帧号**;官方 xlsx 的 `ANNOTATION->SliceIndex` 是 **1-based**,跨界需 ±1。
@@ -568,7 +574,10 @@ argmax=idx1 时一路静默写出 `T=1`。故不依赖下游偶然拦截,在源�
   `INTER_LINEAR` 保概率平滑,二值用 `INTER_NEAREST` 保 `{0,1}` 语义);调用方(runner)透传
   `orig_hw`,缺 `orig_hw` 直接 `V21OutputError`——绝不拿 resize 后的模型输入张量冒充原图。
 - **逐结节**:`nodule_split.split_nodules` 连通域拆分(2D 静态 / 3D 动态跨帧),每结节
-  一个 `.nii.gz`(`nodule_NNN.nii.gz`,值域 `{0,1}`),`detection_confidence` 取区域内概率均值。
+  一个 `.nii.gz`(`nodule_NNN.nii.gz`,值域 `{0,1}`);检测置信度:静态 `detection_confidence`
+  (区域内概率均值),**动态 2026-09-08 起走 `_dynamic_det_conf`**(实例出现帧的逐帧 float
+  概率均值——旧口径在 scatter 后 uint8 上算,语义=帧覆盖率恒≈1.0 无排序能力,检测诊断
+  报告实锤动态 conf 挤 ~1.0,已废弃;连带 `_write_dynamic` 不再分配 soft_3d 死存储)。
 - 每结节 `build_nodule_entry`(良恶性/TI-RADS/ETE/位置/临床T **全部为四头真实预测**,#116b
   2026-08-17 接线;另写 `TI_RADS_Probs`/`ETE_Probs` 对冲键)→
   `build_prediction_json` → `validate_prediction_json` → **原子写**(`.tmp` + `os.replace`)。

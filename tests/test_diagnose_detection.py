@@ -119,6 +119,8 @@ def _fake_static_result(img_hw, boxes):
     (它是 runner.py 调用方注入的键,诊断脚本 `run_static_inference` 负责镜像
     注入)。首版 fake 多给了 `orig_hw` 自证键,变异注入实测:删掉镜像的注入行
     测试依然全绿——与首版动态 fake 多给 `n_total_frames` 是同型事故。
+    (Pyright 对本函数返回 dict 的 `case_result["orig_hw"] = tuple` 赋值报
+    类型不匹配是静态推断误报——动态 dict 结构,运行时契约由测试自守。)
 
     pred_mask/mask_binary 按 **MODEL_HW(32×32)** 生成(模拟模型输出分辨率),
     框坐标是原图 64×64 的,内部线性缩到 32×32 —— 诊断脚本的
@@ -384,10 +386,12 @@ def test_equivalence_dynamic_with_write_case_v21(diag_root, patched_pipeline,
     # area = 三个抽样帧的块面积和(resize 后 ≈20×20×3,插值边界有半像素差,
     # 实例数与 conf 才是逐位断言点,area 用区间断言)。
     assert 3 * 20 * 20 * 0.8 < preds[0]["area"] < 3 * 20 * 20 * 1.2
-    # 🔴 动态 conf 的"帧覆盖率语义"钉死:soft 0.9 经 scatter 二值化后
-    # 实例区域内均值 = 1.0(全覆盖),与生产 write_case_v21 逐位一致。
+    # 🔴 动态 conf 语义(2026-09-08 修复后):soft 块 0.9 + resize 插值边缘混入
+    # 0.1 → 逐帧概率均值 ≈0.86,不再是旧"帧覆盖率"的 1.0。等价断言(与生产
+    # write_case_v21 逐位一致)是主断言;近似值断言钉死"不是帧覆盖率语义"
+    # (旧口径此值恒 1.0,若回归到 1.0 = 修复被撤销)。
     assert preds[0]["confidence"] == pytest.approx(prod_conf)
-    assert preds[0]["confidence"] == pytest.approx(1.0)
+    assert 0.8 < preds[0]["confidence"] < 0.9
 
 
 def test_equivalence_static_with_write_case_v21(diag_root, patched_pipeline,

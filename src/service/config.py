@@ -44,18 +44,21 @@ CALLBACK_PATH = "/api/competition/inference/callback/"
 CALLBACK_MAX_RETRIES = int(os.environ.get("AICOMP_CALLBACK_RETRIES", "3"))
 CALLBACK_TIMEOUT_S = float(os.environ.get("AICOMP_CALLBACK_TIMEOUT", "10"))
 
-# 推理工作线程数。**生产交付默认 2**(2026-09-03 提速:实测 1060 病例纯串行 3 小时,
-# GPU 占用极低,病例级 2 路并发近乎线性提速)。前提已就绪:
+# 推理工作线程数。**生产交付默认 1**(2026-09-09 OOM 事故回拨:2026-09-08 动态全帧
+# 前向上云后,worker=2 双动态大例并发内存峰值 56.9G/64G,22:06 容器被 OOMKilled
+# 重启、内存任务状态清零、回调丢失 → 平台等到 28800s 判超时整批作废——2 路并发的
+# 时间收益(~35 分钟)不值得这个尾部风险。串行实测 1060 病例 ~3.5h,8h 时限余量足)。
+# 历史备注:2026-09-03 曾默认 2(当时动态 32 帧抽样、单例内存 ~16G,2 路 <64G 安全);
+# 全帧后单例峰值 ~14G + split_nodules 全尺寸副本叠加,2 路即触顶,故回拨。
+# 前提(并发场景仍适用,设回 2 时有效):
 # ① Deduplicator 已加线程锁(共享 hashes/embeddings/FAISS 的写读串行化,提取在锁外);
 # ② runner._ensure_built 加构建锁(防两线程并发首调双重建模型);
 # ③ 模型经 `torch.inference_mode()` 无参数更新,多线程 call 前向安全;
 # ④ 已知残留:共享 tamper_detector 的 last_soft_flags 实例属性在并发 detect 下可能
 #   跨病例串台(soft 模式仅污染不计分的审计字段,官方已豁免真实性考核,可接受)。
-# 资源口径(出处:总纲 §3/§6.4):显存实测推理峰值仅数 GB(32G 充裕);**内存**
-# 单大动态病例峰值 ~16G,2 路 < 64G、4 路 > 64G 有 OOM 尾险 → **上界 2**。
 # (runner._run_cases 里另有 min(workers, 2) 硬上界,与本处双保险。)
-# 可用 `AICOMP_INFERENCE_WORKERS` 环境变量覆盖(本地测试/云端诊断需单线程时设 1)。
-INFERENCE_WORKERS = int(os.environ.get("AICOMP_INFERENCE_WORKERS", "2"))
+# 可用 `AICOMP_INFERENCE_WORKERS` 环境变量覆盖。
+INFERENCE_WORKERS = int(os.environ.get("AICOMP_INFERENCE_WORKERS", "1"))
 
 
 def callback_url() -> str:

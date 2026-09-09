@@ -31,6 +31,14 @@ from fastapi.responses import JSONResponse
 
 from src.service import config, tasks
 
+# 🔴 2026-09-09 内存治理(60G OOM):压 glibc 多 arena 碎片。必须在任何重型内存
+# 分配发生前设置,故放模块顶部 import 后立即执行。代码内设置而非容器环境变量:
+# 测评容器不重建(人工上传审核+人工上传窗口太贵),env 改一次要动容器分栏,
+# 代码里改随包部署生效。Python 的 os.environ 只影响本进程后续 malloc 调用链
+# (glibc 读该 env 的时机是 arena 创建时,服务进程启动即此设置先于一切推理)。
+# 已显式设置过则不覆盖(尊重容器分栏里的人工配置)。
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Thyroid US Inference Service", version="1.0")

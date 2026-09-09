@@ -39,8 +39,8 @@ if not proxy:
     print(
         "[PROXY-WARN] 命令文本含外网访问相关字样但未检测到 HTTP_PROXY。\n"
         "rules.md §5 要求走代理，否则会卡住/超时。若命令确实要访问外网，请加前缀：\n"
-        "HTTP_PROXY=http://127.0.0.1:1203 HTTPS_PROXY=http://127.0.0.1:1203\n"
-        "PowerShell 请先: $env:http_proxy='http://127.0.0.1:1203'\n"
+        "HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897\n"
+        "PowerShell 请先: $env:http_proxy='http://127.0.0.1:7897'\n"
         "（若这是误报——命令里只是文本提到 git push，不是真的在调用——可忽略）",
         flush=True,
     )

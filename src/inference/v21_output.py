@@ -69,6 +69,7 @@ except ImportError:  # pragma: no cover - 依赖缺失路径由调用方兜底
 
 from src.inference import prediction_json as pj
 from src.inference.nifti_io import save_binary_mask, scatter_frames_to_full_length
+from src.inference.nodule_split import restore_instance_mask
 from src.inference.nodule_split import detection_confidence, split_nodules
 
 __all__ = ["write_case_v21"]
@@ -200,7 +201,7 @@ def _atomic_write_json(path: str, payload: dict) -> None:
         raise
 
 
-def _dynamic_det_conf(inst: dict, soft_by_frame: dict) -> float:
+def _dynamic_det_conf(inst: dict, soft_by_frame: dict, mask3d) -> float:
     """动态实例的检测置信度(2026-09-08 conf 语义修复)。
 
     = 实例**实际出现的帧**上,区域内 float 概率均值的算术平均。与旧口径
@@ -211,10 +212,13 @@ def _dynamic_det_conf(inst: dict, soft_by_frame: dict) -> float:
     数值契约与 `detection_confidence` 对齐:非有限值 raise(同源 NaN 硬拦理由,
     见其 docstring);实例帧全部缺概率图(理论上不可达,实例帧来自抽样帧)时
     回退 0.0。
+
+    2026-09-09 内存治理:签名加 `mask3d` 参数(3D 实例已改稀疏存储,全尺寸
+    mask 由调用方逐实例重建、用完即弃——本函数不再从 `inst["mask"]` 取)。
     """
     frame_indices = inst.get("frame_indices") or []
     probs = []
-    mask3d = np.asarray(inst["mask"])
+    mask3d = np.asarray(mask3d)
     for fi in frame_indices:
         soft = soft_by_frame.get(int(fi))
         if soft is None:
@@ -237,12 +241,14 @@ def _dynamic_det_conf(inst: dict, soft_by_frame: dict) -> float:
 
 
 def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
-                                  nodule_base_context, soft_by_frame=None):
+                                  nodule_base_context, soft_by_frame=None,
+                                  full_shape=None):
     """公共尾段:逐结节落 mask + 组装 build_nodule_entry。
 
     Args:
-        instances: `split_nodules` 的实例列表(每项含 `mask`,2D 或 3D;3D 另含
-            `frame_indices`,2026-09-08 conf 修复起被消费)。
+        instances: `split_nodules` 的实例列表。**2D**:含 `mask`(全尺寸);**3D**:
+            含 `mask_sparse`(bbox 裁剪稀疏存储,2026-09-09 内存治理)与
+            `frame_indices`(conf 消费)。
         soft_fullres: 与实例 mask 同 shape 的软概率图(2D 原图 / 3D 全帧),供
             `detection_confidence` 取区域内概率均值。🔴 3D 时它是 scatter 后的
             uint8 二值图(帧覆盖率语义,排序能力近零),仅当 `soft_by_frame` 缺席
@@ -250,6 +256,11 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
         soft_by_frame: 2026-09-08 conf 修复新增。动态路径的 **{原始帧号: float
             概率图}**,优先于 soft_fullres —— det_conf 改为"实例出现帧的逐帧
             概率均值再平均",保留连续概率区分度。静态调用方不传(缺省 None)。
+        full_shape: 2026-09-09 内存治理新增。3D 全尺寸 `(n_frames,H,W)`,
+            稀疏实例 `restore_instance_mask` 重建全尺寸 mask 用。🔴 动态路径
+            **必传**(3D 实例无 `mask` 键,缺它无法重建写盘);静态/2D 不传。
+            🔴 **须在调用方 `del binary_3d` 之前捕获 shape**(del 后取会 NameError,
+            审查 P2-1)。
         case_dir / subdir_uid: 落盘根与相对子目录。
         nodule_base_context: dict,含 `malignancy_confidence` / `tirads_class` /
             `ete_code` / `location_probs` / `location` / `t_clin_sig` / `t_confidence`
@@ -266,13 +277,31 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
         # 写进 JSON 的相对路径强制正斜杠(官方 Linux 评测按 `/` 解析,见模块 docstring)。
         rel_path = f"{subdir_uid}/{name}"
 
-        # 落盘:实例 mask(2D/3D,值域 {0,1})。save_binary_mask 内部做 NIfTI 转置。
-        save_binary_mask(inst["mask"], abs_path)
-
-        if soft_by_frame is not None:
-            det_conf = _dynamic_det_conf(inst, soft_by_frame)
+        if "mask_sparse" in inst:
+            # 3D 稀疏实例(2026-09-09 内存治理):全尺寸 mask 逐实例重建,
+            # 写盘 + det_conf 两个消费点共用,用完即弃(全尺寸 ≈0.9GB/例,
+            # 峰值恒为 1 份,不再随实例数累积)。
+            if full_shape is None:
+                raise V21OutputError(
+                    "3D 稀疏实例需传 full_shape 才能 restore_instance_mask"
+                    "(动态调用方漏传——见 _write_dynamic 的构造)")
+            full_mask = restore_instance_mask(inst["mask_sparse"], full_shape)
+            try:
+                # 落盘:实例 mask(值域 {0,1})。save_binary_mask 内部做 NIfTI 转置。
+                save_binary_mask(full_mask, abs_path)
+                if soft_by_frame is not None:
+                    det_conf = _dynamic_det_conf(inst, soft_by_frame, full_mask)
+                else:
+                    det_conf = detection_confidence(soft_fullres, full_mask)
+            finally:
+                del full_mask   # 异常路径也不许全尺寸 mask 存活跨实例
         else:
-            det_conf = detection_confidence(soft_fullres, inst["mask"])
+            # 2D 实例:全尺寸本来就小,原样直落。
+            save_binary_mask(inst["mask"], abs_path)
+            if soft_by_frame is not None:
+                det_conf = _dynamic_det_conf(inst, soft_by_frame, inst["mask"])
+            else:
+                det_conf = detection_confidence(soft_fullres, inst["mask"])
 
         entry = pj.build_nodule_entry(
             nodule_id=f"N{i}",
@@ -479,17 +508,15 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
         soft_frames.append(_resize_soft(p["pred_mask"], hw))
 
     binary_3d = scatter_frames_to_full_length(binary_frames, frame_indices, n_total)
-
+    # 🔴 顺序陷阱(审查 P2-1):full_shape 必须在 del binary_3d **之前**捕获
+    # (3D 实例已稀疏化,写盘前 restore 需要全尺寸 shape;del 后取会 NameError)。
+    full_shape = binary_3d.shape
     # 🔴 2026-09-08 conf 语义修复 + soft_3d 死分配删除(B 路审查 B-P3):
-    # 旧实现把 float soft_frames 也 scatter 成 soft_3d——但 scatter 内部
-    # `out=(m!=0).astype(uint8)` 二值化,在其上算 detection_confidence 得到的是
-    # "实例体素落在有预测帧的比例"(帧覆盖率,恒≈1.0 无排序能力,检测诊断报告
-    # 实锤动态 conf 挤 ~1.0)。现 conf 走下方 soft_by_frame(逐帧 float 概率
-    # 均值),soft_3d 已无消费者 → **不再分配**(全帧 750×原图尺寸 ≈0.87GB/例,
-    # worker=2 并发翻倍)。`_build_entries_and_save_masks` 的 soft_fullres 形参
-    # 传 None;其回退分支(soft_by_frame 缺席才消费 soft_fullres)在动态路径
-    # 不可达,静态路径不受影响。
+    # conf 走 soft_by_frame(逐帧 float 概率均值),soft_3d/soft_frames 不再
+    # 全量驻留。原 `soft_frames` 全帧列表(resize 回原图 float32 ×750 ≈3.5GB)
+    # 已删除:实例帧 ⊆ 抽样帧,`_dynamic_det_conf` 消费时按帧即时取用。
     soft_by_frame = {int(fi): sf for fi, sf in zip(frame_indices, soft_frames)}
+    del binary_frames, soft_frames  # soft 已进 soft_by_frame;scatter 消费完即弃
 
     # --- 3D 连通域 = 跨帧实例关联 ---
     # 🔴 **缝合跨度必须按实际抽样间隔算,不能用默认的 1**(2026-08-17 终审 D 路 P1)。
@@ -524,7 +551,7 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
         _lesion_level_head_preds(per_frame, kf_preds))
     entries = _build_entries_and_save_masks(
         instances, None, case_dir, subdir_uid, context,
-        soft_by_frame=soft_by_frame)
+        soft_by_frame=soft_by_frame, full_shape=full_shape)
 
     payload = pj.build_prediction_json(
         study_uid=patient_id,

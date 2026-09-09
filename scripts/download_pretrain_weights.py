@@ -146,8 +146,8 @@ def main():
     if not os.environ.get('http_proxy') and not os.environ.get('HTTP_PROXY'):
         print("\n[WARN] 未检测到代理设置")
         print("建议先运行:")
-        print('  $env:http_proxy="http://127.0.0.1:1203"')
-        print('  $env:https_proxy="http://127.0.0.1:1203"')
+        print('  $env:http_proxy="http://127.0.0.1:7897"')
+        print('  $env:https_proxy="http://127.0.0.1:7897"')
 
         response = input("\n继续下载? (y/n): ")
         if response.lower() != 'y':

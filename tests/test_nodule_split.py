@@ -100,6 +100,39 @@ class TestSplit3D:
         v[1:4, 10:20, 10:20] = 1  # 3 帧 × 100px
         assert split_nodules(v, min_area_ratio=0)[0]["area"] == 300
 
+    def test_sparse_roundtrip_restores_fullsize_mask(self):
+        """🔴 2026-09-09 稀疏存储回归锚:restore 与旧全尺寸实现**逐位一致**。
+
+        shape 断言抓不住 origin 偏移错/内容错位(restore 出的全零或平移图 shape
+        也对)——**前景体素总数 == area** 才是能抓的断言(审查 P2-5)。
+        """
+        from src.inference.nodule_split import restore_instance_mask
+        v = np.zeros((6, 50, 60), np.uint8)
+        v[2:5, 10:20, 30:40] = 1    # 实例 A:贴内部
+        v[0, 45:49, 0:5] = 1        # 实例 B:贴三面边界(锚定 origin 偏移)
+        nodules = split_nodules(v, min_area_ratio=0)
+        assert len(nodules) == 2
+        merged = np.zeros_like(v)
+        for n in nodules:
+            assert "mask_sparse" in n and "mask" not in n, \
+                "3D 实例须稀疏存储(mask_sparse),不应携带全尺寸 mask 键"
+            full = restore_instance_mask(n["mask_sparse"], v.shape)
+            assert full.shape == v.shape
+            assert full.dtype == np.uint8
+            assert int(full.sum()) == n["area"], \
+                "restore 后前景体素总数须 == area(shape 对但 origin 错位时此断言才红)"
+            assert set(np.unique(full).tolist()) <= {0, 1}
+            merged |= full
+        # 与旧全尺寸实现逐位一致:所有实例按位或后 == 原输入二值图
+        assert np.array_equal(merged, (v != 0).astype(np.uint8)), \
+            "restore 往返不得丢/挪任何前景体素"
+        # 边界实例的 bbox 与 restore 前景位置吻合(防 origin 偏移)
+        b = next(n for n in nodules if n["bbox"][4] == 0)  # z0=0 的贴边界实例
+        fb = restore_instance_mask(b["mask_sparse"], v.shape)
+        assert np.array_equal(
+            fb[0, 45:49, 0:5],
+            np.ones((4, 5), np.uint8)), "贴边界实例的 restore 前景位置须与原输入一致"
+
 
 class TestFrameGapClosing:
     """时间维缝合:分割在个别帧漏检不应把一个结节拆成两个。"""

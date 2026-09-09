@@ -6,7 +6,7 @@
 e40 权重续训 Stage2,3 个 epoch 内分割从 97.71% 塌到 80.6%(lr 暴涨 + 全模型解冻 +
 mal loss 首启 + 物理先验满强度四件事同 epoch 齐发)。三头是随机初始化、只在官方数据
 上从零学,一旦搭上那条崩塌调度,模型只能提交一次、踩上去无法补救。故按
-`docs/训练与架构/训练架构方案.md` 另建 A/B/C:
+`docs/历史存档/训练架构方案_20260809.md` 另建 A/B/C:
 
   Stage A (epoch 1-10) :冻结 cls_backbone/CBM,训四头 + **分割前向链**;头 lr 线性 warmup 至 lr_base。
   Stage B (epoch 11-30):额外解冻 cls_backbone Top-2 block,LLRD(backbone lr = 头 lr ×

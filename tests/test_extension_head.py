@@ -48,7 +48,7 @@ def _square_mask(canvas=40, lo=10, hi=30):
 def test_band_width_is_kernel_minus_one(k, expect_width):
     """带宽 = kernel_size − 1（实测），不是 kernel_size。
 
-    这条钉住的是一个**容易想当然**的量：`docs/训练与架构/训练架构方案.md` 写「5px 交界带」，
+    这条钉住的是一个**容易想当然**的量：`docs/历史存档/训练架构方案_20260809.md` 写「5px 交界带」，
     照字面把 kernel 设 5 得到的其实是 4px。数值本身不重要，重要的是别让后人
     按错误的换算去调核宽。
     """

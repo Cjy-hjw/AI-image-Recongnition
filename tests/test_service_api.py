@@ -288,14 +288,16 @@ class TestConfigPaths:
         _, config_mod, _ = svc
         assert config_mod.SERVICE_PORT == 8000
 
-    def test_default_two_inference_workers(self, svc):
-        """2026-09-03 提速:worker 默认 1→2(1060 病例串行 3 小时→~2 倍吞吐)。
-        前提:Deduplicator 已加线程锁(共享 hashes/embeddings/FAISS 不再竞态);
-        模型前向走 inference_mode 无参数更新,多线程 call 安全。显存口径按
-        官方实测 32G(2026-08-12),2×单例峰值 ~16G×2 < 32G;更高 worker 因
-        内存尾险(64G)不上,详见 config.py 注释。"""
+    def test_default_single_inference_worker(self, svc):
+        """2026-09-09 OOM 事故回拨:worker 默认 2→1。2026-09-08 动态全帧前向上云后,
+        2 路双动态并发内存峰值 56.9G/64G(20:53 告警 82.6%),22:06 容器 OOMKilled
+        重启、内存任务状态清零、回调丢失 → 平台 28800s 超时整批作废。串行 ~3.5h
+        对 8h 时限余量足,2 路的时间收益(~35 分钟)不值得尾部风险。
+        (2026-09-03 曾默认 2:当时 32 帧抽样单例 ~16G 安全;全帧后单例峰值+split
+        副本叠加,2 路即触顶。要恢复 2 用 AICOMP_INFERENCE_WORKERS=2,前提见
+        config.py 注释。)"""
         _, config_mod, _ = svc
-        assert config_mod.INFERENCE_WORKERS == 2
+        assert config_mod.INFERENCE_WORKERS == 1
 
 
 class TestPlaceholderRunner:

@@ -103,7 +103,7 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 ## 测试总数(单一权威,2026-09-06 实测)
 
-**全套 1007 passed + 1 skipped**(2026-09-06 二轮三路复审+D 路修复后,`torch28` 预演
+**全套 1016 passed + 1 skipped**(2026-09-06 二轮三路复审+D 路修复后,`torch28` 预演
 环境实测)。演进链 1002 **+5 = 二轮复审修复**(2026-09-06:第二轮 A/B/C 审查挖出
 4×P0/P1——A-F1 invalid 桶 KeyError/A-F2 匈牙利少算 TP/A-F3 dedup 删真 TP/
 C-F1 静态 fake 自证键——修复时 `test_detection_match.py` 22+5=27、

@@ -68,6 +68,7 @@
   但推理输入目录层级仍须云端首跑核对。
 """
 
+import itertools
 import logging
 import os
 import threading
@@ -258,15 +259,48 @@ def _run_cases(cases, output_dir, state, precision, max_frames):
         for group in groups:
             for case in group:
                 _process_case(case, output_dir, state, precision, max_frames)
+                _maybe_malloc_trim()
         return
 
     def _run_group(group):
         for case in group:
             _process_case(case, output_dir, state, precision, max_frames)
+            _maybe_malloc_trim()
 
     with ThreadPoolExecutor(max_workers=workers,
                             thread_name_prefix="case") as pool:
         list(pool.map(_run_group, groups))
+
+
+# 🔴 2026-09-09 内存治理(60G OOM 重启破案):worker=1 只挡并发叠加,挡不住
+# glibc 跨例碎片累积——大数组 free 后 malloc 不还 OS,RSS 只增不降(39.8→60G
+# 走势的放大器)。每 N 例调 malloc_trim 强制归还;非 glibc 平台(本地
+# Windows/CI)ctypes 找不到 libc.so.6 抛 FileNotFoundError ⊂ OSError,跳过。
+_ENV_TRIM_INTERVAL = "AICOMP_MALLOC_TRIM_INTERVAL"
+_DEFAULT_TRIM_INTERVAL = 16
+_TRIM_COUNTER = itertools.count(1)   # 线程安全的例计数
+
+
+def _maybe_malloc_trim():
+    """每 N 例 malloc_trim(0) 强制 glibc 归还空闲堆;env 可覆盖,<=0 禁用。
+
+    纯优化路径,任何异常都不该把整批打挂(A 路审查 P2:libc 有文件但缺
+    malloc_trim 符号会抛 AttributeError,不在 OSError 面内)——整体吞。
+    """
+    try:
+        interval = int(os.environ.get(_ENV_TRIM_INTERVAL,
+                                      str(_DEFAULT_TRIM_INTERVAL)))
+    except ValueError:
+        interval = _DEFAULT_TRIM_INTERVAL
+    if interval <= 0:
+        return
+    if next(_TRIM_COUNTER) % interval:
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — 纯优化,任何平台差异都静默跳过
+        pass
 
 
 def _inference_workers():

@@ -62,7 +62,7 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 
 | 脚本 | 用途 | 关键参数/产出 | 注意事项 |
 |:---|:---|:---|:---|
-| `download_thyroidxl.py` | 从 HuggingFace（或 hf-mirror）下载 ThyroidXL 公开甲状腺超声数据集，生成 SHA-256 manifest | `--output`（默认 `data/public_datasets/ThyroidXL`）；`--token`（或 `HF_TOKEN` 环境变量）；`--no-mirror` | ThyroidXL 是 Gated Dataset，需先在 HF 申请权限；访问外网须先设代理 `$env:http_proxy="http://127.0.0.1:1203"` |
+| `download_thyroidxl.py` | 从 HuggingFace（或 hf-mirror）下载 ThyroidXL 公开甲状腺超声数据集，生成 SHA-256 manifest | `--output`（默认 `data/public_datasets/ThyroidXL`）；`--token`（或 `HF_TOKEN` 环境变量）；`--no-mirror` | ThyroidXL 是 Gated Dataset，需先在 HF 申请权限；访问外网须先设代理 `$env:http_proxy="http://127.0.0.1:7897"` |
 | `download_pretrain_weights.py` | 离线打包下载四个预训练权重：ConvNeXt-Nano、EfficientNet-B2（timm）、SSCD-ResNet50、MedSAM ViT-B，生成 MD5/SHA-256 manifest | 产出目录：`.cache_weights/`；manifest：`.cache_weights/weights_manifest.json`；总计约 548 MB | 需要代理；CI/自动化环境须预设代理 |
 
 ---

@@ -74,7 +74,7 @@ from src.inference.io import load_input_image  # noqa: E402
 from src.inference.nifti_io import (  # noqa: E402
     load_nifti_frames, scatter_frames_to_full_length)
 from src.inference.nodule_split import (  # noqa: E402
-    detection_confidence, split_nodules)
+    detection_confidence, restore_instance_mask, split_nodules)
 from src.inference.v21_output import (  # noqa: E402
     _dynamic_det_conf, _resize_binary, _resize_soft)
 
@@ -207,18 +207,25 @@ def run_dynamic_inference_from_result(case_result):
     n_sampled = len(frame_idx)
     gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
     instances = split_nodules(binary_3d, close_gap_frames=gap)
-    # 直接复用生产 `_dynamic_det_conf` 保口径(A 路 F4:共享实现使等价测试退化为
-    # 同函数两次调用,公式级回归仅靠 fixture 数值断言兜底——生产侧若改公式,
-    # 本镜像自动跟随,等价性永真但绝对值无独立桩,这是已知取舍)。
+    # 🔴 镜像生产 2026-09-09 稀疏化:full_shape 须在 del binary_3d 前捕获
+    # (3D 实例 mask_sparse 写盘/消费前 restore_instance_mask 重建全尺寸)。
+    full_shape = binary_3d.shape
     soft_by_frame = {int(fi): sf for fi, sf in zip(frame_idx, soft_frames)}
+    del binary_frames, soft_frames
     out = []
     for inst in instances:
+        # 镜像生产 _build_entries_and_save_masks:稀疏实例逐个 restore,
+        # conf 与 IoU 消费共用,用完即弃(峰值恒 1 份全尺寸)。
+        if "mask_sparse" in inst:
+            full_mask = restore_instance_mask(inst["mask_sparse"], full_shape)
+        else:
+            full_mask = inst["mask"]
         out.append({
-            "mask": inst["mask"],
+            "mask": full_mask,
             "area": int(inst["area"]),
-            "confidence": _dynamic_det_conf(inst, soft_by_frame),
+            "confidence": _dynamic_det_conf(inst, soft_by_frame, full_mask),
         })
-    del binary_3d, binary_frames, soft_frames
+    del binary_3d
     return out, n_total
 
 

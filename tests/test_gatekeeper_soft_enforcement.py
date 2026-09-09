@@ -252,16 +252,21 @@ class TestBadFrameIsolation:
             video_mod, "load_video_frames",
             lambda *a, **k: (frames, indices, False, None, len(frames)))
 
-        real_diagnose = case_pipeline._diagnose_frame
+        # 2026-09-09 批量前向迁移:生产循环不再逐帧调 _diagnose_frame,改为
+        # ① 逐帧 preprocess(形状坏帧在此拦) → ② 批量 run_forward → ③ 逐样本
+        # _decode_frame_sample(数值坏帧在此拦)。fake 的注入点随之迁到 ③ 段的
+        # _decode_frame_sample——三个职责(指纹反查帧号/指定帧抛 NaN/mal_probs
+        # 覆写)在新注入点完整保留:frame_np 仍在签名里(测试缝,生产不消费),
+        # NonFiniteProbabilityError 正是 decode 段异常,preds 是其返回值。
+        real_decode = case_pipeline._decode_frame_sample
         from src.inference.postprocess import NonFiniteProbabilityError
 
-        def _fake_diagnose(model, frame_np, precision, device, img_size, calibrator=None):
+        def _fake_decode(outputs, frame_np, calibrator=None):
             pos = int(frame_np[0, 0]) // 10 - 1
             if pos in bad_positions:
                 raise NonFiniteProbabilityError(
                     f"decode_predictions: malignancy 概率含 NaN/Inf (test frame {pos})")
-            preds, img_tensor = real_diagnose(
-                model, frame_np, precision, device, img_size, calibrator=calibrator)
+            preds = real_decode(outputs, frame_np, calibrator=calibrator)
             if mal_probs_by_pos is not None and pos in mal_probs_by_pos:
                 # 必须复刻生产代码的同源关系 `mal_prob = float(mal_probs[1])`
                 # (postprocess.py:78)。若这里各自独立赋值,float32 舍入会让二者
@@ -270,9 +275,9 @@ class TestBadFrameIsolation:
                                  dtype=np.float32)
                 preds["mal_probs"] = probs
                 preds["mal_prob"] = float(probs[1])
-            return preds, img_tensor
+            return preds
 
-        monkeypatch.setattr(case_pipeline, "_diagnose_frame", _fake_diagnose)
+        monkeypatch.setattr(case_pipeline, "_decode_frame_sample", _fake_decode)
 
         argv = [
             "video_predict.py", "--input_video", str(tmp_path / "fake.mp4"),
@@ -363,10 +368,14 @@ class TestBadFrameIsolation:
         assert data["n_frames_failed"] == 0 and data["failed_frame_indices"] == []
 
     def test_runtime_error_still_propagates_to_error_status(self, tmp_path, monkeypatch):
-        """只捕 ValueError:RuntimeError(CUDA OOM/权重维度不符)必须冒泡成 ERROR。
+        """只捕 NonFinite/AssertionError:RuntimeError(权重维度不符)必须冒泡成 ERROR。
 
         若逐帧兜底吞掉 RuntimeError,真故障会被伪装成"少了几帧"的 PASSED 结果——
         评测方拿到一份看似正常的诊断,而实际上模型根本没正常跑。
+        2026-09-09 批量前向迁移:patch 点从 _diagnose_frame 迁到 run_forward
+        (批量前向的实际执行层);消息用**非 OOM 字样**——OOM 会触发 _forward_frames
+        对半降级路径(那由 test_video_batch_inference 专测),本测试锁"真故障
+        立刻冒泡、不重试"。
         """
         import video_predict as video_mod
         from src.inference import case_pipeline
@@ -376,9 +385,9 @@ class TestBadFrameIsolation:
             video_mod, "load_video_frames", lambda *a, **k: (frames, [0, 1], False, None, len(frames)))
 
         def _boom(*a, **k):
-            raise RuntimeError("CUDA out of memory (simulated)")
+            raise RuntimeError("simulated weight shape mismatch")
 
-        monkeypatch.setattr(case_pipeline, "_diagnose_frame", _boom)
+        monkeypatch.setattr(case_pipeline, "run_forward", _boom)
         out = tmp_path / "out"
         monkeypatch.setattr(sys, "argv", [
             "video_predict.py", "--input_video", str(tmp_path / "fake.mp4"),

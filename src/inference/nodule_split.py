@@ -72,7 +72,13 @@ def split_nodules(
 
     Returns:
         list[dict],按 `area` 降序,每项:
-            `mask`     — np.uint8 实例掩码,值域 `{0,1}`,shape 与输入一致
+            `mask`     — **2D**: np.uint8 实例掩码,值域 `{0,1}`,shape 与输入一致。
+                         **3D**: 稀疏存储(2026-09-09 内存治理),键为 `mask_sparse`
+                         `{array:(nz,bh,bw) uint8 bbox 裁剪块, origin:(z0,y0,x0) 全尺寸
+                         坐标系偏移}`——全尺寸视图按需 `restore_instance_mask` 重建
+                         (每实例 (n_frames,H,W) 全尺寸 ≈0.9GB × ≤20 例 ≈17GB 峰值,
+                         实际每结节只在几十帧出现,全尺寸驻留浪费 90%+;
+                         bbox 块典型 <1MB)。**2D 路径不变**(`mask` 键全尺寸,小图无此问题)。
             `area`     — int 前景体素数(3D 为全帧累计)
             `bbox`     — 2D: `(x, y, w, h)`;3D: `(x, y, w, h, z0, z1)`,`z1` 为**闭区间**
             `centroid` — 2D: `(cx, cy)`;3D: `(cx, cy, cz)`,float
@@ -180,24 +186,56 @@ def _split_3d(arr, min_area_ratio, max_nodules, close_gap_frames):
         ys, xs = np.nonzero(inst.any(axis=0))
         zs = frame_idx
 
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        z0, z1 = int(zs.min()), int(zs.max())
+        # 🔴 2026-09-09 内存治理:实例改为 bbox 裁剪稀疏存储(见 split_nodules
+        # docstring 的定量依据)。全尺寸 `inst` 仅在本循环体内临时存在,算完
+        # bbox/centroid 即拷出裁剪块并 del——**峰值 = 1 个临时全尺寸 + 已存
+        # bbox 块**,不再随实例数累积(~17GB → ~几十MB)。全尺寸视图由消费方
+        # `restore_instance_mask` 按需重建(逐实例用完即弃)。
+        sparse = {
+            "array": inst[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1].copy(),
+            "origin": (z0, y0, x0),   # 在 (n_frames,H,W) 全尺寸坐标系中的偏移
+        }
+        del inst
         nodules.append({
-            "mask": inst,
+            "mask_sparse": sparse,
             "area": area,
             "bbox": (
-                int(xs.min()), int(ys.min()),
-                int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1),
-                int(zs.min()), int(zs.max()),
+                x0, y0,
+                x1 - x0 + 1, y1 - y0 + 1,
+                z0, z1,
             ),
             "centroid": (
-                float(np.nonzero(inst)[2].mean()),
-                float(np.nonzero(inst)[1].mean()),
-                float(np.nonzero(inst)[0].mean()),
+                float(np.nonzero(sparse["array"])[2].mean() + x0),
+                float(np.nonzero(sparse["array"])[1].mean() + y0),
+                float(np.nonzero(sparse["array"])[0].mean() + z0),
             ),
             "frame_indices": [int(z) for z in zs],
         })
 
     nodules.sort(key=lambda d: d["area"], reverse=True)
     return nodules[:max_nodules]
+
+
+def restore_instance_mask(sparse: dict, full_shape: tuple) -> np.ndarray:
+    """稀疏存储 → 全尺寸 uint8 实例 mask(值域 `{0,1}`,shape == full_shape)。
+
+    写盘(`save_binary_mask`)与 IoU/逐帧消费需要全尺寸/规范形状;bbox 裁剪只用于
+    **驻留内存**。逐实例调用方须用完即弃(全尺寸 ≈0.9GB/例,重建是手段不是常态)。
+
+    回归锚:`tests/test_nodule_split.py` 的往返测试断言 restore 结果与旧全尺寸
+    实现**逐位一致** + 前景体素总数 == `area`(shape 断言抓不住 origin 偏移错、
+    内容错位,体素数才能抓——审查 P2-5)。
+    """
+    z0, y0, x0 = sparse["origin"]
+    arr = np.asarray(sparse["array"])
+    out = np.zeros(full_shape, dtype=np.uint8)
+    out[z0:z0 + arr.shape[0],
+        y0:y0 + arr.shape[1],
+        x0:x0 + arr.shape[2]] = arr
+    return out
 
 
 def crop_nodule(image: np.ndarray, bbox, pad_ratio: float = 0.25):

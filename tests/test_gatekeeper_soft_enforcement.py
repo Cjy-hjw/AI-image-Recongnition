@@ -261,12 +261,13 @@ class TestBadFrameIsolation:
         real_decode = case_pipeline._decode_frame_sample
         from src.inference.postprocess import NonFiniteProbabilityError
 
-        def _fake_decode(outputs, frame_np, calibrator=None):
+        def _fake_decode(outputs, frame_np, calibrator=None, *, dynamic=False):
             pos = int(frame_np[0, 0]) // 10 - 1
             if pos in bad_positions:
                 raise NonFiniteProbabilityError(
                     f"decode_predictions: malignancy 概率含 NaN/Inf (test frame {pos})")
-            preds = real_decode(outputs, frame_np, calibrator=calibrator)
+            preds = real_decode(outputs, frame_np, calibrator=calibrator,
+                                dynamic=dynamic)
             if mal_probs_by_pos is not None and pos in mal_probs_by_pos:
                 # 必须复刻生产代码的同源关系 `mal_prob = float(mal_probs[1])`
                 # (postprocess.py:78)。若这里各自独立赋值,float32 舍入会让二者

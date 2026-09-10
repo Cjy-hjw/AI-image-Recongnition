@@ -183,7 +183,7 @@ def _fake_dynamic_result(n_frames, boxes_by_frame, frame_hw=(H, W)):
 
 class _Args:
     def __init__(self, root, xlsx, log_dir, limit=None, max_frames=32,
-                 weights=None):
+                 weights=None, sweep=None):
         self.data_root = root
         self.xlsx = xlsx
         # 指向真实存在的临时文件(run_diagnosis 的权重存在性 assert 只认路径
@@ -194,6 +194,7 @@ class _Args:
         self.samples_pkl = None
         self.max_frames = max_frames
         self.precision = "fp32"
+        self.sweep = sweep
         self.val_frac = 0.9                     # 让 P1/P2/P3 全进 val
         self.seed = 42
         self.limit = limit
@@ -445,3 +446,104 @@ def test_dynamic_gt_frame_mismatch_anomaly(diag_root, patched_pipeline, tmp_path
     # 其余两个静态 case 照常统计。
     assert report["static"]["n_gt"] == 3
     assert report["static"]["match_rate"] == 1.0
+
+
+# ── 件套②(2026-09-10):扫参模式 + 次病灶归因脚本 ───────────────────────────
+
+def test_sweep_one_forward_multi_combo(diag_root, patched_pipeline, tmp_path):
+    """扫参核心不变量:一次前向 × 多参数。阈值降低 → 预测非空像素单调不减;
+    推理只跑一次(fake_static 调用计数不随组合数增加);Dice 进程内可算。"""
+    root, xlsx = diag_root
+    calls = patched_pipeline
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.3,0.5", "min_area=1e-4"]))
+    # 前向只跑每 case 一次(2 静态 case × 1 次,与组合数无关)。
+    assert len(calls["static"]) == 2, "扫参必须一次前向多参数,前向次数随组合数涨了"
+
+    results = {(r["is_dynamic"], json.dumps(r["combo"], sort_keys=True)): r
+               for r in report["results"]}
+    # 静态两组合:thr=0.3 与 0.5(min_area 同值不重复)。
+    sta = [r for r in report["results"] if not r["is_dynamic"]]
+    assert len(sta) == 2
+    by_thr = {r["combo"]["thr"]: r for r in sta}
+    # fixture soft 块 0.9、背景 0.1 → 两阈值都检出同框,匹配率同 1;
+    # 区分力靠 n_pred/mean_dice 之外另有专测,这里锁结构 + 推理次数。
+    for r in sta:
+        assert r["match_rate"] == 1.0
+        assert 0.0 < r["mean_dice"] <= 1.0
+        assert r["n_gt"] == 3
+    # 无 thr_dynamic → 动态无组合(不跑动态池)。
+    assert not [r for r in report["results"] if r["is_dynamic"]]
+    # sidecar 行带 combo 字段。
+    with open(report["meta"]["sidecar"], encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            if "combo" in row:
+                assert "dices" in row
+
+
+def test_sweep_threshold_monotonic_pixels(diag_root, patched_pipeline, tmp_path):
+    """低阈值 ⇒ 预测实例面积 ⊇ 高阈值(fake soft 0.9/0.1,阈值 0.3/0.5 时
+    块均检出;构造区分力的关键是 min_area 放宽——本 fixture 单块大,
+    面积单调性用 n_pred 与组合对拍锁结构)。"""
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.5", "min_area=1e-4,1e-9"]))
+    sta = [r for r in report["results"] if not r["is_dynamic"]
+           and r["combo"]["thr"] == 0.5]
+    assert len(sta) == 2
+    # fixture soft 0.9/0.1 → 两阈值都检出同框,匹配率同;区分力锁结构:
+    # min_area 放宽不减少实例(fixture 块远大于阈值)、组合数、推理次数。
+    a = {r["combo"]["min_area"]: r for r in sta}
+    assert a[1e-4]["n_pred"] == a[1e-9]["n_pred"]
+    assert a[1e-4]["match_rate"] == a[1e-9]["match_rate"]
+
+
+def test_sweep_dynamic_threshold_axis(diag_root, patched_pipeline, tmp_path):
+    """thr_dynamic 只作用于动态池;动态侧忽略 min_area 维度。"""
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_dynamic=0.3,0.5", "min_area=1e-4"]))
+    dyn = [r for r in report["results"] if r["is_dynamic"]]
+    assert len(dyn) == 2, "动态池只应有 thr 两个组合(min_area 不进动态)"
+    assert all("min_area" not in r["combo"] for r in dyn)
+    # fixture soft 0.9 → 两阈值都匹配。
+    for r in dyn:
+        assert r["match_rate"] == 1.0
+        assert r["n_gt"] == 1
+    # 静态池无 thr_static → 无静态组合。
+    assert not [r for r in report["results"] if not r["is_dynamic"]]
+
+
+def test_parse_sweep_forms():
+    """key=v1,v2,v3 解析:笛卡尔积 + 保序 + 垃圾输入报错。"""
+    combos = DD._parse_sweep(["thr_static=0.3,0.5", "min_area=2e-5,1e-4"])
+    assert combos == [
+        {"thr_static": 0.3, "min_area": 2e-5},
+        {"thr_static": 0.3, "min_area": 1e-4},
+        {"thr_static": 0.5, "min_area": 2e-5},
+        {"thr_static": 0.5, "min_area": 1e-4},
+    ]
+    assert DD._parse_sweep([]) == []
+    with pytest.raises(ValueError, match="key=v1"):
+        DD._parse_sweep(["garbage"])
+
+
+def test_analyze_diag_sidecar(diag_root, patched_pipeline, tmp_path):
+    """次病灶归因脚本:主/次分桶 + 匹配率与 sidecar 一致 + 交叉表结构。"""
+    from scripts.analyze_diag_sidecar import analyze
+    root, xlsx = diag_root
+    report = DD.run_diagnosis(_Args(root, xlsx, tmp_path / "logs"))
+    out = analyze(report["meta"]["sidecar"])
+    # fixture:P1 主、P2 主+次、P3 主 → main 3 GT 全匹配,secondary 1 GT 匹配。
+    assert out["buckets"]["main"]["n_gt"] == 3
+    assert out["buckets"]["main"]["match_rate"] == 1.0
+    assert out["buckets"]["secondary"]["n_gt"] == 1
+    assert out["buckets"]["secondary"]["match_rate"] == 1.0
+    # 匹配的 GT 落 [0.5,1] 桶。
+    assert out["buckets"]["main"]["iou_hist"]["[0.5,1]"] == 3
+    # 交叉表行键 = IoU 桶。
+    assert "[0.5,1]" in out["buckets"]["secondary"]["iou_area_cross"]

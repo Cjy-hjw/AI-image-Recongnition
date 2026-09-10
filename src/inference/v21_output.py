@@ -69,6 +69,7 @@ except ImportError:  # pragma: no cover - 依赖缺失路径由调用方兜底
 
 from src.inference import prediction_json as pj
 from src.inference.nifti_io import save_binary_mask, scatter_frames_to_full_length
+from src.inference.nodule_split import DEFAULT_MIN_AREA_RATIO
 from src.inference.nodule_split import restore_instance_mask
 from src.inference.nodule_split import detection_confidence, split_nodules
 
@@ -323,6 +324,28 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
     return entries
 
 
+def _qwk_round(probs, lo=1):
+    """加权 Kappa 指标下的决策规则:期望取整 round(Σ j·p_j),编码 = idx + lo。
+
+    (2026-09-10 零训练四件套③,替换 TI-RADS/ETE 的 argmax 决策)
+    二次加权 Kappa 的损失核是 (i-j)²,给定概率 p,最小化期望损失的点估计是
+    期望 E[j]=Σ j·p_j,取整后作为输出编码。概率质量向高分段偏移时,期望取整
+    比 argmax 更早给出高编码 —— argmax 在不确定时恒取峰值类,Kappa"方向对了
+    按距离给分"的口径下这白丢分;期望取整让 0.4/0.3/0.2 这类双峰分布落在中间。
+    ⚠️ 官方只写"加权Kappa"未公布二次/线性形态:期望取整在二次权重下最优,
+    线性权重下最优是中位数,期望取整介于 argmax 与中位数之间 —— 均为合理
+    近似而非两种口径下严格最优(此措辞经 Gate2 审查订正,勿再写强断言)。
+    ⚠️ 训练侧 `metrics_official` 验证指标仍是 argmax 口径,推理侧改期望取整后
+    两侧决策规则脱节(训练已关账,仅诊断性影响,不影响生产)。
+    🔴 `round` 是 Python **银行家舍入**(半整数取向偶数:E=0.5→0、E=1.5→2),
+    不是四舍五入——半整数处相邻两类到均值等距、Kappa 损失完全相同,属纯
+    tie-break,无系统性偏差;但照本 docstring 在别处复刻时若写 floor(x+0.5)
+    会得到不同编码(E=0.5 处 1 vs 0),且两种都合法、本地查不出。复刻须用
+    同款 `int(round(...))`(np.round 同为银行家舍入)。
+    """
+    return int(round(float(np.dot(np.arange(len(probs)), probs)))) + lo
+
+
 def _shared_nodule_context(preds) -> dict:
     """从 preds 提取每结节共享的预测上下文(**四头已于 2026-08-17 接真实输出**)。
 
@@ -333,7 +356,10 @@ def _shared_nodule_context(preds) -> dict:
 
     ## 编码换算(本函数最易错处,错了**不报错**)
 
-    `code = argmax_idx + 1` 对 **ETE / TI-RADS / Location** 三项成立
+    `code = 决策(idx) + 1` 对 **ETE / TI-RADS / Location** 三项成立;其中
+    **ETE / TI-RADS 自 2026-09-10 件套③起决策 = `_qwk_round`(期望取整)而非
+    argmax**(加权 Kappa 下的最优决策,见该函数 docstring),**Location 仍是
+    argmax**(宏 AUC 吃分布,argmax 是其天然点估计)。
     (`label_schema.py`:ETE_CODES=(1,2,3,4) / TIRADS_CODES=(1..5) /
      LOCATION_LABELS[0]="左上叶"→码 1)。
     🔴 **`t_clin_sig` 是唯一不 +1 的** —— 官方 `T∈{0,1}` 与 0-based 下标同值
@@ -359,8 +385,12 @@ def _shared_nodule_context(preds) -> dict:
     t_probs = preds["t_probs"]
     return {
         "malignancy_confidence": float(preds["mal_prob"]),
-        "tirads_class": int(np.argmax(tirads_probs)) + 1,   # idx0→码1(I类)
-        "ete_code": int(np.argmax(ete_probs)) + 1,          # idx0→码1(无侵犯)
+        # 零训练四件套③(2026-09-10):TI-RADS/ETE 走期望取整(_qwk_round),
+        # 替换 argmax —— 加权 Kappa 按类间距离惩罚,期望取整是不确定分布下的
+        # 最优点估计;location/T 不动(位置是宏AUC吃分布、T是AUC吃t_conf排序,
+        # 均非 Kappa 决策路径)。
+        "tirads_class": _qwk_round(tirads_probs),          # idx0→码1(I类)
+        "ete_code": _qwk_round(ete_probs),                 # idx0→码1(无侵犯)
         "location_probs": loc_probs,
         "location": int(np.argmax(loc_probs)) + 1,          # idx0→码1(左上叶)
         "t_clin_sig": int(np.argmax(t_probs)),              # 🔴 0/1,**不 +1**
@@ -455,6 +485,7 @@ def _write_static(case_dir, patient_id, subdir_uid, case_result,
     soft_fullres = _resize_soft(preds["pred_mask"], hw)
     binary_fullres = _resize_binary(preds["mask_binary"], hw)
 
+    # 件套④:静态不传 → split_nodules 默认 None → 吃 AICOMP_MIN_AREA_RATIO env。
     instances = split_nodules(binary_fullres)
     context = _shared_nodule_context(preds)
     entries = _build_entries_and_save_masks(
@@ -539,7 +570,11 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     # 仍正确保持 2 个实例(空间不重叠就连不上),不会把不同结节粘连。
     n_sampled = len(frame_indices)
     gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
-    instances = split_nodules(binary_3d, close_gap_frames=gap)
+    # 件套④:动态显式传 DEFAULT_MIN_AREA_RATIO —— split_nodules 默认参已改
+    # None→env(静态专用),这里不显式传会让动态意外吃到 AICOMP_MIN_AREA_RATIO
+    # (动态放宽会增多 3D 实例,写盘耗时与内存都是 8h 时限下的风险面,故钉死)。
+    instances = split_nodules(binary_3d, min_area_ratio=DEFAULT_MIN_AREA_RATIO,
+                              close_gap_frames=gap)
     # B 路审查 B-P3:3D 连通域已消费完 binary_3d,后续只有 mask 写盘(逐实例
     # 自持数据),全帧下该数组 ≈0.87GB/例,尽早释放(worker=2 双动态并发时
     # 峰值 -1.7GB)。诊断脚本 run_dynamic_inference_from_result 早有同款 del,

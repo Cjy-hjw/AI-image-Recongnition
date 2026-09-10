@@ -123,13 +123,15 @@ def _forward_frames(model, img_tensors, precision, device):
                 + _forward_frames(model, img_tensors[mid:], precision, device))
 
 
-def _decode_frame_sample(outputs, frame_np, calibrator=None):
+def _decode_frame_sample(outputs, frame_np, calibrator=None, *, dynamic=False):
     """单样本切片 outputs → decode_predictions(测试注入点)。
 
     `frame_np` 生产不消费,仅供测试指纹反查帧号(延续 `_fake_diagnose` 的设计手法,
     显式声明的测试缝)——bad-frame 注入测试依赖它定位"第几帧"。
+    `dynamic` 透传给 `decode_predictions` 选 `AICOMP_SEG_THRESHOLD_DYNAMIC`
+    (件套①:动态帧的分割阈值独立于静态,生产动态帧循环恒传 True)。
     """
-    return decode_predictions(outputs, calibrator=calibrator)
+    return decode_predictions(outputs, calibrator=calibrator, dynamic=dynamic)
 
 
 class DynamicCaseError(Exception):
@@ -188,14 +190,18 @@ def diagnose_static_case(model, img_np, config, calibrator, precision, device):
     }
 
 
-def _diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None):
+def _diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None,
+                    *, dynamic=False):
     """单帧前向 → 解码,返回 (preds, img_tensor)。img_tensor 留作关键帧 Grad-CAM 复用。
 
     与原 `video_predict.diagnose_frame` 同义(该函数保留为向后兼容 shim)。
+    `dynamic` 透传 decode(件套①);唯一生产调用方 kf 一致性锁重算分支传 True
+    与动态主循环同阈值(其 preds 本就只取张量,传值是为语义一致)。
     """
     img_tensor = preprocess_image(frame_np, img_size, device)
     outputs = run_forward(model, img_tensor, precision, device)
-    return decode_predictions(outputs, calibrator=calibrator), img_tensor
+    return decode_predictions(outputs, calibrator=calibrator,
+                              dynamic=dynamic), img_tensor
 
 
 def diagnose_dynamic_case(model, frames, frame_indices, config, calibrator,
@@ -271,7 +277,7 @@ def diagnose_dynamic_case(model, frames, frame_indices, config, calibrator,
         for (orig_idx, frame_np, img_tensor), outputs_i in zip(ok, per_outputs):
             try:
                 preds = _decode_frame_sample(outputs_i, frame_np,
-                                             calibrator=calibrator)
+                                             calibrator=calibrator, dynamic=True)
             except NonFiniteProbabilityError as e:
                 failed_frames.append({"frame_index": int(orig_idx), "reason": str(e)})
                 print(f"--> [WARNING] frame {orig_idx} 异常已跳过"
@@ -329,7 +335,8 @@ def diagnose_dynamic_case(model, frames, frame_indices, config, calibrator,
         print(f"--> [WARNING] 关键帧张量下标({kf_img_tensor_pos})与聚合关键帧"
               f"({agg['keyframe_index']})不一致,Grad-CAM 改用重算张量", flush=True)
         _, kf_tensor = _diagnose_frame(
-            model, kf_frame_np, precision, device, img_size, calibrator=calibrator)
+            model, kf_frame_np, precision, device, img_size, calibrator=calibrator,
+            dynamic=True)
 
     mask_resized = cv2.resize(
         kf_preds["mask_binary"], (kf_frame_np.shape[1], kf_frame_np.shape[0]),

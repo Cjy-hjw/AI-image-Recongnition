@@ -26,6 +26,9 @@
 计数)。缓解手段是先做时间维闭运算(`close_gap_frames`),默认开启跨 1 帧的缝合。
 """
 
+import math
+import os
+
 import numpy as np
 
 try:
@@ -52,10 +55,34 @@ DEFAULT_MIN_AREA_RATIO = 1e-4
 # 临床单次超声切面极少超过 10 个可报告结节,20 是宽松上界。超出部分按面积降序截断。
 DEFAULT_MAX_NODULES = 20
 
+# 零训练四件套④(2026-09-10):静态路径的最小面积占比可经 env 放宽(AP 单调性——
+# 尾部追加低 conf 小实例,检测 AP 只涨不跌,Dice 不受影响)。**只作用于静态**:
+# 动态放宽会增多 3D 实例,写盘耗时与内存都是 8h 时限下的风险面,动态生产调用点
+# 显式传 DEFAULT_MIN_AREA_RATIO 钉死不走 env(见 v21_output._write_dynamic)。
+_ENV_MIN_AREA_RATIO = "AICOMP_MIN_AREA_RATIO"
+
+
+def _env_min_area_ratio() -> float:
+    """env 解析静态 min_area_ratio;未设/非法一律回默认(不静默采信垃圾配置)。
+
+    🔴 非 finite 必须挡(A路审查P2):inf 会经 int(ratio*h*w) 抛 OverflowError
+    炸掉整例;nan 在 >=0.0 比较下侥幸回默认但属巧合非设计。
+    """
+    raw = os.environ.get(_ENV_MIN_AREA_RATIO)
+    if raw is None:
+        return DEFAULT_MIN_AREA_RATIO
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_AREA_RATIO
+    if not math.isfinite(v) or v < 0.0:
+        return DEFAULT_MIN_AREA_RATIO
+    return v
+
 
 def split_nodules(
     mask: np.ndarray,
-    min_area_ratio: float = DEFAULT_MIN_AREA_RATIO,
+    min_area_ratio=None,
     max_nodules: int = DEFAULT_MAX_NODULES,
     close_gap_frames: int = 1,
 ):
@@ -65,7 +92,10 @@ def split_nodules(
         mask: 2D `(H, W)` 静态图,或 3D `(n_frames, H, W)` 动态图。**任意非零视作
             前景**(兼容内部 0/255 的 `mask_binary`),内部统一二值化。
         min_area_ratio: 最小面积占比(相对单帧 H×W)。小于此值的连通域视为噪声丢弃。
-            传 0 表示不过滤。
+            传 0 表示不过滤。**None(默认)时走 `AICOMP_MIN_AREA_RATIO` env**
+            (件套④:仅静态生产调用方靠默认参吃 env;动态生产调用方显式传
+            `DEFAULT_MIN_AREA_RATIO` 不受 env 影响)。显式传参时 env 不生效
+            ——诊断脚本扫参/测试靠这一层优先级保持确定性。
         max_nodules: 保留的实例数上限,按面积降序截断。
         close_gap_frames: 仅 3D 有效。时间维闭运算的缝合跨度(帧),弥合分割在个别帧
             漏检导致的同一结节断裂。0 表示不缝合。
@@ -92,6 +122,9 @@ def split_nodules(
         RuntimeError: 所需依赖缺失(2D 需 cv2,3D 需 scipy)。
     """
     arr = np.asarray(mask)
+    # 件套④三层优先级:显式传参 > env(None 时) > DEFAULT(env 未设时)。
+    if min_area_ratio is None:
+        min_area_ratio = _env_min_area_ratio()
     if arr.ndim == 2:
         return _split_2d(arr, min_area_ratio, max_nodules)
     if arr.ndim == 3:

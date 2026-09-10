@@ -67,6 +67,51 @@ class TestSplit2D:
         large[0:10, 0:10] = 1
         assert split_nodules(large) == []  # 100px vs 阈值 400
 
+
+class TestMinAreaEnv:
+    """零训练四件套④(2026-09-10):min_area_ratio 三层优先级。
+
+    显式传参 > env(None 默认时) > DEFAULT(env 未设时)。
+    🔴 静态生产靠默认参吃 env(动态生产显式传 DEFAULT 钉死,不走 env)。
+    """
+
+    def test_no_env_none_equals_default(self, monkeypatch):
+        monkeypatch.delenv("AICOMP_MIN_AREA_RATIO", raising=False)
+        large = np.zeros((2000, 2000), np.uint8)
+        large[0:10, 0:10] = 1  # 100px,默认阈值 400 → 滤除
+        assert split_nodules(large) == []
+
+    def test_env_none_uses_env(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_MIN_AREA_RATIO", "2e-5")  # 2000²×2e-5=80px
+        large = np.zeros((2000, 2000), np.uint8)
+        large[0:10, 0:10] = 1  # 100px > 80 → 现在保留
+        assert len(split_nodules(large)) == 1
+
+    def test_explicit_param_beats_env(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_MIN_AREA_RATIO", "2e-5")
+        large = np.zeros((2000, 2000), np.uint8)
+        large[0:10, 0:10] = 1
+        # 显式传默认值 → env 不生效 → 滤除(动态生产钉死语义的单元级验证)
+        assert split_nodules(large, min_area_ratio=1e-4) == []
+
+    @pytest.mark.parametrize("raw", ["garbage", "-1e-4", "", "inf", "nan",
+                                     "1e400"])
+    def test_invalid_env_falls_back_to_default(self, monkeypatch, raw):
+        """🔴 inf/nan 是 A 路审查 P2 补的反例:inf 曾经只挡负值不挡非有限值,
+        int(inf*h*w) 抛 OverflowError 炸整例(docstring 自述"非法回默认"被
+        自己的实现破坏)。"""
+        monkeypatch.setenv("AICOMP_MIN_AREA_RATIO", raw)
+        large = np.zeros((2000, 2000), np.uint8)
+        large[0:10, 0:10] = 1
+        assert split_nodules(large) == []
+
+    def test_env_zero_disables_filter(self, monkeypatch):
+        """env=0 = 完全不过滤(与显式传 0 同义)。"""
+        monkeypatch.setenv("AICOMP_MIN_AREA_RATIO", "0")
+        m = np.zeros((100, 100), np.uint8)
+        m[5, 5] = 1  # 单像素
+        assert len(split_nodules(m)) == 1
+
     def test_max_nodules_truncates_by_area(self):
         m = np.zeros((200, 200), np.uint8)
         for i in range(5):  # 面积递增,间隔 ≥2px 保证不连通

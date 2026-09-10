@@ -74,7 +74,8 @@ from src.inference.io import load_input_image  # noqa: E402
 from src.inference.nifti_io import (  # noqa: E402
     load_nifti_frames, scatter_frames_to_full_length)
 from src.inference.nodule_split import (  # noqa: E402
-    detection_confidence, restore_instance_mask, split_nodules)
+    DEFAULT_MIN_AREA_RATIO, detection_confidence, restore_instance_mask,
+    split_nodules)
 from src.inference.v21_output import (  # noqa: E402
     _dynamic_det_conf, _resize_binary, _resize_soft)
 
@@ -117,10 +118,13 @@ def group_cases(samples: list) -> tuple:
 # ── 推理(逐行镜像 v21_output 的实例抽取,只不落盘)─────────────────────────
 
 def run_static_inference(model, config, calibrator, precision, device,
-                         img_path: str) -> list:
+                         img_path: str):
     """静态:镜像 `_write_static`(v21_output.py:374-385)的实例抽取链。
 
-    Returns: 实例 list,每项 {"mask": (H,W) uint8, "area": int, "confidence": float}。
+    Returns: (case_result, 后处理函数)。case_result 已注入 `orig_hw`
+    (镜像 runner.py:333);后处理函数消费 (case_result, seg_threshold=...,
+    min_area_ratio=...) → 实例 list——件套②扫参的"一次前向多参数"结构:
+    模型前向只跑一次,阈值参数在后处理层循环。
     """
     img_np, _is_dicom, err = load_input_image(img_path, "")
     if img_np is None:
@@ -130,37 +134,21 @@ def run_static_inference(model, config, calibrator, precision, device,
     # 镜像 runner.py:333 的注入(orig_hw = 原图 H×W,img_tensor 是 resize 到
     # img_size 的模型输入、不能冒充原图——`_static_orig_hw` 缺键即 raise)。
     case_result["orig_hw"] = tuple(int(x) for x in img_np.shape[:2])
-    return run_static_inference_from_result(case_result)
-
-
-def run_static_inference_from_result(case_result) -> list:
-    """从 diagnose_static_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
-
-    实例抽取逐行镜像 `_write_static`(v21_output.py:374-385):resize →
-    `split_nodules`(默认参数)→ `detection_confidence`(float 软图,区域内
-    概率均值——与动态的"帧覆盖率语义"不同源,静/动分叉点)。
-    """
-    preds = case_result["preds"]
-    hw = tuple(int(x) for x in case_result["orig_hw"])
-    soft_fullres = _resize_soft(preds["pred_mask"], hw)
-    binary_fullres = _resize_binary(preds["mask_binary"], hw)
-    instances = split_nodules(binary_fullres)  # 默认参数同生产
-    out = []
-    for inst in instances:
-        out.append({
-            "mask": inst["mask"],
-            "area": int(inst["area"]),
-            "confidence": detection_confidence(soft_fullres, inst["mask"]),
-        })
-    return out
+    return case_result, run_static_inference_from_result
 
 
 def run_dynamic_inference(model, config, calibrator, precision, device,
                           img_path: str, max_frames: int):
     """动态:镜像 `_write_dynamic`(v21_output.py:397-457)的实例抽取链。
 
-    Returns: (实例 list, n_total)。实例 mask 为 `(n_total,H,W)` uint8
-    (帧轴 = 原始帧号,与 GT 对齐,高危对齐点 1)。
+    Returns: (case_result, 后处理函数)。case_result 已注入 `n_total_frames`
+    (镜像 runner.py:410);后处理函数消费 (case_result, seg_threshold=...) →
+    (实例 list, n_total)——件套②扫参的"一次前向多参数"结构:模型前向只跑
+    一次,阈值参数在后处理层循环。
+
+    (2026-09-10 件套②改造:返回值从"实例 list"改为"case_result + 后处理闭包",
+    单参数调用方经 `run_dynamic_inference(...)[0]` 以外的旧写法须改——
+    全仓调用方只有 diagnose_one_case 与测试,均已同步。)
     """
     frames, frame_indices, _is_dicom, err, n_total = load_nifti_frames(
         img_path, "", max_frames)
@@ -177,15 +165,54 @@ def run_dynamic_inference(model, config, calibrator, precision, device,
     # → KeyError → 被宽 except 兜成 anomaly → 云端动态 case 全灭且报告"合法"。
     case_result["n_total_frames"] = n_total
     del frames
-    return run_dynamic_inference_from_result(case_result)
+    return case_result, run_dynamic_inference_from_result
 
 
-def run_dynamic_inference_from_result(case_result):
+def run_static_inference_from_result(case_result, *, seg_threshold=None,
+                                     min_area_ratio=None) -> list:
+    """从 diagnose_static_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
+
+    实例抽取逐行镜像 `_write_static`(v21_output.py:374-385):resize →
+    `split_nodules` → `detection_confidence`(float 软图,区域内
+    概率均值——与动态的"帧覆盖率语义"不同源,静/动分叉点)。
+
+    件套②(2026-09-10)扫参参数:`seg_threshold`/`min_area_ratio` 不传(None)时
+    **逐位镜像生产**——阈值 0.5 复用 preds["mask_binary"](生产静态吃
+    AICOMP_SEG_THRESHOLD 后,诊断脚本的同名 env 同步生效,口径不分叉);
+    min_area 走 split_nodules 默认 None→env(生产静态同源)。**显式传参优先于
+    env**——扫参进程必须确定性,不受运行环境 AICOMP_* 影响(A/B两路审查后
+    定稿:此前"显式钉 DEFAULT"会让云端设 env 后诊断与生产口径脱节)。
+    """
+    preds = case_result["preds"]
+    hw = tuple(int(x) for x in case_result["orig_hw"])
+    soft_fullres = _resize_soft(preds["pred_mask"], hw)
+    if seg_threshold is None:
+        binary_fullres = _resize_binary(preds["mask_binary"], hw)
+    else:
+        binary_fullres = _resize_binary(
+            (preds["pred_mask"] > seg_threshold).astype(np.uint8) * 255, hw)
+    instances = split_nodules(binary_fullres,
+                              min_area_ratio=min_area_ratio)
+    out = []
+    for inst in instances:
+        out.append({
+            "mask": inst["mask"],
+            "area": int(inst["area"]),
+            "confidence": detection_confidence(soft_fullres, inst["mask"]),
+        })
+    return out
+
+
+def run_dynamic_inference_from_result(case_result, *, seg_threshold=None):
     """从 diagnose_dynamic_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
 
     实例抽取逐行镜像 `_write_dynamic`:`n_total_frames` 硬校验、逐帧 resize →
     scatter → gap 按 `len(per_frame)`(高危对齐点 2)→ `split_nodules` → conf。
     Returns: (实例 list, n_total)。
+
+    件套②(2026-09-10):`seg_threshold` 不传(None)时逐位镜像生产(复用
+    preds["mask_binary"]);显式传时从 `pred_mask` 现算(扫参用;thr=0.5 与
+    mask_binary 逐位等价)。动态 min_area 恒 DEFAULT(镜像生产钉死,不扫)。
     """
     n_total = int(case_result["n_total_frames"])
     if not n_total or n_total <= 0:
@@ -197,7 +224,11 @@ def run_dynamic_inference_from_result(case_result):
     binary_frames, soft_frames = [], []
     for f in per_frame:
         p = f["preds"]
-        binary_frames.append(_resize_binary(p["mask_binary"], hw))
+        if seg_threshold is None:
+            binary_frames.append(_resize_binary(p["mask_binary"], hw))
+        else:
+            binary_frames.append(_resize_binary(
+                (p["pred_mask"] > seg_threshold).astype(np.uint8) * 255, hw))
         soft_frames.append(_resize_soft(p["pred_mask"], hw))
     binary_3d = scatter_frames_to_full_length(binary_frames, frame_idx, n_total)
     # 镜像生产 2026-09-08 修复:soft_3d 死分配删除(生产不再 scatter float soft,
@@ -206,7 +237,10 @@ def run_dynamic_inference_from_result(case_result):
     # 非 max_frames。生产 v21_output.py 同口径,取错碎裂数漂移。
     n_sampled = len(frame_idx)
     gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
-    instances = split_nodules(binary_3d, close_gap_frames=gap)
+    # 镜像生产 2026-09-10 件套④:动态显式传 DEFAULT_MIN_AREA_RATIO(不吃 env),
+    # 与 v21_output._write_dynamic 的钉死语义一致——动态放宽是 8h 时限风险面。
+    instances = split_nodules(binary_3d, min_area_ratio=DEFAULT_MIN_AREA_RATIO,
+                              close_gap_frames=gap)
     # 🔴 镜像生产 2026-09-09 稀疏化:full_shape 须在 del binary_3d 前捕获
     # (3D 实例 mask_sparse 写盘/消费前 restore_instance_mask 重建全尺寸)。
     full_shape = binary_3d.shape
@@ -274,6 +308,27 @@ def load_gts_for_case(case: list) -> list:
 
 # ── 单 case 诊断行 ──────────────────────────────────────────────────────────
 
+def _match_row(preds: list, gts: list) -> dict:
+    """实例×GT 匹配的核心段(diagnose_one_case 与扫参共用)。
+
+    Returns: {"iou_m", "match", "keep"} 或 {"anomaly": str}(shape 不齐)。
+    """
+    try:
+        iou_m = build_iou_matrix(preds, gts)
+        match = match_instances(iou_m, MATCH_IOU_THRESHOLD)
+        # C 路 2026-09-05 审查 P1:ap_dedup 的 keep 逐 case 现算库语义
+        # `dedup_keep_mask` 并写进 sidecar —— 池级用近似规则会双向失真:
+        # 分叉A(独苗近失碎片 best_iou∈(0.1,0.5) 未匹配)会被误删 → 高估碎裂损失;
+        # 分叉B(matched 但非该 GT 列 argmax 的 TP)按库语义本该删 → 低估。
+        # 现算 = 单一权威,池化零语义漂移。
+        # A 路 F3 修复(2026-09-05):必须传 match —— 匈牙利 TP 并入 keep 集,
+        # 否则"非列 argmax 的真 TP"被删、无碎裂却读出碎裂损失。
+        keep = dedup_keep_mask(iou_m, match=match)
+    except ValueError as e:
+        return {"anomaly": f"匹配失败(shape 不齐): {e}"}
+    return {"iou_m": iou_m, "match": match, "keep": keep}
+
+
 def diagnose_one_case(model, config, calibrator, precision, device,
                       case: dict, max_frames: int) -> dict:
     """推理 + GT + 匹配 → case 行(sidecar JSONL 的一行,JSON 可序列化)。"""
@@ -289,20 +344,34 @@ def diagnose_one_case(model, config, calibrator, precision, device,
 
     try:
         if case["is_dynamic"]:
-            preds, n_total = run_dynamic_inference(
+            # 件套②:动态只扫阈值(min_area 恒 DEFAULT 镜像生产钉死,不扫)。
+            case_result, post = run_dynamic_inference(
                 model, config, calibrator, precision, device,
                 img_path, max_frames)
-            # 帧/HW 硬断言:GT 帧 mask 数须 == n_total、HW 一致(高危对齐点 1 的防线)。
+            n_total = int(case_result["n_total_frames"])
+            # 帧/HW 硬断言:GT 帧 mask 数须 == n_total、HW 一致(高危对齐点 1 的
+            # 防线)。无预测时用 g 自身 HW 预判(与旧 preds_hw(preds) 空列表回退
+            # 同义,且能在 post 跑之前就拦)。
             for g in gts:
-                if g["n_mask_frames"] != n_total or g["hw"] != preds_hw(preds, g):
+                if g["n_mask_frames"] != n_total:
                     row["anomaly"] = (
                         f"动态 shape 不齐: gt_frames={g['n_mask_frames']} "
-                        f"n_total={n_total} gt_hw={g['hw']} pred_hw={preds_hw(preds, g)}")
+                        f"n_total={n_total} gt_hw={g['hw']}")
+                    return row
+            preds, n_total_rt = post(case_result)
+            assert n_total_rt == n_total
+            # post 后再核 HW(有预测时用预测实例的 HW)。
+            for g in gts:
+                if preds and g["hw"] != preds_hw(preds, g):
+                    row["anomaly"] = (
+                        f"动态 shape 不齐: gt_hw={g['hw']} "
+                        f"pred_hw={preds_hw(preds, g)}")
                     return row
         else:
-            preds = run_static_inference(
+            case_result, post = run_static_inference(
                 model, config, calibrator, precision, device, img_path)
-            # 静态 HW 不齐时 build_iou_matrix 会 ValueError,由下方统一拦。
+            preds = post(case_result)
+            # 静态 HW 不齐时 build_iou_matrix 会 ValueError,由 _match_row 统一拦。
     except Exception as e:  # noqa: BLE001 — 单 case 失败不拖垮全局,记 anomaly
         row["anomaly"] = f"推理失败: {type(e).__name__}: {e}"
         return row
@@ -310,20 +379,11 @@ def diagnose_one_case(model, config, calibrator, precision, device,
     n_gt = len(gts)
     row["n_gt"] = n_gt
     row["n_pred"] = len(preds)
-    try:
-        iou_m = build_iou_matrix(preds, gts)
-        match = match_instances(iou_m, MATCH_IOU_THRESHOLD)
-        # C 路 2026-09-05 审查 P1:ap_dedup 的 keep 逐 case 现算库语义
-        # `dedup_keep_mask` 并写进 sidecar —— 池级用近似规则会双向失真:
-        # 分叉A(独苗近失碎片 best_iou∈(0.1,0.5) 未匹配)会被误删 → 高估碎裂损失;
-        # 分叉B(matched 但非该 GT 列 argmax 的 TP)按库语义本该删 → 低估。
-        # 现算 = 单一权威,池化零语义漂移。
-        # A 路 F3 修复(2026-09-05):必须传 match —— 匈牙利 TP 并入 keep 集,
-        # 否则"非列 argmax 的真 TP"被删、无碎裂却读出碎裂损失。
-        keep = dedup_keep_mask(iou_m, match=match)
-    except ValueError as e:
-        row["anomaly"] = f"匹配失败(shape 不齐): {e}"
+    m = _match_row(preds, gts)
+    if "anomaly" in m:
+        row["anomaly"] = m["anomaly"]
         return row
+    iou_m, match, keep = m["iou_m"], m["match"], m["keep"]
 
     for i, p in enumerate(preds):
         best = float(iou_m[i].max()) if n_gt > 0 else 0.0
@@ -496,6 +556,322 @@ def run_diagnosis(args) -> dict:
     return report
 
 
+def _dice_for_gts(preds: list, gts: list, match: dict) -> list:
+    """逐 GT 的 Dice(官方口径:匹配成功取实际 Dice,未匹配取 0)。
+
+    🔴 只能在扫参进程内算(sidecar 行不落 mask,事后无从计算):Dice 须按
+    GT mask 与匹配预测 mask 直算,不能从 IoU 反推(2IoU/(1+IoU) 是数学等价
+    变换但依赖"两者都是二值集合"前提——反推公式在 IoU 舍入后的误差直接进
+    Dice;直算是官方口径的字面实现)。
+    """
+    out = []
+    for j, g in enumerate(gts):
+        i = int(match["gt_to_pred"][j])
+        if i < 0:
+            out.append(0.0)
+            continue
+        p_mask = np.asarray(preds[i]["mask"]) != 0
+        g_mask = np.asarray(g["mask"]) != 0
+        if g.get("annotated_frames") is not None:
+            # 动态:各标注帧帧级 Dice 的算术平均(与官方 IoU 同结构;
+            # 预测帧全空 → 该帧 Dice=0,自然覆盖)。
+            vals = []
+            for f in g["annotated_frames"]:
+                pm, gm = p_mask[f], g_mask[f]
+                denom = pm.sum() + gm.sum()
+                vals.append(2.0 * float((pm & gm).sum()) / denom if denom else 0.0)
+            out.append(float(np.mean(vals)) if vals else 0.0)
+        else:
+            denom = p_mask.sum() + g_mask.sum()
+            out.append(2.0 * float((p_mask & g_mask).sum()) / denom if denom else 0.0)
+    return out
+
+
+def _combo_rows(case_result, post, gts: list, is_dynamic: bool,
+                combos: list) -> list:
+    """单 case 的扫参核心:一次前向产物 × 参数组合列表 → 逐组合 case 行。
+
+    前向结果(case_result)是本函数入参、组合循环只跑后处理段(resize/split/
+    match)——模型前向(全量 54 分钟的大头)只跑一次,组合数只线性放大 CPU 段。
+    🔴 内存边界(B路审查P2订正):①`preds` 在组合循环末尾显式 del——下一组合的
+    post() 执行期间上一组合的 N 份全尺寸实例 mask 仍被引用,不 del 峰值 2×;
+    ②动态例 soft 驻留估算按**原图分辨率**算(resize 后),750 帧×802×1442×4B
+    ≈3.47GB/例,不是 512² 的 0.75GB;③case 级生命周期(循环完即弃),不跨 case
+    缓存。另外 post() 返回的动态实例是逐实例 restore 的全尺寸 mask(N 份同时
+    驻留,生产 _build_entries_and_save_masks 才是逐个用完即弃)。
+    """
+    rows = []
+    for combo in combos:
+        kw = {}
+        if combo.get("thr") is not None:
+            kw["seg_threshold"] = combo["thr"]
+        if not is_dynamic and combo.get("min_area") is not None:
+            kw["min_area_ratio"] = combo["min_area"]
+        if is_dynamic:
+            preds, _n_total = post(case_result, **kw)
+        else:
+            preds = post(case_result, **kw)
+        row = {"combo": combo, "anomaly": None, "n_pred": len(preds),
+               "n_gt": len(gts), "preds": [], "gts": [], "dices": []}
+        try:
+            m = _match_row(preds, gts)
+            if "anomaly" in m:
+                row["anomaly"] = m["anomaly"]
+                rows.append(row)
+                continue
+            iou_m, match, keep = m["iou_m"], m["match"], m["keep"]
+            for i, p in enumerate(preds):
+                best = float(iou_m[i].max()) if len(gts) else 0.0
+                row["preds"].append({
+                    "confidence": round(float(p["confidence"]), 6),
+                    "area": p["area"], "best_iou": round(best, 6),
+                    "matched": bool(match["pred_to_gt"][i] >= 0),
+                    "dedup_keep": bool(keep[i]),
+                })
+            dices = _dice_for_gts(preds, gts, match)
+            for j, g in enumerate(gts):
+                # 🔴 max_iou/area_ratio 必须进行(B路审查P1):analyze_diag_sidecar
+                # 对缺键用 0.0 兜底——匹配率 100% 的病例会被全计入 miss 桶,
+                # 归因报告指向完全错误的药方。与 diagnose_one_case 的 gts 字段对齐。
+                row["gts"].append({
+                    "is_main": g["is_main"],
+                    "matched": bool(match["gt_to_pred"][j] >= 0),
+                    "max_iou": round(float(iou_m[:, j].max()) if len(preds) else 0.0, 6),
+                    "area_ratio": round(float(g["area_ratio"]), 8),
+                })
+            row["dices"] = [round(d, 6) for d in dices]
+        finally:
+            del preds  # 🔴 下一组合 post() 前释放 N 份全尺寸 mask(防峰值 2×)
+        rows.append(row)
+    return rows
+
+
+def _parse_sweep(specs: list) -> list:
+    """`key=v1,v2,v3` 形式 → 组合列表(笛卡尔积,保序)。
+
+    keys: `thr_static`/`thr_dynamic`(分割阈值)/`min_area`(静态最小面积占比,
+    仅静态路径消费)。交叉维度 = 静态阈值×min_area(静态池)/动态阈值(动态池,
+    min_area 不扫——生产动态钉死 DEFAULT)。实现上为简化:统一笛卡尔积,动态
+    侧忽略 min_area 维度(`_combo_rows` 按分支消费),组合数会略多于理论必要,
+    CPU 段每组合 ~秒级,可接受。
+    """
+    import itertools
+    # 🔴 白名单校验(B路审查P1):未知键(如 thr= 漏写 _static)在派生后两侧皆空,
+    # 会静默跑完全量 54 分钟推理再产出空报告——键名错误必须在入口就报。
+    _ALLOWED = {"thr_static", "thr_dynamic", "min_area"}
+    axes = []
+    for spec in specs or []:
+        if "=" not in spec:
+            raise ValueError(f"--sweep 需要 key=v1,v2,v3 形式,收到 {spec!r}")
+        key, vals = spec.split("=", 1)
+        key = key.strip()
+        if key not in _ALLOWED:
+            raise ValueError(
+                f"--sweep 未知键 {key!r}(允许: {sorted(_ALLOWED)})——"
+                f"键名拼错会让派生组合为空、白跑全量推理后产出空报告")
+        parsed = []
+        for v in vals.split(","):
+            v = v.strip()
+            if not v:
+                continue
+            parsed.append(float(v))
+        if parsed:
+            axes.append((key, parsed))
+    if not axes:
+        return []
+    keys = [k for k, _ in axes]
+    combos = []
+    for values in itertools.product(*[v for _, v in axes]):
+        combos.append(dict(zip(keys, values)))
+    return combos
+
+
+def run_sweep(args) -> dict:
+    """件套②扫参主流程:一次前向 × 参数组合,产出逐组合静/动/合并池指标。
+
+    每组合输出:匹配率、平均 Dice(未匹配计 0,官方口径)、ap_current、
+    n_pred。与 run_diagnosis 共用建模/val 切分/匹配逻辑,但 case 行按组合组织
+    (sidecar 每行带 combo 字段),便于横向对拍。
+    """
+    import torch
+    from src.inference.model_runner import build_model, load_config
+
+    combos = _parse_sweep(args.sweep)
+    if not combos:
+        raise ValueError("扫参模式需要至少一个 --sweep key=v1,v2,v3")
+    # 派生:静态/动态各自适用的组合(动态忽略 min_area)。
+    # 静态必须有 thr_static 才扫(纯 min_area 无阈值轴时不扫静态——min_area
+    # 是阈值的伴随参数,单独扫它对官方阈值 0.5 的基线没有对拍意义)。
+    combos_static = []
+    for c in combos:
+        if "thr_static" not in c:
+            continue
+        d = {k: v for k, v in c.items()
+             if k in ("thr_static", "min_area")}
+        d["thr"] = d.pop("thr_static")
+        if d not in combos_static:
+            combos_static.append(d)
+    combos_dynamic = []
+    for c in combos:
+        d = {"thr": c["thr_dynamic"]} if "thr_dynamic" in c else {}
+        if d and d not in combos_dynamic:
+            combos_dynamic.append(d)
+    # 🔴 派生空护栏(B路审查P1):--sweep min_area=... 这类"无阈值轴"组合派生后
+    # 两侧皆空,白跑全量推理后产出空报告——入口即拦。
+    if not combos_static and not combos_dynamic:
+        raise ValueError(
+            f"扫参组合派生为空(输入 {args.sweep}):至少需要一个 "
+            "thr_static=... 或 thr_dynamic=... 轴;min_area 是静态阈值的伴随参数")
+    _safe_print(f"[sweep] 静态 {len(combos_static)} 组合 × 动态 "
+                f"{len(combos_dynamic)} 组合")
+
+    if not os.path.exists(args.weights):
+        raise FileNotFoundError(f"权重不存在: {args.weights}")
+    _safe_print(f"[sweep] weights = {os.path.abspath(args.weights)}")
+    config = load_config(args.config)
+    device = torch.device(
+        config["environment"]["device"] if torch.cuda.is_available() else "cpu")
+    model = build_model(config, args.weights, device)
+    from src.inference.calibration import TemperatureScaler
+    calibrator = TemperatureScaler.from_file(
+        config.get("calibration", {}).get("param_file",
+                                          "checkpoints/calibration.json"))
+
+    seed = args.seed if args.seed is not None else int(
+        config.get("environment", {}).get("seed", 42))
+    _, val_ds = build_official_datasets(
+        args.data_root, args.xlsx, img_size=int(config["data"]["img_size"]),
+        val_frac=args.val_frac, seed=seed, samples_pkl=args.samples_pkl)
+    samples = val_ds.samples
+    cases, n_no_mask = group_cases(samples)
+    if args.limit:
+        cases = cases[: args.limit]
+    _safe_print(f"[sweep] val 样本 {len(samples)} → {len(cases)} case"
+                f"(limit={args.limit or '全量'})")
+
+    os.makedirs(args.log_dir, exist_ok=True)
+    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    sidecar_path = os.path.join(args.log_dir, f"sweep_{ts}.cases.jsonl")
+    report_path = os.path.join(args.log_dir, f"sweep_{ts}.json")
+    # 池化结构:{("static"|"dynamic"|None, combo_key): rows}
+    all_rows = {}
+    t0 = time.time()
+    n_anomaly = 0
+    with open(sidecar_path, "w", encoding="utf-8") as sf:
+        for k, case in enumerate(cases):
+            gts = load_gts_for_case(case["gts"])
+            bad = [g["error"] for g in gts if "error" in g]
+            if bad:
+                n_anomaly += 1
+                sf.write(json.dumps({"case_key": case["img_path"],
+                                     "anomaly": f"GT 读取异常: {bad[0]}"},
+                                    ensure_ascii=False) + "\n")
+                continue
+            gts = [g for g in gts if "error" not in g]
+            # B路审查P3:该池无组合时跳过整个 case 的推理(动态推理是全跑里最贵
+            # 的一档,无组合还跑 = 纯浪费)。
+            has_combo = (combos_dynamic if case["is_dynamic"]
+                         else combos_static)
+            if not has_combo:
+                continue
+            try:
+                if case["is_dynamic"]:
+                    case_result, post = run_dynamic_inference(
+                        model, config, calibrator, args.precision, device,
+                        case["img_path"], args.max_frames)
+                    rows = _combo_rows(case_result, post, gts, True,
+                                       combos_dynamic)
+                else:
+                    case_result, post = run_static_inference(
+                        model, config, calibrator, args.precision, device,
+                        case["img_path"])
+                    rows = _combo_rows(case_result, post, gts, False,
+                                       combos_static)
+                # 🔴 用完即弃:动态例 resize 回原图后的 soft ≈ 帧数×H×W×4B
+                # (750×802×1442 例 ≈3.47GB,B路审查订正——不是 512² 的 0.75GB),
+                # 勿跨 case。
+                del case_result
+            except Exception as e:  # noqa: BLE001
+                n_anomaly += 1
+                sf.write(json.dumps({"case_key": case["img_path"],
+                                     "anomaly": f"推理失败: {type(e).__name__}: {e}"},
+                                    ensure_ascii=False) + "\n")
+                continue
+            for r in rows:
+                if r.get("anomaly"):
+                    n_anomaly += 1
+                r["case_key"] = case["img_path"]
+                r["is_dynamic"] = case["is_dynamic"]
+                sf.write(json.dumps(r, ensure_ascii=False) + "\n")
+                key = json.dumps(r["combo"], sort_keys=True)
+                all_rows.setdefault((case["is_dynamic"], key), []).append(r)
+            if (k + 1) % 20 == 0 or k + 1 == len(cases):
+                _safe_print(f"[sweep] {k + 1}/{len(cases)} case 完成"
+                            f"(anomaly {n_anomaly})")
+            sf.flush()
+    runtime_s = round(time.time() - t0, 1)
+
+    # 池化:每组合 × (静/动) 的匹配率/平均Dice/AP;合并池 = 静动行并集。
+    from scripts.detection_match import average_precision
+    results = []
+    for (is_dyn, key), rows in sorted(all_rows.items()):
+        ok = [r for r in rows if not r.get("anomaly")]
+        preds_flat, dices_flat, n_gt = [], [], 0
+        for r in ok:
+            for p in r["preds"]:
+                preds_flat.append(p)
+            dices_flat.extend(r["dices"])
+            n_gt += r["n_gt"]
+        labels = [int(p["matched"]) for p in preds_flat]
+        confs = [p["confidence"] for p in preds_flat]
+        results.append({
+            "is_dynamic": is_dyn, "combo": json.loads(key),
+            "n_cases": len(rows), "n_gt": n_gt,
+            "n_tp": sum(labels),
+            "match_rate": (sum(labels) / n_gt) if n_gt else 0.0,
+            "mean_dice": (float(np.mean(dices_flat))
+                          if dices_flat else 0.0),  # 未匹配已在 _dice_for_gts 计 0
+            "ap_current": average_precision(labels, confs, n_gt),
+            "n_pred": len(preds_flat),
+        })
+    # 合并池(静+动同组合并存时):按 combo 键聚合。动态组合键含 thr_dynamic、
+    # 静态含 thr_static/min_area,天然不重合——合并只在"两侧都扫了同一 thr 值"
+    # 的人工对拍场景下由使用者自行汇总,报告不强行合并(避免口径混淆)。
+    report = {
+        "meta": {
+            "weights": os.path.abspath(args.weights), "config": args.config,
+            "seed": seed, "val_frac": args.val_frac,
+            "max_frames": args.max_frames, "precision": args.precision,
+            "n_samples": len(samples), "n_cases": len(cases),
+            "n_no_mask_samples": n_no_mask, "runtime_s": runtime_s,
+            "sidecar": sidecar_path,
+            "sweep_args": list(args.sweep),
+            "combos_static": combos_static, "combos_dynamic": combos_dynamic,
+            "caveats": [
+                "mean_dice = 官方口径(匹配成功取实际Dice,未匹配取0,全部金标准"
+                "结节的平均);Dice 只能在扫参进程内算(sidecar 不落 mask)",
+                "动态 min_area 不扫(生产动态钉死 DEFAULT,镜像同口径);"
+                "静态 min_area 只作用于静态池",
+                "val 只含有 ROI 标注患者,阴性 FP 不在池(与 run_diagnosis 同盲区)",
+                "🔴 选阈值须看 match_rate 与 mean_dice 的联合,不能只看其一:"
+                "降阈值让临界带病例越过 0.5,同时让已匹配病例 IoU 下滑跌出 0.5",
+            ],
+        },
+        "results": results,
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    _safe_print("\n===== 扫参摘要 =====")
+    for r in results:
+        _safe_print(
+            f"[{'dyn' if r['is_dynamic'] else 'sta'}] {r['combo']} | "
+            f"n_gt={r['n_gt']} TP={r['n_tp']} 匹配率={r['match_rate']:.4f} | "
+            f"平均Dice={r['mean_dice']:.4f} | AP={r['ap_current']:.4f} "
+            f"n_pred={r['n_pred']}")
+    _safe_print(f"[sweep] 报告: {report_path}\n[sweep] sidecar: {sidecar_path}")
+    return report
+
+
 def print_summary(report: dict) -> None:
     """控制台摘要表(可直接贴回)。"""
     _safe_print("\n===== 检测诊断摘要 =====")
@@ -535,10 +911,21 @@ def main():
                     help="缺省取 config environment.seed(与训练一致)")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--log-dir", default="logs")
+    # 件套②(2026-09-10)扫参模式:key=v1,v2,v3 形式,可重复传。keys:
+    #   thr_static / thr_dynamic(分割二值化阈值)/ min_area(静态最小面积占比,
+    #   只作用于静态池)。给了 --sweep 就走 run_sweep(一次前向多参数),
+    #   否则走原 run_diagnosis(单参数全量诊断)。
+    ap.add_argument("--sweep", action="append", default=None,
+                    help="例:--sweep thr_static=0.30,0.35,0.40,0.50 "
+                         "--sweep thr_dynamic=0.25,0.30,0.35 "
+                         "--sweep min_area=2e-5,5e-5,1e-4")
     args = ap.parse_args()
     # 逐 case 完整行始终进 sidecar JSONL(崩溃保数据);--save-per-case 曾计划
     # 把行嵌进主报告,但会撑大 JSON 且与 sidecar 重复,已砍,参数不再收。
-    run_diagnosis(args)
+    if args.sweep:
+        run_sweep(args)
+    else:
+        run_diagnosis(args)
 
 
 if __name__ == "__main__":

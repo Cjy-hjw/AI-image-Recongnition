@@ -55,10 +55,13 @@ def _soft_and_binary_single(blob_model):
 def _head_probs(ete=None, loc=None, t=None, tirads=None, t_conf=0.3):
     """官方四头概率(#116b)。默认造**非均匀、argmax 非 idx0** 的分布。
 
-    🔴 默认值刻意避开 idx0:接线代码是 `argmax+1`,若某处漏写 `+1`,idx0 的
+    🔴 默认值刻意避开 idx0:接线代码是 `+1` 编码,若某处漏写 `+1`,idx0 的
     one-hot 恰好也能得到"看似正确"的码 1 —— 用 idx0 当默认等于零区分力。
     默认 argmax:ETE→idx1(码2 包膜) / Location→idx4(码5 右中叶) /
     T→idx1(T=1,**不 +1**) / TI-RADS→idx3(码4)。
+    ⚠️ 件套③(2026-09-10)起 ETE/TI-RADS 走期望取整;默认分布
+    (ETE E=1.3→码2 / TI-RADS E=2.75→码4)恰好与 argmax 同值——分叉用例见
+    test_*_expected_round_diverges_from_argmax。
     """
     return {
         "ete_probs": np.array(ete if ete is not None else [0.1, 0.6, 0.2, 0.1]),
@@ -424,27 +427,73 @@ class TestOfficialHeadWiring:
         assert n["T_ClinSig"]["T_conf"] > 0.0, "T_conf 仍是占位恒 0.0"
 
     @pytest.mark.parametrize("idx,expected", [(1, 2), (2, 3), (3, 4)])
-    def test_ete_code_is_argmax_plus_one(self, tmp_path, idx, expected):
-        """ETE:`code = argmax + 1`。参数化**全部避开 idx0** —— 用 idx0 测等于没测
-        (漏写 `+1` 时 idx0 恰好也"对",off-by-one 逃逸)。"""
+    def test_ete_code_is_expected_round(self, tmp_path, idx, expected):
+        """ETE 编码(零训练四件套③,2026-09-10 起 = 期望取整+1,不再 argmax)。
+        尖锐分布(峰 0.85)下期望取整与 argmax 重合 —— 参数化**全部避开 idx0**,
+        漏写 `+1` 时 idx0 恰好也"对",off-by-one 逃逸。"""
         probs = [0.05] * 4
         probs[idx] = 0.85
         n = self._write_and_read(tmp_path, f"P_ETE{idx}",
                                  head_probs=_head_probs(ete=probs))
         assert n["ExtrathyroidalExtension"] == expected
 
+    def test_ete_expected_round_diverges_from_argmax(self, tmp_path):
+        """🔴 非尖锐分布:期望取整 ≠ argmax,钉住新决策规则本身。
+
+        [0.4,0.35,0.2,0.05]:argmax=idx0(码1 无侵犯),但概率质量整体右移,
+        E=0.9 → 码 2(包膜)。argmax 只看峰值、期望取整看整体质量 —— 这正是
+        Kappa"方向对了按距离给分"口径下 argmax 白丢分的形态。
+        """
+        probs = [0.4, 0.35, 0.2, 0.05]
+        n = self._write_and_read(tmp_path, "P_ETE_ER",
+                                 head_probs=_head_probs(ete=probs))
+        assert n["ExtrathyroidalExtension"] == 2, \
+            "期望取整未生效(仍走 argmax 会得 1)"
+
+    def test_ete_low_tail_does_not_pull_up(self, tmp_path):
+        """🔴 类 3 低概率尾巴不得拉高编码:[0.97,0.02,0,0.01] → E=0.1 → 码 1。"""
+        probs = [0.97, 0.02, 0.0, 0.01]
+        n = self._write_and_read(tmp_path, "P_ETE_TAIL",
+                                 head_probs=_head_probs(ete=probs))
+        assert n["ExtrathyroidalExtension"] == 1
+
+    def test_qwk_half_integer_tie_is_bankers(self, tmp_path):
+        """🔴 精确半整数 tie(B路审查补):E=0.5 是真实可达的两类 50/50。
+        Python round 银行家舍入 → 取偶数 0 → 码 1;floor(x+0.5) 会得码 2。
+        半整数处两类等距、Kappa 损失相同,取哪个都是 tie-break——本测试把
+        当前选择**有意钉死**,防止未来有人在别处复刻成四舍五入静默分叉。
+        TI-RADS 侧 E=2.5 → 银行家取向偶数 2 → 码 3(floor(x+0.5) 会得 4)。"""
+        n = self._write_and_read(tmp_path, "P_ETE_TIE",
+                                 head_probs=_head_probs(ete=[0.5, 0.5, 0.0, 0.0]))
+        assert n["ExtrathyroidalExtension"] == 1
+        # E = 1*0.5 + 4*0.5 = 2.5 → banker round(2.5) = 2(向偶)→ 码 3
+        n2 = self._write_and_read(
+            tmp_path, "P_TR_TIE",
+            head_probs=_head_probs(tirads=[0.0, 0.5, 0.0, 0.0, 0.5]))
+        assert n2["TI_RADS_Class"] == 3
+
     @pytest.mark.parametrize("idx,expected", [(1, 2), (3, 4), (4, 5)])
-    def test_tirads_class_is_argmax_plus_one(self, tmp_path, idx, expected):
-        """TI-RADS:`code = argmax + 1`,且**不再走 ACR 概念积分反推**。
+    def test_tirads_class_is_expected_round(self, tmp_path, idx, expected):
+        """TI-RADS 编码(件套③起 = 期望取整+1),且**不再走 ACR 概念积分反推**。
 
         fixture 的 `total_points=5` 按旧 `_tirads_class_from_breakdown` 会得 4;
         本测试构造的期望码与之不同(idx1→2 / idx4→5),故能区分两条路径。
+        尖锐分布(峰 0.8)下期望取整与 argmax 重合。
         """
         probs = [0.05] * 5
         probs[idx] = 0.8
         n = self._write_and_read(tmp_path, f"P_TR{idx}",
                                  head_probs=_head_probs(tirads=probs))
         assert n["TI_RADS_Class"] == expected
+
+    def test_tirads_expected_round_diverges_from_argmax(self, tmp_path):
+        """🔴 非尖锐分布:期望取整 ≠ argmax。[0.35,0.3,0.25,0.05,0.05]:
+        argmax=idx0(码1 I类),E=1.15 → 码 2(II类)≠ argmax。"""
+        probs = [0.35, 0.3, 0.25, 0.05, 0.05]
+        n = self._write_and_read(tmp_path, "P_TR_ER",
+                                 head_probs=_head_probs(tirads=probs))
+        assert n["TI_RADS_Class"] == 2, \
+            "期望取整未生效(仍走 argmax 会得 1)"
 
     @pytest.mark.parametrize("idx,expected", [(1, 2), (4, 5), (6, 7)])
     def test_location_is_argmax_plus_one(self, tmp_path, idx, expected):
@@ -502,13 +551,16 @@ class TestHedgeKeys:
         assert len(n["ETE_Probs"]) == 4
         assert abs(sum(n["TI_RADS_Probs"]) - 1.0) < 1e-6
         assert abs(sum(n["ETE_Probs"]) - 1.0) < 1e-6
-        # 与 int 字段自洽:argmax+1 必须等于写出的 int
-        assert n["ETE_Probs"].index(max(n["ETE_Probs"])) + 1 == \
-            n["ExtrathyroidalExtension"]
-        assert n["TI_RADS_Probs"].index(max(n["TI_RADS_Probs"])) + 1 == \
-            n["TI_RADS_Class"]
+        # 与 int 字段自洽:期望取整(_qwk_round)必须等于写出的 int。
+        # ⚠️ 件套③(2026-09-10)起 int 不再必然等于 argmax+1 —— 默认 fixture
+        # 是尖锐分布(ETE [0.1,0.6,0.2,0.1]→E=1.3→码2、TI-RADS 峰 0.7→E 落同值),
+        # 此处若换非尖锐 fixture,断言须改用 round(Σ j·p_j)+1 计算。
+        exp_ete = int(round(sum(j * p for j, p in enumerate(n["ETE_Probs"])))) + 1
+        exp_tirads = int(round(sum(j * p for j, p in enumerate(n["TI_RADS_Probs"])))) + 1
+        assert n["ExtrathyroidalExtension"] == exp_ete
+        assert n["TI_RADS_Class"] == exp_tirads
 
-    def test_absent_when_not_provided(self, tmp_path):
+    def test_absent_when_not_provided(self):
         """不传时**不写出该键**(而非写 null)——CLI 调试等旧调用方零污染。"""
         from src.inference import prediction_json as pj
         entry = pj.build_nodule_entry(
@@ -554,17 +606,23 @@ class TestDynamicLesionLevelMean:
     """动态路径:四头按**病灶级均值**汇总(官方 :215),不是取关键帧。"""
 
     def test_mean_differs_from_keyframe(self, tmp_path):
-        """🔴 构造成"三帧均值的 argmax ≠ 关键帧的 argmax",否则测试零区分力
+        """🔴 构造成"三帧均值的决策 ≠ 关键帧的决策",否则测试零区分力
         (沿用关键帧也能过)。
 
         关键帧 = per_frame[0](fixture 的 keyframe_index=0),其 ETE argmax=idx0(码1);
         三帧均值 = ([0.7,0.1,0.1,0.1] + [0.1,0.8,0.05,0.05] + [0.1,0.8,0.05,0.05])/3
-                 = [0.30, 0.5667, 0.0667, 0.0667] → argmax=idx1(码2)。
+                 = [0.30, 0.5667, 0.0667, 0.0667] → 件套③期望取整 E=0.9 → round→1…
+        🔴 E 落回 1 与关键帧同值会零区分力 → 加大偏移:第三帧全押 idx2,
+        均值 = [0.30,0.5333,0.1667,0.0667]×… 重算:[0.7,0.1,0.1,0.1]+
+        [0.1,0.8,0.05,0.05]+[0.1,0.1,0.75,0.05] = [0.9,1.0,0.9,0.2]/3 =
+        [0.30,0.3333,0.30,0.0667] → E=1.4333 → 码 2 ≠ 关键帧码 1 ✓。
+        (argmax=idx1 也是码 2,期望取整与 argmax 此处同值;均值聚合本身
+        由对冲键断言钉死,决策规则的分叉由静态用例专测。)
         """
         heads = [
             _head_probs(ete=[0.7, 0.1, 0.1, 0.1]),
             _head_probs(ete=[0.1, 0.8, 0.05, 0.05]),
-            _head_probs(ete=[0.1, 0.8, 0.05, 0.05]),
+            _head_probs(ete=[0.1, 0.1, 0.75, 0.05]),
         ]
         cr = _dynamic_case_result(per_frame_heads=heads)
         # 前提自检:关键帧单独看是码 1,与期望的均值结果 2 不同
@@ -577,7 +635,7 @@ class TestDynamicLesionLevelMean:
         assert n["ExtrathyroidalExtension"] == 2, \
             "动态四头应取全帧均值,拿到的是关键帧值"
         # 对冲键写出的也必须是均值本身
-        assert abs(n["ETE_Probs"][1] - (0.1 + 0.8 + 0.8) / 3) < 1e-9
+        assert abs(n["ETE_Probs"][1] - (0.1 + 0.8 + 0.1) / 3) < 1e-9
 
     def test_mal_prob_is_lesion_level_mean_not_keyframe(self, tmp_path):
         """🔴 良恶性也走病灶级均值,**不是**关键帧(2026-08-17 终审 P0.1)。

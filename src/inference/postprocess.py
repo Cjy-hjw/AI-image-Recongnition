@@ -1,5 +1,7 @@
 """Decode model outputs and compute TI-RADS breakdown."""
 
+import os
+
 import numpy as np
 import torch
 
@@ -24,7 +26,28 @@ class NonFiniteProbabilityError(ValueError):
     """
 
 
-def decode_predictions(outputs: dict, calibrator=None) -> dict:
+_ENV_SEG_THR = "AICOMP_SEG_THRESHOLD"
+_ENV_SEG_THR_DYNAMIC = "AICOMP_SEG_THRESHOLD_DYNAMIC"
+
+
+def _seg_threshold(dynamic: bool) -> float:
+    """分割二值化阈值(零训练四件套①,2026-09-10)。默认 0.5 = 历史行为逐位不变。
+
+    真实病灶只占 512² 的 0.1~3%,极端不平衡下 Dice/BCE 训出的概率系统性欠分割,
+    最优阈值通常低于 0.5(云端 val 扫参定值)。静/动两条 env 分开:动态匹配是
+    各标注帧 IoU 的算术平均、某帧全空按官方口径记 0,空帧对动态毁灭性更强,
+    动态阈值应比静态更低。解析失败/越界一律钳回 0.5(与 `case_pipeline.
+    _resolve_video_batch_size` 同模式——垃圾配置不静默采信也不崩,回退安全值)。
+    """
+    raw = os.environ.get(_ENV_SEG_THR_DYNAMIC if dynamic else _ENV_SEG_THR, "0.5")
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return 0.5
+    return t if 0.0 < t < 1.0 else 0.5
+
+
+def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False) -> dict:
     """Extract all prediction fields from raw model outputs.
 
     Args:
@@ -93,7 +116,10 @@ def decode_predictions(outputs: dict, calibrator=None) -> dict:
     pred_mask = torch.sigmoid(outputs["mask"].float())[0, 0]
     _assert_finite("mask", pred_mask)
     pred_mask = pred_mask.cpu().numpy()
-    mask_binary = (pred_mask > 0.5).astype(np.uint8) * 255
+    # 件套①:阈值经 _seg_threshold(dynamic) 解析,env 未设时恒 0.5(逐位等于旧
+    # 硬编码)。下游全链(case_pipeline/nodule_split/v21_output/诊断脚本)只读本
+    # mask_binary 的非零性 → 此处一改即全链生效,无第二个分割阈值。
+    mask_binary = (pred_mask > _seg_threshold(dynamic)).astype(np.uint8) * 255
 
     # argmax 对温度缩放不变(T>0 单调),保留校准以与概率刻度一致、便于上层取置信度。
     # 各头统一 .float():AMP fp16 下温度除法 logits/T 在半精度有舍入损失,先升 fp32 再缩放/softmax,

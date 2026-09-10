@@ -163,8 +163,9 @@ Phase 1 给 `decode_predictions` 全部分类头加了 NaN/Inf 硬校验(`_asser
 
 ## 4. `postprocess.py` — Prediction Decoding
 
-### `decode_predictions(outputs, calibrator=None)` → `dict`
+### `decode_predictions(outputs, calibrator=None, *, dynamic=False)` → `dict`
 Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `comp_prob`, `echo_prob`, `shape_prob`, `margin_prob`, `foci_prob`, `mal_prob`, `mal_probs`, **`ete_probs`, `location_probs`, `t_probs`, `t_conf`, `tirads_probs`**(官方四头,#116b 2026-08-17 接入)。
+- **分割二值化阈值 env 化(2026-09-10 零训练四件套①)**:`mask_binary = (pred_mask > _seg_threshold(dynamic))`;静/动两条 env 独立(`AICOMP_SEG_THRESHOLD`/`AICOMP_SEG_THRESHOLD_DYNAMIC`),未设时恒 0.5 = 历史行为逐位不变;垃圾/越界/inf/nan 一律钳回 0.5(NaN 比较返回 False 走越界分支,不会异常)。**`dynamic` 由调用方传**:生产静态路径 `diagnose_static_case` 不传(False),动态帧循环经 `_decode_frame_sample`/`_diagnose_frame` 透传 True(kf 一致性锁同)。非 case_pipeline 的旧调用方(`video_predict.py:42` shim、`evaluate.py:102`)默认 False 行为不变。**全链只有这一个分割阈值**——下游(case_pipeline/nodule_split/v21_output/诊断脚本)只读 mask_binary 非零性,此处一改即全链生效。
 - **官方四头(位置/ETE/临床T/TI-RADS)**:**原样透传各头已算好的 fp32 softmax**(`heads/*.py` 内部已 softmax),`decode_predictions` **不再二次 softmax**(`softmax(softmax(x))≠softmax(x)`,argmax 不变但概率值全错,而"必须输出概率分布"正是官方计分项)。**不走 calibrator**(`CALIBRATED_TASKS` 不含四头,温度缩放对未标定的头是伪精度)。**键缺失即 KeyError 不兜底** —— 四头是 `MultiTaskThyroidModel.forward` 的无条件输出,缺席说明加载的是不含四头结构的旧模型(如 `thyroidxl_merged_v2.pth`),静默兜底会写出确定性占位值而目标四 40% 三项 + 目标三 TI-RADS 全部失分且 JSON 完全合法、本地看不出。**长度也硬校验**(2026-08-17 第三轮 review lane4 L3):下游一律 `argmax+1`,长度错时若 argmax 落在合法值域内就静默产出错误编码 —— 实测唯独 `t_probs` 全程无人校验(4 维且 argmax=idx1 时静默写出 `T=1`),详见文末专条。
 - **`t_conf` 也过 `_assert_finite`**:官方《初赛评审规则》「置信度字段规范」明写 `Detection.confidence`/`Malignancy.confidence`/`T_conf` 若为 NaN/Inf/越界,**评估脚本统一按 0 处理、该样本在 AP/AUC-PR/AUC 中排最后** —— 不是崩溃而是静默垫底,比崩溃阴。
 - `calibrator`: 可选 `TemperatureScaler`。各分类头在 softmax/sigmoid **之前**先 `apply(task, logits)` 温度缩放;`None` 或全 T=1.0 时输出逐位等同无校准。各头统一 `.float()` 后再缩放(fp16 温度除法精度对齐),T>0 单调不改 argmax。mask 分割不走校准。
@@ -282,10 +283,11 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 的控制流交回 main/runner(与原 `video_predict.main()` 两处 `save_rejection_json`+`return`
 逐字节等价)。
 
-### 私有 `_diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None)`
+### 私有 `_diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None, *, dynamic=False)`
 
 单帧前向 → 解码,返回 `(preds, img_tensor)`。与原 `video_predict.diagnose_frame` 同义
-(该函数保留为向后兼容 shim)。
+(该函数保留为向后兼容 shim)。`dynamic` 透传 decode 选动态阈值 env(件套①);
+唯一生产调用方 = kf 一致性锁重算分支(传 True,与动态主循环同阈值)。
 
 ---
 
@@ -426,8 +428,14 @@ loader 默认只抽 32 帧 —— 直接堆叠抽样帧的 mask 会让 Z 长度�
 
 1. **在原图尺寸上拆,不在 512×512 模型分辨率上拆** —— 先拆再逐实例 resize 会让每个
    实例各经历一次最近邻插值,相邻结节边界还原后可能重叠或产生缝隙,累计误差不可控。
-2. **面积阈值用相对比例**(`min_area_ratio=1e-4`)而非绝对像素 —— 超声图 400×300 到
+2. **面积阈值用相对比例**(`min_area_ratio` 默认 None→env)而非绝对像素 —— 超声图 400×300 到
    1024×768 不等,固定像素阈值在小图误杀真结节、大图放过噪声。
+   **三层优先级(2026-09-10 件套④)**:显式传参 > `AICOMP_MIN_AREA_RATIO` env(None 默认时)
+   > `DEFAULT_MIN_AREA_RATIO=1e-4`(env 未设/垃圾/负/inf/nan 一律回默认,inf 会经
+   `int(ratio*h*w)` 抛 OverflowError 炸整例故必须挡)。**只有静态生产调用点靠默认参吃 env**
+   (`v21_output._write_static` 不传);动态生产/镜像三处**显式传 DEFAULT 钉死不走 env**
+   (动态放宽 = 增多 3D 实例,写盘耗时与内存都是 8h 时限下的风险面)。既有测试的显式
+   `min_area_ratio=0`(不过滤)用法不受 env 影响。
 3. **3D 按全帧累计体素过滤,不按单帧峰值** —— 动态图噪声多为单帧瞬时斑点,真结节必然
    跨帧持续;按单帧阈值会误杀"每帧 20px、连续 10 帧"的真结节(单帧 20 < 26,累计 200)。
    代价是单帧大面积斑点被保留,但那通常正是"真结节只在关键帧清晰"的正常情形。
@@ -480,12 +488,20 @@ JSON 完全合法、指标只是"偏低",本地永远查不出根因。
 逐字段显式传给 `build_nodule_entry`。云端训练实测能力:`loc_auc` 0.7519 /
 `t_auc` 0.7441 / `tirads_kappa` 0.6887 / `ete_kappa` 0.2086。
 
-🔴 **编码换算 `code = argmax_idx + 1` 只对 ETE / TI-RADS / Location 成立;
-`T_ClinSig.T` 唯一不 +1**(官方 `T∈{0,1}` 与 0-based 下标同值)。
+🔴 **编码换算 `code = 决策(idx) + 1` 只对 ETE / TI-RADS / Location 成立;
+其中 ETE / TI-RADS 的决策自 2026-09-10 件套③起 = `_qwk_round`(期望取整
+`int(round(Σ j·p_j))`,二次加权 Kappa 最优决策)而非 argmax;**Location 仍是
+argmax**(宏 AUC 吃分布);`T_ClinSig.T` 唯一不 +1**(官方 `T∈{0,1}` 与 0-based
+下标同值)。
+⚠️ `_qwk_round` 的 `round` 是 Python **银行家舍入**(半整数取向偶数:E=0.5→码1,
+`floor(x+0.5)` 会得码 2),复刻须用同款 `int(round(...))`;半整数处两类等距、
+Kappa 损失相同,属纯 tie-break 无系统性偏差。训练侧 `metrics_official` 仍是
+argmax 口径,两侧决策规则已脱节(训练关账,仅诊断性影响)。
 写错 `+1` 的后果不对称:T 多加会得 2 被 `prediction_json` 拦成整例 ERROR(至少会炸);
 其余三项漏加只是变成**另一个合法码**(如"包膜侵犯"报成"无侵犯"),越界校验放行、
 JSON 合法、指标偏低,**本地永远查不出**。回归测试 `TestOfficialHeadWiring` 用
-**全部避开 idx0** 的 one-hot 参数化钉死(用 idx0 测等于没测:漏 `+1` 时 idx0 恰好也"对")。
+**全部避开 idx0** 的 one-hot 参数化钉死(用 idx0 测等于没测:漏 `+1` 时 idx0 恰好也"对");
+另有非尖锐分布分叉用例(argmax 与期望取整给出不同码)+ 半整数 tie 用例钉死新规则。
 
 **`build_nodule_entry` 的占位兜底保留不删**(ETE=1/Location 均匀/T=0),供 CLI 调试等
 不产四头概率的调用方使用。→ 🔴 **在生产 `prediction.json` 里看到 `ETE=1 / 均匀
@@ -529,7 +545,8 @@ raise),拦的是「未来新增调用方忘了注入」这类回归。钉子
 演示旧行为的危害:6 帧原视频只写 5 帧 Z 轴)+ `test_invalid_n_total_frames_raises`(0/负/None)。
 
 🔴 **四头概率的长度契约在 `decode_predictions` 源头硬校验**(同轮 lane4 L3):
-下游 `_shared_nodule_context` 一律 `argmax+1`,**长度错时若 argmax 恰好落在合法值域内
+下游 `_shared_nodule_context` 对 ETE/TI-RADS 走 `_qwk_round`、Location 走
+`argmax+1`(件套③后仍以 idx 为基),**长度错时若决策恰好落在合法值域内
 就静默产出错误编码** —— 该维度按错值计分(Kappa/AUC 污染),JSON 完全合法查不出来。
 实测 8 个长度错场景:ETE/TI-RADS/Location 各自被下游对冲键或 `LocationProbs` 的长度
 校验**侧面**拦下(**那是巧合不是设计**),**唯独 `t_probs` 全程无人校验** —— 4 维且

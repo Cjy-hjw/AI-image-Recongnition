@@ -44,21 +44,24 @@ CALLBACK_PATH = "/api/competition/inference/callback/"
 CALLBACK_MAX_RETRIES = int(os.environ.get("AICOMP_CALLBACK_RETRIES", "3"))
 CALLBACK_TIMEOUT_S = float(os.environ.get("AICOMP_CALLBACK_TIMEOUT", "10"))
 
-# 推理工作线程数。**生产交付默认 1**(2026-09-09 OOM 事故回拨:2026-09-08 动态全帧
-# 前向上云后,worker=2 双动态大例并发内存峰值 56.9G/64G,22:06 容器被 OOMKilled
-# 重启、内存任务状态清零、回调丢失 → 平台等到 28800s 判超时整批作废——2 路并发的
-# 时间收益(~35 分钟)不值得这个尾部风险。串行实测 1060 病例 ~3.5h,8h 时限余量足)。
-# 历史备注:2026-09-03 曾默认 2(当时动态 32 帧抽样、单例内存 ~16G,2 路 <64G 安全);
-# 全帧后单例峰值 ~14G + split_nodules 全尺寸副本叠加,2 路即触顶,故回拨。
-# 前提(并发场景仍适用,设回 2 时有效):
+# 推理工作线程数。**生产交付默认 2**(2026-09-11 回拨上调:09-09 内存三件套
+# (3D 稀疏存储/malloc_trim/ARENA_MAX=2)+ bs=8 批量前向落地后,09-10/09-11 两轮
+# 跑分峰值仅 15.5G/14G,串行推理实测 5-6h/8h 时限余量收窄;2 路并发按最坏单例
+# ~14G×2+系统 ≈30G <64G,余量充足。速度收益 ~2×,把 5-6h 压回 ~3h 安全区)。
+# 历史:2026-09-09 曾因 worker=2 双动态并发 56.9G 触发 OOMKilled 回拨为 1——
+# 当时单例峰值 30G+(split_nodules 全尺寸 mask×20),内存三件套修后单例已压到
+# ~14G,该事故的前提已消灭。若未来单例内存回升(如 640 分辨率上线),先按
+# 最坏单例×workers 算峰值再决定是否回拨 1。
+# 前提(并发场景适用):
 # ① Deduplicator 已加线程锁(共享 hashes/embeddings/FAISS 的写读串行化,提取在锁外);
 # ② runner._ensure_built 加构建锁(防两线程并发首调双重建模型);
 # ③ 模型经 `torch.inference_mode()` 无参数更新,多线程 call 前向安全;
 # ④ 已知残留:共享 tamper_detector 的 last_soft_flags 实例属性在并发 detect 下可能
 #   跨病例串台(soft 模式仅污染不计分的审计字段,官方已豁免真实性考核,可接受)。
 # (runner._run_cases 里另有 min(workers, 2) 硬上界,与本处双保险。)
+# (runner._run_cases 里另有 min(workers, 2) 硬上界,与本处双保险。)
 # 可用 `AICOMP_INFERENCE_WORKERS` 环境变量覆盖。
-INFERENCE_WORKERS = int(os.environ.get("AICOMP_INFERENCE_WORKERS", "1"))
+INFERENCE_WORKERS = int(os.environ.get("AICOMP_INFERENCE_WORKERS", "2"))
 
 
 def callback_url() -> str:

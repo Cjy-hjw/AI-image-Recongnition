@@ -8,7 +8,14 @@ def gate1_shapes(model, x):
         with torch.no_grad():
             out = model(x)
 
-        assert out["mask"].shape == (2, 1, 512, 512), f"Bad mask shape: {out['mask'].shape}"
+        _, _, H, W = x.shape
+        # 输入尺寸必须与模型构建分辨率同源(B路审查 F4-1:纯断言 mask==输入尺寸
+        # 在 U-Net 上恒真,无区分力;真正的护栏是"输入==model.img_size"——
+        # model.img_size 来自 config,错了说明 config/权重/dummy 三者不同源)。
+        assert (H, W) == (model.img_size, model.img_size), (
+            f"输入 {H}x{W} != model.img_size {model.img_size}x{model.img_size}"
+            f"(config 与 dummy 或权重不同源)")
+        assert out["mask"].shape == (2, 1, H, W), f"Bad mask shape: {out['mask'].shape}"
         assert out["malignancy"].shape == (2, 2), f"Bad malignancy shape: {out['malignancy'].shape}"
         assert out["composition"].shape == (2, 4), f"Bad composition shape: {out['composition'].shape}"
         assert out["echogenicity"].shape == (2, 4), f"Bad echogenicity shape: {out['echogenicity'].shape}"

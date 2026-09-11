@@ -48,8 +48,12 @@ def verify():
     print(f"Testing configured backbone: {backbone}")
 
     # 2. Instantiate Model and Loss
+    # 🔴 640 实验起必须传 config(2026-09-11):不传则 model.img_size 恒吃
+    # multi_task_model.py:96 的 512 兜底——dummy 是 640 时撞 forward assert,
+    # dummy 是 512 时 Gate1 静默仍验 512(护栏落空)。config 的 img_size 与
+    # dummy 尺寸必须同源。
     try:
-        model = MultiTaskThyroidModel(backbone_name=backbone, pretrained=False)
+        model = MultiTaskThyroidModel(backbone_name=backbone, pretrained=False, config=config)
         criterion = MultiTaskLoss()
         print("✔ Model & Loss instantiation successful.")
     except Exception as e:
@@ -60,13 +64,17 @@ def verify():
     model = model.to(device)
     criterion = criterion.to(device)
 
-    # Prepare normalized dummy data
-    x = torch.randn(2, 1, 512, 512)
+    # Prepare normalized dummy data(尺寸与模型同源:model.img_size 的取值含 512
+    # 兜底,与 MultiTaskThyroidModel.__init__ 的语义一致——B路审查 F4-2:
+    # 不能裸取 config["data"]["img_size"],缺键时模型静默 512 而 runner 会
+    # KeyError,两者必须同 fallback 语义)
+    S = int(config.get("data", {}).get("img_size", 512))
+    x = torch.randn(2, 1, S, S)
     x = (x - x.min()) / (x.max() - x.min() + 1e-8)  # normalized
     x = x.to(device)
 
     targets = {
-        "mask": torch.randint(0, 2, (2, 1, 512, 512)).float().to(device),
+        "mask": torch.randint(0, 2, (2, 1, S, S)).float().to(device),
         "composition": torch.tensor([0, 3]).to(device),
         "echogenicity": torch.tensor([1, 2]).to(device),
         "shape": torch.tensor([0, 1]).to(device),

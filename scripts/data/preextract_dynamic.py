@@ -115,6 +115,24 @@ def _write_png(path: str, arr: np.ndarray) -> bool:
     return True
 
 
+def _probe_png_size(path: str):
+    """读 PNG 头取 (h, w)(只解析 IHDR,不解码像素,微秒级)。失败返回 None。
+
+    用途:A路审查的分辨率护栏——PNG 尺寸不可伪造(区别于 samples.pkl 的
+    _meta 自称值),抽检首个"已存在"缓存帧的实际尺寸与本次 --img-size 比对。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(33)     # 8B PNG 签名 + 4B 长度 + 4B "IHDR" + 13B IHDR 数据
+        if len(head) < 33 or head[12:16] != b"IHDR":
+            return None
+        w = int.from_bytes(head[16:20], "big")
+        h = int.from_bytes(head[20:24], "big")
+        return (h, w)
+    except OSError:
+        return None
+
+
 def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
             img_size: int, limit: int) -> int:
     frames_dir = os.path.join(cache_dir, "frames")
@@ -150,6 +168,12 @@ def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
     _safe_print(f"[2/3] 导出帧(每个影像文件解压一次,共 {total_files} 个)...")
     for i, (img_path, group) in enumerate(sorted(by_img.items()), 1):
         # 先看这组是不是已经全导完了 —— 全完就连解压都不做(续跑的关键)
+        # 🔴 frame_key 不含 img_size(A路审查):同一 frames/ 目录里 512 与 640 的
+        # PNG 键完全相同。换 --img-size 复用旧 cache-dir 时,这里的"已存在即跳过"
+        # 会原样保留旧分辨率 PNG,而 samples.pkl 的 _meta 又写新值——下游
+        # official_loader 的分辨率 raise 被整个绕过(meta 谎报)。故此处加一道
+        # PNG 实际尺寸抽检:首个"已存在"的帧尺寸≠本次 img_size 即硬拦。
+        _size_checked = False
         pending = []
         for s in group:
             k = frame_key(img_path, s["mask_path"], s["frame_index"])
@@ -158,6 +182,14 @@ def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
             s["cache_img"], s["cache_msk"] = fi, fm
             if (os.path.exists(fi) and os.path.getsize(fi) > 0
                     and os.path.exists(fm) and os.path.getsize(fm) > 0):
+                if not _size_checked:
+                    _size_checked = True
+                    _cached_hw = _probe_png_size(fi)
+                    if _cached_hw is not None and _cached_hw != (img_size, img_size):
+                        raise SystemExit(
+                            f"🔴 frames/ 里已有 {_cached_hw[0]}x{_cached_hw[1]} 的缓存 PNG,"
+                            f"与本次 --img-size {img_size} 不符(frame_key 不含分辨率,旧帧被"
+                            f"原样保留且 meta 会谎报新值)。换分辨率必须用全新 --cache-dir。")
                 skipped += 1
             else:
                 pending.append(s)

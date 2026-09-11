@@ -95,7 +95,11 @@ class MultiTaskThyroidModel(nn.Module):
 
         self.img_size = 512
         if config is not None and "data" in config:
-            self.img_size = config["data"].get("img_size", 512)
+            # int() 强转(A路审查):yaml 里 img_size 误写成引号字符串 "640" 时,
+            # 不强转会让 torch.arange(str) 在物理先验处炸出 TypeError,报错
+            # 指向 physical_prior 而非 config——错误定位误导。强转后与
+            # verify/runner.py 的消费语义一致(单侧强转的不对称已消除)。
+            self.img_size = int(config["data"].get("img_size", 512))
 
         self.current_epoch = 120
 

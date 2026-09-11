@@ -105,8 +105,10 @@ class TestDecodeEmitsDistributions:
 class TestSegThresholdEnv:
     """零训练四件套①(2026-09-10):分割二值化阈值 env 化。
 
-    静/动两条 env 独立;解析失败/越界一律钳回 0.5(历史行为);两 env 都未设时
-    `decode_predictions(dynamic=...)` 逐位等于旧硬编码 0.5。
+    🔴 2026-09-11 云端 val 扫参定参后默认值分道:静态默认 **0.35**(sweep 三项
+    指标全面不劣于 0.5,测评容器不重建改不了 env、故改代码默认值)、动态默认仍
+    **0.5**(五档单调递增、0.5 是测试范围里最优,不改)。解析失败/越界一律钳回
+    各自默认值(静态 0.35 / 动态 0.5)。
     """
 
     def _mask_pixels(self, preds):
@@ -115,11 +117,12 @@ class TestSegThresholdEnv:
     def test_default_unchanged_without_env(self, monkeypatch):
         monkeypatch.delenv("AICOMP_SEG_THRESHOLD", raising=False)
         monkeypatch.delenv("AICOMP_SEG_THRESHOLD_DYNAMIC", raising=False)
+        expected = {False: 0.35, True: 0.5}
         for dynamic in (False, True):
             preds = decode_predictions(_fake_outputs(seed=1), dynamic=dynamic)
             assert np.array_equal(
                 preds["mask_binary"],
-                (preds["pred_mask"] > 0.5).astype(np.uint8) * 255)
+                (preds["pred_mask"] > expected[dynamic]).astype(np.uint8) * 255)
 
     @pytest.mark.parametrize("raw", ["0.35", "0.3", "0.42"])
     def test_static_env_applies(self, monkeypatch, raw):
@@ -143,19 +146,19 @@ class TestSegThresholdEnv:
         assert np.array_equal(
             preds["mask_binary"],
             (preds["pred_mask"] > 0.3).astype(np.uint8) * 255)
-        # 静态路径不受动态 env 影响
+        # 静态路径不受动态 env 影响,走静态默认值 0.35(非动态的 0.5)
         preds_static = decode_predictions(_fake_outputs(seed=1), dynamic=False)
         assert np.array_equal(
             preds_static["mask_binary"],
-            (preds_static["pred_mask"] > 0.5).astype(np.uint8) * 255)
+            (preds_static["pred_mask"] > 0.35).astype(np.uint8) * 255)
 
     @pytest.mark.parametrize("raw", ["garbage", "0", "1", "-0.2", "1.5", "",
                                      "inf", "nan", "1e400"])
-    @pytest.mark.parametrize("key,dynamic", [
-        ("AICOMP_SEG_THRESHOLD", False),
-        ("AICOMP_SEG_THRESHOLD_DYNAMIC", True),
+    @pytest.mark.parametrize("key,dynamic,default", [
+        ("AICOMP_SEG_THRESHOLD", False, 0.35),
+        ("AICOMP_SEG_THRESHOLD_DYNAMIC", True, 0.5),
     ])
-    def test_invalid_env_clamps_to_half(self, monkeypatch, raw, key, dynamic):
+    def test_invalid_env_clamps_to_default(self, monkeypatch, raw, key, dynamic, default):
         """🔴 (key, dynamic) 成对参数化(A路审查P2 订正):首版先 setenv 静态键
         再内层跑 dynamic=True,动态键的钳制从未被真正测过(0.5==0.5 巧合通过,
         外部环境设了动态键时 6 failed 且报错甩锅错误键名)。另补 inf/nan 反例。
@@ -166,8 +169,8 @@ class TestSegThresholdEnv:
         preds = decode_predictions(_fake_outputs(seed=1), dynamic=dynamic)
         assert np.array_equal(
             preds["mask_binary"],
-            (preds["pred_mask"] > 0.5).astype(np.uint8) * 255), \
-            f"{key}={raw!r}(dynamic={dynamic}) 须钳回 0.5"
+            (preds["pred_mask"] > default).astype(np.uint8) * 255), \
+            f"{key}={raw!r}(dynamic={dynamic}) 须钳回默认值 {default}"
 
     def test_lower_threshold_superset_of_higher(self, monkeypatch):
         """单调性:低阈值的前景 ⊇ 高阈值的前景(阈值只增不减像素)。"""

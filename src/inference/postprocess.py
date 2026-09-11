@@ -31,20 +31,27 @@ _ENV_SEG_THR_DYNAMIC = "AICOMP_SEG_THRESHOLD_DYNAMIC"
 
 
 def _seg_threshold(dynamic: bool) -> float:
-    """分割二值化阈值(零训练四件套①,2026-09-10)。默认 0.5 = 历史行为逐位不变。
+    """分割二值化阈值(零训练四件套①,2026-09-10)。
+
+    🔴 2026-09-11 云端 r5 val 扫参定参(sweep_20260910_165002.json,15 静态组合
+    +5 动态组合,官方口径 Dice/AP 进程内直算):静态 thr=0.35 三项(匹配0.8222/
+    Dice0.7286/AP0.7942)全面不劣于默认 0.5(匹配0.8213/Dice0.7287/AP0.7927),
+    改默认值(而非设 env)——**测评容器不重建、env 分栏改不了,只能改代码默认值**。
+    动态五档(0.25→0.50)匹配率/Dice/AP 单调递增、0.50 是测试范围里最优,原先
+    "动态应更低"的假设被数据推翻,动态默认维持 0.5 不动。
 
     真实病灶只占 512² 的 0.1~3%,极端不平衡下 Dice/BCE 训出的概率系统性欠分割,
-    最优阈值通常低于 0.5(云端 val 扫参定值)。静/动两条 env 分开:动态匹配是
-    各标注帧 IoU 的算术平均、某帧全空按官方口径记 0,空帧对动态毁灭性更强,
-    动态阈值应比静态更低。解析失败/越界一律钳回 0.5(与 `case_pipeline.
-    _resolve_video_batch_size` 同模式——垃圾配置不静默采信也不崩,回退安全值)。
+    这是静态阈值低于 0.5 更优的物理原因。解析失败/越界一律钳回各自默认值(与
+    `case_pipeline._resolve_video_batch_size` 同模式——垃圾配置不静默采信也不崩,
+    回退安全值)。env 仍保留(`AICOMP_SEG_THRESHOLD`/`_DYNAMIC`),供下次扫参覆盖。
     """
-    raw = os.environ.get(_ENV_SEG_THR_DYNAMIC if dynamic else _ENV_SEG_THR, "0.5")
+    default = "0.35" if not dynamic else "0.5"
+    raw = os.environ.get(_ENV_SEG_THR_DYNAMIC if dynamic else _ENV_SEG_THR, default)
     try:
         t = float(raw)
     except (TypeError, ValueError):
-        return 0.5
-    return t if 0.0 < t < 1.0 else 0.5
+        return float(default)
+    return t if 0.0 < t < 1.0 else float(default)
 
 
 def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False) -> dict:

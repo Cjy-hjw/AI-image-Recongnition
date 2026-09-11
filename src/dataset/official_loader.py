@@ -821,11 +821,22 @@ def build_official_datasets(
                 f"去掉 --limit 重跑 scripts/data/preextract_dynamic.py 生成完整缓存")
         cached_size = meta.get("img_size")
         if cached_size is not None and int(cached_size) != int(img_size):
-            # 不 raise:降采样后再插值回去只掉画质、不改契约,硬崩会把人堵在门外;
-            # 但必须吼出来 —— 静默掉画质是本项目最怕的一类 bug。
-            _safe_print(
-                f"[WARN] 预抽取缓存 img_size={cached_size} != 训练 img_size={img_size},"
-                f"缓存帧会被二次 resize(掉画质)。重跑预抽取时传 --img-size {img_size}")
+            # 🔴 2026-09-11 由 WARN 升级为 raise(分辨率实验教训,长期保留):
+            # 旧实现只 WARN 不拦,命中旧分辨率缓存时 __getitem__ 会把缓存 PNG
+            # 上采样插值到训练 img_size —— 训练照跑、日志照出、分辨率收益归零,
+            # 属"合法但全错"。任何改 img_size 的实验下这都等于白烧整轮
+            # (预抽取 45min+ + 训练 1h+)。
+            # 该分支只在"缓存分辨率≠训练分辨率"时触发,同分辨率正常路径不受影响。
+            # ⚠️ 仍剩一条绕过路径(结构性,见 preextract_dynamic 的 frame_key):
+            # 复用旧 cache-dir 换 --img-size 重跑,旧 PNG 因 frame_key 不含分辨率
+            # 被原样保留,新 samples.pkl 的 meta 会"声称"新分辨率 → 本 raise 不
+            # 触发。故换分辨率必须用全新 --cache-dir(物理隔离是唯一可靠解)。
+            raise RuntimeError(
+                f"预抽取缓存 img_size={cached_size} != 训练 img_size={img_size},"
+                f"缓存帧会被二次 resize(静默掉画质,分辨率实验收益归零)。"
+                f"重跑预抽取: scripts/data/preextract_dynamic.py --img-size {img_size} "
+                f"(换分辨率须用全新 --cache-dir —— frame_key 不含 img_size,复用旧 "
+                f"frames/ 目录会静默保留旧分辨率 PNG 且 meta 谎报新分辨率)")
     else:
         samples = build_official_samples(root, xlsx_path, sheet_name)
     if not samples:

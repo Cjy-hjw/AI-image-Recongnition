@@ -241,7 +241,8 @@ class MultiTaskThyroidModel(nn.Module):
         Returns:
             pooled:  [B, CLS_POOLED_DIM]  —— 全局平均池化后的向量(既有契约)
             spatial: [B, CLS_POOLED_DIM, H/32, W/32] —— **pool 前**的空间特征图,
-                512² 输入下实测 [B, 352, 16, 16]。位置头需要空间结构(CoordConv 要
+                尺寸跟随 config img_size(512²→[B,352,16,16],640²→[B,352,20,20],
+                2026-09-11 起默认 640)。位置头需要空间结构(CoordConv 要
                 坐标网格),pool 后拿不到。
 
         ⚠️ `spatial` **有意不 detach**:位置头梯度回流 `cls_backbone` 是设计意图

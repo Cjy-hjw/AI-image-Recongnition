@@ -129,6 +129,12 @@ _WEIGHTS = [
 #
 # ImageNet 骨干(convnext_nano / efficientnet_b2 的 .safetensors)**不装**:
 # 云端已有(上一轮训练包传过),重传只是白等上传时间。
+
+# 🔴 当前交付权重的分辨率(2026-09-11 B路审查 F5-1 防线):r5 = 512。
+# 出包前用它对 config 的 img_size 做硬校验,不配套即拒绝出包。
+# 640 实验胜出并交付 640 权重时,这里与云端 AICOMP_WEIGHTS 同步改 640。
+_DELIVERED_IMG_SIZE = 512
+
 _TRAIN_WEIGHTS = [
     (os.path.join(REPO, "checkpoints_a800", "best_model_mixtrain_xl_e40.pth"),
      "checkpoints/best_model_mixtrain_xl_e40.pth"),
@@ -180,6 +186,22 @@ def build_code():
     items = [(os.path.join(REPO, r.replace("/", os.sep)), r) for r in _CLOSURE]
     items += [(os.path.join(REPO, s.replace("/", os.sep)), d) for s, d in _CODE_EXTRA]
     items += _WEIGHTS          # 权重与代码同包:少一次上传 + 少一次人工审核窗口
+    # 🔴 出包前硬校验 config 分辨率与推理权重的配套性(2026-09-11 B路审查 F5-1):
+    # config 的 img_size 烘焙进 checkpoint(prior_extractor.x_coords buffer 形状),
+    # 512 权重 + 640 config(或反向)= build_model 的 load_state_dict 当场
+    # RuntimeError → 测评容器起不来 = 整场零分。云端 r5 交付权重是 512;
+    # 640 实验期间本地 config 是 640,**绝不能**带着它出推理包(实验权重
+    # 未定胜负前,交付面始终是 r5+512)。要出 640 包须先改此处常量。
+    import yaml
+    with open(os.path.join(REPO, "configs", "thyroid_config.yaml"),
+              "r", encoding="utf-8") as fh:
+        _cfg_img_size = int(yaml.safe_load(fh)["data"]["img_size"])
+    if _cfg_img_size != _DELIVERED_IMG_SIZE:
+        raise SystemExit(
+            f"🔴 拒绝出包:configs/thyroid_config.yaml 的 img_size={_cfg_img_size},"
+            f"但交付权重是 {_DELIVERED_IMG_SIZE}(r5)。640 实验的 config 不能进"
+            f"推理包——云端 r5 权重遇到 640 config 会 build_model 崩(整场零分)。"
+            f"640 实验上线交付时,先改本文件的 _DELIVERED_IMG_SIZE 并确认权重已换。")
     copied = _emit(os.path.join(OUT_DIR, "cloud_infer"), items, "推理包(代码+权重)")
     n_py = sum(1 for r in copied if r.endswith(".py"))
     print(f"  .py = {n_py}")

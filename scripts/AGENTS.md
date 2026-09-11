@@ -12,7 +12,7 @@
 |:---|:---|
 | `data/pseudo_labels.py` | `extract_features_from_mask_and_image()` — TI-RADS pseudo-label extraction from image+mask |
 | `data/split_tn3k.py` | `format_split()` + `_split_samples()` — 纯随机图像级 train/val/holdout 划分(见 `scripts/data/AGENTS.md`) |
-| `data/preextract_dynamic.py` | **动态 .nii.gz 预抽取 PNG 缓存(2026-08-15 新增,首轮真训 `invalid block type` + 步耗时 22 倍抖动根因修复)**——把训练真正消费的那一帧一次性导成 512×512 uint8 PNG + `<cache-dir>/samples.pkl`,训练期 `__getitem__` 完全不再碰 `.nii.gz`。`--limit N` 先小规模验证管道(只处理前 N 个动态患者,约 1 分钟);幂等可续跑(已存在且非空的 PNG 跳过,挂掉重跑不重做);故障文件进 `preextract_report.txt`、对应样本从 samples.pkl 剔除(宁可少样本不可让训练在第 30 epoch 才炸)。⚠️ **`--img-size` 必须与训练时 `img_size` 一致**(两侧默认 512):不一致不会报错,loader 把缓存图再 resize 一次 = 降采样后又插值回去,**静默掉画质**(脚本把实际值写进 samples.pkl 的 `_meta`,`build_official_datasets(samples_pkl=...)` 加载时校验不符即 WARN)。产物被 `official_loader._read_cached_pair`/`_load_samples_pkl` 消费,详见 `src/dataset/AGENTS.md` 官方数据加载器节 |
+| `data/preextract_dynamic.py` | **动态 .nii.gz 预抽取 PNG 缓存(2026-08-15 新增,首轮真训 `invalid block type` + 步耗时 22 倍抖动根因修复)**——把训练真正消费的那一帧一次性导成 `<img_size>×<img_size>` uint8 PNG(默认 512;2026-09-11 起 640 实验) + `<cache-dir>/samples.pkl`,训练期 `__getitem__` 完全不再碰 `.nii.gz`。`--limit N` 先小规模验证管道(只处理前 N 个动态患者,约 1 分钟);幂等可续跑(已存在且非空的 PNG 跳过,挂掉重跑不重做);故障文件进 `preextract_report.txt`、对应样本从 samples.pkl 剔除(宁可少样本不可让训练在第 30 epoch 才炸)。⚠️ **`--img-size` 必须与训练时 `img_size` 一致**:不一致 loader **直接 raise**(2026-09-11 由 WARN 升级)。🔴 **换分辨率必须用全新 `--cache-dir`**:frame_key 不含 img_size,复用旧 frames/ 会静默保留旧分辨率 PNG 且 meta 谎报新值——`_probe_png_size` PNG 实际尺寸抽检(2026-09-11 加)会拦复用场景,但物理隔离是唯一可靠解。产物被 `official_loader._read_cached_pair`/`_load_samples_pkl` 消费,详见 `src/dataset/AGENTS.md` 官方数据加载器节 |
 
 `format_tn3k.py` is a thin CLI that imports from `scripts/data/`.
 
@@ -24,7 +24,7 @@
 
 | File | Contents |
 |:---|:---|
-| `verify/runner.py` | `verify()` — orchestrates gate1→gate8, returns True/False |
+| `verify/runner.py` | `verify()` — orchestrates gate1→gate8, returns True/False。🔴 2026-09-11 起建模型**必须传 `config=config`**(原不传则 model.img_size 恒 512 兜底,dummy 尺寸来自 config 时撞 forward assert、dummy 恒 512 时 Gate1 静默验 512——两态都是护栏落空);dummy/targets 尺寸 `S = config.get("data",{}).get("img_size",512)` 与模型同 fallback 语义 |
 | `verify/gates/gate1_shapes.py` | Output tensor shape assertions |
 | `verify/gates/gate2_vclub.py` | vCLUB gradient isolation (encoder grad sum < 1e-7) |
 | `verify/gates/gate3_auc_margin.py` | AUC-Margin dual params + BatchNorm freeze check + **alpha 极性方向断言**(R6 2026-08-11 补,防"只验变化不验方向") |

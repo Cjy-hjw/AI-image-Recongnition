@@ -288,16 +288,16 @@ class TestConfigPaths:
         _, config_mod, _ = svc
         assert config_mod.SERVICE_PORT == 8000
 
-    def test_default_single_inference_worker(self, svc):
-        """2026-09-09 OOM 事故回拨:worker 默认 2→1。2026-09-08 动态全帧前向上云后,
-        2 路双动态并发内存峰值 56.9G/64G(20:53 告警 82.6%),22:06 容器 OOMKilled
-        重启、内存任务状态清零、回调丢失 → 平台 28800s 超时整批作废。串行 ~3.5h
-        对 8h 时限余量足,2 路的时间收益(~35 分钟)不值得尾部风险。
-        (2026-09-03 曾默认 2:当时 32 帧抽样单例 ~16G 安全;全帧后单例峰值+split
-        副本叠加,2 路即触顶。要恢复 2 用 AICOMP_INFERENCE_WORKERS=2,前提见
-        config.py 注释。)"""
+    def test_default_two_inference_workers(self, svc):
+        """2026-09-11 回拨上调:worker 默认 1→2。09-09 内存三件套(3D 稀疏存储/
+        malloc_trim/ARENA_MAX=2)+ bs=8 批量前向落地后,09-10/09-11 两轮跑分峰值仅
+        15.5G/14G,串行推理实测 5-6h/8h 时限余量收窄;2 路按最坏单例 ~14G×2≈30G<64G
+        余量充足,速度收益 ~2× 把 5-6h 压回 ~3h 安全区。
+        (历史:2026-09-09 曾因 worker=2 撞 56.9G OOMKilled 回拨为 1——当时单例峰值
+        30G+(split 全尺寸 mask×20),三件套修后前提已消灭。若单例内存回升(如 640
+        上线),先按最坏单例×workers 算峰值再决定回拨。前提条件见 config.py 注释。)"""
         _, config_mod, _ = svc
-        assert config_mod.INFERENCE_WORKERS == 1
+        assert config_mod.INFERENCE_WORKERS == 2
 
 
 class TestPlaceholderRunner:

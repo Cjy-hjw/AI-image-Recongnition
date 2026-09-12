@@ -133,8 +133,111 @@ def _probe_png_size(path: str):
         return None
 
 
+def _process_one_file(job):
+    """worker:处理**一个**影像文件组(解影像一次 + 按组解各 mask + 写 PNG)。
+
+    纯函数化(2026-09-11 并行化改造):入参全部为可 pickle 的标量/列表,返回
+    可 pickle 的结果 dict —— 主进程据此回填 samples 与 failures。**不碰
+    samples.pkl**(全局唯一写出点在主进程,杜绝并发写竞态)。
+
+    job: {"img_path", "entries": [{k, fi, fm, mask_path, frame_index, s_idx}],
+          "img_size"}
+    返回: {"s_idx": {"cache_img": ..., "cache_msk": ...},  # 按 s_idx 回填;
+                     失败样本两值为 None
+           "failures": [...], "done_frames": N,
+           "probe_hw": (h, w) | None}   # 首个"已存在"PNG 的实际尺寸(分辨率抽检)
+    """
+    img_path = job["img_path"]
+    img_size = job["img_size"]
+    entries = job["entries"]
+
+    result = {"fills": {}, "failures": [], "done_frames": 0, "probe_hw": None,
+              "skipped_in_job": 0}
+
+    # ---- 先看这组是不是已经全导完了(续跑的关键) ----
+    # 🔴 frame_key 不含 img_size(A路审查):同一 frames/ 目录里 512 与 640 的
+    # PNG 键完全相同。换 --img-size 复用旧 cache-dir 时,这里的"已存在即跳过"
+    # 会原样保留旧分辨率 PNG,而 samples.pkl 的 _meta 又写新值——下游
+    # official_loader 的分辨率 raise 被整个绕过(meta 谎报)。故对首个"已存在"
+    # 的帧抽检实际尺寸,尺寸≠本次 img_size 时把 probe_hw 报回主进程硬拦
+    # (worker 不 SystemExit:池里的兄弟进程还有 .part 临时文件要清理,
+    # 主进程收齐后统一 exit 才干净)。
+    pending = []
+    for e in entries:
+        if (os.path.exists(e["fi"]) and os.path.getsize(e["fi"]) > 0
+                and os.path.exists(e["fm"]) and os.path.getsize(e["fm"]) > 0):
+            if result["probe_hw"] is None:
+                result["probe_hw"] = _probe_png_size(e["fi"])
+            # 🔴 已存在的缓存也要回填 fills(2026-09-11 测试抓出的真 bug):旧版串行
+            # 在扫描阶段就写 s["cache_img"],并行版若只在"写出成功"时回填,幂等重跑
+            # 会把全部已缓存样本当失败剔除(pkl 只剩静态样本,静默丢全部动态数据)。
+            result["fills"][e["s_idx"]] = {"cache_img": e["fi"], "cache_msk": e["fm"]}
+            result["skipped_in_job"] += 1
+            continue
+        pending.append(e)
+    if not pending:
+        return result
+
+    # ---- 解影像(一次) ----
+    try:
+        frames, idxs, _, err, _ = load_nifti_frames(img_path, max_frames=-1)
+        if err or not frames:
+            raise RuntimeError(err or "load_nifti_frames 返回空")
+    except Exception as e:                       # noqa: BLE001 - 逐文件降级,不中断全局
+        result["failures"].append(f"IMG {img_path}: {e}")
+        # 🔴 只剔 pending(本次要导出的),不清 entries 里已缓存样本(Gate2 审查 P0):
+        # 旧版串行此分支只处理 pending;若遍历 entries 会把"磁盘已有缓存、可继续
+        # 用"的样本覆盖成 None → 续跑场景撞上解码失败文件时静默丢已缓存样本。
+        for e_ in pending:
+            result["fills"][e_["s_idx"]] = {"cache_img": None, "cache_msk": None}
+        return result
+    pos_of = {f: p for p, f in enumerate(idxs)}
+
+    # ---- 按 mask 分组解 mask(每个 mask 一次) ----
+    by_mask: Dict[str, List[Dict]] = defaultdict(list)
+    for e in pending:
+        by_mask[e["mask_path"]].append(e)
+
+    for mask_path, mentries in by_mask.items():
+        try:
+            binf, midxs = _read_nifti_binmasks(mask_path)
+            if not binf:
+                raise RuntimeError("mask 解码为空")
+        except Exception as e:                   # noqa: BLE001
+            result["failures"].append(f"MSK {mask_path}: {e}")
+            for e_ in mentries:
+                result["fills"][e_["s_idx"]] = {"cache_img": None, "cache_msk": None}
+            continue
+        mpos_of = {f: p for p, f in enumerate(midxs)}
+
+        for e_ in mentries:
+            fidx = int(e_["frame_index"])   # 动态样本必有帧号;int() 兼顾 numpy 整型
+            ip = pos_of.get(fidx, fidx)
+            mp = mpos_of.get(fidx, fidx)
+            if not (0 <= ip < len(frames)) or not (0 <= mp < len(binf)):
+                result["failures"].append(
+                    f"FRM {img_path} frame={fidx}: 越界 img_pos={ip}/{len(frames)} "
+                    f"msk_pos={mp}/{len(binf)}")
+                result["fills"][e_["s_idx"]] = {"cache_img": None, "cache_msk": None}
+                continue
+            img = _resize_img(np.asarray(frames[ip]), img_size)
+            # 0/1 → 0/255:PNG 里 0/1 肉眼不可查,排错时打开就是纯黑;
+            # loader 侧统一 `>0`,两种取值都正确,但 0/255 可目视核对。
+            msk = _resize_mask((np.asarray(binf[mp]) > 0).astype(np.uint8), img_size) * 255
+            if _write_png(e_["fi"], img) and _write_png(e_["fm"], msk):
+                result["done_frames"] += 1
+                result["fills"][e_["s_idx"]] = {"cache_img": e_["fi"], "cache_msk": e_["fm"]}
+            else:
+                result["failures"].append(f"PNG 写失败 {e_['fi']}")
+                result["fills"][e_["s_idx"]] = {"cache_img": None, "cache_msk": None}
+        del binf        # mask 的 binf 是 astype 出来的**真数组**(非视图),及时放手
+
+    del frames                                    # 尽快释放 258MB 级数组
+    return result
+
+
 def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
-            img_size: int, limit: int) -> int:
+            img_size: int, limit: int, workers: int = 4) -> int:
     frames_dir = os.path.join(cache_dir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
 
@@ -165,94 +268,75 @@ def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
     t1 = time.time()
     total_files = len(by_img)
 
-    _safe_print(f"[2/3] 导出帧(每个影像文件解压一次,共 {total_files} 个)...")
-    for i, (img_path, group) in enumerate(sorted(by_img.items()), 1):
-        # 先看这组是不是已经全导完了 —— 全完就连解压都不做(续跑的关键)
-        # 🔴 frame_key 不含 img_size(A路审查):同一 frames/ 目录里 512 与 640 的
-        # PNG 键完全相同。换 --img-size 复用旧 cache-dir 时,这里的"已存在即跳过"
-        # 会原样保留旧分辨率 PNG,而 samples.pkl 的 _meta 又写新值——下游
-        # official_loader 的分辨率 raise 被整个绕过(meta 谎报)。故此处加一道
-        # PNG 实际尺寸抽检:首个"已存在"的帧尺寸≠本次 img_size 即硬拦。
-        _size_checked = False
-        pending = []
+    # ---- 组装 job:每个影像文件一个 job,entries 携带回填用 s_idx ----
+    # s_idx = sample 在 samples 列表里的下标(稳定,不受分组排序影响)。
+    s_index = {id(s): i for i, s in enumerate(samples)}
+    jobs = []
+    for img_path, group in sorted(by_img.items()):
+        entries = []
         for s in group:
             k = frame_key(img_path, s["mask_path"], s["frame_index"])
             fi = os.path.join(frames_dir, f"{k}_img.png")
             fm = os.path.join(frames_dir, f"{k}_msk.png")
-            s["cache_img"], s["cache_msk"] = fi, fm
-            if (os.path.exists(fi) and os.path.getsize(fi) > 0
-                    and os.path.exists(fm) and os.path.getsize(fm) > 0):
-                if not _size_checked:
-                    _size_checked = True
-                    _cached_hw = _probe_png_size(fi)
-                    if _cached_hw is not None and _cached_hw != (img_size, img_size):
-                        raise SystemExit(
-                            f"🔴 frames/ 里已有 {_cached_hw[0]}x{_cached_hw[1]} 的缓存 PNG,"
-                            f"与本次 --img-size {img_size} 不符(frame_key 不含分辨率,旧帧被"
-                            f"原样保留且 meta 会谎报新值)。换分辨率必须用全新 --cache-dir。")
-                skipped += 1
-            else:
-                pending.append(s)
-        if not pending:
-            continue
+            entries.append({
+                "k": k, "fi": fi, "fm": fm,
+                "mask_path": s["mask_path"], "frame_index": s["frame_index"],
+                "s_idx": s_index[id(s)],
+            })
+        jobs.append({"img_path": img_path, "entries": entries, "img_size": img_size})
 
-        # ---- 解影像(一次) ----
-        try:
-            frames, idxs, _, err, _ = load_nifti_frames(img_path, max_frames=-1)
-            if err or not frames:
-                raise RuntimeError(err or "load_nifti_frames 返回空")
-        except Exception as e:                       # noqa: BLE001 - 逐文件降级,不中断全局
-            failures.append(f"IMG {img_path}: {e}")
-            for s in pending:
-                s["cache_img"] = s["cache_msk"] = None
-            continue
-        pos_of = {f: p for p, f in enumerate(idxs)}
+    # ---- 并行/串行分派(2026-09-11 并行化) ----
+    # --workers 1 = 原串行路径(in-process 逐 job 调 _process_one_file),
+    # 不建进程池 —— 与旧版行为逐位一致,worker 内不依赖任何全局状态。
+    # workers>1 走 ProcessPoolExecutor:每个 job 解压 ~700MB 峰值内存,
+    # 64G 机器上 4-8 worker 安全(8×700MB≈5.6G,余量充足);
+    # 🔴 不碰 GPU(纯 CPU 解压+插值),无显存问题。
+    def _dispatch_all():
+        if workers <= 1 or len(jobs) <= 1:
+            for i, job in enumerate(jobs, 1):
+                yield i, _process_one_file(job)
+            return
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            # map 保持顺序;chunksize=1 让大文件(几百帧)之间负载尽量均衡
+            for i, res in enumerate(pool.map(_process_one_file, jobs, chunksize=1), 1):
+                yield i, res
 
-        # ---- 按 mask 分组解 mask(每个 mask 一次) ----
-        by_mask: Dict[str, List[Dict]] = defaultdict(list)
-        for s in pending:
-            by_mask[s["mask_path"]].append(s)
+    # 已存在即跳过的帧数,由 worker 随结果回传(每 job 内首扫阶段计出,
+    # 与旧版串行口径一致 = 本轮开始前就已缓存的帧数,不含本轮产量)。
+    _skip_counts = 0
 
-        for mask_path, msamples in by_mask.items():
-            try:
-                binf, midxs = _read_nifti_binmasks(mask_path)
-                if not binf:
-                    raise RuntimeError("mask 解码为空")
-            except Exception as e:                   # noqa: BLE001
-                failures.append(f"MSK {mask_path}: {e}")
-                for s in msamples:
-                    s["cache_img"] = s["cache_msk"] = None
-                continue
-            mpos_of = {f: p for p, f in enumerate(midxs)}
-
-            for s in msamples:
-                fidx = int(s["frame_index"])   # 动态样本必有帧号;int() 兼顾 numpy 整型
-                ip = pos_of.get(fidx, fidx)
-                mp = mpos_of.get(fidx, fidx)
-                if not (0 <= ip < len(frames)) or not (0 <= mp < len(binf)):
-                    failures.append(
-                        f"FRM {img_path} frame={fidx}: 越界 img_pos={ip}/{len(frames)} "
-                        f"msk_pos={mp}/{len(binf)}")
-                    s["cache_img"] = s["cache_msk"] = None
-                    continue
-                img = _resize_img(np.asarray(frames[ip]), img_size)
-                # 0/1 → 0/255:PNG 里 0/1 肉眼不可查,排错时打开就是纯黑;
-                # loader 侧统一 `>0`,两种取值都正确,但 0/255 可目视核对。
-                msk = _resize_mask((np.asarray(binf[mp]) > 0).astype(np.uint8), img_size) * 255
-                if _write_png(s["cache_img"], img) and _write_png(s["cache_msk"], msk):
-                    done_frames += 1
-                else:
-                    failures.append(f"PNG 写失败 {s['cache_img']}")
-                    s["cache_img"] = s["cache_msk"] = None
-            del binf        # mask 的 binf 是 astype 出来的**真数组**(非视图),及时放手
-
-        del frames                                    # 尽快释放 258MB 级数组
+    _safe_print(
+        f"[2/3] 导出帧(每个影像文件解压一次,共 {total_files} 个,"
+        f"{'串行' if workers <= 1 else f'{workers} 进程并行'})...")
+    for i, res in _dispatch_all():
+        # 分辨率抽检硬拦(worker 报回的 PNG 实际尺寸;串行版语义与旧版一致)。
+        # 🔴 先回填本 res 的 fills 再退出(Gate2 审查 P1-1c):fills 里含"已存在
+        # 跳过"样本的缓存路径,丢弃它们等于把已缓存样本悬空——今天 SystemExit
+        # 在写盘前只是碰巧无害,别把安全性押在这个实现细节上。
+        if res["probe_hw"] is not None and res["probe_hw"] != (img_size, img_size):
+            for s_idx, fill in res["fills"].items():
+                samples[s_idx]["cache_img"] = fill["cache_img"]
+                samples[s_idx]["cache_msk"] = fill["cache_msk"]
+            raise SystemExit(
+                f"🔴 frames/ 里已有 {res['probe_hw'][0]}x{res['probe_hw'][1]} 的缓存 PNG,"
+                f"与本次 --img-size {img_size} 不符(frame_key 不含分辨率,旧帧被"
+                f"原样保留且 meta 会谎报新值)。换分辨率必须用全新 --cache-dir。")
+        for s_idx, fill in res["fills"].items():
+            samples[s_idx]["cache_img"] = fill["cache_img"]
+            samples[s_idx]["cache_msk"] = fill["cache_msk"]
+        failures.extend(res["failures"])
+        done_frames += res["done_frames"]
+        _skip_counts += res.get("skipped_in_job", 0)
         if i % 10 == 0 or i == total_files:
             el = time.time() - t1
             eta = el / i * (total_files - i)
             _safe_print(
-                f"      {i}/{total_files} 文件 | 已导 {done_frames} 帧 | 跳过 {skipped} | "
-                f"失败 {len(failures)} | 用时 {el:.0f}s | 预计剩余 {eta:.0f}s")
+                f"      {i}/{total_files} 文件 | 已导 {done_frames} 帧 | "
+                f"跳过 {_skip_counts} | 失败 {len(failures)} | "
+                f"用时 {el:.0f}s | 预计剩余 {eta:.0f}s")
+    skipped = _skip_counts   # 与旧版同口径:开跑前已存在的帧数(不含本轮产量)
+
 
     # ---- 落盘样本清单 ----
     _safe_print("[3/3] 写 samples.pkl ...")
@@ -311,8 +395,13 @@ def main() -> int:
                     help="必须与训练时 img_size 一致(默认 512)")
     ap.add_argument("--limit", type=int, default=0,
                     help=">0 时只处理前 N 个动态影像文件,用于快速验证管道")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="并行进程数(2026-09-11 并行化);1=串行原路径。"
+                         "纯 CPU 解压不占 GPU;单 job 峰值内存 ~700MB,"
+                         "64G 机器 4-8 安全")
     a = ap.parse_args()
-    return extract(a.data_root, a.xlsx, a.cache_dir, a.sheet_name, a.img_size, a.limit)
+    return extract(a.data_root, a.xlsx, a.cache_dir, a.sheet_name,
+                   a.img_size, a.limit, a.workers)
 
 
 if __name__ == "__main__":

@@ -32,15 +32,33 @@ from src.inference.postprocess import decode_predictions
 
 
 class _AsymMaskModel(torch.nn.Module):
-    """逐像素线性于归一化列坐标的假分割 + 恒定分类头。
+    """逐像素线性于归一化列坐标的假分割 + 位置敏感的分类头。
 
     forward(img[B,1,H,W], gamma_prior) → dict,键集覆盖 decode_predictions
-    全部消费项。分割 logits = a·x_norm + b·(1-x_norm) + c(左右不对称);
-    a/b/c 从权重表取,与 img 内容无关但**与像素位置有关**——翻转输入后同一
-    位置 logits 不同,TTA 平均 ≠ 单前向,测试有区分力。
+    全部消费项。
+    - 分割 logits = a·x_norm + b·(1-x_norm) + c(左右不对称,a/b/c 见 LOGITS)
+      ——翻转输入后同一位置 logits 不同,TTA 平均 ≠ 单前向,测试有区分力;
+    - 分类 logits 恒定基座 + **逐类异号的翻转敏感项** d·sign_per_class:
+      d = 左右半区均值差(hflip 下 d→-d),sign 逐类固定。🔴 这是让"契约1
+      (分类禁止融合)"测试有区分力的唯一构造(修复审查 F2):若实现把两路
+      分类概率平均,(softmax(v+δs)+softmax(v-δs))/2 与 softmax(v) 的差
+      达 0.085(实测),远超 allclose 容差——恒定 logits 或全局同加 δ 的
+      fixture 对融合零区分力(softmax 平移不变,差被 float32 精度淹没)。
     """
 
-    LOGITS = {"a": 4.0, "b": -2.0, "c": 0.5}
+    LOGITS = {"a": 4.0, "b": -2.0, "c": 0.5, "sens": 1.5}
+    # 逐类异号敏感系数(长度=各类别数,与 _head_probs 契约一致)
+    _SIGNS = {"ete": [1.0, -1.0, 0.5, -0.5],
+              "location": [1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5],
+              "t": [1.0, -1.0], "tirads": [1.0, -1.0, 0.5, -0.5, 1.0],
+              "comp": [1.0, -1.0, 0.5, -0.5], "echo": [1.0, -1.0, 0.5, -0.5],
+              "shape": [1.0, -1.0], "margin": [1.0, -1.0, 0.5, -0.5],
+              "foci": [1.0, -1.0, 0.5, -0.5], "mal": [1.0, -1.0]}
+
+    def _half_diff(self, img):
+        """左/右半区均值差——hflip 下变号,作为翻转敏感标量。"""
+        w = img.shape[-1]
+        return img[..., :w // 2].mean() - img[..., w // 2:].mean()
 
     def forward(self, img, gamma_prior=1.0):  # noqa: ARG002
         bsz, _, h, w = img.shape
@@ -49,24 +67,28 @@ class _AsymMaskModel(torch.nn.Module):
         seg_logits = (p["a"] * x + p["b"] * (1.0 - x) + p["c"])
         seg_logits = seg_logits.expand(bsz, 1, h, w)
 
-        def _const(n, v):
-            return torch.full((bsz, n), float(v), device=img.device)
+        d = self._half_diff(img) * p["sens"]
+
+        def _sens(n, base, key):
+            signs = torch.tensor(self._SIGNS[key], device=img.device,
+                                 dtype=torch.float32)
+            return torch.full((bsz, n), float(base), device=img.device) + d * signs
 
         return {
             "mask": seg_logits,
-            # 分类头:常数 logits(与图像内容/翻转无关)
-            "composition": _const(4, 1.0),
-            "echogenicity": _const(4, 0.5),
-            "shape": _const(2, -0.3),
-            "margin": _const(4, 0.2),
-            "foci": _const(4, -1.0),
-            "malignancy": _const(2, 0.7),
+            "composition": _sens(4, 1.0, "comp"),
+            "echogenicity": _sens(4, 0.5, "echo"),
+            "shape": _sens(2, -0.3, "shape"),
+            "margin": _sens(4, 0.2, "margin"),
+            "foci": _sens(4, -1.0, "foci"),
+            "malignancy": _sens(2, 0.7, "mal"),
             # 官方四头:模型内已 softmax 的概率(decode 直收,不二次 softmax)
-            "ete_probs": torch.softmax(_const(4, 0.3), dim=1),
-            "location_probs": torch.softmax(_const(7, 0.9), dim=1),
-            "t_probs": torch.softmax(_const(2, -0.4), dim=1),
-            "tirads_probs": torch.softmax(_const(5, 0.1), dim=1),
-            "t_conf": torch.full((bsz,), 0.62, device=img.device),
+            "ete_probs": torch.softmax(_sens(4, 0.3, "ete"), dim=1),
+            "location_probs": torch.softmax(_sens(7, 0.9, "location"), dim=1),
+            "t_probs": torch.softmax(_sens(2, -0.4, "t"), dim=1),
+            "tirads_probs": torch.softmax(_sens(5, 0.1, "tirads"), dim=1),
+            "t_conf": torch.sigmoid(
+                torch.full((bsz,), 0.5, device=img.device) + d),
         }
 
 
@@ -92,7 +114,9 @@ def _run(img_np, tta_env=None):
             os.environ["AICOMP_STATIC_TTA"] = old
 
 
-IMG = np.full((40, 30), 128, dtype=np.uint8)   # H≠W,防宽高转置性错误
+IMG = np.tile(np.linspace(0, 255, 30, dtype=np.uint8), (40, 1))   # H≠W 且左右不对称:
+# 🔴 必须左右不对称(修复审查 F2 实证:常量图 d=0 → 敏感项恒 0,契约1 零区分力;
+# 渐变图 d=-0.52,逐类异号敏感项被激活,融合变异可测)
 
 
 # ---------------- 开关解析 ----------------

@@ -164,7 +164,16 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     if result.unexpected_keys:
         print(f"--> [warm-start] 忽略 {len(result.unexpected_keys)} 个多余键(底座含已弃用字段)")
     n_head_missing = len(result.missing_keys)
-    print(f"--> [warm-start] 加载 {ckpt_path};四头 {n_head_missing} 键随机初始化(预期)")
+    # 🔴 ete_only 专属判读(Gate2 审查 F1,2026-09-12):r5 全量热启动时四头
+    # missing=0(权重已覆盖),此时打"四头 0 键随机初始化"是**事实错误**且与
+    # 纯分割底座(四头 32 键真随机)的日志格式相同——从 stdout 分不出哪个是
+    # 真热启动。漏传 --resume-from 时 ETE 小试从随机初始化训,整轮白烧还被
+    # 误判为"模式有害"。故按键数分口径打印。
+    if n_head_missing == 0:
+        print(f"--> [warm-start] 加载 {ckpt_path};四头权重全部命中(missing=0,全量热启动)")
+    else:
+        print(f"--> [warm-start] 加载 {ckpt_path};四头 {n_head_missing} 键随机初始化"
+              f"({'🔴 分割底座,四头为随机' if n_head_missing >= 30 else '部分命中,核对 checkpoint'})")
 
 
 
@@ -609,6 +618,9 @@ def main():
     parser.add_argument("--hflip-prob", type=float, default=0.0, help="水平翻转概率(联动翻位置标签)")
     parser.add_argument("--freeze-legacy", action="store_true",
                         help="关 malignancy AUCM + vCLUB 更新,纯头训练(默认保留守旧任务)")
+    parser.add_argument("--ete-only", action="store_true",
+                        help="ETE 头小试(D10-15):冻结全部仅解冻 extension_head,"
+                             "lr 取 Stage C 低档,配 --resume-from r5 权重热启动训 6-8ep")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--log-dir", default=OFFICIAL_LOG_DIR,
                         help=f"JSONL 日志目录;默认云端 {OFFICIAL_LOG_DIR},本地传 logs")
@@ -634,7 +646,29 @@ def main():
     if device.type == "cpu":
         config["train"]["amp"] = False
     print(f"[train_official] device={device} bs={batch_size} img={img_size} "
-          f"lr_base={lr_base} epochs={epochs} mock={args.mock_labels} freeze_legacy={args.freeze_legacy}")
+          f"lr_base={lr_base} epochs={epochs} mock={args.mock_labels} freeze_legacy={args.freeze_legacy}"
+          f"{' ETE_ONLY' if args.ete_only else ''}")
+    # 🔴 ETE 小试的三个启动硬门(Gate2 审查 F1/F2/F4,2026-09-12):
+    # ① --ete-only 必须配 --resume-from(r5 全量权重)——漏传则 ETE 头从随机
+    #    初始化训,6-8ep 白烧且"其余四项崩"会被误判为模式有害;
+    # ② --out 必须显式版本化——默认路径是冒烟产物默认名,与真实产物同名同量级
+    #    分不出来(memory: weights-inventory 记过同类误判);
+    # ③ ETE 损失配方打进启动横幅——损失是 ete_only 唯一实验变量,云 config 是
+    #    可变状态(r7 事故),配方不对横幅/JSONL 当场可见,不用等互斥键事后判。
+    if args.ete_only:
+        if not args.resume_from:
+            parser.error("--ete-only 必须配 --resume-from(r5 全量权重热启动);"
+                         "漏传则 ETE 头随机初始化,整轮白烧")
+        if args.out == "checkpoints/official_heads_best.pth":
+            parser.error("--ete-only 必须显式传版本化 --out(默认路径是冒烟产物名,"
+                         "与真实产物分不出来)")
+        ete_cfg = config["train"]
+        print(f"[ETE-only 配方] cb_beta={ete_cfg.get('ete_cb_beta')} "
+              f"focal_gamma={ete_cfg.get('ete_focal_gamma')} "
+              f"la_tau={ete_cfg.get('ete_la_tau')} "
+              f"qwk_weight={ete_cfg.get('ete_qwk_weight')} "
+              f"class_counts={ete_cfg.get('ete_class_counts')} "
+              f"(应=0.9/0.0/0.0/0.0/[4459,333,81,5] Q7 新表)")
 
     # ── --out 可写性预检(fail-fast,必须在任何耗时操作之前)──────────────────
     # 为什么要有:`torch.save` 失败会抛异常直接中断训练,而保存只发生在每轮 val
@@ -720,8 +754,28 @@ def main():
             model, val_loader, criterion, device, epoch=1, official_metrics_out=base_metrics
         )
         print(f"--> [护栏] warm-start val Dice 基线 = {dice_baseline:.4f}")
+        # 🔴 ETE 小试基线留档(Gate2 审查 F3,2026-09-12):门"ETE≥0.24 且其余
+        # 四项各不降超 0.01"需要同权重同 split 的逐指标基线,而这正是 warm-start
+        # 后第一次 val(r5 权重本身)。此前只取 dice 丢弃其余——门只能拿文档里
+        # 不同 epoch 的峰值当基线,口径不可比。收集进 _baseline_pending,
+        # 待正式 logger 建好后以 epoch=0/phase=val 写 JSONL。
+        _baseline_row = {"note": "warm-start (pre-finetune) r5 metrics"}
+        _baseline_row.update({k: v for k, v in base_metrics.items()
+                              if isinstance(v, (int, float))})
+        _baseline_pending = _baseline_row
+    else:
+        _baseline_pending = None
 
     logger = JsonlLogger(log_dir=args.log_dir, data_source="official/train_v1")
+    if _baseline_pending is not None:
+        # phase 走合法枚举 "val"(epoch=0 标识 warm-start 基线),指标全进 extra
+        # (规范必填字段一个不少,基线指标是额外诊断键不违规)。
+        _extra = {k: v for k, v in _baseline_pending.items()
+                  if k not in ("phase", "epoch", "note")}
+        logger.log(epoch=0, step=0, phase="val", mode="validation",
+                   extra={"baseline_note": _baseline_pending["note"], **_extra})
+        print(f"--> [护栏] baseline 指标已写 JSONL(epoch=0/phase=val): "
+              f"{ {k: round(v, 4) for k, v in _extra.items()} }")
     log_every = 1 if args.smoke else 20
     running_losses_history: list = []
     optimizer = None
@@ -733,9 +787,11 @@ def main():
         for epoch in range(1, epochs + 1):
             param_groups, head_lr, stage_name = configure_official_stage(
                 model, criterion, epoch, lr_base, config["train"]["weight_decay"],
-                freeze_legacy=args.freeze_legacy,
+                freeze_legacy=args.freeze_legacy, ete_only=args.ete_only,
             )
             cur_stage = get_official_stage(epoch)
+            if args.ete_only:
+                cur_stage = "ETE"   # 恒定单阶段:全程不重建 optimizer,动量跨 epoch 承接
             # 阶段边界重建 optimizer(参数集合变了);阶段内只更 lr(承接动量)。
             if optimizer is None or cur_stage != prev_stage:
                 optimizer = torch.optim.AdamW(param_groups, lr=head_lr)

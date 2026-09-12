@@ -138,6 +138,7 @@ def configure_official_stage(
     backbone_lr_scale: float = 0.1,
     llrd_eta: float = 0.75,
     freeze_legacy: bool = False,
+    ete_only: bool = False,
 ) -> Tuple[List[Dict], float, str]:
     """配置官方三头训练的当前阶段:设 requires_grad + 建 param_groups。
 
@@ -151,6 +152,13 @@ def configure_official_stage(
         freeze_legacy: True → 冻结 AUCM 对偶变量(malignancy 损失关闭时用,见
             `train_official.py` 的 `--freeze-legacy`);False(默认)→ 对偶变量可训,
             让 legacy 多任务损失在头微调期间继续守护旧任务不退化。
+        ete_only: True → **ETE 头小试模式**(D10-15,2026-09-12):恒可训集从
+            「四头+分割链」收窄到**仅 `extension_head`**(local_proj+classifier,
+            10 键),其余全冻(含分割与另三头)。从 r5 checkpoint 热启动后微调,
+            期望 ete_kappa 0.2086→≥0.24 且其余指标不动(它们无梯度,数学上
+            只受数值噪声影响)。lr 取 Stage C 档(低 lr 微调,防把热启动的头
+            一步带偏)。**损失仍全量计算**(改损失路径风险大于收益,冻结参数
+            梯度为 0 只是白算——6-8 epoch 量级可接受)。
 
     Returns:
         `(param_groups, head_lr, stage_name)`。head_lr 是调度基准 lr;stage_name 形如
@@ -159,10 +167,12 @@ def configure_official_stage(
     ## requires_grad 政策(逐 stage)
 
     - vclub:恒 True(独立 `vclub_optimizer` 管,排除出主 param_groups —— 与 stages.py 一致)。
-    - 四头:恒 True。
+    - 四头:恒 True。**ete_only 时唯一例外:仅 extension_head True,其余三头也冻**。
     - **分割前向链**(`SEG_TRAIN_PREFIXES`):恒 True(2026-08-16 起,见模块 docstring)。
+      **ete_only 时冻结**(分割是 0.6528 的闸门,不为 ETE 冒险)。
     - Stage A / C:除四头 + 分割 + vclub 外全冻。
-    - Stage B:额外解冻 `STAGE_B_UNFREEZE`(cls_backbone Top-2 block)。
+    - Stage B:额外解冻 `STAGE_B_UNFREEZE`(cls_backbone Top-2 block)。**ete_only 时
+      不解冻 backbone**(backbone 动了四头全跟着漂,违背"仅解冻 ETE"的单变量原则)。
     - criterion.mal_loss_fn(AUCM 对偶):`requires_grad = not freeze_legacy`。
 
     ## lr 档位
@@ -180,6 +190,35 @@ def configure_official_stage(
     head_lr = official_head_lr(epoch, lr_base)
 
     # ── 1. 设 requires_grad ──────────────────────────────────────────────
+    # ete_only(D10-15):恒可训集收窄到仅 extension_head,Stage B 不解冻 backbone,
+    # 分割链冻结。lr 强制取 Stage C 低档(微调而非重学)。
+    if ete_only:
+        head_lr = lr_base * _STAGE_C_LR_SCALE
+        _ete_prefix = "extension_head"
+        for name, p in model.named_parameters():
+            if "vclub" in name:
+                p.requires_grad = True
+                continue
+            p.requires_grad = name.startswith(_ete_prefix)
+        for p in criterion.mal_loss_fn.parameters():
+            p.requires_grad = not freeze_legacy
+        # param_groups:只有 ETE 头一组(decay/no_decay 拆分照旧)
+        ete_named = [
+            (n, p) for n, p in model.named_parameters()
+            if p.requires_grad and "vclub" not in n
+        ]
+        ete_decay, ete_no_decay = _split_decay(ete_named)
+        param_groups: List[Dict] = [
+            {"params": ete_decay, "weight_decay": weight_decay, "lr": head_lr},
+            {"params": ete_no_decay, "weight_decay": 0.0, "lr": head_lr},
+        ]
+        if not freeze_legacy:
+            duals = [p for p in criterion.mal_loss_fn.parameters() if p.requires_grad]
+            if duals:
+                param_groups.append(
+                    {"params": duals, "weight_decay": 0.0, "lr": head_lr})
+        return param_groups, head_lr, "ETE-only finetune (r5 frozen, extension_head only)"
+
     unfreeze_extra = STAGE_B_UNFREEZE if stage == "B" else ()
     # 恒可训集:四头 + 分割前向链。分割整块解冻(解码器 + 主干同时放行),
     # 避免 bn_freeze 的"兄弟 BN 仍被更新"病态。

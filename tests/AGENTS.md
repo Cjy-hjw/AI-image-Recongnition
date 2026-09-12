@@ -101,10 +101,25 @@ blocks[5]=×0.1×0.75,越靠输出 lr 越大)+ **BN 状态**(冻结的 cls 主�
 
 `OfficialThyroidDataset.__getitem__` 动态分支命中 `cache_img` 时不得再碰 `.nii.gz`:缓存命中路径像素与走原路径**逐位一致**、mask 前景像素数精确、缺文件**抛异常**(不静默零图——静默补零=拿全黑图+全零 mask 当真样本训,loss 照常降查不出)、无 `cache_img` 键**回落原 .nii.gz 路径**(向后兼容零回归,用不存在路径反证进了解压分支)、`frame_key` 正确区分同影像不同 mask 且同输入稳定(只哈希影像路径会撞车,让两个病灶读到同一张 mask,不报错、标签与像素静默错配)。另 2 项钉 `samples.pkl` 契约:**`--limit` 残件(`_meta["partial"]=True`)必须被硬拒**(残件里未处理的动态样本没有缓存 → 静默回落到全量解压路径,属"合法但全错",堵在入口才安全)与反向边界(完整 pkl 的 `partial` 键缺失/False 不得被误拒)。
 
-## 测试总数(单一权威,2026-09-10 实测)
+## `test_preextract_parallel.py` — 预抽取并行化契约(5 项,2026-09-11 新增)
 
-**全套 1059 passed + 1 skipped**(2026-09-10 零训练四件套+Gate2 双路审查修复后,
-`torch28` 预演环境实测)。演进链 1016 → **+27 = 批量前向+内存治理**(2026-09-09,
+`preextract_dynamic.py` 的 `--workers` 进程池改造回归。🔴 **fixture 策略教训:mock 与
+`ProcessPoolExecutor` 天然不兼容**——monkeypatch 只在主进程生效,子进程 re-import 模块后
+patch 不存在(首版用 monkeypatch mock `load_nifti_frames`,并行臂全失败 3 例红);故本文件
+**不 mock 任何 IO**,用 nibabel 造真实 mini .nii.gz(6 帧 32×32,含一个真损坏文件走
+IMG 失败路径),主/子进程走完全相同的真代码路径。锁定:① `_process_one_file` 单元回填
+(成功回填路径/越界帧回填 None 且记 failure);② **并行 workers=2 vs 串行 workers=1 的
+PNG 逐字节一致** + pkl 样本逐字段等价;③ 幂等重跑不重写已有 PNG(mtime 不变);④ 分辨率
+抽检护栏串行/并行两路都 SystemExit 硬拦(probe_hw 从 worker 报回主进程)。**本测试抓出
+并已修的真 bug**:「已存在(跳过)」样本必须回填 fills,否则幂等重跑把全部已缓存动态
+样本当失败剔除、pkl 只剩静态样本(静默丢全部动态数据,旧版串行在扫描阶段就写
+`s["cache_img"]` 故无此问题——重构丢了这个语义)。
+
+## 测试总数(单一权威,2026-09-12 实测)
+
+**全套 1064 passed + 1 skipped**(2026-09-12 预抽取并行化轮,`torch28` 预演环境实测;
+演进链 1059→1064 = `test_preextract_parallel.py` +5。判回归须同环境前后对拍)。
+演进链 1016 → **+27 = 批量前向+内存治理**(2026-09-09,
 `test_video_batch_inference.py` 7 + `test_nodule_split` 稀疏往返 1 + 其余修复)
 → **1043 → +16 = 零训练四件套**(2026-09-10:`test_probability_output` 阈值 env
 矩阵 ~17(含 (key,dynamic) 成对参数化 18 组)、`test_nodule_split` env 三层优先级

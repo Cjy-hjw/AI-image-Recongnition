@@ -452,6 +452,24 @@ closing 后变成 (帧1,帧2) —— **帧 0 凭空消失、帧 1 凭空出现**
 `binary_dilation` + `binary_erosion(border_value=1)`。回归锁:
 `tests/test_nodule_split.py::TestFrameGapClosing::test_gap_at_first_frame_survives`。
 
+### 静态 2D 形态学清理(2026-09-12,Fable 低成本点,默认关)
+
+`_split_2d` 加 `AICOMP_CLEAN_2D` env 开关(**默认关 = 逐位等价旧版**,Fable 条款:
+离线回放 Dice/AP 双升才开)。开时:3×3 闭运算(`_CLEAN_2D_ITER=1`,⚠️ 是迭代数
+不是半径,设 2 等效 5×5 膨胀会把独立小结节粘上主结节)+ flood-fill 填孔。
+
+🔴 **Gate2 审查两条硬教训(实测反例,勿改回)**:
+1. **填孔种子必须四角全试**——单 (0,0) 种子在"前景竖带贯通上下边"时,(0,0)
+   所在背景与图内其余背景不连通,整块外部背景被当"孔洞"灌成前景(实测单实例
+   53% 图幅;左缘条带+真结节场景 98%,真结节被吞进巨型 blob,Dice/AP 双灭)。
+2. **填孔后前景占比 >0.5 必须回退原 mask**——flood 静默失败的失败模式是
+   "整图变前景"而非"清理没生效"(变异实测 floodFill no-op 后实心圆变 4096/4096),
+   占比护栏是这条无界失败面的硬兜底。
+
+测试:`tests/test_mask_clean_2d.py` 10 项(填孔/缝缝合/实心恒等/竖带反例/flood
+no-op 兜底/垃圾 env 回关)。性能:开清理每图 +0.8ms,5459 张静态 +4.4s,8h 时限
+无虞。
+
 缝合结果**只用于确定标签归属**,最终实例 mask 仍 `& binary` 回落原始数据,不把补出来
 的虚构帧写进交付 mask。
 

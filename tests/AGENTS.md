@@ -130,8 +130,13 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 
 ## 测试总数(单一权威,2026-09-12 实测)
 
-**全套 1084 passed + 1 skipped**(2026-09-12 D2 TTA 轮,`Demo_D` 环境实测;
-演进链 1064→1084 = `test_static_tta.py` +20。判回归须同环境前后对拍)。
+**全套 1104 passed + 1 skipped**(2026-09-12 ETE-only+mask清理轮,`Demo_D` 环境实测;
+演进链 1064→1084→1089→1104 = `test_static_tta.py` +20 / `test_ete_only_schedule.py` +5 /
+`test_mask_clean_2d.py` +10。判回归须同环境前后对拍)。
+`test_mask_clean_2d.py`(10 项):静态 2D 形态学清理契约——默认关逐位等价旧版
+(红线)/填孔(环→实心)/缝缝合(穿透缝 2 实例→1)/实心恒等/🔴 竖带反例(四角
+种子修复的回归锁:单种子把外部背景当孔洞,实测 53% 图幅)/🔴 flood no-op 兜底
+(填孔后>0.5 回退原 mask)/垃圾 env 回关。
 演进链 1016 → **+27 = 批量前向+内存治理**(2026-09-09,
 `test_video_batch_inference.py` 7 + `test_nodule_split` 稀疏往返 1 + 其余修复)
 → **1043 → +16 = 零训练四件套**(2026-09-10:`test_probability_output` 阈值 env

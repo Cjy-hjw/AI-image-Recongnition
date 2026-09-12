@@ -115,10 +115,23 @@ PNG 逐字节一致** + pkl 样本逐字段等价;③ 幂等重跑不重写已�
 样本当失败剔除、pkl 只剩静态样本(静默丢全部动态数据,旧版串行在扫描阶段就写
 `s["cache_img"]` 故无此问题——重构丢了这个语义)。
 
+## `test_static_tta.py` — 静态 hflip TTA 契约(20 项,2026-09-12 新增,D2)
+
+D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造法(镜像测试须验
+区分力):假模型分割 logits 只随归一化列坐标线性变化(左右不对称,翻转前向
+≠ 原图,TTA 平均可解析验证),分类头输出恒定。锁定 5 条契约:① **分类各头
+(含位置头)与无 TTA 逐位一致**(禁止融合);② mask = 两路 sigmoid 概率的逐
+像素平均(解析式对拍);③ TTA vs 无 TTA mask **必须不同**(fixture 区分力
+反证,防测试退化成全 GREEN);④ 翻转前向异常分流——OOM 回退单前向(逐位
+等价),**非 OOM RuntimeError 冒泡**(Gate2 F2:except 收窄到 _is_oom,真
+故障不得静默劣化成半 TTA);⑤ override NaN 硬拦 + **形状 dim()!=2 硬拦**
+(Gate2 F3:3D/4D 在下游 cv2.resize 被当多通道图静默放行,与 t_probs 长度
+校验同一教义)。另钉 env 开关边界 9 档 + override=None 逐位等价旧版。
+
 ## 测试总数(单一权威,2026-09-12 实测)
 
-**全套 1064 passed + 1 skipped**(2026-09-12 预抽取并行化轮,`torch28` 预演环境实测;
-演进链 1059→1064 = `test_preextract_parallel.py` +5。判回归须同环境前后对拍)。
+**全套 1084 passed + 1 skipped**(2026-09-12 D2 TTA 轮,`Demo_D` 环境实测;
+演进链 1064→1084 = `test_static_tta.py` +20。判回归须同环境前后对拍)。
 演进链 1016 → **+27 = 批量前向+内存治理**(2026-09-09,
 `test_video_batch_inference.py` 7 + `test_nodule_split` 稀疏往返 1 + 其余修复)
 → **1043 → +16 = 零训练四件套**(2026-09-10:`test_probability_output` 阈值 env

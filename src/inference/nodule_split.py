@@ -61,6 +61,25 @@ DEFAULT_MAX_NODULES = 20
 # 显式传 DEFAULT_MIN_AREA_RATIO 钉死不走 env(见 v21_output._write_dynamic)。
 _ENV_MIN_AREA_RATIO = "AICOMP_MIN_AREA_RATIO"
 
+# ── 静态 2D 形态学清理(Fable 低成本点,2026-09-12;🔴 默认关,离线双升才开)──
+# 预测 mask 上的两类噪声:① 孤立小连通域(碎片)→ 变成假阳性结节拖检测 AP;
+# ② 结节内部孔洞(概率中间塌陷)→ 蚀 Dice 边缘。清理 = 填孔 + 小碎片剔除。
+# **默认关的依据**:① 碎片其实已被 min_area_ratio 过滤(1e-4 ≈ 26px@512²,
+#   碎片要活过过滤得先有 26px,而 26px 的"碎片"可能本身就是低置信小结节,
+#   剔它 = 丢 AP 尾部);② 填孔会扩 mask 边界,Dice 在欠分割侧才赚、过分割侧
+#   反亏——方向未经验证。Fable 条款:离线回放 Dice/AP **双升**才开。
+# env 三态:"0"=关(默认)/"1"=开/其它值=关(垃圾配置回安全值)。
+_ENV_CLEAN_2D = "AICOMP_CLEAN_2D"
+# 闭运算迭代数(kernel 恒 3×3):iterations=1 只缝 1-2px 缝。⚠️ 该值是
+# **迭代数不是半径**:设 2 等效 5×5 膨胀,会把独立小结节粘到主结节上
+# (虚减结节数,AP 直接掉),别动。
+_CLEAN_2D_ITER = 1
+
+
+def _clean_2d_enabled() -> bool:
+    raw = os.environ.get(_ENV_CLEAN_2D)
+    return raw is not None and raw.strip() == "1"
+
 
 def _env_min_area_ratio() -> float:
     """env 解析静态 min_area_ratio;未设/非法一律回默认(不静默采信垃圾配置)。
@@ -140,6 +159,38 @@ def _split_2d(arr, min_area_ratio, max_nodules):
         raise RuntimeError("split_nodules(2D) 需要 opencv,但 cv2 未安装")
 
     binary = (arr != 0).astype(np.uint8)
+
+    # 形态学清理(env 开关,默认关,见 _ENV_CLEAN_2D 注释):
+    # ① 3×3 闭运算填 1px 孔/缝;② 边界 flood-fill 填孔。
+    # 🔴 填孔种子必须**四角都试**(Gate2 审查 P1,2026-09-12 实测反例:前景竖带
+    #   贯通上下边时,(0,0) 所在背景与右侧背景不连通 → flood 未达的整块右侧
+    #   被当"孔洞"灌成前景,单实例面积 53% 图幅;左缘条带+真结节场景更炸成
+    #   98% 图幅的单个巨型 blob,Dice/AP 双灭。四角任一命中背景即从它灌;
+    #   四角全是前景(极端)跳过填孔,宁少填不误扩)。
+    # 🔴 holes 面积护栏:填孔后前景占比超 0.5 → 放弃清理回退原始 mask
+    #   (flood 静默失败的失败模式是"整图变前景"而非"清理没生效",变异实测
+    #   floodFill no-op 后实心圆 4096/4096 全前景;占比护栏是这条无界失败
+    #   面的硬兜底,超过 min(seg_over_half 护栏口径, 0.5) 必然是异常)。
+    if _clean_2d_enabled():
+        k = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k,
+                                  iterations=_CLEAN_2D_ITER)
+        h_, w_ = binary.shape[:2]
+        seed = next(((y, x) for y, x in ((0, 0), (0, w_ - 1), (h_ - 1, 0),
+                                         (h_ - 1, w_ - 1))
+                     if binary[y, x] == 0), None)
+        if seed is not None:
+            ff_mask = np.zeros((h_ + 2, w_ + 2), np.uint8)
+            flood = binary.copy()
+            cv2.floodFill(flood, ff_mask, seed, 1)
+            holes = (flood == 0)            # flood 未达 = 孔洞
+            cleaned = ((binary != 0) | holes).astype(np.uint8)
+            if float(cleaned.mean()) <= 0.5:
+                binary = cleaned
+            else:
+                print("--> [WARNING] mask 清理填孔后前景占比>0.5(异常 flood),"
+                      "回退原始 mask", flush=True)
+
     h, w = binary.shape
     min_area = max(1, int(min_area_ratio * h * w))
 

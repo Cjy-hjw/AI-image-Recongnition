@@ -47,6 +47,24 @@ from src.inference.postprocess import NonFiniteProbabilityError
 _ENV_VIDEO_BATCH = "AICOMP_VIDEO_BATCH"
 _DEFAULT_VIDEO_BATCH = 8   # 最小部署面安全值;云端 32G 卡实测单帧激活峰值后可经 env 调 16/32
 
+# --- 静态 hflip TTA(D2,2026-09-12,Fable 收官路线) ---
+# 只对静态图水平翻转一次再前向,只平均**分割概率图**;分类/位置/ETE/T/TI-RADS
+# 一律不融合(各头对翻转不变性的假设未经数据验证,位置头更是 🔴 **绝不能 flip**
+# —— 左右叶语义随翻转直接互换,融合会把 9.36 分的位置 AUC 打崩)。
+# 动态图不做 TTA(全帧前向本来就贵,翻倍前向撞 8h 时限风险)。
+# 默认开(env 设 "0"/"false" 关闭):本地+云端对拍通过后就是交付形态,默认关
+# 会让"忘了设 env"静默退化回无 TTA,与零训练四件套①"改代码默认值而非设 env"
+# 的部署纪律同理——**测评容器不重建、env 分栏改不了**。
+_ENV_TTA = "AICOMP_STATIC_TTA"
+
+
+def _static_tta_enabled() -> bool:
+    """解析 AICOMP_STATIC_TTA(畸形值回默认 True,与 _seg_threshold 同模式)。"""
+    raw = os.environ.get(_ENV_TTA, "1").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return False
+    return True
+
 
 def _resolve_video_batch_size():
     """解析 AICOMP_VIDEO_BATCH(畸形回默认;"0"/负数钳到 1 = 显式回退逐帧旧行为,对拍用)。
@@ -175,7 +193,40 @@ def diagnose_static_case(model, img_np, config, calibrator, precision, device):
     img_size = config["data"]["img_size"]
     img_tensor = preprocess_image(img_np, img_size, device)
     outputs = run_forward(model, img_tensor, precision, device)
-    preds = decode_predictions(outputs, calibrator=calibrator)
+
+    # --- 静态 hflip TTA(D2,2026-09-12) ---
+    # 翻转前向 → sigmoid 概率 → 逆 flip 回原坐标 → 与原图概率**逐像素平均**。
+    # 🔴 平均的是概率不是 logits(sigmoid(平均logits) ≠ 平均(sigmoid(logits)),
+    # 且 sigmoid 非线性下前者无概率语义);🔴 逆变换先于平均(直接平均翻转概率
+    # = 病灶左右镜像错位叠加)。分类各头**不融合**:全部走原图 outputs(下方
+    # decode 的分类路径读的就是这份 outputs,与无 TTA 时逐位一致)。
+    # 回退策略(Gate2 两路审查 F1/F2 修正,2026-09-12):
+    #   ① 只在翻转前向**这一步**罩异常,sigmoid/平均留在 try 外——那两行纯张量
+    #     运算无独立故障面,罩进去只会把"值异常"也吞成静默回退;
+    #   ② except 收窄到 OOM(`_is_oom`,与 `_forward_frames` 的既有策略同源:非 OOM
+    #     的 RuntimeError 是真故障必须冒泡,不能静默劣化成"无 TTA 照常跑"——那
+    #     会让整批处于半 TTA 状态且日志只有 warning,D2-3 的 GO/ROLLBACK 对拍
+    #     判据随之失真);
+    #   ③ NonFiniteProbabilityError 不拦:翻转前向抛 NaN 说明数值层面已异常,
+    #     静默回退会掩盖它,按既有硬拦哲学冒泡交调用方落 ERROR。
+    mask_prob_override = None
+    if _static_tta_enabled():
+        try:
+            outputs_flip = run_forward(
+                model, torch.flip(img_tensor, dims=[3]), precision, device)
+        except RuntimeError as e:
+            if not _is_oom(e):
+                raise
+            print(f"--> [WARNING] TTA 翻转前向 OOM,回退单前向({e})", flush=True)
+            outputs_flip = None
+        if outputs_flip is not None:
+            prob_orig = torch.sigmoid(outputs["mask"].float())[0, 0]
+            prob_flip = torch.flip(
+                torch.sigmoid(outputs_flip["mask"].float())[0, 0], dims=[1])
+            mask_prob_override = (prob_orig + prob_flip) / 2.0
+
+    preds = decode_predictions(outputs, calibrator=calibrator,
+                               mask_prob_override=mask_prob_override)
     mask_resized = cv2.resize(
         preds["mask_binary"], (img_np.shape[1], img_np.shape[0]),
         interpolation=cv2.INTER_NEAREST)

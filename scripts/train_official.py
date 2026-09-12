@@ -711,13 +711,19 @@ def main():
             samples_pkl=args.samples_pkl,
         )
     num_workers = 0 if (args.smoke or device.type == "cpu") else config["environment"]["num_workers"]
+    # persistent_workers(2026-09-12):num_workers>0 时保持 worker 进程跨 epoch
+    # 存活,省每轮的进程池重建(12 workers ≈ 每 epoch 2-5s × 35ep)。
+    # 🔴 必须 _persist 守卫:num_workers=0 时传 True 直接 ValueError。
+    _persist = num_workers > 0
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
         pin_memory=(device.type == "cuda"), worker_init_fn=seed_worker, generator=loader_gen,
+        persistent_workers=_persist,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         pin_memory=(device.type == "cuda"), worker_init_fn=seed_worker,
+        persistent_workers=_persist,
     )
 
     # ── 模型 + 损失 ───────────────────────────────────────────────────────
@@ -775,7 +781,7 @@ def main():
         logger.log(epoch=0, step=0, phase="val", mode="validation",
                    extra={"baseline_note": _baseline_pending["note"], **_extra})
         print(f"--> [护栏] baseline 指标已写 JSONL(epoch=0/phase=val): "
-              f"{ {k: round(v, 4) for k, v in _extra.items()} }")
+              f"{ {k: (round(v, 4) if isinstance(v, float) else v) for k, v in _extra.items()} }")
     log_every = 1 if args.smoke else 20
     running_losses_history: list = []
     optimizer = None

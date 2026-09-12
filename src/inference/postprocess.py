@@ -54,7 +54,8 @@ def _seg_threshold(dynamic: bool) -> float:
     return t if 0.0 < t < 1.0 else float(default)
 
 
-def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False) -> dict:
+def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False,
+                       mask_prob_override=None) -> dict:
     """Extract all prediction fields from raw model outputs.
 
     Args:
@@ -62,6 +63,10 @@ def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False)
         calibrator: 可选 `TemperatureScaler`。每个分类头在 softmax/sigmoid **之前**
             先经 `calibrator.apply(task, logits)` 做温度缩放。为 None 或全 T=1.0 时
             **无任何行为变化**(逐位等同无校准)。argmax 预测类别不受 T 影响。
+        mask_prob_override: 可选 `[H,W]` 张量(静态 hflip TTA 用,D2 2026-09-12)。
+            调用方已把「原图前向 + 翻转图前向(逆翻转回原坐标)」的两张 **sigmoid
+            概率图**平均好;提供时跳过本函数的 sigmoid 直接收下,None(默认)时
+            行为与旧版逐位一致。分割不进 calibrator,override 也不走校准。
 
     Returns dict with keys:
         pred_mask, mask_binary, comp_idx, echo_idx, shape_idx, margin_idx,
@@ -120,9 +125,23 @@ def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False)
     # 经 sigmoid 得 NaN → `(NaN > 0.5)` 恒 False → **静默产出全零分割图**,而
     # status=PASSED、报告正常——人工/评测只看 JSON 完全察觉不到分割已废(比报错更
     # 隐蔽)。故对激活后的 pred_mask 同样硬拦,交上层处置(单图 ERROR / 视频丢帧)。
-    pred_mask = torch.sigmoid(outputs["mask"].float())[0, 0]
-    _assert_finite("mask", pred_mask)
-    pred_mask = pred_mask.cpu().numpy()
+    # TTA(D2 2026-09-12):mask_prob_override 优先——它是调用方已平均的
+    # [H,W] sigmoid 概率(原图前向+翻转前向逆变换后平均),不能再过一次
+    # sigmoid(sigmoid(sigmoid(x)) 压扁值域);NaN 校验/阈值与默认路径同一套。
+    # 🔴 形状契约(Gate2 审查 F3):必须恰为 [H,W] 二维——3D/4D 输入在下游
+    # cv2.resize 会被当多通道图静默通过或直接 cv2.error,与 t_probs 长度硬校验
+    # 同一风险面(维度错→静默产出错误产物),故在源头硬拦,不依赖下游偶发拦截。
+    if mask_prob_override is not None:
+        if mask_prob_override.dim() != 2:
+            raise ValueError(
+                f"mask_prob_override 维度契约不符:期望 2 维 [H,W],实得 "
+                f"{tuple(mask_prob_override.shape)}(dim={mask_prob_override.dim()})"
+                "——TTA 平均概率必须与单前向 [H,W] 概率图同形。")
+        pred_mask = _assert_finite("mask", mask_prob_override.float()).cpu().numpy()
+    else:
+        pred_mask = torch.sigmoid(outputs["mask"].float())[0, 0]
+        _assert_finite("mask", pred_mask)
+        pred_mask = pred_mask.cpu().numpy()
     # 件套①:阈值经 _seg_threshold(dynamic) 解析,env 未设时恒 0.5(逐位等于旧
     # 硬编码)。下游全链(case_pipeline/nodule_split/v21_output/诊断脚本)只读本
     # mask_binary 的非零性 → 此处一改即全链生效,无第二个分割阈值。

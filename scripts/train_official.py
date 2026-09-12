@@ -778,7 +778,10 @@ def main():
         # (规范必填字段一个不少,基线指标是额外诊断键不违规)。
         _extra = {k: v for k, v in _baseline_pending.items()
                   if k not in ("phase", "epoch", "note")}
-        logger.log(epoch=0, step=0, phase="val", mode="validation",
+        # mode 只有 'training'/'inference' 两个合法值(jsonl_logger._MODES),
+        # 基线行属训练侧产物故取 'training'(首版误写 'validation' 撞 assert,
+        # 冒烟走 mock 路径根本不进这段,本地测不出——云端首跑才炸)。
+        logger.log(epoch=0, step=0, phase="val", mode="training",
                    extra={"baseline_note": _baseline_pending["note"], **_extra})
         print(f"--> [护栏] baseline 指标已写 JSONL(epoch=0/phase=val): "
               f"{ {k: (round(v, 4) if isinstance(v, float) else v) for k, v in _extra.items()} }")

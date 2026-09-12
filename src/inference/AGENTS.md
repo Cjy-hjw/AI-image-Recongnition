@@ -163,8 +163,9 @@ Phase 1 给 `decode_predictions` 全部分类头加了 NaN/Inf 硬校验(`_asser
 
 ## 4. `postprocess.py` — Prediction Decoding
 
-### `decode_predictions(outputs, calibrator=None, *, dynamic=False)` → `dict`
+### `decode_predictions(outputs, calibrator=None, *, dynamic=False, mask_prob_override=None)` → `dict`
 Returns keys: `pred_mask`, `mask_binary`, `comp_idx`, `echo_idx`, `shape_idx`, `margin_idx`, `comp_prob`, `echo_prob`, `shape_prob`, `margin_prob`, `foci_prob`, `mal_prob`, `mal_probs`, **`ete_probs`, `location_probs`, `t_probs`, `t_conf`, `tirads_probs`**(官方四头,#116b 2026-08-17 接入)。
+- **静态 hflip TTA(D2,2026-09-12,commit `ed2d2f8`)**:`mask_prob_override` 为调用方已平均的 [H,W] sigmoid 概率(`diagnose_static_case` 的 TTA 段产出:原图前向+翻转前向逆变换后逐像素平均),提供时**直收不再过 sigmoid**(sigmoid(sigmoid(x)) 压扁值域),NaN 校验/阈值与默认路径同一套;🔴 **形状契约硬拦 `dim()!=2`**(Gate2 审查:3D/4D 输入在下游 cv2.resize 被当多通道图静默放行,与 `t_probs` 长度校验同一教义)。None(默认/动态路径/TTA 关或回退)时与旧版逐位一致。**TTA 只平均分割概率**——分类各头全走原图 outputs 逐位不变,🔴 **位置头绝不 flip**(左右叶语义互换);TTA 还会通过 `Detection.confidence`(实例内概率均值)间接影响 AP 排序,回滚判据必须 Dice/AP **双**看,不能只看 Dice。开关 `AICOMP_STATIC_TTA`(默认开,件套①同部署纪律);翻转前向仅 OOM 回退(非 OOM 冒泡,对齐 `_forward_frames` 既有策略)。详见 `case_pipeline.py` TTA 段注释 + `tests/test_static_tta.py`(20 项)。
 - **分割二值化阈值 env 化(2026-09-10 零训练四件套①)**:`mask_binary = (pred_mask > _seg_threshold(dynamic))`;静/动两条 env 独立(`AICOMP_SEG_THRESHOLD`/`AICOMP_SEG_THRESHOLD_DYNAMIC`)。🔴 **2026-09-11 云端 r5 val 扫参定参后默认值分道**(`sweep_20260910_165002.json`,15 静态+5 动态组合,官方口径 Dice/AP 进程内直算):**静态默认改 0.35**(匹配0.8222/Dice0.7286/AP0.7942,三项不劣于旧默认0.5;测评容器不重建改不了 env 分栏,故直接改代码默认值而非设 env)、**动态默认维持 0.5**(五档0.25→0.50匹配率/Dice/AP单调递增、0.50是测试范围里最优,"动态应更低"的原假设被数据推翻)。垃圾/越界/inf/nan 一律钳回**各自默认值**(NaN 比较返回 False 走越界分支,不会异常)。env 仍保留,供下次扫参覆盖。**`dynamic` 由调用方传**:生产静态路径 `diagnose_static_case` 不传(False),动态帧循环经 `_decode_frame_sample`/`_diagnose_frame` 透传 True(kf 一致性锁同)。非 case_pipeline 的旧调用方(`video_predict.py:42` shim、`evaluate.py:102`)默认 False 行为不变(吃静态 0.35 新默认)。**全链只有这一个分割阈值**——下游(case_pipeline/nodule_split/v21_output/诊断脚本)只读 mask_binary 非零性,此处一改即全链生效。min_area_ratio 扫参三档(1e-4/5e-5/2e-5)在每个阈值下匹配率/Dice/AP 逐位相同(零收益、阴性FP风险未测)——**不改**,维持默认 1e-4。
 - **官方四头(位置/ETE/临床T/TI-RADS)**:**原样透传各头已算好的 fp32 softmax**(`heads/*.py` 内部已 softmax),`decode_predictions` **不再二次 softmax**(`softmax(softmax(x))≠softmax(x)`,argmax 不变但概率值全错,而"必须输出概率分布"正是官方计分项)。**不走 calibrator**(`CALIBRATED_TASKS` 不含四头,温度缩放对未标定的头是伪精度)。**键缺失即 KeyError 不兜底** —— 四头是 `MultiTaskThyroidModel.forward` 的无条件输出,缺席说明加载的是不含四头结构的旧模型(如 `thyroidxl_merged_v2.pth`),静默兜底会写出确定性占位值而目标四 40% 三项 + 目标三 TI-RADS 全部失分且 JSON 完全合法、本地看不出。**长度也硬校验**(2026-08-17 第三轮 review lane4 L3):下游一律 `argmax+1`,长度错时若 argmax 落在合法值域内就静默产出错误编码 —— 实测唯独 `t_probs` 全程无人校验(4 维且 argmax=idx1 时静默写出 `T=1`),详见文末专条。
 - **`t_conf` 也过 `_assert_finite`**:官方《初赛评审规则》「置信度字段规范」明写 `Detection.confidence`/`Malignancy.confidence`/`T_conf` 若为 NaN/Inf/越界,**评估脚本统一按 0 处理、该样本在 AP/AUC-PR/AUC 中排最后** —— 不是崩溃而是静默垫底,比崩溃阴。
@@ -258,8 +259,10 @@ Delegates to `src/utils/report_generator.calculate_tirads_points()`.
 - `mask_resized`: `mask_binary` 用 `INTER_NEAREST` 缩放回**原图 H×W**;
 - `breakdown`: `build_tirads_breakdown` 的 TI-RADS 分项。
 
+**静态 hflip TTA(D2,2026-09-12)**:前向链 = `preprocess → 原图前向 → (TTA 开时)翻转前向 → 概率逆变换+平均 → decode`。🔴 分类各头读原图 outputs **逐位不变**;分割概率 = 两路 sigmoid 平均;翻转前向仅 OOM 回退单前向(非 OOM 冒泡)。开关与红线详见 §4 `decode_predictions` 的 TTA 条 + `case_pipeline.py` TTA 段注释。
+
 **Raises `NonFiniteProbabilityError`**:概率/mask 含 NaN/Inf 时 `decode_predictions` 硬拦,
-冒泡给调用方转 ERROR(与原 `predict.main()` 的 except Exception 兜底一致)。
+冒泡给调用方转 ERROR(与原 `predict.main()` 的 except Exception 兜底一致)。TTA 平均概率含 NaN 同样硬拦(不静默回退)。
 
 ### `diagnose_dynamic_case(model, frames, frame_indices, config, calibrator, precision, device)` → `dict`
 

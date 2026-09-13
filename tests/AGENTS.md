@@ -128,11 +128,29 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 (Gate2 F3:3D/4D 在下游 cv2.resize 被当多通道图静默放行,与 t_probs 长度
 校验同一教义)。另钉 env 开关边界 9 档 + override=None 逐位等价旧版。
 
-## 测试总数(单一权威,2026-09-12 实测)
+## 测试总数(单一权威,2026-09-13 实测)
 
-**全套 1104 passed + 1 skipped**(2026-09-12 ETE-only+mask清理轮,`Demo_D` 环境实测;
-演进链 1064→1084→1089→1104 = `test_static_tta.py` +20 / `test_ete_only_schedule.py` +5 /
-`test_mask_clean_2d.py` +10。判回归须同环境前后对拍)。
+**全套 1133 collected**(2026-09-13 阶段1方向A轮,`Demo_D` 环境实测;
+演进链 1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py` env 隔离 autouse
++0)→1133(max_nodules env + spy/护栏/裸轴/静态-only 5 + env 解析含上界/12.9
+哨兵参数化 +4/测试类归位 +0)。判回归须同环境前后对拍)。
+`test_nodule_split.py`(+12=53):`TestMaxNodulesEnv` env 三层优先级 + 畸形值
+参数化(含 `12.9` 截断哨兵/`101`/`1e308` 上界反例/`0` 灾难值) + ceiling 放行
+决策值(30/50/100);`TestSplit2DMisc` 归位(原 TestMinAreaEnv 的两个非 env
+测试,TestMaxNodulesEnv 插入时被吞,按类名选跑会漏)。
+`test_diagnose_detection.py`(+5=21):max_nodules int 轴解析(20.5/0 报错、
+值须 int 非 float)/双池派生/spy 钉 kw 透传真达 split_nodules(变异实测:
+删透传后 dual_pool 测试零区分力,fixture 实例数<20)/裸轴派生空护栏拦截
+(修复:绕护栏静态池静默缺席)/静态-only 不拖动态(修复:combos_dynamic 无条件
+吸收会拉起全帧动态推理跑两遍)。
+`tests/conftest.py`(新增):autouse 删 `AICOMP_MAX_NODULES`/`AICOMP_MIN_AREA_RATIO`
+——不传参的既有测试在 env 残留时 14 假红(实测),反过来也会掩盖真回归。
+`test_diagnose_detection.py` 归因脚本扩展(+4):n_pred 直方图分池+饱和率
+(anomaly 剔除/空池 None)/候选数交叉表分桶/sweep sidecar 入口拦截回归锁。
+
+(历史)1104 passed + 1 skipped(2026-09-12 ETE-only+mask清理轮;
+1064→1084→1089→1104 = `test_static_tta.py` +20 / `test_ete_only_schedule.py` +5 /
+`test_mask_clean_2d.py` +10)。
 `test_mask_clean_2d.py`(10 项):静态 2D 形态学清理契约——默认关逐位等价旧版
 (红线)/填孔(环→实心)/缝缝合(穿透缝 2 实例→1)/实心恒等/🔴 竖带反例(四角
 种子修复的回归锁:单种子把外部背景当孔洞,实测 53% 图幅)/🔴 flood no-op 兜底

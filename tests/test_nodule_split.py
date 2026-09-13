@@ -106,11 +106,68 @@ class TestMinAreaEnv:
         assert split_nodules(large) == []
 
     def test_env_zero_disables_filter(self, monkeypatch):
-        """env=0 = 完全不过滤(与显式传 0 同义)。"""
+        """env=0 = 完全不过滤(与显式传 0 同义)。🔴 0 语义与 max_nodules
+        相反:min_area 的 0=禁用过滤(合法),max_nodules 的 0=归零实例数
+        (灾难,见 TestMaxNodulesEnv 的非法集)。"""
         monkeypatch.setenv("AICOMP_MIN_AREA_RATIO", "0")
         m = np.zeros((100, 100), np.uint8)
         m[5, 5] = 1  # 单像素
         assert len(split_nodules(m)) == 1
+
+
+class TestMaxNodulesEnv:
+    """阶段1(2026-09-13,方向A):max_nodules 三层优先级。
+
+    显式传参 > env(None 默认时) > DEFAULT(env 未设时)。
+    静/动生产调用点均靠默认参吃 env(与 min_area 不同——动态不钉死,分池
+    放开是扫参决策对象)。
+    """
+
+    @staticmethod
+    def _many_blobs(n=25):
+        """25 个互不连通的等面积 blob(超过 DEFAULT_MAX_NODULES=20)。"""
+        m = np.zeros((500, 500), np.uint8)
+        for i in range(n):
+            y, x = (i // 5) * 100 + 40, (i % 5) * 100 + 40
+            m[y:y + 20, x:x + 20] = 1
+        return m
+
+    def test_no_env_none_equals_default(self, monkeypatch):
+        monkeypatch.delenv("AICOMP_MAX_NODULES", raising=False)
+        assert len(split_nodules(self._many_blobs(), min_area_ratio=0)) == 20
+
+    def test_env_none_uses_env(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_MAX_NODULES", "30")
+        assert len(split_nodules(self._many_blobs(), min_area_ratio=0)) == 25
+
+    def test_explicit_param_beats_env(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_MAX_NODULES", "30")
+        # 显式传 20 → env 不生效(扫参确定性)
+        assert len(split_nodules(self._many_blobs(), min_area_ratio=0,
+                                 max_nodules=20)) == 20
+
+    @pytest.mark.parametrize("raw", ["garbage", "0", "-5", "20.5", "12.9",
+                                     "inf", "nan", "1e400", "", "101",
+                                     "1e308", "10000"])
+    def test_invalid_env_falls_back_to_default(self, monkeypatch, raw):
+        """🔴 非正/非整数/超上界(_MAX_NODULES_CEILING=100)必须挡:
+        20.5/12.9 是策略选择(拒绝→20,截断→12/20,断言区分两者——审查实测
+        "20.5"对截断型变异零区分力,12.9 截断会返回 12 必然 RED);101/1e308/
+        10000 是"静默关掉磁盘兜底"的合法大整数(1e308 通过 isfinite/正数/
+        整数三关,nodules[:1e308] 不炸);0 是归零实例数的灾难值(合规空输出、
+        静默全零分)。"""
+        monkeypatch.setenv("AICOMP_MAX_NODULES", raw)
+        assert len(split_nodules(self._many_blobs(), min_area_ratio=0)) == 20
+
+    def test_env_ceiling_allows_decision_values(self, monkeypatch):
+        """上界不能拦住放开决策的候选值(30/50/100 须合法生效)。"""
+        monkeypatch.setenv("AICOMP_MAX_NODULES", "100")
+        assert len(split_nodules(self._many_blobs(n=25), min_area_ratio=0)) == 25
+
+
+class TestSplit2DMisc:
+    """通用 2D 行为(非 env;原在 TestMinAreaEnv 内,TestMaxNodulesEnv 插入
+    后归位到独立类,按类名选跑不再漏)。"""
 
     def test_max_nodules_truncates_by_area(self):
         m = np.zeros((200, 200), np.uint8)

@@ -486,6 +486,7 @@ def _write_static(case_dir, patient_id, subdir_uid, case_result,
     binary_fullres = _resize_binary(preds["mask_binary"], hw)
 
     # 件套④:静态不传 → split_nodules 默认 None → 吃 AICOMP_MIN_AREA_RATIO env。
+    # max_nodules 同理不传(None→AICOMP_MAX_NODULES env→20,阶段1方向A)。
     instances = split_nodules(binary_fullres)
     context = _shared_nodule_context(preds)
     entries = _build_entries_and_save_masks(
@@ -575,6 +576,11 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     # (动态放宽会增多 3D 实例,写盘耗时与内存都是 8h 时限下的风险面,故钉死)。
     instances = split_nodules(binary_3d, min_area_ratio=DEFAULT_MIN_AREA_RATIO,
                               close_gap_frames=gap)
+    # max_nodules 不显式传(默认 None→AICOMP_MAX_NODULES env→20)。🔴 该 env
+    # 与静态 :489 共用同一键,静/动两池**同时**生效,无法分池独立——设之前
+    # 必须同时确认两池的 n_pred 饱和率(analyze_diag_sidecar 分池报);动态侧
+    # 写盘 O(全尺寸体素)是 8h 时限风险面,饱和例多时慎开(与 min_area 钉死
+    # 的差异:max_nodules 是阶段1扫参的决策对象,故不吃钉死、走 env)。
     # B 路审查 B-P3:3D 连通域已消费完 binary_3d,后续只有 mask 写盘(逐实例
     # 自持数据),全帧下该数组 ≈0.87GB/例,尽早释放(worker=2 双动态并发时
     # 峰值 -1.7GB)。诊断脚本 run_dynamic_inference_from_result 早有同款 del,

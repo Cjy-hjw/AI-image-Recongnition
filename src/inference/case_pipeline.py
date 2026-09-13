@@ -47,23 +47,29 @@ from src.inference.postprocess import NonFiniteProbabilityError
 _ENV_VIDEO_BATCH = "AICOMP_VIDEO_BATCH"
 _DEFAULT_VIDEO_BATCH = 8   # 最小部署面安全值;云端 32G 卡实测单帧激活峰值后可经 env 调 16/32
 
-# --- 静态 hflip TTA(D2,2026-09-12,Fable 收官路线) ---
+# --- 静态 hflip TTA(D2,2026-09-12,Fable 收官路线;🔴 2026-09-13 判死回滚默认关)---
 # 只对静态图水平翻转一次再前向,只平均**分割概率图**;分类/位置/ETE/T/TI-RADS
 # 一律不融合(各头对翻转不变性的假设未经数据验证,位置头更是 🔴 **绝不能 flip**
 # —— 左右叶语义随翻转直接互换,融合会把 9.36 分的位置 AUC 打崩)。
 # 动态图不做 TTA(全帧前向本来就贵,翻倍前向撞 8h 时限风险)。
-# 默认开(env 设 "0"/"false" 关闭):本地+云端对拍通过后就是交付形态,默认关
-# 会让"忘了设 env"静默退化回无 TTA,与零训练四件套①"改代码默认值而非设 env"
-# 的部署纪律同理——**测评容器不重建、env 分栏改不了**。
+# 🔴 默认关(2026-09-13 第 9 次跑分判死:67.86 vs 68.80 = -0.94,Dice+0.12 但
+# AP 9.33→8.65 主跌——TTA 平均压缩 Detection.confidence 分布、排序指标受损)。
+# 云端已用备份覆盖回原版(grep AICOMP_STATIC_TTA 应 0 命中);本地代码留库但
+# **默认必须关**,否则下次 pack_upload 出包(闭包含本文件)会把判死的 TTA 复活上云。
+# 部署纪律同零训练四件套①:改代码默认值而非设 env——测评容器不重建、env 分栏改不了。
 _ENV_TTA = "AICOMP_STATIC_TTA"
 
 
 def _static_tta_enabled() -> bool:
-    """解析 AICOMP_STATIC_TTA(畸形值回默认 True,与 _seg_threshold 同模式)。"""
-    raw = os.environ.get(_ENV_TTA, "1").strip().lower()
-    if raw in ("0", "false", "off", "no"):
-        return False
-    return True
+    """解析 AICOMP_STATIC_TTA(畸形值回默认 False——判死后安全侧=关)。
+
+    🔴 默认 False(2026-09-13):TTA 已线上判死(-0.94),"忘了设 env"必须回退到
+    关而不是开;要重新启用须显式 env 设 "1"。
+    """
+    raw = os.environ.get(_ENV_TTA, "0").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    return False
 
 
 def _resolve_video_batch_size():

@@ -123,14 +123,18 @@ IMG = np.tile(np.linspace(0, 255, 30, dtype=np.uint8), (40, 1))   # H≠W 且左
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ("1", True), ("", True), ("true", True), ("TRUE", True), ("garbage", True),
-    ("0", False), ("false", False), ("off", False), ("no", False),
+    ("1", True), ("true", True), ("TRUE", True), ("on", True), ("yes", True),
+    ("0", False), ("", False), ("false", False), ("off", False), ("no", False),
+    ("garbage", False),
 ])
 def test_tta_env_switch(monkeypatch, raw, expected):
     monkeypatch.setenv("AICOMP_STATIC_TTA", raw)
     assert _static_tta_enabled() is expected
     monkeypatch.delenv("AICOMP_STATIC_TTA")
-    assert _static_tta_enabled() is True   # 缺省=开
+    # 🔴 缺省=关(2026-09-13 判死回滚:线上 -0.94,忘了设 env 必须回安全侧;
+    # 旧断言"缺省=开"是判死前的行为,pack_upload 闭包含本文件,默认开会把
+    # 判死的 TTA 随下次出包复活)
+    assert _static_tta_enabled() is False  # 缺省=关
 
 
 # ---------------- 契约 1&2:分类各头与无 TTA 逐位一致 ----------------

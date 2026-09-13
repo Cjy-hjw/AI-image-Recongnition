@@ -677,6 +677,13 @@ def _parse_sweep(specs: list) -> list:
     # 会静默跑完全量 54 分钟推理再产出空报告——键名错误必须在入口就报。
     _ALLOWED = {"thr_static", "thr_dynamic", "min_area", "max_nodules"}
     _INT_KEYS = {"max_nodules"}
+    # int 轴上界与生产 _MAX_NODULES_CEILING 同源(数值改须两侧同步;数值引用
+    # 见 src/inference/nodule_split.py:79)。fix-审查 F1:无上界时
+    # --sweep max_nodules=500 走显式传参绕过 env 的 ceiling 直达 split_nodules,
+    # 而动态诊断镜像逐实例 restore 全尺寸 mask 全部驻留 out(单例 827MiB,
+    # N=50→40GiB/N=500→404GiB,生产 v21_output 是逐个用完即弃、只有镜像累积)
+    # → 云端 64G 机器 OOM-kill 整轮 sweep 丢失。
+    _INT_CEILING = 100
     axes = []
     for spec in specs or []:
         if "=" not in spec:
@@ -697,6 +704,10 @@ def _parse_sweep(specs: list) -> list:
                 if iv < 1:
                     raise ValueError(
                         f"--sweep {key} 须为正整数,收到 {iv}")
+                if iv > _INT_CEILING:
+                    raise ValueError(
+                        f"--sweep {key} 须 ≤{_INT_CEILING}(与生产 env 同源上界;"
+                        f"动态镜像逐实例全尺寸驻留,N=50 已是 40GiB 级 OOM 风险)")
                 parsed.append(iv)
             else:
                 parsed.append(float(v))
@@ -893,8 +904,9 @@ def run_sweep(args) -> dict:
                 "结节的平均);Dice 只能在扫参进程内算(sidecar 不落 mask)",
                 "动态 min_area 不扫(生产动态钉死 DEFAULT,镜像同口径);"
                 "静态 min_area 只作用于静态池",
-                "max_nodules 静/动两池都扫(生产 None→env→DEFAULT 同源),"
-                "min_area 只静态——两轴池覆盖不对称是刻意的",
+                "max_nodules 池覆盖:须伴随同侧 thr 轴才扫该池(静态须 thr_static/"
+                "动态须 thr_dynamic);两侧都带时 max_nodules 进两池,min_area 只静态"
+                "——池覆盖不对称是刻意的",
                 "val 只含有 ROI 标注患者,阴性 FP 不在池(与 run_diagnosis 同盲区)",
                 "🔴 选阈值须看 match_rate 与 mean_dice 的联合,不能只看其一:"
                 "降阈值让临界带病例越过 0.5,同时让已匹配病例 IoU 下滑跌出 0.5",

@@ -89,8 +89,9 @@ python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-si
 # 否则每个 epoch 对每个动态样本全量解压两个 258MB 体积，35 epoch 纯解压 ~24 小时就是白烧
 # （动态 mask 文件 0.2-0.3MB 是压缩后大小，解压后与影像同体素数，勿据文件大小判"小头"）。
 # 🔴 r7 起（2026-09-06 Q7 官方增补表）旧 samples.pkl 是旧表标签、重训前必须重建；
-# 🔴 preextract_dynamic.py 历史上从未进过任何上传包（8-15 首次是云 agent 会话内建的），
-# 每次重建缓存前先确认云端存在该文件（frames/ 缓存幂等复用不用删）。
+# 🔴 preextract_dynamic.py 云端位置 = /2026aicompetition/workspace/scripts/data/（用户 09-13 已上传；
+# 历史上"从未进过上传包"的记载已过时——8-15 首次是云 agent 会话内建，09-13 起本地已上传覆盖），
+# 重建缓存前 ls 该路径确认即可（frames/ 缓存幂等复用不用删）。
 # JSONL 日志默认落 V2.1 强制路径 /2026aicompetition/workspace/logs（不传 --log-dir）
 # 默认保留 legacy 多任务损失守护旧任务不退化；纯头训练传 --freeze-legacy
 # 🔴 backlog #129（2026-08-17 实测定案）：--epochs 24 省 31% —— Stage C（ep31-35）

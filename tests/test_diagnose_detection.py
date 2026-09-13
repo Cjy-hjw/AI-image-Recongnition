@@ -547,3 +547,90 @@ def test_analyze_diag_sidecar(diag_root, patched_pipeline, tmp_path):
     assert out["buckets"]["main"]["iou_hist"]["[0.5,1]"] == 3
     # 交叉表行键 = IoU 桶。
     assert "[0.5,1]" in out["buckets"]["secondary"]["iou_area_cross"]
+
+
+# ── analyze_diag_sidecar 阶段0扩展:n_pred 直方图/20饱和/候选交叉(合成行) ──
+
+
+def _write_synthetic_sidecar(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def _syn_row(is_dynamic, n_pred, gts):
+    """最小合法 sidecar 行(gts 只给 analyze 消费的键)。"""
+    return {"case_key": f"k_{is_dynamic}_{n_pred}_{len(gts)}",
+            "is_dynamic": is_dynamic, "anomaly": None,
+            "n_pred": n_pred, "n_gt": len(gts),
+            "preds": [{"confidence": 0.9, "area": 100, "best_iou": 0.6,
+                       "matched": True, "dedup_keep": True}] * n_pred,
+            "gts": gts}
+
+
+def test_analyze_n_pred_hist_and_saturation(tmp_path):
+    """n_pred 精确直方图分池累计;饱和率 = n_pred==20 行占比(方向A决策依据)。"""
+    from scripts.analyze_diag_sidecar import analyze
+    p = tmp_path / "detection_diag_x.cases.jsonl"
+    _write_synthetic_sidecar(p, [
+        _syn_row(False, 20, []), _syn_row(False, 20, []),
+        _syn_row(False, 3, []), _syn_row(False, 20, []),
+        _syn_row(True, 20, []), _syn_row(True, 2, []),
+        {"case_key": "bad", "is_dynamic": False, "anomaly": "GT 读取异常",
+         "n_pred": 0, "n_gt": 0, "preds": [], "gts": []},
+    ])
+    out = analyze(str(p))
+    # 静态 4 有效行(3 行 n_pred=20 + 1 行 n_pred=3);动态 2 行(1 行 20)。
+    assert out["n_pred_hist"]["static"] == {20: 3, 3: 1}
+    assert out["n_pred_hist"]["dynamic"] == {20: 1, 2: 1}
+    assert out["n_cases"] == {"static": 4, "dynamic": 2}
+    # 饱和率:静态 3/4、动态 1/2。anomaly 行剔除不进分母。
+    assert out["saturation"]["static"] == pytest.approx(0.75)
+    assert out["saturation"]["dynamic"] == pytest.approx(0.5)
+    assert out["max_nodules_default"] == 20
+
+
+def test_analyze_saturation_empty_pool_returns_none(tmp_path):
+    """空池(0 行)饱和率 None 而非 ZeroDivisionError——云端单池无数据时别炸。"""
+    from scripts.analyze_diag_sidecar import analyze
+    p = tmp_path / "detection_diag_x.cases.jsonl"
+    _write_synthetic_sidecar(p, [_syn_row(False, 5, [])])
+    out = analyze(str(p))
+    assert out["saturation"]["dynamic"] is None
+    assert out["saturation"]["static"] == 0.0
+
+
+def test_analyze_cand_cross_buckets(tmp_path):
+    """n_candidates 桶(0/1/2-3/4+)× matched 交叉:碎裂 vs 真漏检归因。"""
+    from scripts.analyze_diag_sidecar import analyze
+    p = tmp_path / "detection_diag_x.cases.jsonl"
+    _write_synthetic_sidecar(p, [
+        _syn_row(False, 2, [
+            {"is_main": True, "area_ratio": 0.01, "max_iou": 0.0,
+             "matched": False, "n_candidates": 0},      # 真漏检
+            {"is_main": True, "area_ratio": 0.01, "max_iou": 0.3,
+             "matched": False, "n_candidates": 3},      # 碎裂未匹配
+            {"is_main": True, "area_ratio": 0.01, "max_iou": 0.8,
+             "matched": True, "n_candidates": 1},       # 干净匹配
+            {"is_main": False, "area_ratio": 0.005, "max_iou": 0.2,
+             "matched": False, "n_candidates": 5},      # 次病灶重碎裂
+        ]),
+    ])
+    out = analyze(str(p))
+    cm = out["cand_cross"]["main"]
+    assert cm["0"] == 1 and cm["0|matched"] == 0
+    assert cm["2-3"] == 1 and cm["2-3|matched"] == 0
+    assert cm["1"] == 1 and cm["1|matched"] == 1
+    assert out["cand_cross"]["secondary"]["4+"] == 1
+
+
+def test_analyze_rejects_sweep_sidecar(tmp_path):
+    """sweep sidecar(gts 行含 combo)入口即拦——既有行为回归锁。"""
+    from scripts.analyze_diag_sidecar import analyze
+    p = tmp_path / "sweep_x.cases.jsonl"
+    _write_synthetic_sidecar(p, [
+        {"case_key": "k", "is_dynamic": False, "anomaly": None,
+         "n_pred": 1, "n_gt": 1, "combo": {"thr": 0.5},
+         "preds": [], "gts": []}])
+    with pytest.raises(ValueError, match="sweep sidecar"):
+        analyze(str(p))

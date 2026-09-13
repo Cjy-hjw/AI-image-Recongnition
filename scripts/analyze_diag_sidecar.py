@@ -19,18 +19,23 @@
     临界带 [0.35,0.5) 占比高   → 差一点过线 → 件套①阈值下调的第一目标
 
 2026-09-13 扩展(Opus 路线阶段 0,max_nodules 放开决策依据):
-    ① `n_pred` 精确直方图 + **n_pred==DEFAULT_MAX_NODULES(20) 行占比**——
+    ① `n_pred` 精确直方图 + **n_pred==生效上限(env 或默认 20) 行占比**——
        截断是否在绑的唯一测量(既有 preds_per_case 0/1/2/3-5/6+ 分桶看不出
-       20 饱和);分静/动两池(动态放开有时限成本,决策分池独立)。
+       截断饱和);分静/动两池(动态放开有时限成本,决策分池独立)。
     ② `n_candidates`(与 GT 重叠>DEDUP 阈值的预测数)× matched 交叉表——
        区分"碎裂(N 候选但没匹配上)"与"真漏检(0 候选)",方向 B(膨胀)
        的前置归因。
+    ⚠️ 上限读分析进程的 env(_effective_max_nodules,与生产同键同域≤100);
+    sidecar 若在别的 env 下产出而分析进程 env 不同,饱和率会按分析侧上限
+    算——直方图尖峰与"本次生效上限"打印行交叉核对,拿不准时以直方图
+    实际最大 n_pred 为准。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -76,15 +81,19 @@ def _bucket(v: float, buckets) -> str:
 
 def _effective_max_nodules() -> int:
     """饱和判据的上限值:读 AICOMP_MAX_NODULES(与生产 nodule_split 同键),
-    未设/畸形回 20。审查 P2:env=50 时 n_pred 饱和在 50,硬编码 20 会把
+    未设/畸形/超上界回 20。审查 P2:env=50 时 n_pred 饱和在 50,硬编码 20 会把
     "截断在绑"读成"饱和率 0%、零收益",恰好反了。不 import 生产模块——
     脚本要能独立 cp 到云端 workspace/scripts/ 运行,import 会拖 src/ 依赖。
+    🔴 合法域与生产 `_MAX_NODULES_CEILING=100` 对齐(数值改须两侧同步):
+    上界取 1000 会让 env=500 时本脚本按 500 算饱和率、生产却静默回 20,
+    结论静默翻转(F2 实测)。inf/nan 必须在 int() 前挡(F3 实测:
+    inf 会抛 OverflowError 直接炸脚本——生产侧同值能挡,此处曾分叉)。
     """
     try:
         v = float(os.environ.get("AICOMP_MAX_NODULES", "20"))
     except (TypeError, ValueError):
         return 20
-    if v != int(v) or not 1 <= v <= 1000:
+    if not math.isfinite(v) or v != int(v) or not 1 <= v <= 100:
         return 20
     return int(v)
 

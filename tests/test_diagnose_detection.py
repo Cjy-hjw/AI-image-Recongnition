@@ -532,6 +532,87 @@ def test_parse_sweep_forms():
         DD._parse_sweep(["garbage"])
 
 
+def test_parse_sweep_max_nodules_axis():
+    """阶段1:①int 轴(20.5 报错非静默 float);②未知键含 max_nodules 白名单;
+    ③派生白名单两侧都透传 max_nodules(漏=双臂同参假阴性)。"""
+    combos = DD._parse_sweep(["thr_static=0.35", "max_nodules=20,30"])
+    assert combos == [{"thr_static": 0.35, "max_nodules": 20},
+                      {"thr_static": 0.35, "max_nodules": 30}]
+    # 值是 int 不是 float(20.0 → nodules[:20.0] TypeError)
+    assert all(isinstance(c["max_nodules"], int) for c in combos)
+    # 非整数/非正 报错
+    with pytest.raises(ValueError):
+        DD._parse_sweep(["max_nodules=20.5"])
+    with pytest.raises(ValueError):
+        DD._parse_sweep(["max_nodules=0"])
+    # 派生:run_sweep 的派生白名单在函数体内,此处经 monkeypatch run_sweep
+    # 的成本过高;直接锁 _ALLOWED 成员(结构断言)+ 派生逻辑由
+    # test_sweep_max_nodules_dual_pool 端到端锁。
+
+
+def test_sweep_max_nodules_dual_pool(diag_root, patched_pipeline, tmp_path):
+    """max_nodules 轴静/动两池都生效(派生白名单漏一侧=该池同参假阴性)。"""
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.5", "thr_dynamic=0.5", "max_nodules=20,30"]))
+    sta = [r for r in report["results"] if not r["is_dynamic"]]
+    dyn = [r for r in report["results"] if r["is_dynamic"]]
+    # 两池各有 2 个 max_nodules 取值(不是同参折叠加重)。
+    assert {r["combo"]["max_nodules"] for r in sta} == {20, 30}
+    assert {r["combo"]["max_nodules"] for r in dyn} == {20, 30}
+    # combo 键类型 int。
+    assert all(isinstance(r["combo"]["max_nodules"], int)
+               for r in report["results"])
+
+
+def test_sweep_max_nodules_axis_reaches_split(diag_root, patched_pipeline,
+                                              tmp_path, monkeypatch):
+    """kw 透传(三处联动之三)的区分力:变异注入实测,删掉 _combo_rows 的
+    max_nodules 透传后 dual_pool 测试仍绿(fixture 实例数<20,20/30 同结果)。
+    本测试用 spy 钉死显式传参真到 split_nodules(参数层面,不依赖实例数)。"""
+    calls = []
+    real_split = DD.split_nodules
+
+    def spy(mask, **kw):
+        calls.append(kw.get("max_nodules", "<absent>"))
+        return real_split(mask, **kw)
+
+    monkeypatch.setattr(DD, "split_nodules", spy)
+    root, xlsx = diag_root
+    DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.5", "max_nodules=20,30"]))
+    got = sorted({c for c in calls if c != "<absent>"})
+    assert got == [20, 30], (
+        f"max_nodules 显式传参未到达 split_nodules(收到 {got})——"
+        f"删掉 _combo_rows 的 kw 透传会使本测试 RED")
+
+
+def test_sweep_bare_max_nodules_axis_rejected(diag_root, patched_pipeline,
+                                              tmp_path):
+    """裸 max_nodules 轴(无 thr 轴)须被派生空护栏拦下——1-2路审查 P1 实测:
+    修复前它绕过护栏、静态池静默缺席出半份报告(饱和归因走 run_diagnosis,
+    单扫 max_nodules 对默认阈值基线无对拍意义)。"""
+    root, xlsx = diag_root
+    with pytest.raises(ValueError, match="派生为空"):
+        DD.run_sweep(_Args(root, xlsx, tmp_path / "logs",
+                           sweep=["max_nodules=20,30"]))
+
+
+def test_sweep_static_only_axis_not_drag_dynamic(diag_root, patched_pipeline,
+                                                 tmp_path):
+    """纯静态扫参(thr_static+max_nodules)不得拖起动态池——1-2路审查 P1:
+    修复前 combos_dynamic 无条件吸收 max_nodules,任何含该轴的 spec 都会
+    拉起全帧动态推理(54 分钟级成本)跑两遍。"""
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.5", "max_nodules=20,30"]))
+    assert not [r for r in report["results"] if r["is_dynamic"]], (
+        "无 thr_dynamic 轴时动态池不应被扫")
+
+
 def test_analyze_diag_sidecar(diag_root, patched_pipeline, tmp_path):
     """次病灶归因脚本:主/次分桶 + 匹配率与 sidecar 一致 + 交叉表结构。"""
     from scripts.analyze_diag_sidecar import analyze

@@ -169,7 +169,8 @@ def run_dynamic_inference(model, config, calibrator, precision, device,
 
 
 def run_static_inference_from_result(case_result, *, seg_threshold=None,
-                                     min_area_ratio=None) -> list:
+                                     min_area_ratio=None,
+                                     max_nodules=None) -> list:
     """从 diagnose_static_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
 
     实例抽取逐行镜像 `_write_static`(v21_output.py:374-385):resize →
@@ -182,6 +183,7 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
     min_area 走 split_nodules 默认 None→env(生产静态同源)。**显式传参优先于
     env**——扫参进程必须确定性,不受运行环境 AICOMP_* 影响(A/B两路审查后
     定稿:此前"显式钉 DEFAULT"会让云端设 env 后诊断与生产口径脱节)。
+    `max_nodules` 同款三层优先级(阶段1:None→env→DEFAULT,镜像生产默认参)。
     """
     preds = case_result["preds"]
     hw = tuple(int(x) for x in case_result["orig_hw"])
@@ -192,7 +194,8 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
         binary_fullres = _resize_binary(
             (preds["pred_mask"] > seg_threshold).astype(np.uint8) * 255, hw)
     instances = split_nodules(binary_fullres,
-                              min_area_ratio=min_area_ratio)
+                              min_area_ratio=min_area_ratio,
+                              max_nodules=max_nodules)
     out = []
     for inst in instances:
         out.append({
@@ -203,7 +206,8 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
     return out
 
 
-def run_dynamic_inference_from_result(case_result, *, seg_threshold=None):
+def run_dynamic_inference_from_result(case_result, *, seg_threshold=None,
+                                      max_nodules=None):
     """从 diagnose_dynamic_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
 
     实例抽取逐行镜像 `_write_dynamic`:`n_total_frames` 硬校验、逐帧 resize →
@@ -213,6 +217,7 @@ def run_dynamic_inference_from_result(case_result, *, seg_threshold=None):
     件套②(2026-09-10):`seg_threshold` 不传(None)时逐位镜像生产(复用
     preds["mask_binary"]);显式传时从 `pred_mask` 现算(扫参用;thr=0.5 与
     mask_binary 逐位等价)。动态 min_area 恒 DEFAULT(镜像生产钉死,不扫)。
+    `max_nodules`(阶段1):None→env→DEFAULT 同生产默认参,扫参显式传参优先。
     """
     n_total = int(case_result["n_total_frames"])
     if not n_total or n_total <= 0:
@@ -239,7 +244,10 @@ def run_dynamic_inference_from_result(case_result, *, seg_threshold=None):
     gap = max(1, -(-n_total // n_sampled) + 1) if n_sampled else 1
     # 镜像生产 2026-09-10 件套④:动态显式传 DEFAULT_MIN_AREA_RATIO(不吃 env),
     # 与 v21_output._write_dynamic 的钉死语义一致——动态放宽是 8h 时限风险面。
+    # max_nodules 不钉死(None→env→DEFAULT):动态放开是阶段1扫参的决策对象,
+    # 与 min_area 的"已知零收益正成本"不同,须可测。
     instances = split_nodules(binary_3d, min_area_ratio=DEFAULT_MIN_AREA_RATIO,
+                              max_nodules=max_nodules,
                               close_gap_frames=gap)
     # 🔴 镜像生产 2026-09-09 稀疏化:full_shape 须在 del binary_3d 前捕获
     # (3D 实例 mask_sparse 写盘/消费前 restore_instance_mask 重建全尺寸)。
@@ -607,6 +615,10 @@ def _combo_rows(case_result, post, gts: list, is_dynamic: bool,
             kw["seg_threshold"] = combo["thr"]
         if not is_dynamic and combo.get("min_area") is not None:
             kw["min_area_ratio"] = combo["min_area"]
+        # 阶段1三处联动之三:max_nodules 透传 post(静/动同)——显式传参优先于
+        # env,扫参确定性;不传(None)时生产 env/默认参路径不变。
+        if combo.get("max_nodules") is not None:
+            kw["max_nodules"] = combo["max_nodules"]
         if is_dynamic:
             preds, _n_total = post(case_result, **kw)
         else:
@@ -650,15 +662,21 @@ def _parse_sweep(specs: list) -> list:
     """`key=v1,v2,v3` 形式 → 组合列表(笛卡尔积,保序)。
 
     keys: `thr_static`/`thr_dynamic`(分割阈值)/`min_area`(静态最小面积占比,
-    仅静态路径消费)。交叉维度 = 静态阈值×min_area(静态池)/动态阈值(动态池,
-    min_area 不扫——生产动态钉死 DEFAULT)。实现上为简化:统一笛卡尔积,动态
-    侧忽略 min_area 维度(`_combo_rows` 按分支消费),组合数会略多于理论必要,
+    仅静态路径消费)/`max_nodules`(预测结节数上限,静/动两池都消费)。
+    交叉维度 = 静态阈值×min_area×max_nodules(静态池)/动态阈值×max_nodules
+    (动态池,min_area 不扫——生产动态钉死 DEFAULT)。实现上为简化:统一笛卡尔积,
+    动态侧忽略 min_area 维度(`_combo_rows` 按分支消费),组合数会略多于理论必要,
     CPU 段每组合 ~秒级,可接受。
+
+    🔴 max_nodules 是 int 轴(阶段1三处联动之一):float 解析会产 20.0 →
+    `nodules[:20.0]` TypeError,按键走 int 转换;非整数值入口报错(扫参拼错
+    20.5 应该炸而不是静默回默认)。
     """
     import itertools
     # 🔴 白名单校验(B路审查P1):未知键(如 thr= 漏写 _static)在派生后两侧皆空,
     # 会静默跑完全量 54 分钟推理再产出空报告——键名错误必须在入口就报。
-    _ALLOWED = {"thr_static", "thr_dynamic", "min_area"}
+    _ALLOWED = {"thr_static", "thr_dynamic", "min_area", "max_nodules"}
+    _INT_KEYS = {"max_nodules"}
     axes = []
     for spec in specs or []:
         if "=" not in spec:
@@ -674,7 +692,14 @@ def _parse_sweep(specs: list) -> list:
             v = v.strip()
             if not v:
                 continue
-            parsed.append(float(v))
+            if key in _INT_KEYS:
+                iv = int(v)          # 非整数串直接 ValueError(入口报,好过下游炸)
+                if iv < 1:
+                    raise ValueError(
+                        f"--sweep {key} 须为正整数,收到 {iv}")
+                parsed.append(iv)
+            else:
+                parsed.append(float(v))
         if parsed:
             axes.append((key, parsed))
     if not axes:
@@ -702,26 +727,42 @@ def run_sweep(args) -> dict:
     # 派生:静态/动态各自适用的组合(动态忽略 min_area)。
     # 静态必须有 thr_static 才扫(纯 min_area 无阈值轴时不扫静态——min_area
     # 是阈值的伴随参数,单独扫它对官方阈值 0.5 的基线没有对拍意义)。
+    # 🔴 阶段1三处联动之二:max_nodules 必须同时进两侧派生白名单——漏掉则
+    # 双臂同参(20 vs 20),方向A被假阴性杀掉(B路审查 P1 同型)。静/动两池
+    # 都消费它(split_nodules 通用参数)。
+    # 🔴 动态侧须 thr_dynamic 在场才吸收 max_nodules(1-2路审查 P1,实测两种
+    # 失败形态:①裸 max_nodules 轴绕过下方派生空护栏,静态池静默缺席出半份
+    # 报告;②纯静态扫参(thr_static+max_nodules)被拖去跑全帧动态推理两遍,
+    # 54 分钟级成本)。对称语义:动态池被扫 ⇔ 显式带了 thr_dynamic 轴;
+    # 要扫动态 max_nodules 就显式传 thr_dynamic(哪怕单值)。
     combos_static = []
     for c in combos:
         if "thr_static" not in c:
             continue
         d = {k: v for k, v in c.items()
-             if k in ("thr_static", "min_area")}
+             if k in ("thr_static", "min_area", "max_nodules")}
         d["thr"] = d.pop("thr_static")
         if d not in combos_static:
             combos_static.append(d)
     combos_dynamic = []
     for c in combos:
-        d = {"thr": c["thr_dynamic"]} if "thr_dynamic" in c else {}
-        if d and d not in combos_dynamic:
+        if "thr_dynamic" not in c:
+            continue
+        d = {"thr": c["thr_dynamic"]}
+        if "max_nodules" in c:
+            d["max_nodules"] = c["max_nodules"]
+        if d not in combos_dynamic:
             combos_dynamic.append(d)
-    # 🔴 派生空护栏(B路审查P1):--sweep min_area=... 这类"无阈值轴"组合派生后
-    # 两侧皆空,白跑全量推理后产出空报告——入口即拦。
+    # 🔴 派生空护栏(B路审查P1;阶段1实测加固:裸 max_nodules 轴在此被拦):
+    # --sweep min_area=... / max_nodules=... 这类"无阈值轴"组合派生后
+    # 两侧皆空,白跑全量推理后产出空报告——入口即拦。min_area 是静态阈值的
+    # 伴随参数;max_nodules 是阈值的伴随参数(两侧都是),单扫它对默认阈值
+    # 基线没有对拍意义(饱和归因走 run_diagnosis + analyze_diag_sidecar)。
     if not combos_static and not combos_dynamic:
         raise ValueError(
             f"扫参组合派生为空(输入 {args.sweep}):至少需要一个 "
-            "thr_static=... 或 thr_dynamic=... 轴;min_area 是静态阈值的伴随参数")
+            "thr_static=... 或 thr_dynamic=... 轴;min_area/max_nodules 是"
+            "阈值轴的伴随参数")
     _safe_print(f"[sweep] 静态 {len(combos_static)} 组合 × 动态 "
                 f"{len(combos_dynamic)} 组合")
 
@@ -852,6 +893,8 @@ def run_sweep(args) -> dict:
                 "结节的平均);Dice 只能在扫参进程内算(sidecar 不落 mask)",
                 "动态 min_area 不扫(生产动态钉死 DEFAULT,镜像同口径);"
                 "静态 min_area 只作用于静态池",
+                "max_nodules 静/动两池都扫(生产 None→env→DEFAULT 同源),"
+                "min_area 只静态——两轴池覆盖不对称是刻意的",
                 "val 只含有 ROI 标注患者,阴性 FP 不在池(与 run_diagnosis 同盲区)",
                 "🔴 选阈值须看 match_rate 与 mean_dice 的联合,不能只看其一:"
                 "降阈值让临界带病例越过 0.5,同时让已匹配病例 IoU 下滑跌出 0.5",
@@ -913,12 +956,14 @@ def main():
     ap.add_argument("--log-dir", default="logs")
     # 件套②(2026-09-10)扫参模式:key=v1,v2,v3 形式,可重复传。keys:
     #   thr_static / thr_dynamic(分割二值化阈值)/ min_area(静态最小面积占比,
-    #   只作用于静态池)。给了 --sweep 就走 run_sweep(一次前向多参数),
-    #   否则走原 run_diagnosis(单参数全量诊断)。
+    #   只作用于静态池)/ max_nodules(预测结节数上限,静/动两池都消费,但
+    #   须伴随同侧 thr 轴才扫该池)。给了 --sweep 就走 run_sweep(一次前向多
+    #   参数),否则走原 run_diagnosis(单参数全量诊断)。
     ap.add_argument("--sweep", action="append", default=None,
                     help="例:--sweep thr_static=0.30,0.35,0.40,0.50 "
                          "--sweep thr_dynamic=0.25,0.30,0.35 "
-                         "--sweep min_area=2e-5,5e-5,1e-4")
+                         "--sweep min_area=2e-5,5e-5,1e-4 "
+                         "--sweep max_nodules=20,30,50")
     args = ap.parse_args()
     # 逐 case 完整行始终进 sidecar JSONL(崩溃保数据);--save-per-case 曾计划
     # 把行嵌进主报告,但会撑大 JSON 且与 sidecar 重复,已砍,参数不再收。

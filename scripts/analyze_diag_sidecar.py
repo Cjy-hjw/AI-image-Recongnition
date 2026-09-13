@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 sys.path.insert(0, ".")
@@ -73,6 +74,21 @@ def _bucket(v: float, buckets) -> str:
     return buckets[-1][2]
 
 
+def _effective_max_nodules() -> int:
+    """饱和判据的上限值:读 AICOMP_MAX_NODULES(与生产 nodule_split 同键),
+    未设/畸形回 20。审查 P2:env=50 时 n_pred 饱和在 50,硬编码 20 会把
+    "截断在绑"读成"饱和率 0%、零收益",恰好反了。不 import 生产模块——
+    脚本要能独立 cp 到云端 workspace/scripts/ 运行,import 会拖 src/ 依赖。
+    """
+    try:
+        v = float(os.environ.get("AICOMP_MAX_NODULES", "20"))
+    except (TypeError, ValueError):
+        return 20
+    if v != int(v) or not 1 <= v <= 1000:
+        return 20
+    return int(v)
+
+
 def analyze(sidecar_path: str) -> dict:
     """读 sidecar → 主/次分桶统计 + n_pred 分布 + 候选数交叉表。
 
@@ -83,14 +99,12 @@ def analyze(sidecar_path: str) -> dict:
     stats = {
         "main": _empty(), "secondary": _empty(),
     }
-    # 阶段0扩展:①n_pred 直方图(分静/动池,20 截断饱和测量);
+    # 阶段0扩展:①n_pred 直方图(分静/动池,截断饱和测量);
     # ②n_candidates×matched 交叉(碎裂 vs 真漏检;按 GT 桶 main/secondary 归属)。
     n_pred_hist = {"static": {}, "dynamic": {}}
     n_cases = {"static": 0, "dynamic": 0}
     cand_cross = {"main": {}, "secondary": {}}
-    # 与 nodule_split.DEFAULT_MAX_NODULES 数值一致(不 import——脚本要能
-    # 独立 cp 到云端 workspace/scripts/ 运行,import 链会拖 src/ 依赖)。
-    MAX_NODULES_DEFAULT = 20
+    MAX_NODULES_DEFAULT = _effective_max_nodules()
     n_anomaly = 0
     with open(sidecar_path, encoding="utf-8") as f:
         for line in f:
@@ -159,6 +173,8 @@ def main():
 
     # --- 阶段0扩展①:n_pred 分布 + 20 截断饱和(放开候选的决策依据) ---
     print("\n== n_pred 分布(行=每病例预测数,分静/动池) ==")
+    print(f"  本次生效上限(AICOMP_MAX_NODULES 或默认 20) = "
+          f"{report['max_nodules_default']}")
     for pool in ("static", "dynamic"):
         hist = report["n_pred_hist"][pool]
         n = report["n_cases"][pool]

@@ -61,6 +61,23 @@ DEFAULT_MAX_NODULES = 20
 # 显式传 DEFAULT_MIN_AREA_RATIO 钉死不走 env(见 v21_output._write_dynamic)。
 _ENV_MIN_AREA_RATIO = "AICOMP_MIN_AREA_RATIO"
 
+# 阶段1(2026-09-13,Opus 路线方向A):预测结节数上限 env 化。None 哨兵→读 env
+# 模式(照 _ENV_MIN_AREA_RATIO 先例),调用点(静态生产/动态生产/诊断镜像静/动
+# ——4 个非测试调用点)默认同源——只改 v21_output 调用点会让诊断镜像静默停在
+# 20,离线测不到生产行为。
+# 🔴 前置条件:n_pred==cap 截断饱和率(analyze_diag_sidecar)证明截断在绑才设 env,
+# 盲开 = 零收益正成本(动态写盘 O(全尺寸体素),本地实测最坏动态例
+# 750×802×1442 约 13.6s/实例,20→50 每例 +400s 量级,数百饱和例对 8h 硬限
+# 是数小时级风险)。不饱和的池设了也只在 n_pred≥cap 时才生效,天然零影响。
+# 🔴 单一 env 静/动两池同时生效(无法分池独立)——设之前必须确认**两池**的
+# n_pred 饱和率(analyze_diag_sidecar 分池报),任一侧不饱和则不开。
+# 诊断扫参轴 `max_nodules` 显式传参优先于 env(扫参进程必须确定性)。
+_ENV_MAX_NODULES = "AICOMP_MAX_NODULES"
+# env 上界(审查 P2:1e308 是有限正整数、通过全部合法性检查,nodules[:1e308]
+# 不炸 → 单个 env 即静默关掉 DEFAULT_MAX_NODULES 的"防分割崩坏撑爆磁盘"兜底;
+# ceiling=100 ≈ 最坏写入量已验证量级,放开决策的候选值 30/50 远在其下)。
+_MAX_NODULES_CEILING = 100
+
 # ── 静态 2D 形态学清理(Fable 低成本点,2026-09-12;🔴 默认关,离线双升才开)──
 # 预测 mask 上的两类噪声:① 孤立小连通域(碎片)→ 变成假阳性结节拖检测 AP;
 # ② 结节内部孔洞(概率中间塌陷)→ 蚀 Dice 边缘。清理 = 填孔 + 小碎片剔除。
@@ -99,10 +116,34 @@ def _env_min_area_ratio() -> float:
     return v
 
 
+def _env_max_nodules() -> int:
+    """env 解析 max_nodules;未设/非法/非正整数/超上界一律回默认(不静默采信垃圾配置)。
+
+    - 非整数(20.5)回默认是**策略选择**(与扫参轴的报错策略对齐),不是
+      TypeError 防护——防 TypeError 的是 int() 转换本身;
+    - 🔴 0 必须并入非法集:0 对 min_area 是合法值(不过滤),对 max_nodules
+      是**归零实例数**的灾难值(nodules[:0]==[] → 每例零结节 → 静默全零分,
+      且空 Nodules 数组是合规阴性输出、不报错);
+    - 上界 _MAX_NODULES_CEILING:防 1e3/1e308 类合法大整数静默关掉
+      DEFAULT_MAX_NODULES 的磁盘兜底(见常量注释)。
+    """
+    raw = os.environ.get(_ENV_MAX_NODULES)
+    if raw is None:
+        return DEFAULT_MAX_NODULES
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_NODULES
+    if (not math.isfinite(v) or v < 1.0 or v != int(v)
+            or v > _MAX_NODULES_CEILING):
+        return DEFAULT_MAX_NODULES
+    return int(v)
+
+
 def split_nodules(
     mask: np.ndarray,
     min_area_ratio=None,
-    max_nodules: int = DEFAULT_MAX_NODULES,
+    max_nodules=None,
     close_gap_frames: int = 1,
 ):
     """整图二值 mask → 按面积降序的实例列表。
@@ -115,7 +156,9 @@ def split_nodules(
             (件套④:仅静态生产调用方靠默认参吃 env;动态生产调用方显式传
             `DEFAULT_MIN_AREA_RATIO` 不受 env 影响)。显式传参时 env 不生效
             ——诊断脚本扫参/测试靠这一层优先级保持确定性。
-        max_nodules: 保留的实例数上限,按面积降序截断。
+        max_nodules: 保留的实例数上限,按面积降序截断。**None(默认)时走
+            `AICOMP_MAX_NODULES` env**(阶段1方向A:三调用点默认同源,显式传参
+            优先于 env——扫参确定性同上)。
         close_gap_frames: 仅 3D 有效。时间维闭运算的缝合跨度(帧),弥合分割在个别帧
             漏检导致的同一结节断裂。0 表示不缝合。
 
@@ -144,6 +187,8 @@ def split_nodules(
     # 件套④三层优先级:显式传参 > env(None 时) > DEFAULT(env 未设时)。
     if min_area_ratio is None:
         min_area_ratio = _env_min_area_ratio()
+    if max_nodules is None:
+        max_nodules = _env_max_nodules()
     if arr.ndim == 2:
         return _split_2d(arr, min_area_ratio, max_nodules)
     if arr.ndim == 3:

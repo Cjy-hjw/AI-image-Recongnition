@@ -17,6 +17,14 @@
     miss 桶(IoU=0)占比高      → 小实例被 min_area/阈值抹掉 → 件套①④的活
     低 IoU 桶(0.1,0.35)占比高 → 预测与 GT 形状/位置偏差 → 分割质量(640)的活
     临界带 [0.35,0.5) 占比高   → 差一点过线 → 件套①阈值下调的第一目标
+
+2026-09-13 扩展(Opus 路线阶段 0,max_nodules 放开决策依据):
+    ① `n_pred` 精确直方图 + **n_pred==DEFAULT_MAX_NODULES(20) 行占比**——
+       截断是否在绑的唯一测量(既有 preds_per_case 0/1/2/3-5/6+ 分桶看不出
+       20 饱和);分静/动两池(动态放开有时限成本,决策分池独立)。
+    ② `n_candidates`(与 GT 重叠>DEDUP 阈值的预测数)× matched 交叉表——
+       区分"碎裂(N 候选但没匹配上)"与"真漏检(0 候选)",方向 B(膨胀)
+       的前置归因。
 """
 
 from __future__ import annotations
@@ -66,7 +74,7 @@ def _bucket(v: float, buckets) -> str:
 
 
 def analyze(sidecar_path: str) -> dict:
-    """读 sidecar → 主/次分桶统计。
+    """读 sidecar → 主/次分桶统计 + n_pred 分布 + 候选数交叉表。
 
     🔴 只接受 run_diagnosis 的 sidecar(detection_diag_*.cases.jsonl)。
     sweep sidecar(sweep_*.cases.jsonl)的 gts 行含 combo 字段且 GT 按组合
@@ -75,6 +83,14 @@ def analyze(sidecar_path: str) -> dict:
     stats = {
         "main": _empty(), "secondary": _empty(),
     }
+    # 阶段0扩展:①n_pred 直方图(分静/动池,20 截断饱和测量);
+    # ②n_candidates×matched 交叉(碎裂 vs 真漏检;按 GT 桶 main/secondary 归属)。
+    n_pred_hist = {"static": {}, "dynamic": {}}
+    n_cases = {"static": 0, "dynamic": 0}
+    cand_cross = {"main": {}, "secondary": {}}
+    # 与 nodule_split.DEFAULT_MAX_NODULES 数值一致(不 import——脚本要能
+    # 独立 cp 到云端 workspace/scripts/ 运行,import 链会拖 src/ 依赖)。
+    MAX_NODULES_DEFAULT = 20
     n_anomaly = 0
     with open(sidecar_path, encoding="utf-8") as f:
         for line in f:
@@ -86,6 +102,10 @@ def analyze(sidecar_path: str) -> dict:
             if r.get("anomaly"):
                 n_anomaly += 1
                 continue
+            pool = "dynamic" if r.get("is_dynamic") else "static"
+            n_pred_hist[pool][r["n_pred"]] = \
+                n_pred_hist[pool].get(r["n_pred"], 0) + 1
+            n_cases[pool] += 1
             for g in r.get("gts", []):
                 key = "main" if g.get("is_main") else "secondary"
                 s = stats[key]
@@ -100,9 +120,26 @@ def analyze(sidecar_path: str) -> dict:
                     b_iou, {}).get(b_area, 0) + 1
                 matched = bool(g.get("matched"))
                 s["n_matched"] += int(matched)
-    out = {"n_anomaly_cases": n_anomaly, "buckets": stats}
+                # n_candidates 分桶:0=真漏检;1=干净;2-3=轻碎裂;4+=重碎裂。
+                nc = int(g.get("n_candidates", 0))
+                nc_b = ("0" if nc == 0 else "1" if nc == 1
+                        else "2-3" if nc <= 3 else "4+")
+                cand_cross[key][nc_b] = cand_cross[key].get(nc_b, 0) + 1
+                cand_cross[key].setdefault(f"{nc_b}|matched", 0)
+                if matched:
+                    cand_cross[key][f"{nc_b}|matched"] += 1
+    out = {
+        "n_anomaly_cases": n_anomaly, "buckets": stats,
+        "n_pred_hist": n_pred_hist, "n_cases": n_cases,
+        "max_nodules_default": MAX_NODULES_DEFAULT, "cand_cross": cand_cross,
+    }
     for key, s in stats.items():
         s["match_rate"] = (s["n_matched"] / s["n_gt"]) if s["n_gt"] else None
+    # n_pred==20 行占比:截断饱和率(=1.0 时每行都被截,放开候选空间最大)。
+    out["saturation"] = {
+        p: (n_pred_hist[p].get(MAX_NODULES_DEFAULT, 0) / n_cases[p])
+        if n_cases[p] else None
+        for p in ("static", "dynamic")}
     return out
 
 
@@ -119,6 +156,35 @@ def main():
 
     report = analyze(args.sidecar)
     print(f"anomaly cases(已剔除): {report['n_anomaly_cases']}")
+
+    # --- 阶段0扩展①:n_pred 分布 + 20 截断饱和(放开候选的决策依据) ---
+    print("\n== n_pred 分布(行=每病例预测数,分静/动池) ==")
+    for pool in ("static", "dynamic"):
+        hist = report["n_pred_hist"][pool]
+        n = report["n_cases"][pool]
+        sat = report["saturation"][pool]
+        sat_s = f"{sat:.1%}" if sat is not None else "n/a"
+        print(f"\n  [{pool}] cases={n} 饱和率(n_pred=={report['max_nodules_default']})={sat_s}")
+        for k in sorted(hist):
+            marker = " <-- 截断在绑" if k == report["max_nodules_default"] else ""
+            print(f"    n_pred={k:3d} {hist[k]:5d} ({hist[k] / (n or 1):.1%}){marker}")
+        if (sat or 0.0) >= 0.05:
+            print(f"    → 饱和率≥5%:截断在绑,放开候选(方向A)有测量依据")
+        else:
+            print(f"    → 饱和率<5%:截断基本不绑,放开 max_nodules 预期零收益")
+
+    # --- 阶段0扩展②:候选数×matched 交叉(碎裂 vs 真漏检) ---
+    print("\n== n_candidates×matched 交叉(行=GT 候选数桶) ==")
+    for key in ("main", "secondary"):
+        cross = report["cand_cross"][key]
+        print(f"\n  [{key}]")
+        for b in ("0", "1", "2-3", "4+"):
+            total = cross.get(b, 0)
+            m = cross.get(f"{b}|matched", 0)
+            rate = f"{m / total:.1%}" if total else "n/a"
+            print(f"    候选{b:4s} {total:5d}  其中matched {m:5d} ({rate})")
+        print("    (候选0=真漏检:阈值/min_area 抹掉;候选2+/未匹配=碎裂或形状偏差)")
+
     for key in ("main", "secondary"):
         s = report["buckets"][key]
         rate = f"{s['match_rate']:.4f}" if s["match_rate"] is not None else "n/a"

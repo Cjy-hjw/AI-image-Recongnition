@@ -172,7 +172,10 @@ def test_complete_pkl_is_accepted_by_the_real_gate(tmp_path, meta_extra):
     from src.dataset.official_loader import build_official_datasets
 
     s = {
-        "img_path": "/x.dcm", "mask_path": None, "is_dynamic": False,
+        # img_path 必须真实存在(2026-09-14 起加载路径有文件级漂移防御,不存在的
+        # 路径会被样本级过滤丢弃;这里用本测试文件自己当"存在的文件",mask=None
+        # 跳过 mask 检查),否则断言的 2 条样本会被过滤成 0、撞"未构造出任何样本"。
+        "img_path": __file__, "mask_path": None, "is_dynamic": False,
         "frame_index": None, "patient_key": "p1", "label": 0, "labels": _labels(),
     }
     p = tmp_path / "samples.pkl"

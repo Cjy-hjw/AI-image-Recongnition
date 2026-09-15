@@ -279,7 +279,7 @@ class TestMaskedSegmentationLoss:
         dice_fn = DiceLoss()
         outs = _make_seg_outputs(self.B, self.H)
         targets = _make_seg_targets(self.B, self.H, valid_mask=[0.0] * self.B)
-        loss = compute_segmentation_loss(bce_fn, dice_fn, outs, targets)
+        loss, _ = compute_segmentation_loss(bce_fn, dice_fn, outs, targets)
         assert abs(loss.item()) < 1e-6, f"Expected ~0, got {loss.item()}"
 
     def test_all_invalid_zero_gradient(self):
@@ -288,7 +288,7 @@ class TestMaskedSegmentationLoss:
         dice_fn = DiceLoss()
         outs = _make_seg_outputs(self.B, self.H)
         targets = _make_seg_targets(self.B, self.H, valid_mask=[0.0] * self.B)
-        loss = compute_segmentation_loss(bce_fn, dice_fn, outs, targets)
+        loss, _ = compute_segmentation_loss(bce_fn, dice_fn, outs, targets)
         loss.backward()
         if outs["mask"].grad is not None:
             assert outs["mask"].grad.abs().sum().item() < 1e-6, (
@@ -307,14 +307,14 @@ class TestMaskedSegmentationLoss:
 
         outs_leg = {"mask": pred.clone()}
         targets_leg = {"mask": gt}
-        loss_leg = compute_segmentation_loss(bce_fn, dice_fn, outs_leg, targets_leg)
+        loss_leg, _ = compute_segmentation_loss(bce_fn, dice_fn, outs_leg, targets_leg)
 
         outs_masked = {"mask": pred.clone()}
         targets_masked = {
             "mask": gt,
             "valid_mask": torch.ones(B),
         }
-        loss_masked = compute_segmentation_loss(bce_fn, dice_fn, outs_masked, targets_masked)
+        loss_masked, _ = compute_segmentation_loss(bce_fn, dice_fn, outs_masked, targets_masked)
 
         assert abs(loss_leg.item() - loss_masked.item()) < 1e-4, (
             f"Legacy={loss_leg.item():.6f} vs masked={loss_masked.item():.6f}"
@@ -335,11 +335,11 @@ class TestMaskedSegmentationLoss:
 
         outs_masked = {"mask": pred}
         targets_masked = {"mask": gt, "valid_mask": valid_mask}
-        loss_masked = compute_segmentation_loss(bce_fn, dice_fn, outs_masked, targets_masked)
+        loss_masked, _ = compute_segmentation_loss(bce_fn, dice_fn, outs_masked, targets_masked)
 
         outs_full = {"mask": pred}
         targets_full = {"mask": gt}
-        loss_full = compute_segmentation_loss(bce_fn, dice_fn, outs_full, targets_full)
+        loss_full, _ = compute_segmentation_loss(bce_fn, dice_fn, outs_full, targets_full)
 
         _assert_no_nan(loss_masked, "partial masked seg loss")
         # They should differ since not all samples contribute

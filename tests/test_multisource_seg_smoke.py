@@ -300,7 +300,7 @@ class TestSegZeroGradientWhenInvalid:
         dice_fn = DiceLoss()
         pred = torch.randn(4, 1, self.H, self.H, requires_grad=True)
         gt = (torch.rand(4, 1, self.H, self.H) > 0.5).float()
-        loss = compute_segmentation_loss(bce_fn, dice_fn,
+        loss, _ = compute_segmentation_loss(bce_fn, dice_fn,
                                          {"mask": pred}, {"mask": gt,
                                                           "valid_mask": torch.zeros(4)})
         loss.backward()
@@ -318,7 +318,7 @@ class TestSegZeroGradientWhenInvalid:
         dice_fn = DiceLoss()
         pred = torch.randn(4, 1, self.H, self.H, requires_grad=True)
         gt = (torch.rand(4, 1, self.H, self.H) > 0.5).float()
-        loss = compute_segmentation_loss(bce_fn, dice_fn,
+        loss, _ = compute_segmentation_loss(bce_fn, dice_fn,
                                          {"mask": pred}, {"mask": gt,
                                                           "valid_mask": torch.ones(4)})
         loss.backward()

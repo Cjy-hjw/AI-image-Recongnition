@@ -4,7 +4,11 @@
 environment:
   device: "cuda"            # cuda or cpu
   seed: 42
-  num_workers: 12            # Enable multi-threaded data loading (recommended for speed)
+  # num_workers 12→16(2026-09-15 seg-only 首轮实测:官方盘慢时 12 worker 全堵在
+  # .dcm 读上,CPU 仅 3/16 核、GPU 大量陪等——IO 等待型瓶颈,加 worker 提高并发
+  # IO 深度。16 = 实测 vCPU 全额(总纲旧记"14 vCPU"过时,2026-09-15 用户实测 16);
+  # EDT 池 min(B,8) 与 worker 抢核的风险由 persistent_workers 跨 epoch 摊平)
+  num_workers: 16
 
 data:
   train_path: "data/train"
@@ -195,3 +199,19 @@ train:
   # 🔴 默认 0(关闭):二次有序项对齐官方"加权 Kappa"(quadratic)语义,但没有真实
   # 数据无法调参(rules.md §5「先证后改」)。权重=0 时对 loss 精确无贡献。
   tirads_ordinal_weight: 0.0
+
+  # ── Stage2 seg-only 微调(2026-09-13,17天冲刺阶段2)────────────────────
+  # Boundary Loss(Kervadec 2019)+ Lovász-Hinge(Berman 2018),外挂在
+  # compute_segmentation_loss(见该函数 docstring)。0(默认)= 老路径零回归。
+  # 量级实测(2026-09-14 三批专审 T8,mock 稀疏 GT 3% 覆盖):
+  #   lovasz/main ≈ 1.6-3.7(O(1) 同档成立);
+  #   boundary/main ≈ 0.03-0.08(⚠️ 比主项小 1-2 个数量级,且完美预测下
+  #   boundary→0——seg-only 起点 dice 已 0.65,实测比率只会更低)。
+  # 🔴 **起手权重必须现场反推,勿抄绝对数**:
+  #   w_b ≈ 0.2×loss_seg / loss_seg_boundary(实测原始项,JSONL 分项键);
+  #   w_l ≈ 0.2×loss_seg / loss_seg_lovasz。
+  #   旧版"起手 0.1-0.3"是 b/main≈1 假设下的数字,照抄 = boundary 只贡献
+  #   主项的 ~2%,近似空微调(r7 同型,权重非 0 硬门挡不住)。
+  #   对齐目标 = 加权后分项贡献 ≈ 0.2-1× 主项;先跑 1 epoch 读分项再定。
+  seg_boundary_weight: 0.1
+  seg_lovasz_weight: 0.1

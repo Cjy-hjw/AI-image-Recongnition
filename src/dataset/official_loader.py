@@ -841,6 +841,29 @@ def build_official_datasets(
         samples = build_official_samples(root, xlsx_path, sheet_name)
     if not samples:
         raise RuntimeError(f"未在 {root} + {xlsx_path} 构造出任何样本,检查路径/表头")
+    # 🔴 pkl 加载路径的文件级漂移防御(2026-09-14 实证):pkl 是历史快照,生成
+    # 后官方数据侧可能删/改文件(9-12 晚 ete_only 还能跑、9-14 同一份 pkl 已有
+    # 2 img + 21 mask 消失——xlsx 引用了不存在的 DICOM 子目录)。build 路径
+    # 自带 exists 过滤(:543)不受影响,只有 pkl 路径无防御;DataLoader worker
+    # 里炸 FileNotFoundError 会整轮崩。按样本级过滤:img 或 mask 任一缺失即
+    # 丢弃该样本并打点(量级 <1% 属数据漂移噪声;大规模消失才值得停机排查,
+    # 阈值 5% 超限即 raise,防"过滤掩盖真事故"——如挂载半掉线时几乎全缺)。
+    _before = len(samples)
+    _dropped = []
+    for _s in samples[:]:
+        _ip, _mp = _s.get("img_path"), _s.get("mask_path")
+        _bad = (_ip and not os.path.exists(_ip)) or (_mp and not os.path.exists(_mp))
+        if _bad:
+            _dropped.append(_s.get("patient_key", "?"))
+            samples.remove(_s)
+    if _dropped:
+        _frac = len(_dropped) / _before
+        print(f"--> [official_loader] ⚠️ 过滤 {len(_dropped)}/{_before} 个文件缺失样本"
+              f"({', '.join(sorted(set(_dropped))[:8])}),占比 {_frac:.2%}")
+        if _frac > 0.05:
+            raise RuntimeError(
+                f"文件缺失样本占比 {_frac:.1%} > 5% —— 疑似数据侧事故(挂载/官方更新),"
+                f"非正常漂移,停机排查勿盲跑")
     train_s, val_s = patient_grouped_split(samples, val_frac=val_frac, seed=seed)
     train_ds = OfficialThyroidDataset(train_s, img_size=img_size, transform=train_transform,
                                       hflip_prob=hflip_prob)

@@ -142,6 +142,9 @@ def main() -> None:
     print(f"\n[基线] n_gt={n_gt} n_pred={n_pred} n_tp={n_tp} "
           f"TP_min_conf={min_tp:.4f}")
     print(f"[基线] AP 全局混排={base_global:.6f}  逐例平均={base_percase:.6f}")
+    # 🔴 无 TP 的池:沉底判定的基准不存在,网格照出但表3 记 -1(标记无效)
+    if n_tp == 0:
+        print("[基线] ⚠️ 静态池零 TP——表3 沉底计数无基准,记 -1")
 
     # 小 TP 清单(位移监控对象)
     small_tps_all = [(p["area"], float(p["confidence"])) for r in pool
@@ -175,10 +178,15 @@ def main() -> None:
             max_dr = max((new_rank[i] - base_rank[i] for i in small_tp_idx),
                          default=0)
 
-            # 高分小 FP 沉底计数(落到全部 TP 之后)
+            # 高分小 FP 沉底计数(落到全部 TP 之后)。
+            # 🔴 基准必须用**重打分后的 TP 最小值**:小面积 TP 的 s' 同样被压,
+            # 用原始 min_tp 会在"最低分 TP 恰为小面积"时虚计沉底数。
+            new_min_tp = min((new_scores[i] for i, (_, _, m) in enumerate(flat)
+                              if m), default=float("inf"))
             hi_fp_idx = [i for i, (c, a, m) in enumerate(flat)
                          if not m and a < thr and c > HI_CONF]
-            sunk = sum(1 for i in hi_fp_idx if new_scores[i] < min_tp)
+            sunk = (sum(1 for i in hi_fp_idx if new_scores[i] < new_min_tp)
+                    if n_tp else -1)  # 零 TP 时基准不存在,-1=无效
 
             if d_glob > 0 and d_case > 0:
                 any_positive = True

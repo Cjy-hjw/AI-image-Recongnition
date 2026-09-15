@@ -1,10 +1,17 @@
 def vclub_learning_step(model, vclub_optimizer, prev_z_latent, prev_concept_vector):
     """
     vCLUB 独立优化：使用前一批次的 detached 输出，在 autocast 外执行独立 backward。
+
+    vclub 参数全冻(如 seg_only 模式)时直接跳过:learning_loss 的输入是已
+    detach 的 latent,唯一梯度来源就是 vclub 自身参数,全冻后 backward 必抛
+    "does not require grad"(2026-09-14 Gate2 P0,端到端实测复现于
+    --seg-only 冒烟第 2 个 batch)。跳过 = 单变量原则下 vclub 不更新。
     """
     if prev_z_latent is None:
         return
-    
+    if not any(p.requires_grad for p in model.vclub.parameters()):
+        return
+
     vclub_optimizer.zero_grad()
     vclub_learning_loss = model.vclub.learning_loss(
         prev_z_latent, prev_concept_vector

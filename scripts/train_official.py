@@ -130,6 +130,10 @@ def build_official_head_config(config: dict) -> dict:
             if tr.get("tirads_use_class_weights", False) and tirads_counts
             else None
         ),
+        # Stage2 seg-only(2026-09-13):0(默认)= 老路径零回归,权重非 0 时
+        # compute_segmentation_loss 内消费(见该函数 docstring)。
+        "seg_boundary_weight": float(tr.get("seg_boundary_weight", 0.0)),
+        "seg_lovasz_weight": float(tr.get("seg_lovasz_weight", 0.0)),
     }
     return cfg
 
@@ -580,6 +584,73 @@ def evaluate_seg_guards(epoch: int, val_dice, metrics: dict, epochs: int):
     return None, "", warns
 
 
+# seg_only 门指标:val_dice 硬门 + 分类五项降幅门。
+_SEG_GATE_DICE = 0.72        # Q7 基线 0.6974 + 0.023 余量
+_SEG_GATE_DROP = 0.01        # 分类五项各不降超此值
+_SEG_GATE_KEYS = {
+    "malignancy_auc_pr": "mal", "tirads_weighted_kappa": "tirads",
+    "location_weighted_auc": "loc", "clinical_t_auc": "t",
+    "ete_weighted_kappa": "ete",
+}
+
+
+def evaluate_seg_only_gate(val_dice, seg_baseline, metrics):
+    """seg_only 六项护栏的**纯判定**(阶段2,2026-09-13;抽成纯函数+测试是
+    2026-09-14 Gate2 F7-1 的要求——内联在 main 的 epoch 循环里 = 零测试覆盖,
+    复刻 evaluate_seg_guards 抽出前的同型缺陷)。
+
+    门 = val_dice ≥ 0.72 **且** mal/tirads/loc/t/ete 各不降超 0.01(对照
+    epoch=0 同源基线)。单变量原则下分类五项理论上梯度精确 0(全冻),此门
+    测的是"是否真冻住"——若某项跌超 0.01,说明 requires_grad/param_groups
+    配置有泄漏(BN running stats/共享层等)。
+
+    🔴 缺值(含顶层入参 None / dict 内 None)**报"无法判定"而非"已过"**:
+    pass 门跳过 None 是把"测不出"当"通过"(abort 门跳过 None 才是保守),
+    与 evaluate_seg_guards 的"不拿 None 当 0 判死刑"同一纪律、方向相反,别抄混。
+    判定与产物的同源性:门判的是传入的那份指标,调用方传"best 那轮"或
+    "末轮"由调用方决定(2026-09-14 修复轮专审 F8:末轮门+best 产物错位仍在,
+    最终以 best_epoch 行 JSONL 为准)。
+
+    Returns:
+        (passed, lines):passed=None 表示无法判定(缺基线/缺当轮值)。
+    """
+    lines: list = []
+    if val_dice is None or seg_baseline is None or metrics is None:
+        return None, ["  [SEG-only 门 无法判定] 顶层入参含 None"
+                      "(val_dice/seg_baseline/metrics)"]
+    if not math.isfinite(val_dice):
+        return None, [f"  [SEG-only 门 无法判定] val_dice={val_dice} 非有限值"]
+    if val_dice < _SEG_GATE_DICE:
+        return False, [f"  [SEG-only 门 未过] val_dice={val_dice:.4f} < "
+                       f"{_SEG_GATE_DICE},不满足上线门槛(不 abort,留权重供分析)"]
+    # 🔴 NaN/+inf 与 None 同等报"无法判定"(3B 专审 P2-1:nan>0.01 恒 False、
+    # baseline-inf=-inf 也不触发 bad,两种"测不出"都被判"已过"——与函数
+    # docstring 的保守纪律矛盾)。当前生产链路大概率不可达(sklearn 对 NaN
+    # 输入先 raise、metrics_official 的 NaN 出口有 None 守卫),此为最终
+    # 所有者的防御性自持,不依赖上游守卫。
+    def _finite_or_nan(v):
+        return v if (v is not None and math.isfinite(v)) else float("nan")
+    _missing_or_nonfinite = [
+        short for mk, short in _SEG_GATE_KEYS.items()
+        if seg_baseline.get(mk) is None or metrics.get(mk) is None
+        or not (math.isfinite(_finite_or_nan(seg_baseline.get(mk)))
+                and math.isfinite(_finite_or_nan(metrics.get(mk))))
+    ]
+    if _missing_or_nonfinite:
+        # 逐项列出谁缺,操作者能判断是否可忽略,而不是静默放行。
+        return None, [f"  [SEG-only 门 无法判定] val_dice 达标但指标缺值/非有限:"
+                      f" {_missing_or_nonfinite}"
+                      f"(不把'测不出'当'通过')"]
+    bad = [f"{short}:{seg_baseline[mk]:.4f}→{metrics[mk]:.4f}"
+           for mk, short in _SEG_GATE_KEYS.items()
+           if seg_baseline[mk] - metrics[mk] > _SEG_GATE_DROP]
+    if bad:
+        return False, [f"  [SEG-only 门 未过] 分类项跌超 {_SEG_GATE_DROP}: {bad}"
+                       f" —— 疑似冻结泄漏,停机排查(不 abort,留权重供分析)"]
+    return True, [f"  [SEG-only 门 已过] val_dice={val_dice:.4f}≥{_SEG_GATE_DICE}"
+                  f" 且分类五项均未跌超 {_SEG_GATE_DROP},可跑分验证"]
+
+
 def _abort(logger, epoch: int, reason: str, message: str):
     """abort 前先把原因写进 JSONL,再抛异常。
 
@@ -621,6 +692,11 @@ def main():
     parser.add_argument("--ete-only", action="store_true",
                         help="ETE 头小试(D10-15):冻结全部仅解冻 extension_head,"
                              "lr 取 Stage C 低档,配 --resume-from r5 权重热启动训 6-8ep")
+    parser.add_argument("--seg-only", action="store_true",
+                        help="阶段2 分割微调:冻结四头/cls_backbone/Adaptor,仅训分割"
+                             "前向链(decoder@head_lr + seg_backbone@×0.1),配 Boundary/"
+                             "Lovász 损失(config.train.seg_boundary_weight/seg_lovasz_weight),"
+                             "必须 --resume-from r5 + epoch≤20(γ_prior 边界)+ 版本化 --out")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--log-dir", default=OFFICIAL_LOG_DIR,
                         help=f"JSONL 日志目录;默认云端 {OFFICIAL_LOG_DIR},本地传 logs")
@@ -647,7 +723,15 @@ def main():
         config["train"]["amp"] = False
     print(f"[train_official] device={device} bs={batch_size} img={img_size} "
           f"lr_base={lr_base} epochs={epochs} mock={args.mock_labels} freeze_legacy={args.freeze_legacy}"
-          f"{' ETE_ONLY' if args.ete_only else ''}")
+          f"{' ETE_ONLY' if args.ete_only else ''}{' SEG_ONLY' if args.seg_only else ''}")
+    # 🔴 损失权重无条件打进横幅(Gate2 F7-2,2026-09-14):这两个权重经
+    # build_official_head_config 无条件进 criterion,**不挂在 --seg-only 旗标下**
+    # ——阶段2 把 config 权重改成非 0 后,任何不带 --seg-only 的重训也会静默
+    # 消费它们(r7 同型泄漏),必须横幅可见。
+    _hc = config["train"]
+    print(f"[seg 损失配方] boundary_weight={_hc.get('seg_boundary_weight', 0.0)} "
+          f"lovasz_weight={_hc.get('seg_lovasz_weight', 0.0)}"
+          f"{' (SEG_ONLY 实验变量)' if args.seg_only else ''}")
     # 🔴 ETE 小试的三个启动硬门(Gate2 审查 F1/F2/F4,2026-09-12):
     # ① --ete-only 必须配 --resume-from(r5 全量权重)——漏传则 ETE 头从随机
     #    初始化训,6-8ep 白烧且"其余四项崩"会被误判为模式有害;
@@ -669,6 +753,45 @@ def main():
               f"qwk_weight={ete_cfg.get('ete_qwk_weight')} "
               f"class_counts={ete_cfg.get('ete_class_counts')} "
               f"(应=0.9/0.0/0.0/0.0/[4459,333,81,5] Q7 新表)")
+
+    # 🔴 seg_only 三硬门(阶段2,照 ete_only 门型,2026-09-13):
+    # ① 必须 --resume-from(r5 全量权重)——漏传则分割链以外的四头/分类表征
+    #    从随机初始化出发,epoch=0 基线无意义、门"其余不降"必炸;
+    # ② 必须版本化 --out(默认路径是冒烟产物名,与真实产物同名同量级分不出;
+    #    basename 判,反斜杠/绝对路径/./ 前缀写法不绕过——Gate2 2026-09-14);
+    # ③ epoch ≤ SEG_ABORT_EPOCH(=20):γ_prior 在 ep≤20 恒 0(分类→分割非
+    #    detach 通路梯度精确 0,单变量成立);ep21 起 γ>0,Stage2 崩塌机制混入
+    #    (soft_mask→prior 通路全强度回传)。用常量而非字面量 20——同文件
+    #    SEG_ABORT_EPOCH 与 γ 退火起点本就同源,:428 注释明言"重排必须同步改"。
+    # 损失配方横幅:Boundary/Lovász 权重是本实验唯一变量,config 是云端可变
+    # 状态(r7 事故:增量包漏带 config 整轮跑在已证伪分支),配方必须打进横幅
+    # (已上移到无条件区,非 seg_only 轮也可见)。
+    if args.seg_only:
+        if args.ete_only:
+            parser.error("--seg-only 与 --ete-only 互斥")
+        if not args.resume_from:
+            parser.error("--seg-only 必须配 --resume-from(r5 全量权重热启动)")
+        if os.path.basename(args.out) == "official_heads_best.pth":
+            parser.error("--seg-only 必须显式传版本化 --out(默认路径是冒烟产物名)")
+        if epochs > SEG_ABORT_EPOCH:
+            parser.error(f"--seg-only 预算上限 {SEG_ABORT_EPOCH} epoch(γ_prior ep≤"
+                         f"{SEG_ABORT_EPOCH} 恒 0 的单变量窗口,常量同源防漂移),"
+                         f"got {epochs}")
+        seg_cfg = config["train"]
+        bw = seg_cfg.get("seg_boundary_weight", 0.0)
+        lw = seg_cfg.get("seg_lovasz_weight", 0.0)
+        # 🔴 量级标定豁免(2026-09-14 云端实证:标定=权重 0 跑 1ep 读分项基线,
+        # 与此门"防全 0 空微调"冲突,原版把标定也拦了)。epochs==1 视为标定
+        # 放行——空微调白烧至少要 2ep 才成立,1ep 的产物本就是丢弃的探针。
+        if (args.smoke is False and epochs > 1
+                and bw == 0.0 and lw == 0.0):
+            # 冒烟/标定允许全 0;真训全 0 = 空微调白烧(r7 同型)。
+            parser.error("--seg-only 真训须 config.train.seg_boundary_weight 或 "
+                         "seg_lovasz_weight 至少一项 > 0(全 0 = 空 微调白烧;"
+                         "权重 0 的 1ep 量级标定放行)")
+        print(f"[SEG-only 配方] boundary_weight={bw} lovasz_weight={lw} "
+              f"epochs={epochs} (门:val_dice≥0.72 且 mal/tirads/loc/t/ete "
+              f"各不降超 0.01,对照 epoch=0 基线)")
 
     # ── --out 可写性预检(fail-fast,必须在任何耗时操作之前)──────────────────
     # 为什么要有:`torch.save` 失败会抛异常直接中断训练,而保存只发生在每轮 val
@@ -754,6 +877,7 @@ def main():
 
     # ── Dice 护栏基线(warm-start 后测一次;mock 无意义则跳过)──────────────
     dice_baseline = None
+    seg_baseline = None
     if not args.mock_labels:
         base_metrics: dict = {}
         _, dice_baseline, _, _, _ = validate_epoch(
@@ -769,6 +893,17 @@ def main():
         _baseline_row.update({k: v for k, v in base_metrics.items()
                               if isinstance(v, (int, float))})
         _baseline_pending = _baseline_row
+        # 🔴 seg_only 六项护栏的分类五项基线(阶段2,2026-09-13):门=
+        # "val_dice≥0.72 且 mal/tirads/loc/t/ete 各不降超 0.01(对照 epoch=0)"
+        # 需要逐指标基线,与 ETE 小试同源(epoch=0/phase=val 已写 JSONL,上面)。
+        # 此处额外钉运行时断言变量(逐 epoch 判降幅用)。
+        if args.seg_only:
+            # 🔴 键清单从 _SEG_GATE_KEYS 单源派生(3B 专审 P2-3:两份手工
+            # 列表改一处漏一处 → 门静默退化"无法判定");composite 仅作
+            # 参考记录(门不消费)。
+            seg_baseline = {**{k: base_metrics.get(k) for k in _SEG_GATE_KEYS},
+                            "composite": base_metrics.get("composite")}
+            print(f"--> [SEG-only 护栏基线] {seg_baseline}")
     else:
         _baseline_pending = None
 
@@ -797,10 +932,13 @@ def main():
             param_groups, head_lr, stage_name = configure_official_stage(
                 model, criterion, epoch, lr_base, config["train"]["weight_decay"],
                 freeze_legacy=args.freeze_legacy, ete_only=args.ete_only,
+                seg_only=args.seg_only,
             )
             cur_stage = get_official_stage(epoch)
             if args.ete_only:
                 cur_stage = "ETE"   # 恒定单阶段:全程不重建 optimizer,动量跨 epoch 承接
+            if args.seg_only:
+                cur_stage = "SEG"   # 同上:恒定单阶段(seg_only 不随 epoch 变参数集)
             # 阶段边界重建 optimizer(参数集合变了);阶段内只更 lr(承接动量)。
             if optimizer is None or cur_stage != prev_stage:
                 optimizer = torch.optim.AdamW(param_groups, lr=head_lr)
@@ -876,6 +1014,26 @@ def main():
                 if drop > 0.01:
                     print(f"  [护栏 warn] val Dice 跌 {drop*100:.2f} 点(>1,<3)")
 
+            # 🔴 seg_only 六项护栏(阶段2,2026-09-13):判定在
+            # `evaluate_seg_only_gate()` 纯函数(2026-09-14 Gate2 F7-1 抽出,
+            # 内联在 epoch 循环里 = 零测试覆盖)。**只在末轮判**且判的是当轮
+            # val 指标;⚠️ 落地产物是"composite 最优"那轮的权重(见选模逻辑),
+            # 两者可能是不同 epoch——门过≠产物达门,门不过≠产物废,最终以
+            # best_epoch 行的 JSONL 指标为准(best 保存时已写 checkpoint 行)。
+            # mock 冒烟无 seg_baseline(上面 `not args.mock_labels` 分支跳过)——
+            # 冒烟只验管道数值健康,不验护栏本身,跳过此门。
+            if args.seg_only and epoch == epochs and not args.mock_labels:
+                assert seg_baseline is not None  # not args.mock_labels 已保证赋值
+                _gate_pass, _gate_lines = evaluate_seg_only_gate(
+                    val_dice, seg_baseline, metrics)
+                for _gl in _gate_lines:
+                    print(_gl)
+                # 🔴 门结果(含"无法判定")无条件进 JSONL(2026-09-14 修复轮
+                # 专审 F8):只 print 不落 JSONL,事后无法区分"没判"和"判了
+                # 缺值";None 在 json.dumps 里合法(null)。
+                logger.log(epoch=epoch, step=0, phase="val",
+                           extra={"seg_only_gate_pass": _gate_pass})
+
             # 早停熔断(rules§3):epoch 3 后 composite 仍偏低 → 警告。
             # ⚠️ 阈值 2026-08-16 由 0.35 下调:composite 口径从"5 项分类均值"变成
             # "含 seg_dice 的 6 项均值",早期 epoch 分割≈0 会把它系统性拉低约 1/6
@@ -890,8 +1048,17 @@ def main():
                 print(f"--> 保存 best(composite={composite:.4f})→ {args.out}")
                 # checkpoint 字段填实际路径(此前恒 null);V2.1 样例即
                 # `"checkpoints/best_model.pth"` 这种相对路径。
+                # 🔴 best_epoch + 五项指标必须随行落盘(3B 专审 P1-1):
+                # seg_only 门判末轮、产物是本行那轮,注释让操作者"以
+                # best_epoch 行 JSONL 为准"——缺这些字段该操作不可执行。
+                _best_extra = {"composite_best": round(float(composite), 6),
+                               "best_epoch": epoch,
+                               "val_dice": round(float(val_dice), 6)}
+                _best_extra.update({
+                    mk: (round(float(v), 6) if v is not None and math.isfinite(v) else None)
+                    for mk, v in ((k, metrics.get(k)) for k in _SEG_GATE_KEYS)})
                 logger.log(epoch=epoch, step=0, phase="val", checkpoint=args.out,
-                           extra={"composite_best": round(float(composite), 6)})
+                           extra=_best_extra)
         # 循环结束:composite 可能全程 None(val 子集单类/无恶性主病灶时各指标均不可算),
         # 此时无条件存最终权重保证有产物。**不能加 `not os.path.exists(args.out)`**——
         # 第二次运行时该文件已存在,兜底会被跳过、训练白跑零产出(Gate2 lane4 查出)。

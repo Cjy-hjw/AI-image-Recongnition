@@ -86,6 +86,14 @@ class MultiTaskLoss(nn.Module):
         self.lambda_ete = float(cfg.get("ete_loss_weight", 1.0))
         self.lambda_clin_t = float(cfg.get("clin_t_loss_weight", 1.0))
         self.lambda_tirads = float(cfg.get("tirads_loss_weight", 1.0))
+        # Stage2 seg-only 微调(2026-09-13):Boundary/Lovász 权重透传到
+        # compute_segmentation_loss。0(默认)= 老路径逐位一致,零回归。
+        # 🔴 config 驱动 + `.get(k,0.0)` 缺键静默 0 = r7 事故同型的雷
+        # (空微调被误读"损失无效"),故 train_official 的 --seg-only 启动门
+        # 会打印配方横幅;权重在 config.train 下(seg_boundary_weight/
+        # seg_lovasz_weight)。
+        self.seg_boundary_weight = float(cfg.get("seg_boundary_weight", 0.0))
+        self.seg_lovasz_weight = float(cfg.get("seg_lovasz_weight", 0.0))
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
         # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径,零回归。
@@ -135,9 +143,11 @@ class MultiTaskLoss(nn.Module):
             if 'mask' in task_mask and 'valid_mask' not in targets:
                 targets = {**targets, 'valid_mask': task_mask['mask'].float()}
 
-        # 1. Segmentation Loss (自动应用valid_mask)
-        loss_seg = compute_segmentation_loss(
-            self.bce_seg, self.dice_seg, outputs, targets
+        # 1. Segmentation Loss (自动应用valid_mask;Boundary/Lovász 可选外挂)
+        loss_seg, seg_extra = compute_segmentation_loss(
+            self.bce_seg, self.dice_seg, outputs, targets,
+            boundary_weight=self.seg_boundary_weight,
+            lovasz_weight=self.seg_lovasz_weight,
         )
 
         # 2. Concept losses
@@ -234,5 +244,10 @@ class MultiTaskLoss(nn.Module):
         # 三头监控项(未乘 λ 的原始量级)。targets 无三头键时 head_detail 为空,
         # loss_dict 与 legacy 完全一致。
         loss_dict.update(head_detail)
+        # seg 分项监控(Gate2 F3,2026-09-14):seg_boundary/seg_lovasz 的
+        # 实际量级必须进 loss_dict → JSONL——config 写着"先观察量级再定权重",
+        # 合并进 "seg" 后操作者无从观察;分项恒写出(权重=0 时为 0.0),
+        # 接线被删时 JSONL 立刻可见(不自证)。
+        loss_dict.update(seg_extra)
 
         return total_loss, loss_dict

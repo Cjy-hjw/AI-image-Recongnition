@@ -157,6 +157,24 @@ def validate_batch(
         "foci": labels["foci"].to(device),
         "malignancy": labels["malignancy"].to(device),
     }
+    # 🔴 valid_mask 顶层直传(2026-09-13 修复,2026-09-14 Gate2 收紧为与
+    # train_step **同存在性闸门**):此前验证路径漏组这个键,导致
+    # compute_segmentation_loss 永远走 legacy 分支——权重全 0 时无副作用
+    # (掩盖至今),seg-only 阶段2 加 boundary/lovasz 显式 raise 后才暴露。
+    # ⚠️ 与 train_step.py 同条件(labels 有 valid_* 键才写,缺席走 legacy):
+    # 若无条件写全 1 兜底,labels 无该键的数据集上 train 走 legacy、val 走
+    # masked,两侧不同式且 seg_only 的 raise 只在 train 侧触发,报错指向误导。
+    # 官方 loader 恒写 valid_mask(loader.py:96 / official_loader.py:552 /
+    # pathology_dataset.py:250),官方路径两侧均走 masked 分支。
+    # ⚠️ 口径注:本修复使官方 val_loss 从 legacy 换到 masked 路径(此前 train
+    # masked/val legacy 本就不同式),r5/r6/r7 轮 JSONL 的 val_loss 与新轮不可比。
+    if "valid_composition" in labels:
+        v_mask = labels.get("valid_mask")
+        targets["valid_mask"] = (
+            v_mask.float().to(device) if isinstance(v_mask, torch.Tensor)
+            else torch.full((images.size(0),), float(v_mask) if v_mask is not None else 1.0,
+                            dtype=torch.float32, device=device)
+        )
     targets.update(_official_head_targets(labels, images.size(0), device))
 
     # 验证期固定 gamma_prior=1.0(与最终部署一致),使各 epoch 的 val 指标在相同

@@ -130,10 +130,49 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 
 ## 测试总数(单一权威,2026-09-13 实测)
 
-**全套 1133 collected**(2026-09-13 阶段1方向A轮,`Demo_D` 环境实测;
-演进链 1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py` env 隔离 autouse
-+0)→1133(max_nodules env + spy/护栏/裸轴/静态-only 5 + env 解析含上界/12.9
-哨兵参数化 +4/测试类归位 +0)。判回归须同环境前后对拍)。
+**全套 1158 collected**(2026-09-14 阶段2 Gate2 四批审查修复收官,`Demo_D` 环境实测;
+演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
+`test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
+→1156(修复轮专审:`test_seg_only_gate.py` 新增 6——护栏纯函数终于有测试,
+→1158(第三批专审:NaN 防御用例+γ 起点断言+nextafter 边界重构;含顶层 None 不崩/缺值报无法判定/恰好跌0.01档)。
+判回归须同
+环境前后对拍。
+`test_seg_only_schedule.py`(新增,7):`configure_official_stage(seg_only=True)`
+契约——恒可训集=SEG_TRAIN_PREFIXES(vclub 显式冻,与 ete_only 相反)/lr 恒
+Stage C 档/param_groups **两档 lr、四组**(每档 decay/no_decay 拆两组;decoder@head_lr、seg_backbone@
+head_lr×backbone_lr_scale,不是 ete_only 式两组)/optimizer 覆盖=可训参数
+精确集合/AUCM 对偶恒冻/与 ete_only 互斥(实测抓到一个真 bug:互斥检查原写
+在 seg_only 分支内部,而 ete_only 分支先 return,导致检查永远走不到——已
+把检查提到函数最前)/默认路径零回归。
+`test_seg_only_losses.py`(新增 10+Gate2 修复轮 1=11):`compute_segmentation_loss` 的
+Boundary(Kervadec 2019)/Lovász-Hinge(Berman 2018)扩展——权重=0 零回归/
+GT 全零阴性样本恒 0 不炸/valid_mask=0 梯度精确 0/legacy 路径对非零权重
+显式 raise(防静默丢变量,r7 事故同型)/**两项均实测抓到第一版符号错误**:
+Lovász 用 inclusive-cumsum + 商法则展开时 worst 预测得负分(应最大);
+Boundary 用纯内部距离(内部为正)时对齐预测的 loss 反而大于偏移预测(方向
+反了),已改带符号距离场(GT 内负/外正)。均已钉方向性 + 梯度符号回归测试防回退。
+🔴 **Lovász 第二版仍错(2026-09-14 Gate2 实锤)**:exclusive cumsum 只是
+索引平移、漏了官方差分步 `jaccard[1:]-=jaccard[:-1]`——量级 O(1e5) 且
+梯度方向不对(cos 0.40),而**方向性测试(perfect<half<worst)对两版都
+绿,无区分力**;修为 inclusive+差分后与官方参考逐值对拍全等、量级回 O(1)。
+**教训:方向性测试钉不住"错误但单调"的实现,数学函数必须与参考实现逐值
+对拍**。旧记"O(1e4) 量级/不能照抄同档权重"是该 bug 的症状非固有属性,
+已废(见 config 注释)。分项经 loss_dict 的 `seg_boundary`/`seg_lovasz`
+进 JSONL,开工前跑一步真实数据核对分项与 seg 主项同档再定权重。
+🔴 **同轮修了一个独立生产 bug**:`validate_step.py` 的 targets 组装此前
+漏加 `valid_mask` 键(只有 train_step.py 加了),导致验证阶段永远走
+`compute_segmentation_loss` 的 legacy 分支——boundary/lovasz 权重=0 时
+无副作用被掩盖至今,阶段2 加显式 raise 后当场炸出。已修(2026-09-14 起
+与 train_step 同存在性闸门:labels 有 valid_composition 才写,两侧同式),
+不影响既有 dice 指标计算(dice_sum 独立算,不吃 valid_mask)。
+⚠️ val_loss 口径自本轮起与 r5/r6/r7 轮 JSONL 不可比(此前 train masked/
+val legacy 本就不同式);验证阶段权重非 0 时也会计算两项(EDT 75ms/批,
+val_loss 随实验权重漂移,选模用 composite 不受影响)。
+
+(历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
+扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`
+env 隔离 autouse +0)→1133(max_nodules env + spy/护栏/裸轴/静态-only 5 +
+env 解析含上界/12.9 哨兵参数化 +4/测试类归位 +0)。
 `test_nodule_split.py`(+12=53):`TestMaxNodulesEnv` env 三层优先级 + 畸形值
 参数化(含 `12.9` 截断哨兵/`101`/`1e308` 上界反例/`0` 灾难值) + ceiling 放行
 决策值(30/50/100);`TestSplit2DMisc` 归位(原 TestMinAreaEnv 的两个非 env

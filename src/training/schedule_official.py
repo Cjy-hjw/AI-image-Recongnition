@@ -139,6 +139,7 @@ def configure_official_stage(
     llrd_eta: float = 0.75,
     freeze_legacy: bool = False,
     ete_only: bool = False,
+    seg_only: bool = False,
 ) -> Tuple[List[Dict], float, str]:
     """配置官方三头训练的当前阶段:设 requires_grad + 建 param_groups。
 
@@ -159,6 +160,17 @@ def configure_official_stage(
             只受数值噪声影响)。lr 取 Stage C 档(低 lr 微调,防把热启动的头
             一步带偏)。**损失仍全量计算**(改损失路径风险大于收益,冻结参数
             梯度为 0 只是白算——6-8 epoch 量级可接受)。
+        seg_only: True → **seg-only 微调模式**(阶段2,2026-09-13):恒可训集
+            从「四头+分割链」收窄到**仅分割前向链**(`SEG_TRAIN_PREFIXES`
+            = decoder+seg_backbone),四头/cls_backbone/Adaptor/vclub **全冻**
+            (单变量:Boundary/Lovász 分割损失实验不牵动分类表征;vclub 冻结
+            由 `vclub_learning_step` 的 requires_grad 早退兜住,不走独立
+            optimizer)。lr 恒 Stage C 低档。param_groups 照正常路径**两档 lr、
+            四组**(每档按 decay/no_decay 拆两组;decoder@head_lr /
+            seg_backbone@head_lr×backbone_lr_scale;3B 专审 P2-2:此前误记
+            "三组",实测 len(groups)==4)。
+            前提:--resume-from r5 权重(分类头全冻,基线才有意义);预算
+            ≤20 epoch(γ_prior 在 ep≤20 恒 0 的单变量窗口)。
 
     Returns:
         `(param_groups, head_lr, stage_name)`。head_lr 是调度基准 lr;stage_name 形如
@@ -167,13 +179,19 @@ def configure_official_stage(
     ## requires_grad 政策(逐 stage)
 
     - vclub:恒 True(独立 `vclub_optimizer` 管,排除出主 param_groups —— 与 stages.py 一致)。
-    - 四头:恒 True。**ete_only 时唯一例外:仅 extension_head True,其余三头也冻**。
+      **两个 only 模式例外:ete_only 恒 True(仍由 vclub_optimizer 管);
+      seg_only 显式 False(vclub 不更新,learning_step 早退兜底)**。
+    - 四头:恒 True。**ete_only 时唯一例外:仅 extension_head True,其余三头也冻;
+      seg_only 时四头全冻**。
     - **分割前向链**(`SEG_TRAIN_PREFIXES`):恒 True(2026-08-16 起,见模块 docstring)。
-      **ete_only 时冻结**(分割是 0.6528 的闸门,不为 ETE 冒险)。
+      **ete_only 时冻结**(分割是 0.6528 的闸门,不为 ETE 冒险);**seg_only 时
+      是唯一可训集**。
     - Stage A / C:除四头 + 分割 + vclub 外全冻。
     - Stage B:额外解冻 `STAGE_B_UNFREEZE`(cls_backbone Top-2 block)。**ete_only 时
-      不解冻 backbone**(backbone 动了四头全跟着漂,违背"仅解冻 ETE"的单变量原则)。
+      不解冻 backbone**(backbone 动了四头全跟着漂,违背"仅解冻 ETE"的单变量原则);
+      seg_only 不走 Stage 分支(恒定单阶段,也永不解冻 backbone)。
     - criterion.mal_loss_fn(AUCM 对偶):`requires_grad = not freeze_legacy`。
+      **seg_only 时恒 False**(对偶变量也不动)。
 
     ## lr 档位
 
@@ -184,12 +202,19 @@ def configure_official_stage(
     | Stage B `cls_backbone.blocks[6]` | `head_lr × backbone_lr_scale` (同上,刻意重合) |
     | Stage B `cls_backbone.blocks[5]` | `head_lr × backbone_lr_scale × llrd_eta` |
 
-    刻意不新增第三档 lr —— 相邻 epoch lr 比值约束与既有测试均按两档写死。
+    only 模式(ete_only/seg_only)head_lr 恒取 `lr_base × _STAGE_C_LR_SCALE`,
+    不新增第三档 —— 相邻 epoch lr 比值约束与既有测试均按两档写死;seg_only
+    内部仍是上表两档(decoder@head_lr / seg_backbone@head_lr×backbone_lr_scale)。
     """
     stage = get_official_stage(epoch)
     head_lr = official_head_lr(epoch, lr_base)
 
     # ── 1. 设 requires_grad ──────────────────────────────────────────────
+    # 🔴 互斥检查必须在两个 early-return 分支之前(ete_only 分支先 return,
+    # 若把检查放进 seg_only 分支内部,ete_only=True+seg_only=True 会先命中
+    # ete_only 分支直接返回,互斥检查永远走不到——实测发现,test 曾误过)。
+    if ete_only and seg_only:
+        raise ValueError("seg_only 与 ete_only 互斥,不能同开")
     # ete_only(D10-15):恒可训集收窄到仅 extension_head,Stage B 不解冻 backbone,
     # 分割链冻结。lr 强制取 Stage C 低档(微调而非重学)。
     if ete_only:
@@ -218,6 +243,49 @@ def configure_official_stage(
                 param_groups.append(
                     {"params": duals, "weight_decay": 0.0, "lr": head_lr})
         return param_groups, head_lr, "ETE-only finetune (r5 frozen, extension_head only)"
+
+    # ── seg_only(阶段2,2026-09-13):仅分割前向链可训,Boundary/Lovász 微调 ──
+    # 恒可训集 = SEG_TRAIN_PREFIXES(decoder+seg_backbone);四头/cls_backbone/
+    # Adaptor/vclub 全冻(单变量:分割损失的实验不牵动分类表征)。
+    # 🔴 vclub 显式冻 True→False(照抄 ete_only 模板会把 vclub 放行,违背单变量
+    # —— plan 审查 finding);lr 取 Stage C 低档(微调而非重学,与 ete_only 同理)。
+    # 🔴 param_groups **照正常路径两档 lr、四组**(每档 decay/no_decay 拆两组):
+    # decoder@head_lr / seg_backbone@
+    # head_lr×backbone_lr_scale(下方正常路径先例),不照抄 ete_only 两组——那
+    # 会给 seg_backbone 10× lr(既有档位的 10 倍,微调场景会一步带偏)。
+    # 组构建与正常路径同构(两档 lr × decay/no_decay 拆分),改一处须同步另一处。
+    if seg_only:
+        head_lr = lr_base * _STAGE_C_LR_SCALE
+        for name, p in model.named_parameters():
+            if "vclub" in name:
+                p.requires_grad = False
+                continue
+            p.requires_grad = any(name.startswith(pfx) for pfx in SEG_TRAIN_PREFIXES)
+        for p in criterion.mal_loss_fn.parameters():
+            p.requires_grad = False
+        # 组 1:分割解码器(随机初始化出身)@ head_lr
+        dec_named = [
+            (n, p) for n, p in model.named_parameters()
+            if p.requires_grad and any(n.startswith(pfx) for pfx in SEG_TRAIN_DECODER)
+        ]
+        dec_decay, dec_no_decay = _split_decay(dec_named)
+        param_groups: List[Dict] = [
+            {"params": dec_decay, "weight_decay": weight_decay, "lr": head_lr},
+            {"params": dec_no_decay, "weight_decay": 0.0, "lr": head_lr},
+        ]
+        # 组 2:分割主干(ImageNet 预训练)@ head_lr × backbone_lr_scale
+        bb_named = [
+            (n, p) for n, p in model.named_parameters()
+            if p.requires_grad and any(n.startswith(pfx) for pfx in SEG_TRAIN_BACKBONE)
+        ]
+        if bb_named:
+            bb_lr = head_lr * backbone_lr_scale
+            bb_decay, bb_no_decay = _split_decay(bb_named)
+            param_groups.append(
+                {"params": bb_decay, "weight_decay": weight_decay, "lr": bb_lr})
+            param_groups.append(
+                {"params": bb_no_decay, "weight_decay": 0.0, "lr": bb_lr})
+        return param_groups, head_lr, "SEG-only finetune (r5 frozen, seg chain only)"
 
     unfreeze_extra = STAGE_B_UNFREEZE if stage == "B" else ()
     # 恒可训集:四头 + 分割前向链。分割整块解冻(解码器 + 主干同时放行),

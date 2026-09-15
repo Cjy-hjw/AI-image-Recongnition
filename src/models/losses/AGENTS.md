@@ -9,7 +9,7 @@
 - ✅ **三头固定 λ 外挂(阶段 2.4 接线)**:`__init__(official_head_config=...)` 读取 `lambda_loc/lambda_ete/lambda_clin_t`(默认各 1.0)与 ETE/T 的类加权/平滑超参;三个 `register_buffer("ete_class_weights", ...)` 等缓存——**传 None 时不进 state_dict(legacy 零影响)**。`forward` 在 `apply_famo_weighting` 之后、`compute_regularizers` 之前调用 `compute_official_head_losses` 并把 `detail` 数入 `loss_dict`(location/location_side/location_level/ete/ete_ce/clin_t/clin_t_ce)。🔴 **三头不进 FAMO 5 通道**(扩通道破坏 checkpoint 兼容 + masked 0 值被 FAMO 误读为"已收敛",见 `components/official_heads.py`)。三头键缺席 → 跳过,legacy `train.py` 路径零回归。
 
 ### 组件化设计 (`components/`)
-- `segmentation.py`: `compute_segmentation_loss()` — BCE+Dice,支持`valid_mask`
+- `segmentation.py`: `compute_segmentation_loss()` — BCE+Dice,支持`valid_mask`;阶段2 seg-only 扩展:可选外挂 Boundary(带符号距离场)/Lovász-Hinge(Berman 官方差分版)两项,返回 `(loss, {"seg_boundary","seg_lovasz"})` 分项进 JSONL;legacy 路径非零新权重 raise。
 - `concepts.py`: `compute_concept_losses()` — TI-RADS五项SLR+临床先验正则
 - `malignancy.py`: `compute_malignancy_losses()` — AUCM+SupCon
 - `famo_mix.py`: `apply_famo_weighting()` — FAMO权重应用与更新

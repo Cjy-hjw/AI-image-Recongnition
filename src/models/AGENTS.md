@@ -41,7 +41,7 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | File | Contents |
 |:---|:---|
 | `components/__init__.py` | Re-exports all computation functions |
-| `components/segmentation.py` | `compute_segmentation_loss(bce_fn, dice_fn, outputs, targets)` |
+| `components/segmentation.py` | `compute_segmentation_loss(bce_fn, dice_fn, outputs, targets, boundary_weight=0, lovasz_weight=0)` → `(loss, {"seg_boundary","seg_lovasz"})`(阶段2 seg-only 扩展;legacy 无 valid_mask 路径对非零新权重 raise)。含 `boundary_loss_per_sample`(带符号距离场,ThreadPool EDT)/`lovasz_hinge_per_sample`(Berman 官方 inclusive cumsum+**差分**,🔴首版漏差分步曾是 P1 bug) |
 | `components/concepts.py` | `resolve_mix_params(outputs, mix_info)`, `compute_concept_losses(outputs, targets, lam, index, mask_weight, label_smoothing, tirads_matrix)`;⚠️ 本组件把 `lam` 当**软插值系数**、`mask_weight` 当**门控系数**消费(2026-08-15 起四头监督闸门只能在 train_step 侧按阈值分派、**禁在 mixup.py 侧把软 lam 硬化成 0/1**——会连带改掉本组件的软插值数学,见 `src/training/AGENTS.md` 闸门红线) |
 | `components/malignancy.py` | `compute_malignancy_losses(mal_loss_fn, supcon_loss_fn, outputs, targets, mask_weight, slr_weights)` |
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |

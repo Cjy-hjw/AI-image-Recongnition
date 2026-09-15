@@ -92,8 +92,11 @@ def ap_global(pool: list, scores) -> float:
 def ap_percase(pool: list, scores) -> float:
     """逐例平均口径:每例自己算 AP(例内排序)再算术平均。
 
-    有预测实例的例才计入分母(与 09-15 云端统计 G3 的 by_case 写法同口径:
-    `if r['n_pred'] or r['n_gt']`)。
+    排除条件 = 无预测且无 GT 的空例(与 09-15 云端统计 G3 的 by_case 写法
+    同口径:`if r['n_pred'] or r['n_gt']`)。**有 GT 无预测的漏检例计入且记
+    AP=0**(漏检必须受罚);`n_gt=0 但有 preds` 的例也计入、恒为 0.0——
+    它对 ΔAP 无影响(基线与重打分同值),但会拉低 base_percase 绝对值,
+    判读时勿把 base_percase 当"模型逐例 AP"引用(审查 Finding 2)。
     """
     vals = []
     for r, sc in zip(pool, scores):
@@ -144,7 +147,7 @@ def main() -> None:
     print(f"[基线] AP 全局混排={base_global:.6f}  逐例平均={base_percase:.6f}")
     # 🔴 无 TP 的池:沉底判定的基准不存在,网格照出但表3 记 -1(标记无效)
     if n_tp == 0:
-        print("[基线] ⚠️ 静态池零 TP——表3 沉底计数无基准,记 -1")
+        print("[基线] 警告: 静态池零 TP——表3 沉底计数无基准,记 -1")
 
     # 小 TP 清单(位移监控对象)
     small_tps_all = [(p["area"], float(p["confidence"])) for r in pool

@@ -17,7 +17,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `video_io.py` | 动态图/视频(cine)抽帧:MP4/AVI/MOV/MKV via OpenCV + 多帧 DICOM cine via pydicom;复用 `io._PHI_FIELDS` 脱敏,经 `_to_gray` 统一灰度兜底(含彩色/多普勒 cine);OpenCV 视频帧传 `channel_order="bgr"`、DICOM cine 用默认 `"rgb"`。供 `video_predict.py`(根目录) |
 | `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先;**空输入安全返回 `keyframe_index=-1` 不抛**,由 `video_predict.py` 的显式守卫拦全帧失败,见下方「坏帧隔离」) |
 | `nifti_io.py` | **2026-08-01 新增,已接入(A1/V2.1 交付链路)**。NIfTI(.nii/.nii.gz)读写:`save_binary_mask`(交付 mask,值域强制 `{0,1}`)、`load_nifti_frames`(动图输入,签名与 `load_video_frames` 逐位对齐)、`scatter_frames_to_full_length`(抽样帧回填全帧序列)、`is_nifti_path`。A1 起 `entrypoint.sh` 按 `.nii.gz` 分发,`src/service/case_discovery.py`/`runner.py` 经本模块读写动态图输入与逐结节 mask 落盘。见 §8 |
-| `nodule_split.py` | **2026-08-01 新增,已接入(v21_output)**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。A3 起 `v21_output.write_case_v21` 经 `split_nodules` 把整图 mask 拆成逐结节实例。见 §9 |
+| `nodule_split.py` | **2026-08-01 新增,已接入(v21_output)**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`hysteresis_binarize`(阶段3 手段4 滞回阈值,默认恒等)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。A3 起 `v21_output.write_case_v21` 经 `split_nodules` 把整图 mask 拆成逐结节实例。见 §9 |
 | `prediction_json.py` | **2026-08-01 新增,已接入(A3)**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。V2.1 起 `StudyUID` 填 PatientId、`MaskFile` 为相对病例一级目录路径。见 §10 |
 | `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6 |
 | `v21_output.py` | **A3 新增**。**唯一 V2.1 写盘入口** `write_case_v21`:把 `case_pipeline` 结果落成官方 V2.1 逐结节交付形态(软/二值 mask resize 回原图 → `split_nodules` 逐实例 → 每结节 `.nii.gz` + `prediction.json` 原子写)。静/动两链路,动态逐结节 3D mask 跨帧关联(最简实现,@云TODO)。见 §12 |
@@ -420,8 +420,13 @@ loader 默认只抽 32 帧 —— 直接堆叠抽样帧的 mask 会让 Z 长度�
 
 ## 9. `nodule_split.py` — 整图 mask → 逐结节实例(2026-08-01 新增)
 
-> **状态:已实现 + 已测试(27 例)+ 已接入。** `v21_output.write_case_v21` 在 V2.1
+> **状态:已实现 + 已测试 + 已接入。** `v21_output.write_case_v21` 在 V2.1
 > 交付链路中调用 `split_nodules` 把整图 mask 拆成逐结节实例。
+> 2026-09-16 新增 `hysteresis_binarize`(手段4 滞回阈值):`thr_grow >= thr_seed`
+> 逐位恒等;`thr_grow < thr_seed` 时只扩张含 seed 的连通域,跨实例接触面切开
+> (单通道二值图不能靠"最近 seed 归属"分离——归属后仍 8/26 连通,必须删边界
+> 非 seed 像素)。接线点=`postprocess.decode_predictions` 的 `mask_binary`,
+> 默认关(grow=seed)。扫参轴 `grow_static`/`grow_dynamic` 见 `diagnose_detection`。
 
 官方要求**每个检出结节**单独一条记录,而本项目模型输出的是**单通道整图 mask**
 (`multi_task_model.seg_head` 是 `Conv2d(20,1,1)`,无实例分割概念)。本模块用连通域

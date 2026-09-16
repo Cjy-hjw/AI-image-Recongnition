@@ -140,6 +140,112 @@ def _env_max_nodules() -> int:
     return int(v)
 
 
+def hysteresis_binarize(soft: np.ndarray, thr_seed: float,
+                        thr_grow: float) -> np.ndarray:
+    """滞回阈值二值化(阶段3 手段4,2026-09-16):高阈值成核 + 低阈值描边。
+
+    尺度规则:soft 是**任意尺寸**的概率图,函数不 resize。生产在模型分辨率
+    (512²)上调用(与 `postprocess.decode_predictions` 的既有二值化点同源),
+    之后由 `v21_output._resize_binary`(INTER_NEAREST)升到原图 —— **不要**
+    挪到原图尺寸上做:那会与 `soft_fullres` 的 INTER_LINEAR 插值产生二次误差,
+    且 conf 消费的是另一条链路。
+
+    与"全局降阈值"的本质区别(这是本函数存在的唯一理由):
+    - 全局降阈值:`soft > thr_low` 让新的低概率区域**独立成核**,实例候选集变大;
+    - 本函数:`seed = soft > thr_seed` 决定**谁能成核**,`grow = soft > thr_grow`
+      只负责把已成核实例的轮廓外延;**不含任何 seed 的 grow 连通域整块丢弃**
+      —— 低概率区域永远无法独立成核,实例候选集与 `soft > thr_seed` 逐位相同。
+
+    跨实例接触面切割(🔴 实现要点,不是可选优化):
+    同一 grow 连通域可能含**多个 seed 实例**(低阈值区域把两个高阈值核桥连)。
+    仅按"最近 seed 归属"给像素打标签**不解决问题** —— 输出的仍是二值图,
+    归属后两核在 8/26 邻域下依然相邻,下游 `split_nodules` 照样合并成一个
+    实例(实测:20px 一行两个 seed + 全桥接,归属后连通域数仍为 1)。
+    正解是把接触面上的**非 seed 像素**删掉,使两核在二值图上断开;seed 像素
+    **恒保留**(接触面判据显式排除 seed),故即使核只有 1px 宽也不会被削空。
+
+    Args:
+        soft: 2D `(H, W)` 或 3D `(n_frames, H, W)` 分割**概率**图(sigmoid 后)。
+        thr_seed: 成核阈值。`soft > thr_seed` 的像素为种子。
+        thr_grow: 生长阈值,须 ≤ thr_seed 才有效(生长语义)。
+            **`thr_grow >= thr_seed` 时逐位退化为 `soft > thr_seed`** —— 这既是
+            默认关闭态(`postprocess._grow_threshold` 默认返回 thr_seed),也是
+            钉死零回归的恒等路径。⚠️ 该分支在 scipy 检查**之前**返回,故默认
+            路径不引入 scipy 依赖。
+
+    Returns:
+        np.uint8 数组,shape 与输入一致,值域 `{0, 255}`(与
+        `postprocess.py:148` 原契约一致;下游只看非零性,但 `_resize_binary`
+        走 INTER_NEAREST,值域不一致会埋雷)。
+
+    Raises:
+        ValueError: ndim 非 2/3。
+        RuntimeError: 生长路径需要 scipy,而 scipy 未安装(恒等路径不触发)。
+    """
+    arr = np.asarray(soft)
+    if arr.ndim not in (2, 3):
+        raise ValueError(
+            f"hysteresis_binarize 只接受 2D (H,W) 或 3D (n_frames,H,W),"
+            f"收到 ndim={arr.ndim} shape={arr.shape}")
+
+    # 恒等退化:默认关闭态即走这里。**必须在 scipy 检查之前**(见 docstring)。
+    if thr_grow >= thr_seed:
+        return (arr > thr_seed).astype(np.uint8) * 255
+
+    if not HAS_SCIPY:
+        raise RuntimeError(
+            "hysteresis_binarize 的生长路径需要 scipy.ndimage,但 scipy 未安装")
+
+    seed = arr > thr_seed
+    grow = arr > thr_grow
+    # 2D 用 (3,3)=8 邻域、3D 用 (3,3,3)=26 邻域,与 `_split_3d:302` 的
+    # connectivity 口径一致(2D 侧 `_split_2d` 用 cv2 connectivity=8,等价)。
+    struct = np.ones((3,) * arr.ndim, dtype=bool)
+
+    lab_grow, _ = ndi.label(grow, structure=struct)
+    out = np.zeros(arr.shape, dtype=bool)
+    # find_objects 给每域的 bbox 切片:EDT 只在"多 seed 域"的 bbox 内做,
+    # 而非全图 —— 若未来在 3D 大体积(如 750×512×512 离线工具)上调用,全尺寸
+    # EDT 是秒级成本;单 seed 域(真实数据绝大多数)完全跳过 EDT。
+    # ⚠️ 生产路径静/动都是**逐帧 2D**调用(case_pipeline 逐帧 decode),
+    # 3D 分支仅供测试与未来离线工具;3D 大体积下 lab_grow int32 全尺寸
+    # 数组本身即是内存大头,须先做预算再启用。
+    for i, sl in enumerate(ndi.find_objects(lab_grow), start=1):
+        sub_grow = lab_grow[sl] == i
+        # thr_grow < thr_seed(恒等分支已拦)⇒ seed ⊆ grow 逐位成立,无需再交。
+        sub_seed = seed[sl]
+        if not sub_seed.any():
+            # 不含种子的低概率连通域 —— 整块丢弃。这正是本函数与"全局降阈值"
+            # 的唯一分野,对应测试的"孤立低概率区域不成核"核心断言。
+            continue
+        lab_seed, n_seed = ndi.label(sub_seed, structure=struct)
+        if n_seed == 1:
+            out[sl] |= sub_grow
+            continue
+
+        # 多 seed 桥连:最近种子归属 + 切开接触面。
+        _, inds = ndi.distance_transform_edt(~sub_seed, return_indices=True)
+        owner = lab_seed[tuple(inds)]
+        # EDT 对全切片每像素都给最近 seed 索引 → 非 grow 像素也会拿到标签,
+        # 必须显式清零,否则边界判据会把域外像素算进来。
+        owner = np.where(sub_grow, owner, 0)
+
+        # 接触面 = 邻域内出现不同 owner 的 grow 像素。
+        # maximum_filter 直接可用(0 天然最小);minimum_filter 须把 0 换成
+        # sentinel 大值,否则域外/背景的 0 会把 mn 拉到 0,使**每个**非 seed
+        # 像素都满足 mx!=mn → 整个域的外轮廓被当接触面删光(实测该误删会让
+        # 输出 mask 收缩一圈甚至消失)。
+        pos_max = owner
+        pos_min = np.where(owner > 0, owner, np.iinfo(np.int32).max)
+        mx = ndi.maximum_filter(pos_max, size=3, mode="constant", cval=0)
+        mn = ndi.minimum_filter(pos_min, size=3, mode="constant",
+                                cval=np.iinfo(np.int32).max)
+        boundary = (mx != mn) & sub_grow & ~sub_seed
+        out[sl] |= (sub_grow & ~boundary)
+
+    return out.astype(np.uint8) * 255
+
+
 def split_nodules(
     mask: np.ndarray,
     min_area_ratio=None,

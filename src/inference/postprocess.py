@@ -9,6 +9,7 @@ import torch
 # 单一权威在 `src.models` 侧,此处只读不再抄一份 —— 若模型改类别数而这里抄了个
 # 旧数字,校验就会把正确输出judge成错误(或反过来放行真错误)。
 # 依赖方向合规:`.importlinter` 契约禁的是 `src.models` 依赖 `src.inference`,反向可以。
+from src.inference.nodule_split import hysteresis_binarize
 from src.models.heads.clinical_t import NUM_CLIN_T_CLASSES
 from src.models.label_schema import ETE_CODES, NUM_LOCATIONS, NUM_TIRADS_CLASSES
 from src.utils.report_generator import calculate_tirads_points
@@ -28,6 +29,10 @@ class NonFiniteProbabilityError(ValueError):
 
 _ENV_SEG_THR = "AICOMP_SEG_THRESHOLD"
 _ENV_SEG_THR_DYNAMIC = "AICOMP_SEG_THRESHOLD_DYNAMIC"
+# 阶段3 手段4(2026-09-16):生长阈值 env。默认 = thr_seed(关,恒等退化)。
+# 测评容器改不了 env,上线前必须把离线扫参定的值改成代码默认值(与件套①同型)。
+_ENV_SEG_GROW = "AICOMP_SEG_GROW"
+_ENV_SEG_GROW_DYNAMIC = "AICOMP_SEG_GROW_DYNAMIC"
 
 
 def _seg_threshold(dynamic: bool) -> float:
@@ -52,6 +57,27 @@ def _seg_threshold(dynamic: bool) -> float:
     except (TypeError, ValueError):
         return float(default)
     return t if 0.0 < t < 1.0 else float(default)
+
+
+def _grow_threshold(dynamic: bool, thr_seed: float) -> float:
+    """生长阈值(阶段3 手段4,2026-09-16)。默认 = thr_seed(关,恒等退化)。
+
+    解析失败/越界/≥ thr_seed 一律钳回 thr_seed —— grow ≥ seed 时
+    `hysteresis_binarize` 走恒等路径,垃圾配置不静默采信也不崩。
+    env 仍保留(`AICOMP_SEG_GROW`/`_DYNAMIC`),供扫参覆盖。
+    ⚠️ grow > seed 没有生长语义(低阈值必须低于成核阈值),钳回比报错更安全:
+    测评容器注入错 env 时退化为现状,不产出反向 mask。
+    """
+    raw = os.environ.get(_ENV_SEG_GROW_DYNAMIC if dynamic else _ENV_SEG_GROW)
+    if raw is None:
+        return thr_seed
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return thr_seed
+    if not (0.0 < t < 1.0) or t >= thr_seed:
+        return thr_seed
+    return t
 
 
 def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False,
@@ -142,10 +168,14 @@ def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False,
         pred_mask = torch.sigmoid(outputs["mask"].float())[0, 0]
         _assert_finite("mask", pred_mask)
         pred_mask = pred_mask.cpu().numpy()
-    # 件套①:阈值经 _seg_threshold(dynamic) 解析,env 未设时恒 0.5(逐位等于旧
-    # 硬编码)。下游全链(case_pipeline/nodule_split/v21_output/诊断脚本)只读本
-    # mask_binary 的非零性 → 此处一改即全链生效,无第二个分割阈值。
-    mask_binary = (pred_mask > _seg_threshold(dynamic)).astype(np.uint8) * 255
+    # 件套①+手段4:thr_seed 经 _seg_threshold(dynamic) 解析(静态默认 0.35/
+    # 动态 0.5);thr_grow 经 _grow_threshold(默认 = thr_seed,恒等退化)。
+    # 下游全链只读本 mask_binary 的非零性 → 此处一改即全链生效。
+    # ⚠️ 扫参显式阈值路径(diagnose_detection 的 seg_threshold/grow 参数)是
+    # **第二个**二值化点,必须调同一个 hysteresis_binarize,否则镜像漂移。
+    thr_seed = _seg_threshold(dynamic)
+    mask_binary = hysteresis_binarize(
+        pred_mask, thr_seed, _grow_threshold(dynamic, thr_seed))
 
     # argmax 对温度缩放不变(T>0 单调),保留校准以与概率刻度一致、便于上层取置信度。
     # 各头统一 .float():AMP fp16 下温度除法 logits/T 在半精度有舍入损失,先升 fp32 再缩放/softmax,

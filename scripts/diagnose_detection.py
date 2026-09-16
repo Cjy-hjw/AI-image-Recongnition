@@ -74,8 +74,8 @@ from src.inference.io import load_input_image  # noqa: E402
 from src.inference.nifti_io import (  # noqa: E402
     load_nifti_frames, scatter_frames_to_full_length)
 from src.inference.nodule_split import (  # noqa: E402
-    DEFAULT_MIN_AREA_RATIO, detection_confidence, restore_instance_mask,
-    split_nodules)
+    DEFAULT_MIN_AREA_RATIO, detection_confidence, hysteresis_binarize,
+    restore_instance_mask, split_nodules)
 from src.inference.v21_output import (  # noqa: E402
     _dynamic_det_conf, _resize_binary, _resize_soft)
 
@@ -170,7 +170,8 @@ def run_dynamic_inference(model, config, calibrator, precision, device,
 
 def run_static_inference_from_result(case_result, *, seg_threshold=None,
                                      min_area_ratio=None,
-                                     max_nodules=None) -> list:
+                                     max_nodules=None,
+                                     grow=None) -> list:
     """从 diagnose_static_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
 
     实例抽取逐行镜像 `_write_static`(v21_output.py:374-385):resize →
@@ -184,15 +185,29 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
     env**——扫参进程必须确定性,不受运行环境 AICOMP_* 影响(A/B两路审查后
     定稿:此前"显式钉 DEFAULT"会让云端设 env 后诊断与生产口径脱节)。
     `max_nodules` 同款三层优先级(阶段1:None→env→DEFAULT,镜像生产默认参)。
+    `grow`(阶段3 手段4):None 时若 `seg_threshold` 也 None,复用生产
+    `mask_binary`(已走 hysteresis);显式传参时调**同一个**
+    `hysteresis_binarize`(镜像同源,防"以为扫了实际没扫")。grow 必须伴随
+    seg_threshold,裸 grow 入口报错。
     """
     preds = case_result["preds"]
     hw = tuple(int(x) for x in case_result["orig_hw"])
     soft_fullres = _resize_soft(preds["pred_mask"], hw)
     if seg_threshold is None:
+        if grow is not None:
+            raise ValueError("grow 扫参必须伴随 seg_threshold(裸 grow 无法定 seed)")
         binary_fullres = _resize_binary(preds["mask_binary"], hw)
     else:
+        if grow is not None and grow >= seg_threshold:
+            # Gate2 2026-09-16 P2:hysteresis 对 grow≥seed 静默恒等退化,
+            # 生产 _grow_threshold 会钳回,这里若不拦会把拼参错误伪装成
+            # "生长零收益"(扫了等于没扫)。
+            raise ValueError(
+                f"grow({grow}) 必须 < seg_threshold({seg_threshold}),"
+                "否则滞回静默退化为纯阈值扫参")
+        g = seg_threshold if grow is None else grow
         binary_fullres = _resize_binary(
-            (preds["pred_mask"] > seg_threshold).astype(np.uint8) * 255, hw)
+            hysteresis_binarize(preds["pred_mask"], seg_threshold, g), hw)
     instances = split_nodules(binary_fullres,
                               min_area_ratio=min_area_ratio,
                               max_nodules=max_nodules)
@@ -207,7 +222,7 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
 
 
 def run_dynamic_inference_from_result(case_result, *, seg_threshold=None,
-                                      max_nodules=None):
+                                      max_nodules=None, grow=None):
     """从 diagnose_dynamic_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
 
     实例抽取逐行镜像 `_write_dynamic`:`n_total_frames` 硬校验、逐帧 resize →
@@ -218,6 +233,7 @@ def run_dynamic_inference_from_result(case_result, *, seg_threshold=None,
     preds["mask_binary"]);显式传时从 `pred_mask` 现算(扫参用;thr=0.5 与
     mask_binary 逐位等价)。动态 min_area 恒 DEFAULT(镜像生产钉死,不扫)。
     `max_nodules`(阶段1):None→env→DEFAULT 同生产默认参,扫参显式传参优先。
+    `grow`(阶段3 手段4):同静态,显式传参调同一个 `hysteresis_binarize`。
     """
     n_total = int(case_result["n_total_frames"])
     if not n_total or n_total <= 0:
@@ -230,10 +246,17 @@ def run_dynamic_inference_from_result(case_result, *, seg_threshold=None,
     for f in per_frame:
         p = f["preds"]
         if seg_threshold is None:
+            if grow is not None:
+                raise ValueError("grow 扫参必须伴随 seg_threshold(裸 grow 无法定 seed)")
             binary_frames.append(_resize_binary(p["mask_binary"], hw))
         else:
+            if grow is not None and grow >= seg_threshold:
+                raise ValueError(
+                    f"grow({grow}) 必须 < seg_threshold({seg_threshold}),"
+                    "否则滞回静默退化为纯阈值扫参")
+            g = seg_threshold if grow is None else grow
             binary_frames.append(_resize_binary(
-                (p["pred_mask"] > seg_threshold).astype(np.uint8) * 255, hw))
+                hysteresis_binarize(p["pred_mask"], seg_threshold, g), hw))
         soft_frames.append(_resize_soft(p["pred_mask"], hw))
     binary_3d = scatter_frames_to_full_length(binary_frames, frame_idx, n_total)
     # 镜像生产 2026-09-08 修复:soft_3d 死分配删除(生产不再 scatter float soft,
@@ -619,6 +642,10 @@ def _combo_rows(case_result, post, gts: list, is_dynamic: bool,
         # env,扫参确定性;不传(None)时生产 env/默认参路径不变。
         if combo.get("max_nodules") is not None:
             kw["max_nodules"] = combo["max_nodules"]
+        # 阶段3 手段4:grow 透传 post(静/动同)。不传时生产 env/默认参路径不变
+        # (hysteresis 恒等退化)。
+        if combo.get("grow") is not None:
+            kw["grow"] = combo["grow"]
         if is_dynamic:
             preds, _n_total = post(case_result, **kw)
         else:
@@ -662,11 +689,12 @@ def _parse_sweep(specs: list) -> list:
     """`key=v1,v2,v3` 形式 → 组合列表(笛卡尔积,保序)。
 
     keys: `thr_static`/`thr_dynamic`(分割阈值)/`min_area`(静态最小面积占比,
-    仅静态路径消费)/`max_nodules`(预测结节数上限,静/动两池都消费)。
-    交叉维度 = 静态阈值×min_area×max_nodules(静态池)/动态阈值×max_nodules
-    (动态池,min_area 不扫——生产动态钉死 DEFAULT)。实现上为简化:统一笛卡尔积,
-    动态侧忽略 min_area 维度(`_combo_rows` 按分支消费),组合数会略多于理论必要,
-    CPU 段每组合 ~秒级,可接受。
+    仅静态路径消费)/`max_nodules`(预测结节数上限,静/动两池都消费)/
+    `grow_static`/`grow_dynamic`(阶段3 手段4 生长阈值,须伴随同侧 thr 轴)。
+    交叉维度 = 静态阈值×min_area×max_nodules×grow_static(静态池)/动态阈值×
+    max_nodules×grow_dynamic(动态池,min_area 不扫——生产动态钉死 DEFAULT)。
+    实现上为简化:统一笛卡尔积,动态侧忽略 min_area 维度(`_combo_rows` 按
+    分支消费),组合数会略多于理论必要,CPU 段每组合 ~秒级,可接受。
 
     🔴 max_nodules 是 int 轴(阶段1三处联动之一):float 解析会产 20.0 →
     `nodules[:20.0]` TypeError,按键走 int 转换;非整数值入口报错(扫参拼错
@@ -675,7 +703,8 @@ def _parse_sweep(specs: list) -> list:
     import itertools
     # 🔴 白名单校验(B路审查P1):未知键(如 thr= 漏写 _static)在派生后两侧皆空,
     # 会静默跑完全量 54 分钟推理再产出空报告——键名错误必须在入口就报。
-    _ALLOWED = {"thr_static", "thr_dynamic", "min_area", "max_nodules"}
+    _ALLOWED = {"thr_static", "thr_dynamic", "min_area", "max_nodules",
+                "grow_static", "grow_dynamic"}
     _INT_KEYS = {"max_nodules"}
     # int 轴上界与生产 _MAX_NODULES_CEILING 同源(数值改须两侧同步;数值引用
     # 见 src/inference/nodule_split.py:79)。fix-审查 F1:无上界时
@@ -751,8 +780,10 @@ def run_sweep(args) -> dict:
         if "thr_static" not in c:
             continue
         d = {k: v for k, v in c.items()
-             if k in ("thr_static", "min_area", "max_nodules")}
+             if k in ("thr_static", "min_area", "max_nodules", "grow_static")}
         d["thr"] = d.pop("thr_static")
+        if "grow_static" in d:
+            d["grow"] = d.pop("grow_static")
         if d not in combos_static:
             combos_static.append(d)
     combos_dynamic = []
@@ -762,6 +793,8 @@ def run_sweep(args) -> dict:
         d = {"thr": c["thr_dynamic"]}
         if "max_nodules" in c:
             d["max_nodules"] = c["max_nodules"]
+        if "grow_dynamic" in c:
+            d["grow"] = c["grow_dynamic"]
         if d not in combos_dynamic:
             combos_dynamic.append(d)
     # 🔴 派生空护栏(B路审查P1;阶段1实测加固:裸 max_nodules 轴在此被拦):
@@ -772,8 +805,8 @@ def run_sweep(args) -> dict:
     if not combos_static and not combos_dynamic:
         raise ValueError(
             f"扫参组合派生为空(输入 {args.sweep}):至少需要一个 "
-            "thr_static=... 或 thr_dynamic=... 轴;min_area/max_nodules 是"
-            "阈值轴的伴随参数")
+            "thr_static=... 或 thr_dynamic=... 轴;min_area/max_nodules/"
+            "grow_static/grow_dynamic 是阈值轴的伴随参数")
     _safe_print(f"[sweep] 静态 {len(combos_static)} 组合 × 动态 "
                 f"{len(combos_dynamic)} 组合")
 
@@ -907,6 +940,9 @@ def run_sweep(args) -> dict:
                 "max_nodules 池覆盖:须伴随同侧 thr 轴才扫该池(静态须 thr_static/"
                 "动态须 thr_dynamic);两侧都带时 max_nodules 进两池,min_area 只静态"
                 "——池覆盖不对称是刻意的",
+                "grow_static/grow_dynamic 同 max_nodules:须伴随同侧 thr 轴;"
+                "显式传参调 hysteresis_binarize(与生产 decode_predictions 同源);"
+                "不传 grow 时 thr 扫参走恒等路径(grow=thr)",
                 "val 只含有 ROI 标注患者,阴性 FP 不在池(与 run_diagnosis 同盲区)",
                 "🔴 选阈值须看 match_rate 与 mean_dice 的联合,不能只看其一:"
                 "降阈值让临界带病例越过 0.5,同时让已匹配病例 IoU 下滑跌出 0.5",
@@ -969,13 +1005,15 @@ def main():
     # 件套②(2026-09-10)扫参模式:key=v1,v2,v3 形式,可重复传。keys:
     #   thr_static / thr_dynamic(分割二值化阈值)/ min_area(静态最小面积占比,
     #   只作用于静态池)/ max_nodules(预测结节数上限,静/动两池都消费,但
-    #   须伴随同侧 thr 轴才扫该池)。给了 --sweep 就走 run_sweep(一次前向多
+    #   须伴随同侧 thr 轴才扫该池)/ grow_static / grow_dynamic(阶段3 手段4
+    #   生长阈值,须伴随同侧 thr 轴)。给了 --sweep 就走 run_sweep(一次前向多
     #   参数),否则走原 run_diagnosis(单参数全量诊断)。
     ap.add_argument("--sweep", action="append", default=None,
                     help="例:--sweep thr_static=0.30,0.35,0.40,0.50 "
                          "--sweep thr_dynamic=0.25,0.30,0.35 "
                          "--sweep min_area=2e-5,5e-5,1e-4 "
-                         "--sweep max_nodules=20,30,50")
+                         "--sweep max_nodules=20,30,50 "
+                         "--sweep grow_static=0.32,0.28,0.24")
     args = ap.parse_args()
     # 逐 case 完整行始终进 sidecar JSONL(崩溃保数据);--save-per-case 曾计划
     # 把行嵌进主报告,但会撑大 JSON 且与 sidecar 重复,已砍,参数不再收。

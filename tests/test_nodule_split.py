@@ -14,6 +14,7 @@ import pytest
 from src.inference.nodule_split import (
     crop_nodule,
     detection_confidence,
+    hysteresis_binarize,
     split_nodules,
 )
 
@@ -360,3 +361,109 @@ class TestDetectionConfidence:
         m = np.zeros((5, 5), np.uint8)
         m[1:3, 1:3] = 1
         assert detection_confidence(p, m) == pytest.approx(0.8)
+
+
+def _dual_seed_soft(h=16, w=40):
+    """双核 + 低概率桥 + 孤立低概率块。seed=0.9,桥/孤立=0.4。"""
+    s = np.zeros((h, w), np.float32)
+    s[4:12, 2:8] = 0.9       # 左核 8×6
+    s[4:12, 32:38] = 0.9     # 右核 8×6
+    s[7:9, 8:32] = 0.4       # 桥
+    s[0:3, 18:22] = 0.4      # 孤立,无 seed
+    return s
+
+
+class TestHysteresisBinarize:
+    """阶段3 手段4(2026-09-16):滞回阈值。核心不变量=实例候选集由 seed 决定。"""
+
+    def test_identity_when_grow_ge_seed(self):
+        s = _dual_seed_soft()
+        ident = (s > 0.5).astype(np.uint8) * 255
+        assert np.array_equal(hysteresis_binarize(s, 0.5, 0.5), ident)
+        assert np.array_equal(hysteresis_binarize(s, 0.5, 0.8), ident)
+
+    def test_value_domain_is_0_or_255(self):
+        out = hysteresis_binarize(_dual_seed_soft(), 0.5, 0.3)
+        assert out.dtype == np.uint8
+        assert set(np.unique(out).tolist()) <= {0, 255}
+
+    def test_isolated_low_prob_does_not_nucleate(self):
+        """核心断言:不含 seed 的 grow 连通域整块丢弃。
+        变异'全保留 grow'必须让本测试变红——那是与已死实验(全局降阈值)
+        的唯一区别。"""
+        s = _dual_seed_soft()
+        out = hysteresis_binarize(s, 0.5, 0.3) != 0
+        assert not out[0:3, 18:22].any(), "孤立低概率块不应成核"
+
+    def test_seed_region_expands(self):
+        s = np.zeros((20, 20), np.float32)
+        s[6:14, 6:14] = 0.4
+        s[8:12, 8:12] = 0.9
+        seed_only = hysteresis_binarize(s, 0.5, 0.5) != 0
+        grown = hysteresis_binarize(s, 0.5, 0.3) != 0
+        assert seed_only.sum() == 16
+        assert grown.sum() == 64
+        assert np.all(seed_only <= grown)
+
+    def test_dual_seed_bridge_stays_two_instances(self):
+        """Opus P1-2 RED 用例:低阈值桥连两核,切开后仍是两个实例。
+        变异'整块 grow 并给一个 seed'必须让本测试变红。"""
+        s = _dual_seed_soft()
+        binary = hysteresis_binarize(s, 0.5, 0.3)
+        nodules = split_nodules(binary, min_area_ratio=0)
+        assert len(nodules) == 2, (
+            f"桥连后实例数={len(nodules)}(期望 2)——seed 裁决失效会合并成 1")
+        bridge_mid = binary[7:9, 18:22] != 0
+        assert not bridge_mid.all(), "桥接带应被切开,不能整条保留"
+
+    def test_contact_boundary_sentinel_keeps_outer_contour(self):
+        """🔴 哨兵回归锁(Gate2 2026-09-16 P1-3):多 seed 域的**外轮廓**不得被
+        当接触面删光。
+
+        `minimum_filter` 前把 owner 的 0 换成 int32 最大值的哨兵,防的是"域外
+        0 把 mn 拉到 0 → 每个 grow 像素都满足 mx!=mn → 整域外轮廓被误删"。
+        审查实测该变异(删哨兵)在窄桥 fixture 上零差异,但在 **grow 域大于
+        seed 域(有真正外轮廓)**的场景误删 32px(80→48)而全套测试仍绿。
+        本测试用外环 grow 包双 seed 的构型钉死它:变异后外轮廓整圈被吃,
+        前景跌破下限即红。
+        """
+        s = np.zeros((20, 20), np.float32)
+        s[5:15, 5:15] = 0.4     # 外环 grow(无 seed 的外轮廓在此)
+        s[8:12, 8] = 0.9        # 左 seed 竖条
+        s[8:12, 12] = 0.9       # 右 seed 竖条
+        binary = hysteresis_binarize(s, 0.5, 0.3)
+        fg = binary != 0
+        # 正确行为:seed 全保留 + 外轮廓大部分保留。变异(删哨兵)后外轮廓
+        # 整圈被删,前景跌到 48,断言红。
+        assert fg.sum() >= 72 + 8, (
+            f"前景={fg.sum()}:两条 seed 竖条(4×4×2=32)必须完整保留,外轮廓"
+            "被哨兵缺失误删时前景跌破此下限(实测变异值 48)")
+        assert fg[8:12, 8].all(), "左 seed 竖条完整保留"
+        assert fg[8:12, 12].all(), "右 seed 竖条完整保留"
+
+    def test_single_pixel_seed_not_eroded_by_boundary(self):
+        """🔴 1px 核不变量(Gate2 2026-09-16 P2-4):接触面判据显式排除 seed,
+        核再窄也不被削空。N5 变异(boundary 不排除 seed)在两核相距 24px 的
+        旧 fixture 上逐位零差异,本测试把两核贴到接触面上钉死该不变量。"""
+        s = np.zeros((5, 9), np.float32)
+        s[2, 2] = 0.9   # 左核 1px
+        s[2, 6] = 0.9   # 右核 1px
+        s[1:4, 1:8] = np.maximum(s[1:4, 1:8], 0.4)  # grow 覆盖两核
+        binary = hysteresis_binarize(s, 0.5, 0.3)
+        assert binary[2, 2] != 0, "1px 左核必须保留"
+        assert binary[2, 6] != 0, "1px 右核必须保留"
+
+    def test_3d_isolated_and_identity(self):
+        s2 = _dual_seed_soft()
+        s3 = np.stack([np.zeros_like(s2), s2, np.zeros_like(s2)])
+        ident = (s3 > 0.5).astype(np.uint8) * 255
+        assert np.array_equal(hysteresis_binarize(s3, 0.5, 0.5), ident)
+        out = hysteresis_binarize(s3, 0.5, 0.3)
+        assert out.shape == s3.shape
+        assert not (out[1, 0:3, 18:22] != 0).any()
+        nodules = split_nodules(out, min_area_ratio=0, close_gap_frames=0)
+        assert len(nodules) == 2
+
+    def test_bad_ndim_raises(self):
+        with pytest.raises(ValueError, match="2D"):
+            hysteresis_binarize(np.zeros(8), 0.5, 0.3)

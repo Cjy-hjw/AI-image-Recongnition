@@ -182,6 +182,87 @@ class TestSegThresholdEnv:
         low_bool, high_bool = low["mask_binary"] != 0, high["mask_binary"] != 0
         assert np.all(high_bool <= low_bool), "高阈值前景必须逐位 ⊆ 低阈值前景"
 
+
+class TestGrowThresholdEnv:
+    """阶段3 手段4:生长阈值 env。默认 = thr_seed(关,恒等)。"""
+
+    @staticmethod
+    def _outputs_with_ring():
+        """中心 seed(sigmoid≈0.9)+ 环 grow-only(≈0.30)+ 孤立 grow-only。"""
+        out = _fake_outputs(seed=1)
+        # logit = log(p/(1-p)); 0.90→+2.197, 0.30→-0.847, 0.10→-2.197
+        m = torch.full((1, 1, 8, 8), -2.197)
+        m[0, 0, 2:6, 2:6] = -0.847     # 环
+        m[0, 0, 3:5, 3:5] = 2.197      # 核
+        m[0, 0, 0, 7] = -0.847         # 孤立,无 seed
+        out["mask"] = m
+        return out
+
+    def test_default_is_identity(self, monkeypatch):
+        monkeypatch.delenv("AICOMP_SEG_GROW", raising=False)
+        monkeypatch.delenv("AICOMP_SEG_GROW_DYNAMIC", raising=False)
+        preds = decode_predictions(self._outputs_with_ring())
+        assert np.array_equal(
+            preds["mask_binary"],
+            (preds["pred_mask"] > 0.35).astype(np.uint8) * 255)
+
+    def test_default_is_identity_sensitive_band(self, monkeypatch):
+        """🔴 敏感带回归锁(Gate2 2026-09-16 P1-2):默认 grow 必须精确等于
+        thr_seed,而不是"thr_seed 附近的某个值"。
+
+        上一版 fixture 概率只有 {0.10, 0.30, 0.90},全在 (0.34, 0.35] 带外——
+        `_grow_threshold` 默认值被变异成 thr_seed-0.01 后 24 项测试照样全绿,
+        "默认关闭=逐位零回归"这条 68.80 基线最依赖的不变量对近恒等扰动零区分力。
+        构型必须是**环包核**(敏感带像素与 seed 连通):p=0.345 的环包着 0.90
+        的核——默认态环必须在 mask 外(0.345<0.35,仅核 4px);若默认 grow 被
+        压低到 0.34,环长进 mask(16px),断言变红。孤立块构型不行:孤立 grow
+        永远被丢弃(不成核是设计),对变异零区分力。logit(0.345)≈-0.6424。
+        """
+        monkeypatch.delenv("AICOMP_SEG_GROW", raising=False)
+        monkeypatch.delenv("AICOMP_SEG_GROW_DYNAMIC", raising=False)
+        out = _fake_outputs(seed=1)
+        m = torch.full((1, 1, 8, 8), -2.197)   # 0.10 背景
+        m[0, 0, 2:6, 2:6] = -0.6424            # 0.345 环(敏感带)
+        m[0, 0, 3:5, 3:5] = 2.197              # 0.90 核(seed)
+        out["mask"] = m
+        preds = decode_predictions(out)
+        fg = preds["mask_binary"] != 0
+        assert fg[3:5, 3:5].all(), "seed 核必须进 mask"
+        assert not fg[2, 2] and not fg[5, 5], (
+            "敏感带环像素(0.345<0.35)默认态不得进 mask——若 _grow_threshold"
+            " 默认值被压低到 0.34 以下,环会长进来,本断言变红")
+
+    def test_grow_expands_and_isolated_dropped(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_SEG_GROW", "0.20")
+        preds = decode_predictions(self._outputs_with_ring())
+        fg = preds["mask_binary"] != 0
+        # 核 2×2 + 环 4×4 = 16,孤立 1px 不成核
+        assert int(fg.sum()) == 16
+        assert not fg[0, 7]
+
+    def test_grow_ge_seed_clamps_to_identity(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_SEG_GROW", "0.40")  # ≥ 静态 seed 0.35
+        preds = decode_predictions(self._outputs_with_ring())
+        assert np.array_equal(
+            preds["mask_binary"],
+            (preds["pred_mask"] > 0.35).astype(np.uint8) * 255)
+
+    @pytest.mark.parametrize("raw", ["garbage", "0", "1", "-0.2", "", "inf", "nan"])
+    def test_invalid_grow_clamps_to_identity(self, monkeypatch, raw):
+        monkeypatch.setenv("AICOMP_SEG_GROW", raw)
+        preds = decode_predictions(self._outputs_with_ring())
+        assert np.array_equal(
+            preds["mask_binary"],
+            (preds["pred_mask"] > 0.35).astype(np.uint8) * 255)
+
+    def test_dynamic_grow_env_does_not_affect_static(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_SEG_GROW_DYNAMIC", "0.20")
+        monkeypatch.delenv("AICOMP_SEG_GROW", raising=False)
+        preds = decode_predictions(self._outputs_with_ring(), dynamic=False)
+        assert np.array_equal(
+            preds["mask_binary"],
+            (preds["pred_mask"] > 0.35).astype(np.uint8) * 255)
+
     def test_temperature_scaling_applies_to_distributions(self):
         """概率必须走与 argmax 同一条温度校准通路,而不是绕开校准直接 softmax。"""
         from src.inference.calibration import TemperatureScaler

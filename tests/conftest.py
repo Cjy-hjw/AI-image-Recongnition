@@ -16,3 +16,5 @@ def _isolate_split_envs(monkeypatch):
     """删掉可能影响 split_nodules 默认行为的 AICOMP_* env(含 min_area 同款哨兵)。"""
     monkeypatch.delenv("AICOMP_MAX_NODULES", raising=False)
     monkeypatch.delenv("AICOMP_MIN_AREA_RATIO", raising=False)
+    monkeypatch.delenv("AICOMP_SEG_GROW", raising=False)
+    monkeypatch.delenv("AICOMP_SEG_GROW_DYNAMIC", raising=False)

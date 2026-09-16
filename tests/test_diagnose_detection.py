@@ -629,6 +629,23 @@ def test_sweep_bare_grow_axis_rejected(diag_root, patched_pipeline, tmp_path):
                            sweep=["grow_static=0.28,0.24"]))
 
 
+def test_sweep_grow_ge_thr_rejected_at_entry(diag_root, patched_pipeline,
+                                             tmp_path):
+    """🔴 lane3-4 审查 P1(2026-09-16):grow≥thr 必须**入口**拦截。
+
+    若靠镜像函数内的 raise,毒化发生在 per-case 循环里——run_sweep 的
+    except 把整个 case 记 anomaly,同 case 已算好的合法组合行全部丢失,
+    烧完全量推理产出空报告(与 B 路"键名错误白跑"同型)。
+    """
+    root, xlsx = diag_root
+    with pytest.raises(ValueError, match="必须 < thr"):
+        DD.run_sweep(_Args(root, xlsx, tmp_path / "logs",
+                           sweep=["thr_static=0.35", "grow_static=0.4"]))
+    with pytest.raises(ValueError, match="必须 < thr"):
+        DD.run_sweep(_Args(root, xlsx, tmp_path / "logs",
+                           sweep=["thr_dynamic=0.5", "grow_dynamic=0.5"]))
+
+
 def test_sweep_grow_axis_reaches_hysteresis(diag_root, patched_pipeline,
                                             tmp_path, monkeypatch):
     """kw 透传的区分力:显式 grow 必须到达 hysteresis_binarize。

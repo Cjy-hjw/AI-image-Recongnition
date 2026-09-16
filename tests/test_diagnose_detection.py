@@ -613,6 +613,56 @@ def test_sweep_static_only_axis_not_drag_dynamic(diag_root, patched_pipeline,
         "无 thr_dynamic 轴时动态池不应被扫")
 
 
+def test_parse_sweep_grow_axis():
+    """阶段3 手段4:grow 是 float 轴,须伴随 thr;裸轴入口被派生空护栏拦。"""
+    combos = DD._parse_sweep(["thr_static=0.35", "grow_static=0.28,0.24"])
+    assert combos == [{"thr_static": 0.35, "grow_static": 0.28},
+                      {"thr_static": 0.35, "grow_static": 0.24}]
+    assert all(isinstance(c["grow_static"], float) for c in combos)
+
+
+def test_sweep_bare_grow_axis_rejected(diag_root, patched_pipeline, tmp_path):
+    """裸 grow_static 轴(无 thr 轴)须被派生空护栏拦下。"""
+    root, xlsx = diag_root
+    with pytest.raises(ValueError, match="派生为空"):
+        DD.run_sweep(_Args(root, xlsx, tmp_path / "logs",
+                           sweep=["grow_static=0.28,0.24"]))
+
+
+def test_sweep_grow_axis_reaches_hysteresis(diag_root, patched_pipeline,
+                                            tmp_path, monkeypatch):
+    """kw 透传的区分力:显式 grow 必须到达 hysteresis_binarize。
+    fixture 块 soft=0.9,0.28/0.24 同结果,不 spy 测不出漏接线。"""
+    calls = []
+    real = DD.hysteresis_binarize
+
+    def spy(soft, thr_seed, thr_grow):
+        calls.append((thr_seed, thr_grow))
+        return real(soft, thr_seed, thr_grow)
+
+    monkeypatch.setattr(DD, "hysteresis_binarize", spy)
+    root, xlsx = diag_root
+    DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.35", "grow_static=0.28,0.24"]))
+    got = sorted({c[1] for c in calls})
+    assert got == [0.24, 0.28], (
+        f"grow 显式传参未到达 hysteresis_binarize(收到 {got})")
+
+
+def test_sweep_static_grow_not_drag_dynamic(diag_root, patched_pipeline,
+                                            tmp_path):
+    """纯静态 grow 扫参不得拖起动态池。"""
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.5", "grow_static=0.28"]))
+    assert not [r for r in report["results"] if r["is_dynamic"]]
+    sta = [r for r in report["results"] if not r["is_dynamic"]]
+    assert len(sta) == 1
+    assert sta[0]["combo"]["grow"] == 0.28
+
+
 def test_analyze_diag_sidecar(diag_root, patched_pipeline, tmp_path):
     """次病灶归因脚本:主/次分桶 + 匹配率与 sidecar 一致 + 交叉表结构。"""
     from scripts.analyze_diag_sidecar import analyze

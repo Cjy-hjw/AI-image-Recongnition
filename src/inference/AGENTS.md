@@ -427,6 +427,11 @@ loader 默认只抽 32 帧 —— 直接堆叠抽样帧的 mask 会让 Z 长度�
 > (单通道二值图不能靠"最近 seed 归属"分离——归属后仍 8/26 连通,必须删边界
 > 非 seed 像素)。接线点=`postprocess.decode_predictions` 的 `mask_binary`,
 > 默认关(grow=seed)。扫参轴 `grow_static`/`grow_dynamic` 见 `diagnose_detection`。
+> Gate2 四路审查(2026-09-16)定案的扫参判读注意事项:①grow 光环会让
+> sub-min_area 的小 seed 通过面积过滤(新 FP 面,grow 扫参须与 min_area
+> 联合判读);②`AICOMP_CLEAN_2D=1` 的 3×3 闭运算会把滞回切开的接触面
+> 重新桥接(潜伏冲突,当前 clean_2d 判死默认关);③grow 后小核+光环可
+> 反超大核,max_nodules 截断的面积序会翻转(跨配置对拍同一实例时注意)。
 
 官方要求**每个检出结节**单独一条记录,而本项目模型输出的是**单通道整图 mask**
 (`multi_task_model.seg_head` 是 `Conv2d(20,1,1)`,无实例分割概念)。本模块用连通域

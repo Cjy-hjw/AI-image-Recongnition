@@ -807,6 +807,17 @@ def run_sweep(args) -> dict:
             f"扫参组合派生为空(输入 {args.sweep}):至少需要一个 "
             "thr_static=... 或 thr_dynamic=... 轴;min_area/max_nodules/"
             "grow_static/grow_dynamic 是阈值轴的伴随参数")
+    # 🔴 grow≥thr 入口校验(lane3-4 审查 P1,2026-09-16):镜像函数内的
+    # raise 发生在 per-case 循环里,run_sweep 的 except 会把整个 case 记
+    # anomaly——已算好的合法组合行全部被毒化,烧完 54 分钟推理产出空报告
+    # (与 B 路"键名错误白跑"同型)。必须入口即拦:grow 是阈值的伴随参数,
+    # 且须 < 同侧阈值(hysteresis 对 grow≥thr 静默恒等退化)。
+    for label, pool in (("静态", combos_static), ("动态", combos_dynamic)):
+        for d in pool:
+            if "grow" in d and d["grow"] >= d["thr"]:
+                raise ValueError(
+                    f"{label}池 grow({d['grow']}) 必须 < thr({d['thr']}):"
+                    "滞回对 grow≥thr 静默退化为纯阈值扫参,扫了等于没扫")
     _safe_print(f"[sweep] 静态 {len(combos_static)} 组合 × 动态 "
                 f"{len(combos_dynamic)} 组合")
 

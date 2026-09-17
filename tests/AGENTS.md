@@ -130,7 +130,7 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 
 ## 测试总数(单一权威,2026-09-13 实测)
 
-**全套 1180 collected**(2026-09-16 阶段3 手段4 滞回生长 Gate2 收官,`Demo_D`
+**全套 1182 collected**(2026-09-17 诊断 case 级并行提速,`Demo_D`
 环境实测(--ignore=test_preextract_parallel.py,该文件依赖 nibabel 本环境缺失;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
@@ -138,7 +138,10 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 →1158(第三批专审:NaN 防御用例+γ 起点断言+nextafter 边界重构;含顶层 None 不崩/缺值报无法判定/恰好跌0.01档)
 →1180(阶段3 手段4:`test_nodule_split.py` TestHysteresisBinarize 7+哨兵/1px核
 回归锁 2、`test_probability_output.py` TestGrowThresholdEnv 5+敏感带 1、
-`test_diagnose_detection.py` grow 扫参轴 3;Gate2 三路审查 2026-09-16)。
+`test_diagnose_detection.py` grow 扫参轴 3;Gate2 三路审查 2026-09-16)
+→1182(诊断提速:`test_diagnose_detection.py` +2——AICOMP_DIAG_WORKERS 并行/串行
+sidecar 逐位等价(含 group_cases 插入序绝对锚,变异 A 写序反转实测 RED)+ env 钳位
+9 用例;变异 B 静态池丢 case 实测双测试 RED,26 passed 全绿)。
 判回归须同
 环境前后对拍。
 `test_seg_only_schedule.py`(新增,7):`configure_official_stage(seg_only=True)`

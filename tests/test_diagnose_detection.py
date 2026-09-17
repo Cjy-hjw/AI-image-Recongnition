@@ -782,3 +782,68 @@ def test_analyze_rejects_sweep_sidecar(tmp_path):
          "preds": [], "gts": []}])
     with pytest.raises(ValueError, match="sweep sidecar"):
         analyze(str(p))
+
+
+# ── case 级并行(2026-09-17 提速)──
+
+def test_parallel_static_pool_equivalence(diag_root, patched_pipeline, tmp_path,
+                                          monkeypatch):
+    """AICOMP_DIAG_WORKERS=4 与默认 1 的 sidecar 逐位等价(2026-09-17 提速)。
+
+    并行保序设计:executor.map 静态行 + 主线程动态行 → 写入顺序与串行一致。
+    本测试跑两遍 run_diagnosis(一次 env=4 一次默认),sidecar 的行序列
+    (剔除路径里的 tmp 目录差异后)必须完全一致。fake 推理无共享态,
+    并行/串行结果不同 = 调度 bug(顺序错乱/行丢失/重复)。
+    """
+    import json
+    import os
+
+    root, xlsx = diag_root
+
+    # 第一遍:强制 workers=4(静态 2 case 进 2 线程池,动态 1 case 主线程)
+    monkeypatch.setenv("AICOMP_DIAG_WORKERS", "4")
+    report_a = DD.run_diagnosis(_Args(root, xlsx, tmp_path / "logs_par"))
+
+    # 第二遍:删 env 回默认 1(纯串行)
+    monkeypatch.delenv("AICOMP_DIAG_WORKERS", raising=False)
+    report_b = DD.run_diagnosis(_Args(root, xlsx, tmp_path / "logs_ser"))
+
+    def _rows(report):
+        with open(report["meta"]["sidecar"], encoding="utf-8") as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+
+    rows_a, rows_b = _rows(report_a), _rows(report_b)
+    assert len(rows_a) == len(rows_b) == 3, (len(rows_a), len(rows_b))
+    # 绝对锚(变异 A 教训:等价测试对"两臂同构变异"零区分力——写序反转时
+    # 并行/串行两臂一起反,等价仍过。此锚定死行序 = group_cases 插入序,
+    # fixture 构造序 = P1/P2/P3,任何写序改动在此 RED):
+    order = [os.path.basename(r["case_key"]) for r in rows_a]
+    assert order == ["img1.dcm", "img2.dcm", "P3.nii.gz"], order
+    # 逐行逐位对比(case 顺序 = group_cases 插入序,两遍必须同序同内容)
+    for ra, rb in zip(rows_a, rows_b):
+        assert ra == rb, f"并行/串行行不一致:\n{ra}\nvs\n{rb}"
+    # 汇总三池指标也逐位相等(并行只许改墙钟,不许改数)
+    for name in ("static", "dynamic", "combined"):
+        for k in report_a[name]:
+            if k == "runtime_s":
+                continue
+            assert report_a[name][k] == report_b[name][k], (name, k)
+
+
+def test_diag_workers_env_clamping():
+    """_diag_workers 钳位:非法/越界/负数一律回 1,合法 1-4 直通,>4 钳 4。"""
+    from scripts.diagnose_detection import _diag_workers
+    import os
+
+    cases = {
+        None: 1, "1": 1, "2": 2, "4": 4, "8": 4,
+        "0": 1, "-2": 1, "abc": 1, "": 1, "3.5": 1,
+    }
+    for raw, want in cases.items():
+        if raw is None:
+            os.environ.pop("AICOMP_DIAG_WORKERS", None)
+        else:
+            os.environ["AICOMP_DIAG_WORKERS"] = raw
+        got = _diag_workers()
+        assert got == want, f"env={raw!r}: got {got} want {want}"
+    os.environ.pop("AICOMP_DIAG_WORKERS", None)

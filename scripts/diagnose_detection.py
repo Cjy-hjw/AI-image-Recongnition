@@ -56,6 +56,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -78,6 +79,28 @@ from src.inference.nodule_split import (  # noqa: E402
     restore_instance_mask, split_nodules)
 from src.inference.v21_output import (  # noqa: E402
     _dynamic_det_conf, _resize_binary, _resize_soft)
+
+
+# ── case 级并行(2026-09-17 提速,grow 扫参 2h9m 只吃 2 核的欠账)────────────
+_ENV_DIAG_WORKERS = "AICOMP_DIAG_WORKERS"
+
+
+def _diag_workers() -> int:
+    """诊断进程的 case 级并行度。默认 1 = 旧串行行为逐位零回归。
+
+    上限 4 的理由(与生产 runner 的 worker≤2 上界不同源):
+    ① 诊断不落盘 mask/prediction.json → 无 #117 同 pid 写文件竞争;
+    ② 诊断链无 gatekeeper/tamper_detector → 无软 flag 并发覆盖;
+    ③ 动态 case 内存峰值 ~8G(3D 稀疏化后),4 路 < 32G 内存余量充足;
+    ④ GPU 单帧前向 ~50ms 非瓶颈,4 路并发显存 ~16-20G < 32G。
+    畸形值(非数字/≤0/超上限)一律钳回 1:诊断要确定性,不产反向行为。
+    """
+    raw = os.environ.get(_ENV_DIAG_WORKERS, "1")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(n, 4))
 
 
 # ── case 聚合 ───────────────────────────────────────────────────────────────
@@ -530,11 +553,45 @@ def run_diagnosis(args) -> dict:
     report_path = os.path.join(args.log_dir, f"detection_diag_{ts}.json")
     case_rows = []
     t0 = time.time()
+    workers = _diag_workers()
+    if workers > 1:
+        _safe_print(f"[diag] case 级并行 workers={workers}"
+                    "(动态 case 在主线程串行,静态 case 进线程池)")
     with open(sidecar_path, "w", encoding="utf-8") as sf:
-        for k, case in enumerate(cases):
-            row = diagnose_one_case(
+        # 并行保序设计(2026-09-17 提速):诊断不落盘 mask/prediction.json、
+        # 无 gatekeeper 共享态,case 之间天然独立——与生产 runner 的
+        # worker≤2 上界约束不同源(那是同 pid 写文件竞争 + 软 flag 覆盖,
+        # 诊断链两者皆无,见 _diag_workers docstring)。
+        # **动态 case 留在主线程串行**:动态例内存 ~8G/例是峰值大头,
+        # 且全帧前向+CPU 后处理已被静态 993 例的线程池填满间隙;
+        # 静态 case(95% 数量、CPU 后处理为主)进池吃多核。
+        # executor.map 保序 → sidecar 写入顺序与旧串行逐位一致,判读零漂移。
+        def _run_static(c):
+            return diagnose_one_case(
                 model, config, calibrator, args.precision, device,
-                case, args.max_frames)
+                c, args.max_frames)
+
+        static_idx = [k for k, c in enumerate(cases) if not c["is_dynamic"]]
+        dyn_idx = [k for k, c in enumerate(cases) if c["is_dynamic"]]
+        if workers > 1 and static_idx:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            try:
+                static_rows = {k: r for k, r in zip(
+                    static_idx,
+                    pool.map(_run_static, [cases[k] for k in static_idx]))}
+            finally:
+                pool.shutdown()
+        else:
+            static_rows = {k: diagnose_one_case(
+                model, config, calibrator, args.precision, device,
+                cases[k], args.max_frames) for k in static_idx}
+        for k in dyn_idx:
+            # 动态串行(主线程):内存大头不叠加;异常语义与旧循环一致。
+            static_rows[k] = diagnose_one_case(
+                model, config, calibrator, args.precision, device,
+                cases[k], args.max_frames)
+        for k in range(len(cases)):
+            row = static_rows[k]
             case_rows.append(row)
             sf.write(json.dumps(row, ensure_ascii=False) + "\n")
             sf.flush()

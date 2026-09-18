@@ -37,7 +37,7 @@
 | `test_mixup_label_dominance.py` | **四头监督闸门 lam 阈值分派 + 软 lam 反向保护**(2026-08-15 新增)——详见下方专节 | 12 | Phase 2 |
 | `test_dynamic_frame_cache.py` | **预抽取 PNG 缓存契约**(2026-08-15 新增)——详见下方专节 | 9 | Phase 1 |
 | `test_detection_match.py` | **检测诊断仪表盘·纯逻辑层**(2026-09-05 新增,检测 AP 3.05 主战场第一步)——官方匹配口径逐条:iou_2d 已知值/双空(「切片全0记0」)/形状不齐拒;iou_dynamic 只遍历标注帧+未覆盖帧记0(官方两条限定)+空标注帧;匈牙利一对一最优+**阈值丢弃**(解里 IoU<0.5 的对双方回未匹配)+空矩阵不崩;**手写 step-wise AP 的 n_gt 分母**(sklearn 虚高口径对拍钉死:单TP+99漏检 sklearn=1.0 vs 真值0.01)+同分合并用**组末下标**(首版用组首下标,同分 FP 被挤出分母 AP 虚高,A路审查实测[1,0]/[0.8,0.8]给1.0真值0.5)+手算PR曲线+TP≤n_gt护栏(A路:无护栏时 n_gt=1 两 TP 静默返回2.0);dedup「各GT最优并集」语义+多GT冲突不误删他GT最优(A路P1:逐列淘汰法`[[0.9,0.2],[0.0,0.8]]`误删gt0最优,级联ap_dedup语义反转);ap_breakdown四件套(oracle==匹配率/碎裂场景手算)+桶边界(0.1/0.35/0.5名实一致)+NaN落invalid桶(A路:NaN曾静默落">=0.5"命中桶)+anomaly行跳过+主/次病灶匹配率+临界带占比 | 22 | — |
-| `test_diagnose_detection.py` | **检测诊断仪表盘·端到端**(2026-09-05 新增)——合成 P1静态单GT/P2静态一图两GT(钉死只推理一次+一起进匈牙利)/P3动态5帧mask帧1/3非零;fake与真实`diagnose_*_case`返回**逐键一致**(B路P0教训:fake多给`n_total_frames`自证键,把「动态链漏注入」藏在测试外);fake预测图用**MODEL_HW=32×32**≠原图64×64(B路变异注入实证:同尺寸resize恒等映射,插值/尺寸漂移全被吞);**等价回归双桩**(动:write_case_v21 vs run_dynamic_inference_from_result,n_total=100抽帧{0,70,99}使gap±1落在区分窗口——n_sampled=32/gap去+1/静态conf常量/插值错误四个变异注入全RED;静:write_case_v21("static") vs run_static_inference_from_result,conf∈(0.1,0.9)开区间排除常量与二值化漂移);GT帧数≠n_total记anomaly跳过;mask_path=None过滤;动态conf「帧覆盖率语义」钉死(scatter二值化后=1.0,与生产逐位一致) | 5 | — |
+| `test_diagnose_detection.py` | **检测诊断仪表盘·端到端**(2026-09-05 新增)——合成 P1静态单GT/P2静态一图两GT(钉死只推理一次+一起进匈牙利)/P3动态5帧mask帧1/3非零;fake与真实`diagnose_*_case`返回**逐键一致**(B路P0教训:fake多给`n_total_frames`自证键,把「动态链漏注入」藏在测试外);fake预测图用**MODEL_HW=32×32**≠原图64×64(B路变异注入实证:同尺寸resize恒等映射,插值/尺寸漂移全被吞);**等价回归双桩**(动:write_case_v21 vs run_dynamic_inference_from_result,n_total=100抽帧{0,70,99}使gap±1落在区分窗口——n_sampled=32/gap去+1/静态conf常量/插值错误四个变异注入全RED;静:write_case_v21("static") vs run_static_inference_from_result,conf∈(0.1,0.9)开区间排除常量与二值化漂移);GT帧数≠n_total记anomaly跳过;mask_path=None过滤;动态conf「帧覆盖率语义」钉死(scatter二值化后=1.0,与生产逐位一致)。**2026-09-18 扩至 26**:机制采集接线(`--mechanism-audit` 开/关零回归——开关前后预测实例/匹配/AP **逐位不变**)、`cls_preds` 快照落 sidecar v2、机制采集失败落 `anomaly` 而非静默丢行、`_mechanism_pool_summary` 的 anomaly 计数按 `int(row.get("n_gt") or 0)`(P1-A) | 26 | — |
 
 ---
 
@@ -128,10 +128,51 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 (Gate2 F3:3D/4D 在下游 cv2.resize 被当多通道图静默放行,与 t_probs 长度
 校验同一教义)。另钉 env 开关边界 9 档 + override=None 逐位等价旧版。
 
+## `test_detection_audit.py` — 机制分账纯逻辑(41 项,2026-09-18 新增,plan 任务 A)
+
+`scripts/detection_audit.py` 的契约锁(无 I/O 无 torch,只依赖 numpy)。五机制判据
+边界用 `nextafter` 构造相邻浮点值钉死(`0.10/0.15/0.35/0.45/0.50` 各两侧);
+多标签 + 主桶优先级 `5→2→3→4→1` 的**唯一 GT 并集计数**(禁重复计数)与交叉表;
+三态 flags(`True/False/None`)语义——**全 False→unclassified,全 False 且任一 None
+→unobservable**(不拿"没证据"当"零命中"强归类;有任一机制命中时不因软证据缺失
+让位 unobservable)。
+
+🔴 **两个必须保留的设计约束(各有测试钉死)**:
+1. **`soft_valid=False` 时数值字段必须是 `None` 不是 NaN** —— 返回 NaN 会被
+   `json.dumps(allow_nan=False)` 拒写整行,判定路径靠 `soft_valid` 短路;
+2. **`aggregate_mechanism_counts` 信任行内 `mechanism_primary`/`mechanism_flags`,
+   缺键才重算**(2026-09-18 再审 P1-B)——行内值由 `diagnose_one_case` 在**未舍入
+   值**上算好随行落盘,重算会消费 `round(6)` 后的落盘副本,round 窗口 ≈5e-7
+   足以翻转 mech1/mech4,导致报告与行内字段**逐例矛盾**。
+
+机制4 的带外早退(2026-09-18 Gate2 P1-4):`max_iou` 已不在 `[0.35,0.5)` 时直接
+`False`,不因缺质心证据被拉进 unobservable——"max_iou=0 明确非漂移"本可判定。
+cls_preds 快照(`_classification_snapshot`)3 例覆盖静态直读/动态复用生产
+`_lesion_level_head_preds` per_frame 均值。
+
+## `test_compare_detection_runs.py` — 恒定人口分类分对拍(22 项,2026-09-18 新增,plan 任务 B)
+
+`scripts/compare_detection_runs.py` 的契约锁。frozen 人口(基线实际匹配 GT 稳定 ID,
+**不取交集**——候选丢难病例后会虚假改善)/分母筛选/`population_delta`/`S_det_seg`/
+None 传染(任一指标 None = 无法裁决,不按 0 填充)/bootstrap 人口校验。
+
+🔴 **交付口径 Kappa 的接线必须用 argmax≠期望取整的分裂预测构造**——`_delivery_hard`
+直用生产 `_qwk_round`(银行家舍入),测试若只验"值在合法范围"则占位换真值后仍绿
+而零区分力([[placeholder-tests-stay-green-after-wiring]])。位置 AUC 方向性测试
+用**峰列**构造(gt=2 峰列 1、gt=4 峰列 3),反转测试交换峰列——防 fixture 退化
+导致方向断言恒 GREEN。
+
+🔴 **位置编码 off-by-one 已修**:xlsx `lesion_loc` 码 1..7 vs `location_probs`
+0-based idx,**必须 `码-1`**;`probs[:, present]` 里 `present` 是列索引不是布尔掩码。
+
+`row_skip_stats`(`anomaly_gt`/`no_cls_preds_gt`)按 run 重置并汇总进
+`views["row_skip_stats"]`——异常 GT 与无 cls_preds 的 GT 都进不了分类人口,
+必须显式计数而非静默丢弃。空文件 raise;bootstrap 失败落 `bootstrap_error`
+不丢报告;`json.dump(allow_nan=False)`。
+
 ## 测试总数(单一权威,2026-09-13 实测)
 
-**全套 1182 collected**(2026-09-17 诊断 case 级并行提速,`Demo_D`
-环境实测(--ignore=test_preextract_parallel.py,该文件依赖 nibabel 本环境缺失;
+**全套 1254 collected**(2026-09-18 seg_only 调教轮,`Demo_D` 环境实测;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
 →1156(修复轮专审:`test_seg_only_gate.py` 新增 6——护栏纯函数终于有测试,
@@ -141,7 +182,15 @@ D2 TTA 的契约锁。fixture 用「确定性的空间不对称响应」构造�
 `test_diagnose_detection.py` grow 扫参轴 3;Gate2 三路审查 2026-09-16)
 →1182(诊断提速:`test_diagnose_detection.py` +2——AICOMP_DIAG_WORKERS 并行/串行
 sidecar 逐位等价(含 group_cases 插入序绝对锚,变异 A 写序反转实测 RED)+ env 钳位
-9 用例;变异 B 静态池丢 case 实测双测试 RED,26 passed 全绿)。
+9 用例;变异 B 静态池丢 case 实测双测试 RED,26 passed 全绿)
+→1250(架构冲刺 A/B:`test_detection_audit.py` **41** 新增 + `test_compare_detection_runs.py`
+**22** 新增 + `test_diagnose_detection.py` 21→**26**(机制采集/cls_preds 快照/anomaly
+计数);三路审查 + 修复轮 10 finding 全闭环,2026-09-18)
+→1254(seg_only 调教:`test_seg_only_gate.py` 7→**11**——dice 门已删的回归锁
+`test_zero_dice(0.0)`(变异实杀验证:加回 0.3 门即 RED)/`test_low_dice(0.60)`/
+`test_dice_none_still_decidable` + 快照纯函数 2 项(`_snapshot_path` 版本化命名/
+`_SEG_SNAPSHOT_EPOCHS` 上限锚 SEG_ABORT_EPOCH;删 ep20 变异存活是已知测试力边界,
+由任务书 §2 的 6 产物清单兜底);单路审查 2026-09-18,P1×2 已修)。
 判回归须同
 环境前后对拍。
 `test_seg_only_schedule.py`(新增,7):`configure_official_stage(seg_only=True)`

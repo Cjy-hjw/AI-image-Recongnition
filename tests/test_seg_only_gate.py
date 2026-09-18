@@ -5,22 +5,28 @@
 否则抽出的动作只换了位置没换覆盖。同型先例:tests/test_seg_guards.py 之于
 evaluate_seg_guards。
 
-关键分支(修复轮专审 F6 一并钉死:顶层 None 不崩、报"无法判定"):
-1. val_dice 达标 + 五项全不跌 → (True, 已过)
-2. val_dice 不达标 → (False, 未过)
-3. 某项跌超 0.01 → (False, 未过+列明细)
-4. 指标缺值(基线/当轮 None)→ (None, 无法判定)——🔴 pass 门跳过 None 是
+🔴 2026-09-18 seg_only 调教:**val_dice≥0.72 硬门已删**(当年判死用的错尺子,
+P0 验尸实锤官方口径下 seg_only 双超 r5;选模改由训后快照官方口径筛)。本文件
+同步改写:dice 不再参与判定(低 dice 不再 False),并补快照路径纯函数测试。
+
+关键分支:
+1. 五项全不跌 → (True, 已过)——**即使 val_dice 很低**(0.60 也过,门只管冻结泄漏)
+2. 某项跌超 0.01 → (False, 未过+列明细)
+3. 指标缺值(基线/当轮 None)→ (None, 无法判定)——🔴 pass 门跳过 None 是
    把"测不出"当"通过",与 abort 门的保守方向相反
-5. 顶层入参 None(val_dice/seg_baseline/metrics)→ (None, 无法判定)不崩
-   (2026-09-14 修复轮专审 F6:此前 math.isfinite(None) 直接 TypeError)
-6. 恰好跌 0.01 不算越界(> 0.01 判据)
+4. 顶层入参 None(seg_baseline/metrics)→ (None, 无法判定)不崩
+5. 恰好跌 0.01 不算越界(> 0.01 判据)
+6. 快照路径:<out 去后缀>_ep<N>.pth;快照点上限锚 SEG_ABORT_EPOCH
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.train_official import evaluate_seg_only_gate  # noqa: E402
+from scripts.train_official import (  # noqa: E402
+    evaluate_seg_only_gate, _snapshot_path, _SEG_SNAPSHOT_EPOCHS,
+    SEG_ABORT_EPOCH,
+)
 
 _BASE = {
     "malignancy_auc_pr": 0.9359, "tirads_weighted_kappa": 0.8733,
@@ -41,10 +47,29 @@ def test_all_pass():
     assert any("已过" in ln for ln in lines)
 
 
-def test_dice_below_threshold_fails():
-    ok, lines = evaluate_seg_only_gate(0.71, dict(_BASE), _cur())
-    assert ok is False
-    assert any("未过" in ln for ln in lines)
+def test_low_dice_no_longer_fails():
+    """🔴 2026-09-18 删 dice 硬门:低 dice 不再 False。当年 0.6861<0.72 被判
+    死,而官方口径下它是最强的——门只管"分类是否冻住",dice 留档不判。"""
+    ok, lines = evaluate_seg_only_gate(0.60, dict(_BASE), _cur())
+    assert ok is True
+    assert any("已过" in ln for ln in lines)
+    # dice 仍出现在留档文案里(操作者能对照)
+    assert any("0.6000" in ln for ln in lines)
+
+
+def test_zero_dice_no_longer_fails():
+    """🔴 dice=0.0 也过:这条断言专门杀"dice 门被加回"变异——审查实锤
+    val_dice=0.60/None 对任何合理阈值(0.0,0.6)恒 GREEN 零区分力,加回
+    0.3/0.5 门只有 0.0 这种极值才 RED。0 是真实可达值(分割未起步)。"""
+    ok, _ = evaluate_seg_only_gate(0.0, dict(_BASE), _cur())
+    assert ok is True
+
+
+def test_dice_none_still_decidable():
+    """val_dice=None(旧版顶层 None 报无法判定):删门后不再参与判定,
+    缺失也能判分类门——但这不是"把测不出当通过"(测的是分类,dice 只是留档)。"""
+    ok, _ = evaluate_seg_only_gate(None, dict(_BASE), _cur())
+    assert ok is True
 
 
 def test_classification_drop_fails_with_detail():
@@ -61,17 +86,15 @@ def test_missing_metric_values_reports_undecidable():
     assert ok is None
     assert any("无法判定" in ln for ln in lines)
     # 基线 None 同理
-    base = dict(_BASE); base["clinical_t_auc"] = None
+    base: dict = dict(_BASE); base["clinical_t_auc"] = None
     ok2, _ = evaluate_seg_only_gate(0.75, base, _cur())
     assert ok2 is None
 
 
 def test_toplevel_none_inputs_report_undecidable_not_crash():
-    # 修复轮专审 F6:math.isfinite(None) 曾 TypeError,现报无法判定
-    ok, lines = evaluate_seg_only_gate(None, dict(_BASE), _cur())
-    assert ok is None and any("无法判定" in ln for ln in lines)
-    ok2, _ = evaluate_seg_only_gate(0.75, None, _cur())
-    assert ok2 is None
+    # seg_baseline/metrics None → 无法判定;val_dice None 不再拦(删门后仅留档)
+    ok, _ = evaluate_seg_only_gate(0.75, None, _cur())
+    assert ok is None
     ok3, _ = evaluate_seg_only_gate(0.75, dict(_BASE), None)
     assert ok3 is None
 
@@ -112,3 +135,21 @@ def test_exactly_01_drop_is_not_violation():
     ok2, _ = evaluate_seg_only_gate(0.75, base,
                                     _cur(ete_weighted_kappa=cur_over))
     assert ok2 is False, f"差值 {0.6 - cur_over!r} 应越界"
+
+
+# ── 快照路径与快照点(2026-09-18 调教)────────────────────────────────────
+
+
+def test_snapshot_path_versioned():
+    assert _snapshot_path("checkpoints/seg_v2.pth", 8) == \
+        "checkpoints/seg_v2_ep8.pth"
+    # 无后缀/多后缀:splitext 只去最后一段
+    assert _snapshot_path("checkpoints/seg_v2", 4) == "checkpoints/seg_v2_ep4.pth"
+    assert _snapshot_path("checkpoints/a.b.pth", 12) == "checkpoints/a.b_ep12.pth"
+
+
+def test_snapshot_epochs_within_gamma_window():
+    """快照点上限必须 ≤ SEG_ABORT_EPOCH(γ_prior ep≤20 恒 0 单变量窗口):
+    越界 = 快照落在 γ>0 区间,单变量前提被污染。常量同源防漂移。"""
+    assert _SEG_SNAPSHOT_EPOCHS[-1] <= SEG_ABORT_EPOCH
+    assert _SEG_SNAPSHOT_EPOCHS == tuple(sorted(set(_SEG_SNAPSHOT_EPOCHS)))

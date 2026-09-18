@@ -218,3 +218,10 @@ train:
   #   → 0 剔除;lovasz 0.1→0.3(P0 轮 2 +1.07pt 是权重 0.1 的上限,非损失上限,
   #   Lovász=IoU 优化正是漏检分账指向的欠分割药方)。
   seg_lovasz_weight: 0.3
+  # plan 任务C CC-DiceCE(新架构线,2026-09-18):实例级局部 DiceCE,默认 0 关闭
+  # ——主 config 是**生产默认**,CC 实验用版本化实验配置
+  # (configs/thyroid_config_ccdice.yaml,Boundary/Lovász 保持 0 隔离变量)。
+  # 权重=0 时对 loss 精确零贡献,zero-weight 回归测试钉死。
+  # 起手权重按量级标定反推(先 1ep 读 loss_seg_ccdice 分项,对齐目标
+  # ≈0.2-1× 主项),勿抄绝对数(r7 事故同型)。
+  seg_ccdice_weight: 0.0

@@ -94,6 +94,9 @@ class MultiTaskLoss(nn.Module):
         # seg_lovasz_weight)。
         self.seg_boundary_weight = float(cfg.get("seg_boundary_weight", 0.0))
         self.seg_lovasz_weight = float(cfg.get("seg_lovasz_weight", 0.0))
+        # plan 任务C CC-DiceCE(2026-09-18,新架构线):默认 0 = 老路径零回归,
+        # 权重在 config.train.seg_ccdice_weight;门/横幅见 train_official。
+        self.seg_ccdice_weight = float(cfg.get("seg_ccdice_weight", 0.0))
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
         # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径,零回归。
@@ -143,11 +146,12 @@ class MultiTaskLoss(nn.Module):
             if 'mask' in task_mask and 'valid_mask' not in targets:
                 targets = {**targets, 'valid_mask': task_mask['mask'].float()}
 
-        # 1. Segmentation Loss (自动应用valid_mask;Boundary/Lovász 可选外挂)
+        # 1. Segmentation Loss (自动应用valid_mask;Boundary/Lovász/CC-DiceCE 可选外挂)
         loss_seg, seg_extra = compute_segmentation_loss(
             self.bce_seg, self.dice_seg, outputs, targets,
             boundary_weight=self.seg_boundary_weight,
             lovasz_weight=self.seg_lovasz_weight,
+            ccdice_weight=self.seg_ccdice_weight,
         )
 
         # 2. Concept losses

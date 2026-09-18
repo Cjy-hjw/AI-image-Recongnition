@@ -467,6 +467,23 @@ SEG_ABORT_EPOCH, SEG_ABORT_DICE = 20, 0.02
 # composite 早停警告阈值。口径含 seg_dice 后由 0.35 下调,见 main() 注释。
 COMPOSITE_WARN = 0.30
 
+# ── seg_only 版本化快照(2026-09-18 调教,总纲 §6.4)──────────────────────
+# 预注册快照点。🔴 不加快照则训完只有一个权重,仍走"composite(无 AP 无匹配)
+# 选模"老路——P0 验尸实锤官方口径下最强权重与 composite 最优不同源。
+# 上限锚 SEG_ABORT_EPOCH(=20,γ_prior 单变量窗口),两常量同源防漂移:
+# 若提预算须同步改,否则快照点落在 γ>0 区间污染单变量前提。
+_SEG_SNAPSHOT_EPOCHS = (4, 8, 12, 16, 20)
+
+
+def _snapshot_path(out_path: str, epoch: int) -> str:
+    """--out → 快照路径:<out 去后缀>_ep<N>.pth,同目录。
+
+    复用 --out 的目录与可写性预检(冒烟/真训共用同一防线);版本化命名与
+    `--out 必须版本化` 三硬门同型,防止快照冒充/覆盖 best 文件。
+    """
+    root, _ext = os.path.splitext(out_path)
+    return f"{root}_ep{epoch}.pth"
+
 
 def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss) -> dict:
     """epoch 级 val 指标 → JSONL `extra` 字段。
@@ -584,8 +601,12 @@ def evaluate_seg_guards(epoch: int, val_dice, metrics: dict, epochs: int):
     return None, "", warns
 
 
-# seg_only 门指标:val_dice 硬门 + 分类五项降幅门。
-_SEG_GATE_DICE = 0.72        # Q7 基线 0.6974 + 0.023 余量
+# seg_only 门指标:分类五项降幅门。
+# 🔴 2026-09-18 seg_only 调教(总纲 §6.4/P0 翻案):**val_dice≥0.72 硬门已删**——
+# 当年 seg_only 判死就死在这把错尺子上(像素 dice 0.6754→0.6861 未过 0.72 门,
+# 而官方口径下它是最强的:匹配 0.8469/AP 0.8149 双超 r5)。像素 dice 与官方
+# IoU 匹配口径脱节,Lovász 优化的恰是 IoU。选模改为训完对版本化快照各跑
+# diagnose_detection 用官方口径筛(train_official 不再单裁上线资格)。
 _SEG_GATE_DROP = 0.01        # 分类五项各不降超此值
 _SEG_GATE_KEYS = {
     "malignancy_auc_pr": "mal", "tirads_weighted_kappa": "tirads",
@@ -599,10 +620,15 @@ def evaluate_seg_only_gate(val_dice, seg_baseline, metrics):
     2026-09-14 Gate2 F7-1 的要求——内联在 main 的 epoch 循环里 = 零测试覆盖,
     复刻 evaluate_seg_guards 抽出前的同型缺陷)。
 
-    门 = val_dice ≥ 0.72 **且** mal/tirads/loc/t/ete 各不降超 0.01(对照
-    epoch=0 同源基线)。单变量原则下分类五项理论上梯度精确 0(全冻),此门
-    测的是"是否真冻住"——若某项跌超 0.01,说明 requires_grad/param_groups
-    配置有泄漏(BN running stats/共享层等)。
+    🔴 2026-09-18 调教:**val_dice≥0.72 硬门已删**(当年判死用的错尺子,
+    P0 验尸实锤:官方口径下 seg_only 匹配/AP 双超 r5;选模改由训后对快照跑
+    diagnose_detection 官方口径筛)。val_dice 仍作为入参保留——仅供 JSONL
+    留档对照,不再参与判定。
+
+    门 = mal/tirads/loc/t/ete 各不降超 0.01(对照 epoch=0 同源基线)。单变量
+    原则下分类五项理论上梯度精确 0(全冻),此门测的是"是否真冻住"——若某项
+    跌超 0.01,说明 requires_grad/param_groups 配置有泄漏(BN running stats/
+    共享层等)。
 
     🔴 缺值(含顶层入参 None / dict 内 None)**报"无法判定"而非"已过"**:
     pass 门跳过 None 是把"测不出"当"通过"(abort 门跳过 None 才是保守),
@@ -615,14 +641,12 @@ def evaluate_seg_only_gate(val_dice, seg_baseline, metrics):
         (passed, lines):passed=None 表示无法判定(缺基线/缺当轮值)。
     """
     lines: list = []
-    if val_dice is None or seg_baseline is None or metrics is None:
+    if seg_baseline is None or metrics is None:
         return None, ["  [SEG-only 门 无法判定] 顶层入参含 None"
-                      "(val_dice/seg_baseline/metrics)"]
-    if not math.isfinite(val_dice):
-        return None, [f"  [SEG-only 门 无法判定] val_dice={val_dice} 非有限值"]
-    if val_dice < _SEG_GATE_DICE:
-        return False, [f"  [SEG-only 门 未过] val_dice={val_dice:.4f} < "
-                       f"{_SEG_GATE_DICE},不满足上线门槛(不 abort,留权重供分析)"]
+                      "(seg_baseline/metrics)"]
+    # val_dice 仅留档不判(2026-09-18 删 0.72 硬门);非有限值如实留档。
+    _dice_note = (val_dice if (val_dice is not None
+                                and math.isfinite(val_dice)) else None)
     # 🔴 NaN/+inf 与 None 同等报"无法判定"(3B 专审 P2-1:nan>0.01 恒 False、
     # baseline-inf=-inf 也不触发 bad,两种"测不出"都被判"已过"——与函数
     # docstring 的保守纪律矛盾)。当前生产链路大概率不可达(sklearn 对 NaN
@@ -638,7 +662,7 @@ def evaluate_seg_only_gate(val_dice, seg_baseline, metrics):
     ]
     if _missing_or_nonfinite:
         # 逐项列出谁缺,操作者能判断是否可忽略,而不是静默放行。
-        return None, [f"  [SEG-only 门 无法判定] val_dice 达标但指标缺值/非有限:"
+        return None, [f"  [SEG-only 门 无法判定] 指标缺值/非有限:"
                       f" {_missing_or_nonfinite}"
                       f"(不把'测不出'当'通过')"]
     bad = [f"{short}:{seg_baseline[mk]:.4f}→{metrics[mk]:.4f}"
@@ -647,8 +671,11 @@ def evaluate_seg_only_gate(val_dice, seg_baseline, metrics):
     if bad:
         return False, [f"  [SEG-only 门 未过] 分类项跌超 {_SEG_GATE_DROP}: {bad}"
                        f" —— 疑似冻结泄漏,停机排查(不 abort,留权重供分析)"]
-    return True, [f"  [SEG-only 门 已过] val_dice={val_dice:.4f}≥{_SEG_GATE_DICE}"
-                  f" 且分类五项均未跌超 {_SEG_GATE_DROP},可跑分验证"]
+    _dice_str = (f"val_dice={_dice_note:.4f}(仅留档)" if _dice_note is not None
+                 else "val_dice 缺失/非有限(仅留档)")
+    return True, [f"  [SEG-only 门 已过] 分类五项均未跌超 {_SEG_GATE_DROP},"
+                  f"{_dice_str};上线资格以官方口径快照筛为准"
+                  f"(diagnose_detection,2026-09-18 删 dice 硬门)"]
 
 
 def _abort(logger, epoch: int, reason: str, message: str):
@@ -790,8 +817,9 @@ def main():
                          "seg_lovasz_weight 至少一项 > 0(全 0 = 空 微调白烧;"
                          "权重 0 的 1ep 量级标定放行)")
         print(f"[SEG-only 配方] boundary_weight={bw} lovasz_weight={lw} "
-              f"epochs={epochs} (门:val_dice≥0.72 且 mal/tirads/loc/t/ete "
-              f"各不降超 0.01,对照 epoch=0 基线)")
+              f"epochs={epochs} (门:mal/tirads/loc/t/ete "
+              f"各不降超 0.01,对照 epoch=0 基线;🔴 dice 硬门已删 2026-09-18,"
+              f"上线资格以训后快照官方口径筛为准)")
 
     # ── --out 可写性预检(fail-fast,必须在任何耗时操作之前)──────────────────
     # 为什么要有:`torch.save` 失败会抛异常直接中断训练,而保存只发生在每轮 val
@@ -816,6 +844,25 @@ def main():
             f"[FATAL] --out 不可写:{args.out}({type(e).__name__}: {e})。"
             f"训练前置检查失败,拒绝空跑 —— 若等到训练结束才发现,整轮算力全废。"
         )
+    # 快照路径同一预检(P2 修复,2026-09-18 审查):预检只探 args.out 本身,
+    # 快照路径坏(上轮只读残留)要到 ep4 才炸,前面全废。探针语义与 --out 同型
+    # ("ab" 不截断、仅 0 字节新建才删);仅 seg_only 真训需要,其余轮次零成本跳过。
+    if args.seg_only and args.smoke is False:
+        for _se in _SEG_SNAPSHOT_EPOCHS:
+            if _se > epochs:
+                break  # 快照点在预算外(短训),不预检不落盘
+            _sp = _snapshot_path(args.out, _se)
+            try:
+                with open(_sp, "ab"):
+                    pass
+                if os.path.getsize(_sp) == 0:
+                    os.remove(_sp)
+            except OSError as e:
+                raise SystemExit(
+                    f"[FATAL] seg_only 快照路径不可写:{_sp}"
+                    f"({type(e).__name__}: {e})。第 {_se} epoch 才发现 = 前面全废,"
+                    f"拒绝开训(修掉上轮只读残留或换 --out)。"
+                )
 
     # ── 数据 ──────────────────────────────────────────────────────────────
     if args.mock_labels:
@@ -893,8 +940,8 @@ def main():
         _baseline_row.update({k: v for k, v in base_metrics.items()
                               if isinstance(v, (int, float))})
         _baseline_pending = _baseline_row
-        # 🔴 seg_only 六项护栏的分类五项基线(阶段2,2026-09-13):门=
-        # "val_dice≥0.72 且 mal/tirads/loc/t/ete 各不降超 0.01(对照 epoch=0)"
+        # 🔴 seg_only 护栏的分类五项基线(阶段2,2026-09-13):门=
+        # "mal/tirads/loc/t/ete 各不降超 0.01(对照 epoch=0)"
         # 需要逐指标基线,与 ETE 小试同源(epoch=0/phase=val 已写 JSONL,上面)。
         # 此处额外钉运行时断言变量(逐 epoch 判降幅用)。
         if args.seg_only:
@@ -1059,6 +1106,33 @@ def main():
                     for mk, v in ((k, metrics.get(k)) for k in _SEG_GATE_KEYS)})
                 logger.log(epoch=epoch, step=0, phase="val", checkpoint=args.out,
                            extra=_best_extra)
+
+            # ── seg_only 版本化快照(ep4/8/12/16/20,2026-09-18 调教)──────────
+            # 🔴 当年判死的第二把尺子:只有 best-composite 单文件,选模被 composite
+            #    (无 AP 无匹配)垄断。快照让训后能用 diagnose_detection 官方口径
+            #    逐个筛(P0 轮 2 实锤:官方口径下最强权重与 composite 最优不同源)。
+            # 只在 seg_only 真训落(冒烟/标定不落,防冒烟产物冒充快照);路径=
+            # <out 去后缀>_ep<N>.pth,与 --out 同目录,不覆盖 best 文件。
+            if (args.seg_only and args.smoke is False
+                    and epoch in _SEG_SNAPSHOT_EPOCHS):
+                _snap = _snapshot_path(args.out, epoch)
+                # 覆盖警告(P2 修复,2026-09-18 审查):同 --out 二跑会静默覆盖首轮
+                # 快照且 best_epoch 指针随之指错。不阻断(重跑同 out 本就是重做
+                # 同一实验),但必须在 stdout+JSONL 留痕,否则事后无从区分
+                # "快照是本轮产物"还是"首轮残留"。
+                _snap_reused = os.path.exists(_snap)
+                if _snap_reused:
+                    print(f"  [快照 warn] {_snap} 已存在,本轮覆盖写(上轮残留;"
+                          f"若非有意重跑,先 mv 走旧快照再启动)")
+                torch.save(model.state_dict(), _snap)
+                logger.log(epoch=epoch, step=0, phase="val", checkpoint=_snap,
+                           extra={"snapshot": True,
+                                  "snapshot_epoch": epoch,
+                                  "snapshot_overwrote_existing": bool(_snap_reused),
+                                  "val_dice": round(float(val_dice), 6),
+                                  "composite": (round(float(composite), 6)
+                                                if composite is not None else None)})
+                print(f"--> 保存快照 ep{epoch} → {_snap}")
         # 循环结束:composite 可能全程 None(val 子集单类/无恶性主病灶时各指标均不可算),
         # 此时无条件存最终权重保证有产物。**不能加 `not os.path.exists(args.out)`**——
         # 第二次运行时该文件已存在,兜底会被跳过、训练白跑零产出(Gate2 lane4 查出)。

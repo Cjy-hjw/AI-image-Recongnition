@@ -213,5 +213,8 @@ train:
   #   旧版"起手 0.1-0.3"是 b/main≈1 假设下的数字,照抄 = boundary 只贡献
   #   主项的 ~2%,近似空微调(r7 同型,权重非 0 硬门挡不住)。
   #   对齐目标 = 加权后分项贡献 ≈ 0.2-1× 主项;先跑 1 epoch 读分项再定。
-  seg_boundary_weight: 0.1
-  seg_lovasz_weight: 0.1
+  seg_boundary_weight: 0.0
+  # 🔴 2026-09-18 seg_only 调教(总纲 §6.4):boundary 标定实测 ≈-0.0007 零信号
+  #   → 0 剔除;lovasz 0.1→0.3(P0 轮 2 +1.07pt 是权重 0.1 的上限,非损失上限,
+  #   Lovász=IoU 优化正是漏检分账指向的欠分割药方)。
+  seg_lovasz_weight: 0.3

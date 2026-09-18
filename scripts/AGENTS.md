@@ -71,13 +71,44 @@ If any gate fails (Exit Code != 0), output a structured JSON diagnostic report: 
 
 | 脚本 | 用途 | 关键参数/产出 | 注意事项 |
 |:---|:---|:---|:---|
-| `train_official.py` | **官方四头(位置/ETE/临床T/TI-RADS)A/B/C 调度训练入口**(Phase E,2026-08-13;backlog #124 补 TI-RADS 后同一调度自动覆盖四头)。复用 `train_batch`(内建四头 targets 组装,归属闸门按 lam 阈值 `<=0.35` donor / `>=0.65` recipient 分派,详见 `src/training/AGENTS.md`),调度走 `src/training/schedule_official.py` | `--data-root --xlsx`(官方数据,云端)/`--mock-labels --smoke`(本地合成冒烟)/`--resume-from`(分割底座 warm-start)/`--hflip-prob`/`--freeze-legacy`/`--log-dir`/**`--samples-pkl <cache-dir>/samples.pkl`**(2026-08-15 新增:跳过 10-25 分钟样本重建,必与预抽取 `--img-size` 一致,见 `scripts/data/preextract_dynamic.py` 行);产出 `checkpoints/official_heads_best.pth` + JSONL 日志 | **不动 `train.py`**(legacy 交付路径);warm-start 用 `strict=False` 但**断言 missing_keys ⊆ 四头前缀**(多缺一个非头键即 fail-loud,杜绝静默半载);**Dice 护栏**相对 warm-start 基线跌 >1 点警、>3 点 abort(防重演 Stage2 崩塌);默认**保留 legacy 多任务损失**守护旧任务,`--freeze-legacy` 才纯头训练;JSONL 默认落 V2.1 强制的容器绝对路径,本地必须传 `--log-dir logs`。🔴 **`--out` 可写性预检(2026-08-13 加,位置在 argparse 之后、建数据集/建模型/warm-start 之前)**:`torch.save` 只在每轮 val 后执行,35 epoch 跑到第 30 轮才发现写不进去 = 前面全废。**`os.makedirs` 测不出这个** —— A800 实测复现:`checkpoints/` 目录 owner 是当前用户可写(makedirs 通过),但目标文件 owner 是 root、模式 644,`torch.save` 走 open(w) 覆盖时 Permission denied,**目录可写 ≠ 目标文件可写**。探针用 `open(path,"ab")`(append 不截断,已有权重零风险)+ 仅当 `size==0` 才删(绝不误删已有权重),失败即 `SystemExit`。三环境对拍实测:不可写时 `EXIT=1 / FATAL=1 / [smoke]=0 / Epoch=0`,正常时 `EXIT=0 / SMOKE_OK=1 / Epoch=3`。**`torch.amp.GradScaler(device.type, ...)`** 用新 API(`torch.cuda.amp.GradScaler` 在 2.8 已 deprecated,见 `docs/交付与部署/torch2.8迁移方案.md:80`;传 `device.type` 而非硬编码 `'cuda'`,CPU 冒烟不刷无谓警告;上游未把它放进 `torch.amp.__all__`,故带 `# type: ignore`,2.5.1/2.6.0/2.8.0 三版**运行时均实测可构造**)。warm-start 的 `torch.load` 显式 `weights_only=False` 是**防御性**非修 bug(A800 torch2.6 实测 17 个 checkpoint:分割底座均为纯 OrderedDict、默认参数下正常;唯一失败的 `authenticity_model.pth` 由 `gatekeeper/authenticity.py:229` 自己以 `weights_only=False` 加载,不走这里) |
+| `train_official.py` | **官方四头(位置/ETE/临床T/TI-RADS)A/B/C 调度训练入口**(Phase E,2026-08-13;backlog #124 补 TI-RADS 后同一调度自动覆盖四头)。复用 `train_batch`(内建四头 targets 组装,归属闸门按 lam 阈值 `<=0.35` donor / `>=0.65` recipient 分派,详见 `src/training/AGENTS.md`),调度走 `src/training/schedule_official.py` | `--data-root --xlsx`(官方数据,云端)/`--mock-labels --smoke`(本地合成冒烟)/`--resume-from`(分割底座 warm-start)/`--hflip-prob`/`--freeze-legacy`/`--log-dir`/**`--samples-pkl <cache-dir>/samples.pkl`**(2026-08-15 新增:跳过 10-25 分钟样本重建,必与预抽取 `--img-size` 一致,见 `scripts/data/preextract_dynamic.py` 行);产出 `checkpoints/official_heads_best.pth` + JSONL 日志 | **不动 `train.py`**(legacy 交付路径);warm-start 用 `strict=False` 但**断言 missing_keys ⊆ 四头前缀**(多缺一个非头键即 fail-loud,杜绝静默半载);**Dice 护栏**相对 warm-start 基线跌 >1 点警、>3 点 abort(防重演 Stage2 崩塌);默认**保留 legacy 多任务损失**守护旧任务,`--freeze-legacy` 才纯头训练;JSONL 默认落 V2.1 强制的容器绝对路径,本地必须传 `--log-dir logs`。🔴 **seg_only 快照输出(2026-09-18 调教轮)**:`--seg-only` 真训在 ep4/8/12/16/20 各落一份版本化快照(`_SEG_SNAPSHOT_EPOCHS`/`_snapshot_path`,落 `<out去后缀>_ep<N>.pth`,冒烟/标定不落),快照路径纳入 `--out` 同型可写性预检,覆盖写前 warn+JSONL `snapshot_overwrote_existing` 留痕;`evaluate_seg_only_gate` **val_dice≥0.72 硬门已删**(当年判死用的错尺子,P0 验尸翻案;dice 仅留档,门只剩分类五项降幅 0.01)——选模改为训后对快照跑 diagnose_detection 官方口径筛。🔴 **`--out` 可写性预检(2026-08-13 加,位置在 argparse 之后、建数据集/建模型/warm-start 之前)**:`torch.save` 只在每轮 val 后执行,35 epoch 跑到第 30 轮才发现写不进去 = 前面全废。**`os.makedirs` 测不出这个** —— A800 实测复现:`checkpoints/` 目录 owner 是当前用户可写(makedirs 通过),但目标文件 owner 是 root、模式 644,`torch.save` 走 open(w) 覆盖时 Permission denied,**目录可写 ≠ 目标文件可写**。探针用 `open(path,"ab")`(append 不截断,已有权重零风险)+ 仅当 `size==0` 才删(绝不误删已有权重),失败即 `SystemExit`。三环境对拍实测:不可写时 `EXIT=1 / FATAL=1 / [smoke]=0 / Epoch=0`,正常时 `EXIT=0 / SMOKE_OK=1 / Epoch=3`。**`torch.amp.GradScaler(device.type, ...)`** 用新 API(`torch.cuda.amp.GradScaler` 在 2.8 已 deprecated,见 `docs/交付与部署/torch2.8迁移方案.md:80`;传 `device.type` 而非硬编码 `'cuda'`,CPU 冒烟不刷无谓警告;上游未把它放进 `torch.amp.__all__`,故带 `# type: ignore`,2.5.1/2.6.0/2.8.0 三版**运行时均实测可构造**)。warm-start 的 `torch.load` 显式 `weights_only=False` 是**防御性**非修 bug(A800 torch2.6 实测 17 个 checkpoint:分割底座均为纯 OrderedDict、默认参数下正常;唯一失败的 `authenticity_model.pth` 由 `gatekeeper/authenticity.py:229` 自己以 `weights_only=False` 加载,不走这里) |
 | `pretrain_malignancy.py` | MultiTaskThyroidModel malignancy 通路单帧 CE 预训练基线（绕 CBM 用临时线性头） | `--data-root` `--epochs`(30) `--batch-size`(32) `--smoke` 快速3epoch；产出 `checkpoints/malignancy_pretrain_best.pth` | 无泄漏 val AUC ≈ 0.50（患者级弱标签瓶颈，已确认），**勿据此 checkpoint 微调**；评估强制 `patient_grouped_split` |
 | `pretrain_malignancy_mil.py` | 门控注意力 MIL 患者级 malignancy 预训练（一患者所有帧=一个 bag） | 阶段1（冻结backbone）：`--epochs --batch-size --max-frames-per-bag`；阶段2加 `--unfreeze-backbone --resume-from --backbone-lr-scale --llrd-eta`；产出 `checkpoints/malignancy_mil_best.pth` | Phase1 best AUC=0.5653，**低于 0.65 退出判据，当前已暂停**；Phase2 待 Phase1 突破后启动。2026-07-10 已用 `train_thyus2path_lora.py` 对拍证实卡点是数据本身而非 MIL 框架，见该行 |
 | `retrain_authenticity.py` | 重训 AuthenticityClassifier（修复特征维度变更后的 gatekeeper 崩溃） | `--data-root` `--out`(默认 `checkpoints/authenticity_model.pth`)；产出含 `state_dict` + `feat_mean`/`feat_std` | **特征维度变更后必须重跑**；必须在 A800 上运行；输入维度断言==13 |
 | `train_thyroidxl.py` | ThyroidXL LP-FT-LoRA 训练入口（LP 10epoch 只训头部 → FT-LoRA 40epoch 解冻 LoRA A/B）；患者级 GroupKFold(fold0) 评估 patient-AUC(Max聚合)+Dice | `--use-lora`(默认True) `--lora-r`(8) `--lora-alpha`(16) `--lp-epochs`(10) `--ft-epochs`(40) `--batch-size`(16)；产出 `checkpoints/thyroidxl_best.pth`（`{"epoch","stage","state_dict","patient_val_auc","dice"}` 包装格式，非裸 state_dict，供续训用） | **必须每 epoch 调用 `set_frozen_modules_eval()`**（2026-07-10 血泪教训：遗漏此调用导致冻结 backbone 的 BN running stats 漂移，50 epoch 后数值病态、checkpoint 报废，详见 `src/training/AGENTS.md`）；训练循环内部报告的 AUC **不能直接采信**，必须先跑 `merge_lora_checkpoint.py` 合并后用 `predict.py`/`evaluate.py` 真实推理链路重测；只用 ThyroidXL 单一数据源，不与 27021604/ThyUS2Path 混训 |
 | `merge_lora_checkpoint.py` | 把 `train_thyroidxl.py` 产出的 LoRA 结构 checkpoint 合并为纯 Conv2d 部署权重（`disable_lora`/`merge_weights` 数学合并，fp32、非 autocast） | `--in`(源LoRA checkpoint) `--out`(合并后裸 state_dict路径) `--lora-r`/`--lora-alpha`(须与训练时一致，否则 `strict=True` 加载直接报错) | 产出可被 `model_runner.build_model()` 直接 strict 加载（无需推理侧感知 LoRA）；**合并脚本本身无罪**——若合并前后模型输出差异巨大，先怀疑 backbone 数值病态（退化 BatchNorm），不要怀疑合并数学（已用单层测试 diff~1e-7 验证正确性） |
 | `train_thyus2path_lora.py` | 27021604(ThyUS2Path) LP-FT-LoRA 训练——**MIL vs LoRA 对拍实验**，同架构/同LP-FT-LoRA协议搬到该数据集，绕开 MIL bag 框架，验证 MIL 卡点是框架问题还是数据天花板 | `--data-root`(默认`data/27021604_extract`) `--lp-epochs`(10) `--ft-epochs`(40) `--batch-size`(16) `--val-frac`(0.2)；产出 `checkpoints/thyus2path_lora_best.pth` | 2026-07-10 实测：best patient-AUC=**0.5531**（FT-LoRA阶段train loss崩到0.02但val AUC全程0.45~0.55震荡，收官0.4998），与MIL的0.5653、随机猜0.50均在噪声范围内——**结论：瓶颈是数据本身（患者级标签广播到大量非靶区背景帧），非MIL框架问题**；不训分割头(该数据无mask标注)；只用27021604单一数据源 |
+
+---
+
+## 6.1 检测诊断与对拍三脚本(2026-09-18 架构冲刺,plan 任务 A/B/D)
+
+> **定位**:这三个脚本是**诊断/仲裁工具**,不进生产推理闭包、不影响交付物。
+> 云端位置 `/2026aicompetition/workspace/scripts/`(workspace 挂载盘,非训练树)。
+> 本地入口一律 `python -m scripts.<name>`(需 `PYTHONPATH=<workspace>/pylibs`)。
+
+| 脚本 | 职责 | 关键契约 |
+|:---|:---|:---|
+| `diagnose_detection.py` | **检测诊断仪表盘**(2026-09-05 起)——跑一轮全量前向,输出池级摘要(匹配率/AP/Dice/临界带/实例数直方图)+ case 级 sidecar JSONL。2026-09-18 扩 `--mechanism-audit`(漏检机制分账)与 `cls_preds`(分类快照,供任务 B 消费) | 🔴 **`--mechanism-audit` 开关前后,预测实例/匹配/AP 必须逐位不变**(纯诊断旁路,零副作用);`--log-dir` **必须每轮换新目录**(r5 与 seg_only 的 sidecar 时间戳接近会混淆);`AICOMP_DIAG_WORKERS` case 级并行(静态池多线程/动态串行,每轮 2h→40-60min);🔴 双进程并行动态段实测 60G/64G 逼近上限,**要并行必须错峰 15-20 分钟** |
+| `detection_audit.py` | **机制分账纯逻辑库**——五机制判据 + 多标签 flags + 主桶优先级 + 池级汇总。**无 I/O 无 torch**,只依赖 numpy,被 `diagnose_detection` 在 case 级采完证据后调用 | 五种机制判据见其模块 docstring 表格(阈值 0.10/0.15/0.35/0.45/0.5 与 IoU/质心);主桶优先级 **5→2→3→4→1**(信息量递减,防"浅药方遮住深病根");三态 flags(`None`=不可观测,**不伪装成"零命中"**);路线比例按**唯一 GT 机制标志并集**算(禁重复计数);🔴 `aggregate_mechanism_counts` **信任行内字段、缺键才重算**(行内值算在未舍入值上,重算会消费 round(6) 副本导致逐例矛盾) |
+| `compare_detection_runs.py` | **恒定人口分类分对拍**(plan 任务 B)——基线实际匹配 GT 稳定 ID 作 frozen 人口,对拍两轮的分类指标(五项)+ 检测分割分 + 配对 bootstrap | 🔴 **不取交集**(候选丢难病例后会虚假改善);任一指标 None/NaN = **无法裁决,不按 0 填充**;交付口径 Kappa **直用生产 `_qwk_round`**(银行家舍入),不手抄;位置编码 **xlsx 码 1..7 → 0-based 必须 `码-1`**;`row_skip_stats` 显式计数异常/无 cls_preds 的 GT;`--bootstrap 0` 即跳过 |
+| `analyze_mechanism_layers.py` | **unclassified 漏检的三段分层**(plan 任务 D 人工分层检查)——把 `mechanism_primary=="unclassified"` 的漏检按连续证据轴切三段(repr/threshold/shape)+ 交叉表 + 预注册判读 | 消费 sidecar v2 行;v1 行跳过并计数;三段互斥优先级 repr>threshold>shape;🔴 **"阈值段"标签会骗人,见下方警告** |
+
+### 🔴 `analyze_mechanism_layers.py` 的"阈值段"语义反转警告(2026-09-18 实测,勿误读)
+
+2026-09-18 云端回读:`unclassified` 96 个静态漏检中 **80 个(83.3%)落"阈值段"**
+(`soft_p95≥0.35`),动态 27/28(96.4%)同向。**但字面标签与真实语义相反**:
+
+- `unclassified` 的定义**保证 `mech1=False`**,而 mech1 判据是「`p95≥0.35` **且**
+  无保留覆盖」→ 落进阈值段 ⇒ **p95≥0.35 且必有保留预测以 IoU>0.1 覆盖该 GT**;
+- 同批 `mech4=False`(质心在等效半径内=未漂移)、`mech3=False`(无碎片)。
+
+⇒ 这批的真实画像是**「软响应很强 + 已有保留预测压在病灶上,但 IoU 卡在 0.1~0.5」**
+= **掩膜尺寸/形状不匹配(欠分割)**,药方是 **IoU 优化,不是调阈值**。
+佐证:max_iou 43 个落在 `[0.35,0.5)` 临界带、主病灶占 73/96、area_ratio 偏大。
+
+**判定纪律**:任何后续 agent 读到"阈值段 83%"若直接去调阈值/后处理,
+就是踩了这个坑——该段名只描述"p95 高"这个**采集轴位置**,不描述病因。
 
 ---
 

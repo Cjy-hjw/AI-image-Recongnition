@@ -62,6 +62,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scripts.detection_audit import (  # noqa: E402
+    SIDECAR_SCHEMA_VERSION, SOFT_STATS_PIXEL_CAP, aggregate_mechanism_counts,
+    classify_miss_mechanisms, collect_gt_probability_stats,
+    compute_centroid_metrics, compute_merge_pred_count, make_gt_key)
 from scripts.detection_match import (  # noqa: E402
     DEDUP_OVERLAP_THRESHOLD, MATCH_IOU_THRESHOLD, aggregate_case_rows,
     build_iou_matrix, dedup_keep_mask, match_instances)
@@ -78,11 +82,43 @@ from src.inference.nodule_split import (  # noqa: E402
     DEFAULT_MIN_AREA_RATIO, detection_confidence, hysteresis_binarize,
     restore_instance_mask, split_nodules)
 from src.inference.v21_output import (  # noqa: E402
-    _dynamic_det_conf, _resize_binary, _resize_soft)
+    _dynamic_det_conf, _lesion_level_head_preds, _resize_binary, _resize_soft)
 
 
 # ── case 级并行(2026-09-17 提速,grow 扫参 2h9m 只吃 2 核的欠账)────────────
 _ENV_DIAG_WORKERS = "AICOMP_DIAG_WORKERS"
+
+# ── 2026-09-18 内存治理(镜像生产 runner 09-09 治理,plan 任务 A)────────────
+# 本轮双进程并行动态段实测 60G/64G 逼近上限的根因之一:诊断镜像保留逐帧软图
+# + 实例恢复全尺寸放列表,而生产 runner 09-09 已加 malloc_trim/ARENA_MAX,
+# 诊断侧一直没抄。两件:①进程启动即 MALLOC_ARENA_MAX=2(setdefault 不覆盖
+# 云端显式设置);②逐 case 后调 malloc_trim 强制归还 glibc 堆(非 glibc
+# 平台静默跳过——与 runner._maybe_malloc_trim 同款防御)。
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+# P2-10(Gate2 2026-09-18):trim 间隔节流(镜像生产 runner 的计数器语义,
+# 间隔比生产 16 收紧——诊断 case 峰值更高)。env 可覆盖,<=0 禁用。
+_ENV_TRIM_INTERVAL_DIAG = "AICOMP_MALLOC_TRIM_INTERVAL"
+_TRIM_INTERVAL_DIAG = 8
+_TRIM_COUNTER_DIAG = {"n": 0}
+
+
+def _maybe_malloc_trim_diag() -> None:
+    """每 N 例 malloc_trim(0) 强制 glibc 归还;任何异常静默跳过(纯优化)。"""
+    try:
+        interval = int(os.environ.get(_ENV_TRIM_INTERVAL_DIAG,
+                                      str(_TRIM_INTERVAL_DIAG)))
+    except ValueError:
+        interval = _TRIM_INTERVAL_DIAG
+    if interval <= 0:
+        return
+    _TRIM_COUNTER_DIAG["n"] += 1
+    if _TRIM_COUNTER_DIAG["n"] % interval:
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — Windows/CI 无此符号,非 glibc 平台跳过
+        pass
 
 
 def _diag_workers() -> int:
@@ -319,6 +355,18 @@ def run_dynamic_inference_from_result(case_result, *, seg_threshold=None,
 
 # ── GT 装载 ─────────────────────────────────────────────────────────────────
 
+def _clinical_labels_of(labels: dict) -> dict:
+    """GT 行的临床标签快照(任务 B 恒定人口分类分的标签来源)。
+
+    只取五项分类监督 + is_main(筛选条件);valid_* 原样保留——固定人口
+    各指标按自己的有效性筛选,不按预测良恶性决定 ETE/T 入池。
+    """
+    keys = ["malignancy", "valid_malignancy", "lesion_loc", "valid_lesion_loc",
+            "extrathy_ext", "valid_extrathy_ext", "clin_t_stage",
+            "valid_clin_t_stage", "tirads", "valid_tirads"]
+    return {k: labels[k] for k in keys if k in labels}
+
+
 def load_gts_for_case(case: list) -> list:
     """case 的 GT 病灶 list(读 mask,静态转 2D、动态保留 3D+标注帧)。
 
@@ -333,6 +381,13 @@ def load_gts_for_case(case: list) -> list:
         if not binf:
             gts.append({"error": f"GT mask 读取失败: {s['mask_path']}"})
             continue
+        # 机制分账(plan 任务 A):GT 行附带标签溯源(临床标签留给任务 B
+        # 恒定人口分类分;gt_key 由 patient_id+lesion_id 构成,跨轮稳定)。
+        base_ev = {
+            "patient_id": s["labels"]["patient_id"],
+            "lesion_id": s["labels"]["lesion_id"],
+            "clinical": _clinical_labels_of(s["labels"]),
+        }
         if s["is_dynamic"]:
             g3d = np.stack(binf)  # (n_total, H, W),帧轴 = 原始帧号
             ann = [i for i, m in zip(idxs, binf) if m.any()]
@@ -345,6 +400,7 @@ def load_gts_for_case(case: list) -> list:
                 "hw": (g3d.shape[1], g3d.shape[2]),
                 "area": area,
                 "area_ratio": area / float(g3d.shape[1] * g3d.shape[2]),
+                **base_ev,
             })
         else:
             m0 = np.asarray(binf[0])
@@ -356,11 +412,222 @@ def load_gts_for_case(case: list) -> list:
                 "n_mask_frames": len(binf), "hw": m0.shape[:2],
                 "area": float(m0.sum()),
                 "area_ratio": float(m0.sum()) / float(m0.size),
+                **base_ev,
             })
     return gts
 
 
 # ── 单 case 诊断行 ──────────────────────────────────────────────────────────
+
+def _collect_soft_probs_static(case_result: dict, gts: list) -> list:
+    """机制分账:静态 GT 前景软概率采集(每 GT 一份,只采样前景像素)。
+
+    `pred_mask`(模型分辨率)resize 到 GT 原图坐标,对每个 GT 取其 mask
+    前景像素的概率值。**内存契约(plan 任务 A)**:逐 GT 处理,resize 产物
+    用完即弃,不驻留全图(与 run_static_inference_from_result 的 soft_fullres
+    生命周期不同——那在实例抽取后即弃)。
+    超容量(SOFT_STATS_PIXEL_CAP)→ 该 GT 统计退出(soft_valid=False),
+    不偷偷换近似分位数。
+    """
+    hw = tuple(int(x) for x in case_result["orig_hw"])
+    soft_full = _resize_soft(case_result["preds"]["pred_mask"], hw)
+    out = []
+    for g in gts:
+        gm = np.asarray(g["mask"]) != 0
+        # P0-1(Gate2 2026-09-18):GT mask 与影像 hw 不一致时,布尔索引抛
+        # IndexError 且崩点在 diagnose_one_case 的 try 之外 → 整轮作废无报告。
+        # shape 不齐在此显式 ValueError,由 _mechanism_evidence 的调用方
+        # (diagnose_one_case 内层 try)捕成单 case anomaly——与既有防御网
+        # (build_iou_matrix 的 ValueError → anomaly)同一隔离哲学。
+        if gm.shape != soft_full.shape:
+            raise ValueError(
+                f"机制采集 shape 不齐: gt_hw={gm.shape} img_hw={soft_full.shape}")
+        n_px = int(gm.sum())
+        if n_px == 0 or n_px > SOFT_STATS_PIXEL_CAP:
+            out.append(None)       # 不可观测:空 GT / 超容量
+            continue
+        vals = soft_full[gm]
+        out.append(vals.astype(np.float64).ravel().tolist())
+    del soft_full
+    return out
+
+
+def _collect_soft_probs_dynamic(case_result: dict, gts: list) -> list:
+    """机制分账:动态 GT 前景软概率(逐标注帧、只采该帧前景)。
+
+    **内存契约(plan 任务 A)**:每次只 resize 一帧、提取前景后释放整图;
+    病灶级保存标注帧紧凑前景概率向量;不新增全帧 3D 浮点概率体。
+    GT 某标注帧不在预测帧列表(坏帧/抽样缺帧)→ 该帧不采;全部标注帧
+    缺失 → None(不可观测,不用零概率伪装零响应)。
+    """
+    per_frame = case_result["per_frame"]
+    hw = tuple(int(x) for x in
+               np.asarray(per_frame[0]["frame_np"]).shape[:2])
+    # P2-8(Gate2 2026-09-18):内存契约兑现——不建全帧 soft dict(旧版
+    # 一次性 resize 全部抽样帧驻留,750 帧×802×1442 例 ≈3.47GB/例);
+    # 逐 GT 逐标注帧现 resize、提取前景后释放。帧级 resize 结果在 GT 间
+    # 复用(逐 case 生命周期,g["mask"] 帧轴同原始帧号,resize 只算一次)。
+    soft_cache = {}
+    preds_by_fi = {int(f["frame_index"]): f["preds"] for f in per_frame}
+    out = []
+    for g in gts:
+        vals = []
+        overflow = False
+        for fi in g["annotated_frames"]:
+            if fi not in preds_by_fi:
+                continue        # 缺预测帧:不采(不算零概率)
+            if fi not in soft_cache:
+                soft_cache[fi] = _resize_soft(
+                    preds_by_fi[fi]["pred_mask"], hw)
+            soft_f = soft_cache[fi]
+            gm = np.asarray(g["mask"][fi]) != 0
+            # P0-1 同款:hw 不齐显式 ValueError → 调用方捕成 anomaly。
+            if gm.shape != soft_f.shape:
+                raise ValueError(
+                    f"机制采集 shape 不齐(帧{fi}): gt_hw={gm.shape} "
+                    f"frame_hw={soft_f.shape}")
+            n_px = int(gm.sum())
+            if n_px == 0:
+                continue
+            if n_px > SOFT_STATS_PIXEL_CAP:
+                overflow = True
+                break
+            vals.append(soft_f[gm].astype(np.float64).ravel())
+        if overflow:
+            out.append(None)
+            continue
+        if not vals:
+            out.append(None)   # 全部标注帧缺预测/空前景 → 不可观测
+            continue
+        merged = np.concatenate(vals)
+        out.append(merged.tolist())
+    return out
+
+
+def _classification_snapshot(case_result: dict, is_dynamic: bool) -> dict:
+    """任务 B 恒定人口分类分:当前前向已产生的分类概率快照(cls_preds)。
+
+    不额外跑分类头(plan 任务 B 契约)。静态直读 `case_result["preds"]`
+    (decode_predictions 输出);动态复用生产 `v21_output._lesion_level_head_preds`
+    (per_frame 算术平均 + kf_preds 兜底——与 _write_dynamic 同口径,两侧互为
+    约束,勿改单侧)。只保留 compare_detection_runs 消费的五项。
+    """
+    if is_dynamic:
+        merged = _lesion_level_head_preds(
+            case_result["per_frame"], case_result["kf_preds"])
+        src = merged
+    else:
+        src = case_result["preds"]
+    return {
+        "mal_probs": [float(x) for x in src["mal_probs"]],
+        "ete_probs": [float(x) for x in src["ete_probs"]],
+        "location_probs": [float(x) for x in src["location_probs"]],
+        "t_conf": float(src["t_conf"]),
+        "tirads_probs": [float(x) for x in src["tirads_probs"]],
+    }
+
+
+def _mechanism_evidence(case_result, preds, gts, iou_m, match, keep,
+                        is_dynamic: bool) -> list:
+    """sidecar v2:每 GT 的机制证据(软概率统计 + IoU 全列 + 质心 + 粘连)。
+
+    判定用未舍入数值(round 只发生在 sidecar 落盘时)。动态质心逐帧二维
+    (裁决:不混 z 轴帧号与二维像素距离),报有效帧均值及覆盖率。
+    """
+    soft_lists = (_collect_soft_probs_dynamic(case_result, gts)
+                  if is_dynamic else
+                  _collect_soft_probs_static(case_result, gts))
+    ev_rows = []
+    for j, g in enumerate(gts):
+        stats = collect_gt_probability_stats(soft_lists[j] or [])
+        pred_ious = ([float(iou_m[i, j]) for i in range(iou_m.shape[0])]
+                     if iou_m.size else [])
+        merge_count = compute_merge_pred_count(iou_m, j) if iou_m.size else 0
+        # 质心:漂移候选=最大 IoU 对应预测,同 IoU 按稳定预测索引(首个)。
+        centroid_d, eq_r, nearest_i = _centroid_for_gt(
+            preds, g, iou_m, j, is_dynamic)
+        matched_i = int(match["gt_to_pred"][j])
+        kept_flags = [bool(k) for k in keep] if iou_m.size else []
+        max_iou = float(iou_m[:, j].max()) if iou_m.size and iou_m.shape[0] else 0.0
+        row = {
+            "gt_key": make_gt_key(g["patient_id"], g["lesion_id"]),
+            "patient_id": g["patient_id"],
+            "lesion_id": g["lesion_id"],
+            "clinical": g.get("clinical"),
+            "is_main": g["is_main"],
+            "area_ratio": float(g["area_ratio"]),
+            "matched": bool(matched_i >= 0),
+            "matched_pred_index": matched_i,
+            "max_iou": max_iou,
+            "pred_ious": pred_ious,
+            "kept_flags": kept_flags,
+            "merge_pred_count": int(merge_count),
+            "centroid_distance": centroid_d,
+            "equivalent_radius": eq_r,
+            "nearest_pred_index": nearest_i,
+            "soft_max": stats["soft_max"],
+            "soft_p95": stats["soft_p95"],
+            "soft_mean": stats["soft_mean"],
+            "soft_valid": stats["soft_valid"],
+            "n_soft_pixels": stats["n_pixels"],
+        }
+        if is_dynamic:
+            row["n_annotated_frames"] = len(g["annotated_frames"])
+        ev_rows.append(row)
+    return ev_rows
+
+
+def _centroid_for_gt(preds, g, iou_m, j: int, is_dynamic: bool):
+    """机制4 质心证据。静态:2D 一次;动态:逐标注帧二维、有效帧均值。
+
+    Returns: (centroid_distance|None, equivalent_radius|None,
+              nearest_pred_index|-1)。无预测 → (None, r, -1)。
+    动态缺预测帧单独跳过(该帧不采,不伪装 0 距离);有效帧覆盖率由
+    n_soft_pixels/n_annotated_frames 侧写(sidecar 层面)。
+    """
+    if iou_m.size == 0 or iou_m.shape[0] == 0:
+        # 无预测:静态可算等效半径;动态逐帧半径取均值。
+        # (_gt_radius 返回 (radius, None) 单元素对,拼装成三段返回。)
+        r, _unused = _gt_radius(g, is_dynamic)
+        return None, r, -1
+    col = np.asarray(iou_m[:, j], dtype=np.float64)
+    cand = int(np.argmax(col))          # 同 IoU argmax 取首个 = 稳定索引
+    p_mask = np.asarray(preds[cand]["mask"]) != 0
+    if not is_dynamic:
+        d, r, ni = compute_centroid_metrics(
+            np.asarray(g["mask"]) != 0, [p_mask])
+        return d, r, ni
+    # 动态:逐标注帧二维质心距;预测帧缺该帧 → 跳过
+    g3 = np.asarray(g["mask"]) != 0
+    ds, rs = [], []
+    for fi in g["annotated_frames"]:
+        if fi >= p_mask.shape[0]:
+            continue
+        d, r, _ = compute_centroid_metrics(g3[fi], [p_mask[fi]])
+        if d is not None and r is not None:
+            ds.append(d)
+            rs.append(r)
+    if not ds:
+        return None, None, cand
+    return float(np.mean(ds)), float(np.mean(rs)), cand
+
+
+def _gt_radius(g: dict, is_dynamic: bool):
+    """GT 等效半径(静态 2D;动态标注帧均值)。"""
+    if not is_dynamic:
+        m = np.asarray(g["mask"]) != 0
+        ys, xs = np.nonzero(m)
+        if ys.size == 0:
+            return None, None
+        return float(np.sqrt(ys.size / np.pi)), None
+    g3 = np.asarray(g["mask"]) != 0
+    rs = []
+    for fi in g.get("annotated_frames", []):
+        ys, xs = np.nonzero(g3[fi])
+        if ys.size:
+            rs.append(float(np.sqrt(ys.size / np.pi)))
+    return (float(np.mean(rs)) if rs else None), None
+
 
 def _match_row(preds: list, gts: list) -> dict:
     """实例×GT 匹配的核心段(diagnose_one_case 与扫参共用)。
@@ -384,8 +651,14 @@ def _match_row(preds: list, gts: list) -> dict:
 
 
 def diagnose_one_case(model, config, calibrator, precision, device,
-                      case: dict, max_frames: int) -> dict:
-    """推理 + GT + 匹配 → case 行(sidecar JSONL 的一行,JSON 可序列化)。"""
+                      case: dict, max_frames: int,
+                      mechanism_audit: bool = False) -> dict:
+    """推理 + GT + 匹配 → case 行(sidecar JSONL 的一行,JSON 可序列化)。
+
+    `mechanism_audit`(plan 任务 A,--mechanism-audit 开关):额外采集
+    sidecar v2 机制证据(gt_key/soft_*/pred_ious/centroid/merge_count),
+    **只加字段不改既有字段**——开关前后 preds/gts 行逐位不变(回归钉死)。
+    """
     img_path = case["img_path"]
     row = {"case_key": img_path, "is_dynamic": case["is_dynamic"],
            "anomaly": None, "n_pred": 0, "n_gt": 0, "preds": [], "gts": []}
@@ -439,6 +712,26 @@ def diagnose_one_case(model, config, calibrator, precision, device,
         return row
     iou_m, match, keep = m["iou_m"], m["match"], m["keep"]
 
+    # 机制证据(sidecar v2):消费 case_result/preds/gts 的活引用。
+    # P0-1(Gate2 2026-09-18):采集自身可抛(软概率 shape 不齐 ValueError)
+    # ——必须捕成单 case anomaly(与推理段同款隔离),否则崩点在主循环
+    # try 之外、整轮 54 分钟作废且报告不落盘。
+    ev_rows = None
+    if mechanism_audit:
+        try:
+            ev_rows = _mechanism_evidence(
+                case_result, preds, gts, iou_m, match, keep, case["is_dynamic"])
+            # 再审 P1-C(2026-09-18):cls_preds 采集与机制采集同一崩点面
+            # (读 5 个概率键+动态 per_frame/kf_preds),必须进同一 try——
+            # 失败降级为该行无 v2 字段(cls_preds 是诊断增益非硬依赖),
+            # 不让一条 case 的快照失败作废整轮。失败行照记 anomaly 保留线索。
+            row["cls_preds"] = _classification_snapshot(
+                case_result, case["is_dynamic"])
+        except Exception as e:  # noqa: BLE001 — 证据采集失败不拖垮整轮
+            row["anomaly"] = f"机制采集失败: {type(e).__name__}: {e}"
+            row["cls_preds"] = None
+            return row
+
     for i, p in enumerate(preds):
         best = float(iou_m[i].max()) if n_gt > 0 else 0.0
         row["preds"].append({
@@ -450,7 +743,7 @@ def diagnose_one_case(model, config, calibrator, precision, device,
         })
     for j, g in enumerate(gts):
         max_iou = float(iou_m[:, j].max()) if len(preds) > 0 else 0.0
-        row["gts"].append({
+        gt_out = {
             "is_main": g["is_main"],
             "area_ratio": round(float(g["area_ratio"]), 8),
             "max_iou": round(max_iou, 6),
@@ -459,7 +752,38 @@ def diagnose_one_case(model, config, calibrator, precision, device,
             # 字面量 0.1 会在常量调整后静默分叉。
             "n_candidates": (int((iou_m[:, j] > DEDUP_OVERLAP_THRESHOLD).sum())
                              if len(preds) else 0),
-        })
+        }
+        if ev_rows is not None:
+            # P1-3(Gate2 2026-09-18):机制分类必须先在**未舍入值**上算
+            # (round(6) 窗口 ≈5e-7 可翻转 mech1/mech4 判定,docstring 声称
+            # 的"判定用未舍入数值"此前不成立)。分类结果(mechanism_flags/
+            # mechanism_primary)写入行;数值字段 round 后仅作落盘净化,
+            # 分类不再从落盘副本反推。
+            ev = ev_rows[j]
+            cls = classify_miss_mechanisms(ev)
+            for k in ("soft_max", "soft_p95", "soft_mean",
+                      "centroid_distance", "equivalent_radius"):
+                ev[k] = (round(ev[k], 6) if ev[k] is not None else None)
+            ev["area_ratio"] = round(ev["area_ratio"], 8)
+            ev["max_iou"] = round(ev["max_iou"], 6)
+            ev["pred_ious"] = [round(x, 6) for x in ev["pred_ious"]]
+            ev["centroid_ratio"] = (
+                round(ev["centroid_distance"] / ev["equivalent_radius"], 6)
+                if ev.get("centroid_distance") is not None
+                and ev.get("equivalent_radius") not in (None, 0) else None)
+            ev["mechanism_flags"] = cls["mechanism_flags"]
+            ev["mechanism_primary"] = cls["mechanism_primary"]
+            gt_out.update(ev)
+        row["gts"].append(gt_out)
+    if ev_rows is not None:
+        row["schema_version"] = SIDECAR_SCHEMA_VERSION
+        # cls_preds 已在机制采集 try 内写入(P1-C);此处兜底只对
+        # mechanism_audit=True 但 ev_rows 循环后仍缺键的路径补 None 占位
+        # (正常不可达,防御性)。
+        row.setdefault("cls_preds", None)
+        for i, p in enumerate(preds):
+            row["preds"][i]["pred_index"] = i
+    _maybe_malloc_trim_diag()
     return row
 
 
@@ -502,6 +826,20 @@ def _pool(case_rows: list, is_dynamic=None) -> dict:
     labels_d = [l for l, k in zip(labels, keep) if k]
     confs_d = [c for c, k in zip(confs, keep) if k]
     from scripts.detection_match import average_precision
+    # 评估基础补齐(plan 任务 A):病例 Macro-AP(逐 case AP 的算术平均,
+    # 只聚合 n_gt>0 的 case;官方口径未公布,与 Micro-AP(主门)并排展示)。
+    macro_aps = []
+    for row in case_rows:
+        if row.get("anomaly") or (is_dynamic is not None
+                                  and row["is_dynamic"] != is_dynamic):
+            continue
+        if not row["n_gt"]:
+            continue
+        p_l, p_c = [], []
+        for pp in row["preds"]:
+            p_l.append(int(pp["matched"]))
+            p_c.append(pp["confidence"])
+        macro_aps.append(average_precision(p_l, p_c, row["n_gt"]))
     return {
         "n_pred": len(preds), "n_gt": n_gt, "n_tp": sum(labels),
         "match_rate": (sum(labels) / n_gt) if n_gt else 0.0,
@@ -509,7 +847,78 @@ def _pool(case_rows: list, is_dynamic=None) -> dict:
         "ap_oracle": average_precision(labels, oracle, n_gt),
         "ap_iou_ranked": average_precision(labels, ranked, n_gt),
         "ap_dedup": average_precision(labels_d, confs_d, n_gt),
+        "ap_macro_per_case": (float(np.mean(macro_aps))
+                              if macro_aps else None),
     }
+
+
+def _mechanism_pool_summary(case_rows: list) -> dict:
+    """机制分账汇总(报告 mechanism_audit 段;未开审计时返回 None 占位)。
+
+    漏检 GT = matched=False 且证据在(sidecar v2 字段)。v1 行(旧 sidecar
+    重放/扫参行)缺证据 → 不进分账并计数 evidence_missing(**只计漏检**,
+    matched GT 缺证据无分账意义——P2-5 语义修正),不默认补零误判机制5
+    (契约)。近失带 [0.35,0.5) / 远失 (0,0.35) 子群另报——路线仲裁的
+    分母=全部漏检,子群只是参照(plan 任务 D)。
+
+    P1-2(Gate2 2026-09-18):anomaly 行的 GT 按**官方口径 = 漏检进分母**
+    (推理失败病例全部 GT 计漏检)——机制无法分类(证据不存在),单列
+    `n_anomaly_missed`(静/动分列)并入各池 n_miss,**不塞进机制桶**也
+    不静默消失。近失/远失/零IoU 三桶只覆盖 v2 可分类漏检(匈牙利一对一
+    把预测让给别的 GT 时,GT max_iou 可 ≥0.5 仍漏检——三桶之和 ≤ n_miss
+    是预期,不构成分解)。
+    """
+    static_rows, dyn_rows = [], []
+    n_missing_evidence = 0
+    anomaly_missed = {"static": 0, "dynamic": 0}
+    seen_keys = set()
+    for row in case_rows:
+        if row.get("anomaly"):
+            # P1-2:anomaly 行 GT 数(推理失败=全 GT 漏检,官方口径进分母)。
+            # 再审 P1-A(2026-09-18):取值源从 gts(6 条 anomaly 路径全部在
+            # gts 循环前早退,恒空 → 恒 0 = 修复 no-op)改为 n_gt 字段——
+            # n_gt 在推理段后写入(GT 读取成功才有值),是 anomaly 行唯一
+            # 可靠的 GT 计数。GT 读取失败的行 n_gt=0(真不可知,不猜)。
+            pool = "dynamic" if row.get("is_dynamic") else "static"
+            anomaly_missed[pool] += int(row.get("n_gt") or 0)
+            continue
+        for g in row.get("gts", []):
+            if "gt_key" not in g:
+                if not g.get("matched"):
+                    n_missing_evidence += 1
+                continue
+            if g.get("matched"):
+                continue
+            if g["gt_key"] in seen_keys:      # 唯一 GT 并集,禁重复计数
+                continue
+            seen_keys.add(g["gt_key"])
+            # 再审 P1-B(2026-09-18):aggregate 在报告侧重调
+            # classify_miss_mechanisms,此前消费的是 round 后落盘副本——
+            # 行内已存 mechanism_primary(未舍入值算的)却零消费,报告与
+            # 行可逐例矛盾。改为**信任行内分类结果**:行有 mechanism_primary
+            # 直接用(单一权威);缺该键(手造行/异源 sidecar)才重算兜底。
+            if "mechanism_primary" not in g or "mechanism_flags" not in g:
+                cls = classify_miss_mechanisms(g)
+                g = {**g, "mechanism_primary": cls["mechanism_primary"],
+                     "mechanism_flags": cls["mechanism_flags"]}
+            (dyn_rows if row["is_dynamic"] else static_rows).append(g)
+    out = {}
+    for name, rows in (("static", static_rows), ("dynamic", dyn_rows)):
+        agg = aggregate_mechanism_counts(rows)
+        near = sum(1 for g in rows
+                   if g.get("max_iou") is not None and 0.35 <= g["max_iou"] < 0.5)
+        far = sum(1 for g in rows
+                  if g.get("max_iou") is not None and 0.0 < g["max_iou"] < 0.35)
+        zero = sum(1 for g in rows
+                   if g.get("max_iou") is not None and g["max_iou"] == 0.0)
+        agg["near_miss_band"] = near
+        agg["far_miss"] = far
+        agg["zero_iou"] = zero
+        agg["n_miss"] = agg["n_miss"] + anomaly_missed[name]  # 官方口径分母
+        agg["n_anomaly_missed"] = anomaly_missed[name]
+        out[name] = agg
+    out["n_evidence_missing"] = n_missing_evidence
+    return out
 
 
 def run_diagnosis(args) -> dict:
@@ -566,10 +975,12 @@ def run_diagnosis(args) -> dict:
         # 且全帧前向+CPU 后处理已被静态 993 例的线程池填满间隙;
         # 静态 case(95% 数量、CPU 后处理为主)进池吃多核。
         # executor.map 保序 → sidecar 写入顺序与旧串行逐位一致,判读零漂移。
+        mech = bool(getattr(args, "mechanism_audit", False))
+
         def _run_static(c):
             return diagnose_one_case(
                 model, config, calibrator, args.precision, device,
-                c, args.max_frames)
+                c, args.max_frames, mechanism_audit=mech)
 
         static_idx = [k for k, c in enumerate(cases) if not c["is_dynamic"]]
         dyn_idx = [k for k, c in enumerate(cases) if c["is_dynamic"]]
@@ -584,12 +995,13 @@ def run_diagnosis(args) -> dict:
         else:
             static_rows = {k: diagnose_one_case(
                 model, config, calibrator, args.precision, device,
-                cases[k], args.max_frames) for k in static_idx}
+                cases[k], args.max_frames,
+                mechanism_audit=mech) for k in static_idx}
         for k in dyn_idx:
             # 动态串行(主线程):内存大头不叠加;异常语义与旧循环一致。
             static_rows[k] = diagnose_one_case(
                 model, config, calibrator, args.precision, device,
-                cases[k], args.max_frames)
+                cases[k], args.max_frames, mechanism_audit=mech)
         for k in range(len(cases)):
             row = static_rows[k]
             case_rows.append(row)
@@ -631,6 +1043,7 @@ def run_diagnosis(args) -> dict:
         "static": _pool(case_rows, is_dynamic=False),
         "dynamic": _pool(case_rows, is_dynamic=True),
         "combined": _pool(case_rows, is_dynamic=None),
+        "mechanism_audit": _mechanism_pool_summary(case_rows),
         "stats_static": aggregate_case_rows(
             [r for r in ok_rows if not r["is_dynamic"]]),
         "stats_dynamic": aggregate_case_rows(
@@ -1041,6 +1454,17 @@ def print_summary(report: dict) -> None:
             f"TP={p['n_tp']:5d} 匹配率={p['match_rate']:.4f} | "
             f"AP current={p['ap_current']:.4f} oracle={p['ap_oracle']:.4f} "
             f"iou_ranked={p['ap_iou_ranked']:.4f}")
+    ma = report.get("mechanism_audit")
+    if ma:
+        for name in ("static", "dynamic"):
+            a = ma[name]
+            _safe_print(
+                f"[mech_{name}] 漏检={a['n_miss']} 主桶={a['primary_hist']} | "
+                f"并集占比={ {k: round(v, 3) for k, v in a['union_ratios'].items()} } | "
+                f"近失带={a['near_miss_band']} 远失={a['far_miss']} 零IoU={a['zero_iou']}")
+        if ma.get("n_evidence_missing"):
+            _safe_print(f"[mech] 证据缺失 GT(v1 行,未进分账)="
+                        f"{ma['n_evidence_missing']}")
     for name in ("stats_static", "stats_dynamic"):
         s = report[name]
         # n_anomaly 不打(ok_rows 已滤掉 anomaly,该键恒 0 是死键——真实数在
@@ -1076,6 +1500,12 @@ def main():
     #   须伴随同侧 thr 轴才扫该池)/ grow_static / grow_dynamic(阶段3 手段4
     #   生长阈值,须伴随同侧 thr 轴)。给了 --sweep 就走 run_sweep(一次前向多
     #   参数),否则走原 run_diagnosis(单参数全量诊断)。
+    # plan 任务 A(2026-09-18):机制分账开关。默认关——v1 sidecar 行为
+    # 逐位零回归;开启后 gts 行并入 sidecar v2 证据字段(gt_key/soft_*/
+    # pred_ious/centroid/merge_pred_count)+ schema_version=2,preds 行加
+    # pred_index。既有字段(round 值)不动。
+    ap.add_argument("--mechanism-audit", action="store_true", default=False,
+                    help="漏检机制分账(五机制判据 DR §6.2;sidecar v2)")
     ap.add_argument("--sweep", action="append", default=None,
                     help="例:--sweep thr_static=0.30,0.35,0.40,0.50 "
                          "--sweep thr_dynamic=0.25,0.30,0.35 "

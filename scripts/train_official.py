@@ -134,6 +134,9 @@ def build_official_head_config(config: dict) -> dict:
         # compute_segmentation_loss 内消费(见该函数 docstring)。
         "seg_boundary_weight": float(tr.get("seg_boundary_weight", 0.0)),
         "seg_lovasz_weight": float(tr.get("seg_lovasz_weight", 0.0)),
+        # plan 任务C CC-DiceCE(新架构线):默认 0 零回归;权重非 0 时
+        # 实例级局部损失生效(见 cc_dice_ce_per_sample docstring)。
+        "seg_ccdice_weight": float(tr.get("seg_ccdice_weight", 0.0)),
     }
     return cfg
 
@@ -757,7 +760,8 @@ def main():
     # 消费它们(r7 同型泄漏),必须横幅可见。
     _hc = config["train"]
     print(f"[seg 损失配方] boundary_weight={_hc.get('seg_boundary_weight', 0.0)} "
-          f"lovasz_weight={_hc.get('seg_lovasz_weight', 0.0)}"
+          f"lovasz_weight={_hc.get('seg_lovasz_weight', 0.0)} "
+          f"ccdice_weight={_hc.get('seg_ccdice_weight', 0.0)}"
           f"{' (SEG_ONLY 实验变量)' if args.seg_only else ''}")
     # 🔴 ETE 小试的三个启动硬门(Gate2 审查 F1/F2/F4,2026-09-12):
     # ① --ete-only 必须配 --resume-from(r5 全量权重)——漏传则 ETE 头从随机
@@ -807,16 +811,19 @@ def main():
         seg_cfg = config["train"]
         bw = seg_cfg.get("seg_boundary_weight", 0.0)
         lw = seg_cfg.get("seg_lovasz_weight", 0.0)
+        cw = seg_cfg.get("seg_ccdice_weight", 0.0)
         # 🔴 量级标定豁免(2026-09-14 云端实证:标定=权重 0 跑 1ep 读分项基线,
         # 与此门"防全 0 空微调"冲突,原版把标定也拦了)。epochs==1 视为标定
         # 放行——空微调白烧至少要 2ep 才成立,1ep 的产物本就是丢弃的探针。
         if (args.smoke is False and epochs > 1
-                and bw == 0.0 and lw == 0.0):
+                and bw == 0.0 and lw == 0.0 and cw == 0.0):
             # 冒烟/标定允许全 0;真训全 0 = 空微调白烧(r7 同型)。
-            parser.error("--seg-only 真训须 config.train.seg_boundary_weight 或 "
-                         "seg_lovasz_weight 至少一项 > 0(全 0 = 空 微调白烧;"
+            parser.error("--seg-only 真训须 config.train.seg_boundary_weight / "
+                         "seg_lovasz_weight / seg_ccdice_weight 至少一项 > 0"
+                         "(全 0 = 空 微调白烧;"
                          "权重 0 的 1ep 量级标定放行)")
         print(f"[SEG-only 配方] boundary_weight={bw} lovasz_weight={lw} "
+              f"ccdice_weight={cw} "
               f"epochs={epochs} (门:mal/tirads/loc/t/ete "
               f"各不降超 0.01,对照 epoch=0 基线;🔴 dice 硬门已删 2026-09-18,"
               f"上线资格以训后快照官方口径筛为准)")

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# seg_only v2 快照批量诊断(2026-09-18,云端 /root/cloud_train_pkg 下跑)
+# seg_only v2 快照批量诊断(2026-09-18,云端 workspace 下跑)
 # 逐个加载 5 快照 + r5 基线,各跑一轮 diagnose_detection(官方口径),
 # 结束把 6 份报告的静态/动态关键指标抽成一张对比表(快照筛选就靠它)。
 # nohup 挂后台一次跑完,不占跑分名额。
+# 🔴 2026-09-18 实跑修订(两坑,勿改回):
+#   ①cd 必须是 /2026aicompetition/workspace(诊断脚本依赖 src/inference/,
+#     cloud_train_pkg 树没有,cd 错=ModuleNotFoundError);
+#   ②汇总 glob 是 detection_diag_*.json(报告带时间戳),不是 report.json
+#     (错名匹配零个→summary 空表,诊断本体完好只补汇总即可)。
+# 🟢 2026-09-19 已跑完定案:ep16 最优(Δ匹配+2.51pt/ΔAP+2.95pt 双全场最优)。
 set -u
-cd /root/cloud_train_pkg
+cd /2026aicompetition/workspace
 
 # 六个权重:r5 基线 + 5 快照。名字与任务书 §2 的产物对齐;
 # 快照文件名若不同(任务书 --out=seg_only_finetune_v2.pth),
@@ -23,7 +29,7 @@ mkdir -p "$OUTROOT"
 run_one() {
     w="$1"
     tag=$(basename "$w" .pth)
-    if [ -f "$OUTROOT/$tag/report.json" ]; then
+    if ls "$OUTROOT/$tag"/detection_diag_*.json >/dev/null 2>&1; then
         echo "[skip] $tag 已有报告,跳过(删 $OUTROOT/$tag 重跑)"
         return 0
     fi
@@ -52,7 +58,7 @@ python - "$OUTROOT" <<'PYEOF'
 import json, sys, glob, os
 out_root = sys.argv[1]
 rows = []
-for rp in sorted(glob.glob(os.path.join(out_root, "*", "report.json"))):
+for rp in sorted(glob.glob(os.path.join(out_root, "*", "detection_diag_*.json"))):
     tag = os.path.basename(os.path.dirname(rp))
     try:
         r = json.load(open(rp, encoding="utf-8"))

@@ -7,9 +7,11 @@
 - 使用Homoscedastic Uncertainty Weighting自动平衡任务权重
 - 支持FAMO动态权重调度
 - ✅ **三头固定 λ 外挂(阶段 2.4 接线)**:`__init__(official_head_config=...)` 读取 `lambda_loc/lambda_ete/lambda_clin_t`(默认各 1.0)与 ETE/T 的类加权/平滑超参;三个 `register_buffer("ete_class_weights", ...)` 等缓存——**传 None 时不进 state_dict(legacy 零影响)**。`forward` 在 `apply_famo_weighting` 之后、`compute_regularizers` 之前调用 `compute_official_head_losses` 并把 `detail` 数入 `loss_dict`(location/location_side/location_level/ete/ete_ce/clin_t/clin_t_ce)。🔴 **三头不进 FAMO 5 通道**(扩通道破坏 checkpoint 兼容 + masked 0 值被 FAMO 误读为"已收敛",见 `components/official_heads.py`)。三头键缺席 → 跳过,legacy `train.py` 路径零回归。
+- **CC-DiceCE 透传(2026-09-18)**:`__init__` 读 `seg_ccdice_weight`(默认 0.0),`forward` 传 `ccdice_weight=self.seg_ccdice_weight` 给 `compute_segmentation_loss`(masked 路径);权重 0 时逐位零回归。横幅/实验门在 `train_official.py`(三权重判空)。
 
 ### 组件化设计 (`components/`)
 - `segmentation.py`: `compute_segmentation_loss()` — BCE+Dice,支持`valid_mask`;阶段2 seg-only 扩展:可选外挂 Boundary(带符号距离场)/Lovász-Hinge(Berman 官方差分版)两项,返回 `(loss, {"seg_boundary","seg_lovasz"})` 分项进 JSONL;legacy 路径非零新权重 raise。
+  **CC-DiceCE 实例级局部损失(2026-09-18,plan 任务 C,默认关待命)**:`cc_dice_ce_per_sample(logits, gt) -> Tensor[B]` 由 `seg_ccdice_weight`(config,默认 0)经 `multitask.py` 透传外挂,`extra["seg_ccdice"]` 恒在。每样本:①GT CPU **显式十字 4 连通**标记(`ndimage.label` 默认就是 4 连通非 8,structure 显式钉死防漂移);②每实例 bbox 外扩 `max(2, ceil(0.1×max(h,w)))` ROI,**邻近其他实例前景从本实例背景惩罚排除**(增量并集 `all_fg & ~inst`,O(K²)→O(K),K=100: 3.81s→87ms);③ROI 内 BCE+Soft-Dice 实例等权平均。🔴 **BCE 必须 logit 域直算(BCEWithLogits),禁 sigmoid→clamp→log 反解**——`1-1e-8` 在 float32 舍入为 1.0,logit≥17 即 sigmoid==1.0→log 反解 inf→NaN,NaN×valid_mask 屏蔽失效、GradScaler 静默跳步(Gate2 P0,r5 日志 seg_prob_max=1.0 证明饱和可达)。K=0/软 GT 归 0(监督归主项不混纲)。前景须用**实例自身窗口**非整 GT 切窗(邻接实例像素混入=朴素对拍当场杀出的实现期真 bug)。测试 `tests/test_ccdice_loss.py` 17 项(朴素参考逐值对拍+变异杀测);量级:512² B=16 2实例≈102ms/step,启动前 1ep 标定读分项定权重。
 - `concepts.py`: `compute_concept_losses()` — TI-RADS五项SLR+临床先验正则
 - `malignancy.py`: `compute_malignancy_losses()` — AUCM+SupCon
 - `famo_mix.py`: `apply_famo_weighting()` — FAMO权重应用与更新

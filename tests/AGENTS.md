@@ -170,9 +170,30 @@ None 传染(任一指标 None = 无法裁决,不按 0 填充)/bootstrap 人口�
 必须显式计数而非静默丢弃。空文件 raise;bootstrap 失败落 `bootstrap_error`
 不丢报告;`json.dump(allow_nan=False)`。
 
-## 测试总数(单一权威,2026-09-13 实测)
+## `test_ccdice_loss.py` — CC-DiceCE 实例级局部损失契约(17 项,2026-09-18 新增,plan 任务 C;2026-09-19 随 worktree 合并主树)
 
-**全套 1254 collected**(2026-09-18 seg_only 调教轮,`Demo_D` 环境实测;
+`src/models/losses/components/segmentation.py::cc_dice_ce_per_sample` 的契约锁
+(默认 `seg_ccdice_weight: 0`,零回归)。核心是**独立朴素参考实现逐值对拍**
+(`naive_cc_dice_ce_one_sample`,numpy 逐实例循环,4 参数化 case:single/
+multi_gap/multi_edge_touch/k0)——数学函数必须与参考实现逐值对拍,与
+Lovász 两版皆错同一教训([[seg-only-finetune-implementation-and-bugs]])。
+另钉:multi_edge_touch 语义(边接触两矩形在显式十字 4 连通下=1 实例;对角
+接触=2)、`extra["seg_ccdice"]` 恒在(权重 0 时=0)、legacy 路径对
+`ccdice_weight>0` 显式 raise(r7 空微调同型事故防线)、权重可加性分解
+(`L(w)-L(0)==w×seg_ccdice`)、valid_mask=0 零贡献、**K=0/软 GT 归 0**
+(监督归主项不混纲;P2 修复后口径)、软 GT 计数三元组、B=0 空批、
+bf16 autocast 梯度有限(CUDA skipif)、CPU 梯度有限非零、**变异杀测 4 组**
+(像素加权替代实例等权/去掉邻接背景排除/前景误用整 GT 切窗/K0 改回全局
+BCE+Dice——实现期前两变异曾真实存活,朴素对拍当场杀出)。
+🔴 **BCE 必须 logit 域直算(BCEWithLogits),禁 sigmoid→clamp→log 反解**:
+`clamp(eps,1-1e-8)` 上界在 float32 舍入为 1.0 → logit≥17 时
+sigmoid==1.0 → log(p/(1-p))=inf → NaN/Inf,NaN×valid_mask 屏蔽失效、
+GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)。
+
+## 测试总数(单一权威,2026-09-19 实测)
+
+**全套 1271 collected**(2026-09-19 CC-DiceCE 合主树后,`Demo_D` 环境实测,
+全量 1270 passed + 1 skipped;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
 →1156(修复轮专审:`test_seg_only_gate.py` 新增 6——护栏纯函数终于有测试,
@@ -190,7 +211,9 @@ sidecar 逐位等价(含 group_cases 插入序绝对锚,变异 A 写序反转实
 `test_zero_dice(0.0)`(变异实杀验证:加回 0.3 门即 RED)/`test_low_dice(0.60)`/
 `test_dice_none_still_decidable` + 快照纯函数 2 项(`_snapshot_path` 版本化命名/
 `_SEG_SNAPSHOT_EPOCHS` 上限锚 SEG_ABORT_EPOCH;删 ep20 变异存活是已知测试力边界,
-由任务书 §2 的 6 产物清单兜底);单路审查 2026-09-18,P1×2 已修)。
+由任务书 §2 的 6 产物清单兜底);单路审查 2026-09-18,P1×2 已修)
+→1271(CC-DiceCE 合主树:`test_ccdice_loss.py` **17** 新增,见上方专节;
+2026-09-19 零冲突合并 `7bb5e5a`,worktree/分支已删)。
 判回归须同
 环境前后对拍。
 `test_seg_only_schedule.py`(新增,7):`configure_official_stage(seg_only=True)`

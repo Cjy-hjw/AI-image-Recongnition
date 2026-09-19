@@ -1,0 +1,237 @@
+# ============================================================================
+# CC-DiceCE 版本化实验配置(plan 任务 C,2026-09-19)
+# 与 configs/thyroid_config.yaml 的唯一差异:seg_ccdice_weight(见文件内注释)。
+# 用法:python scripts/train_official.py --config configs/thyroid_config_ccdice.yaml ...
+# 主 config 保持 seg_ccdice_weight: 0.0(生产默认),两者勿混。
+# ============================================================================
+# Configuration for Thyroid AI Detection Pipeline
+# Optimized for NVIDIA A800 80GB GPU
+
+environment:
+  device: "cuda"            # cuda or cpu
+  seed: 42
+  # num_workers 12→16(2026-09-15 seg-only 首轮实测:官方盘慢时 12 worker 全堵在
+  # .dcm 读上,CPU 仅 3/16 核、GPU 大量陪等——IO 等待型瓶颈,加 worker 提高并发
+  # IO 深度。16 = 实测 vCPU 全额(总纲旧记"14 vCPU"过时,2026-09-15 用户实测 16);
+  # EDT 池 min(B,8) 与 worker 抢核的风险由 persistent_workers 跨 epoch 摊平)
+  num_workers: 16
+
+data:
+  train_path: "data/train"
+  val_path: "data/val"
+  holdout_path: "data/holdout"
+  batch_size: 64              # Reduced from 128 to prevent NaN accumulation
+  img_size: 512             # Resized resolution(2026-09-12 起回 512 定稿:640 实验已判死
+                            # ——dice 0.6479<r5 0.6528 零增益、mal 0.865<0.8988 降0.034 触
+                            # 淘汰线,分辨率阶梯证伪,r5=甜点位。所有交付 checkpoint 均为 512)。
+                            # 🔴 换分辨率≠热插拔(实测 512→1024 直接 load_state_dict size mismatch,2026-07-11
+                            # A800 复核):该值烘焙进 checkpoint——prior_extractor.x_coords/y_coords 按 img_size
+                            # 存的固定形状 buffer(进 state_dict)。**权重与 config 的 img_size 必须原子配套**:
+                            # 512 权重+640 config(或反向)= build_model 的 load_state_dict 当场 RuntimeError。
+                            # 四头结构本身分辨率无关(全 adaptive pooling),改此值无需改 heads。
+
+# Post-hoc 置信度校准(温度缩放)。param_file 缺失时全任务 T=1.0(不校准,输出不变);
+# 初赛真实数据到位后用 src/inference/calibration.fit_temperature 在独立验证集拟合 T 写入。
+calibration:
+  param_file: "checkpoints/calibration.json"
+
+gatekeeper:
+  # 审计命中后的处置模式(主开关):
+  #   soft(默认,交付值) — 命中只作 flag 写进 result.json,诊断照常输出;
+  #   hard              — 去重/篡改命中即 REJECTED,不输出任何诊断字段。
+  # 默认 soft 的依据:2026-07-28 官方赛前动员会明确赛道七豁免全部医保安全考核,
+  # 总分 = 临床诊断得分 Sclin × 100,gatekeeper 零计分贡献;且"真实病例被误判为
+  # 伪造,诊断结果仍参与目标三四五计分"(前提是必须先输出诊断)。故硬拒绝已成
+  # 纯负期望——拒对零收益,误拒一次白丢该病例全部临床得分。hard 仅供回归测试与
+  # 未来规则变化时启用(非法值一律降级 soft,见 gatekeeper_runner.resolve_enforcement_mode)。
+  #
+  # ⚠️ 本项与下方 `bag_hard_reject` 是**两把独立的锁**,只切一把不会生效:
+  #   enforcement_mode 决定"硬判据命中后是否 REJECTED";
+  #   bag_hard_reject  决定"BAG 相位命中算不算硬判据"(false 时只进 soft_flags)。
+  # 故 `enforcement_mode: hard` + `bag_hard_reject: false` 下,BAG 命中**仍不拒绝**——
+  # 想让 BAG 真正参与拒绝,两处都要切。切换时务必同时确认另一处。
+  enforcement_mode: soft
+  fpr_threshold: 0.01
+  precision_threshold: 0.98
+  phash_threshold: 1        # Hamming distance limit
+  # 余弦近重复阈值,按激活后端分别取值(单一标量无法同时服务两后端):
+  #   sscd 0.86     — SSCD 描述符对裁切/水印/色调偏移近似不变,0.86 治近重复漏检
+  #                   (官方 README 给 0.75@90%精度,取更严的 0.86 压误报);
+  #   resnet18 0.995 — 降级后端守一票否决红线「宁可漏检不可误杀真实影像」,故调严。
+  cosine_threshold:
+    sscd: 0.86
+    resnet18: 0.995
+  faiss_dim: 512            # 描述符维度(SSCD/ResNet18 均 512;实际以后端实测维度建索引)
+  # sscd_weights:           # 可选,显式指定 SSCD TorchScript 路径;缺省自动探测 checkpoints/
+  # catnet_weights:         # 可选,CAT-Net v2 TorchScript 路径;缺省探测 checkpoints/catnet_v2.torchscript.pt
+                            #   缺失则降级 dct-bag(纯 NumPy 块伪影栅格取证),detect() 仍含几何检测器并集
+  # BAG 相位取证是否作硬拒绝。默认 false(仅软 flag,进 result.json 的
+  # gatekeeper.soft_flags)——BAG 阈值仅经 8 个合成种子小样本验证,远小于
+  # copy_move/splice 的 359 张真实图验证量级。恢复硬拒绝的唯一闸门:官方真实干净
+  # JPG holdout 上预注册、带置信区间的 FPR 验收达标(统一软flag制度)。
+  #
+  # ⚠️ 与上方 `enforcement_mode` 是**两把独立的锁**:本项只决定"BAG 命中算不算
+  # 硬判据",即使置 true,也还要 `enforcement_mode: hard` 才会真的 REJECTED。
+  # 反之 `enforcement_mode: hard` 单独切换不会让 BAG 参与拒绝。切一处前先看另一处。
+  # 注:copy_move/splice 无对应开关——二者**恒为软判据**(真实图误报 27.3%),
+  # 无论两把锁怎么切都只进 soft_flags,不驱动 would_reject_in_hard_mode。
+  bag_hard_reject: false
+  tamper_threshold: 0.5
+
+model:
+  backbone: "efficientnet_b2"      # Backbone optimized for multi-task thyroid diagnostic
+  pretrained: true
+  num_classes_composition: 4 # cystic, spongiform, mixed, solid
+  num_classes_echogenicity: 4 # anechoic, hyperechoic/isoechoic, hypoechoic, very hypoechoic
+  num_classes_shape: 2        # wider-than-tall, taller-than-wide
+  num_classes_margin: 4       # smooth, ill-defined, lobulated/irregular, extrathyroidal extension
+  num_classes_foci: 4         # none/comet-tail, large coarse, peripheral/rim, punctate echogenic
+  num_classes_malignancy: 2   # benign, malignant
+  # ── 官方新增三维度（Phase2 三头）──────────────────────────────────────────
+  num_classes_location: 7     # 1左上 2左中 3左下 4右上 5右中 6右下 7峡部（顺序权威见 src/models/label_schema.py）
+  num_classes_ete: 4          # 1无 2甲状腺包膜 3毗邻软组织 4血管
+                              # 🔴 保 4 类不并类：血管仅 5 例，若官方指标是 Macro-AUC，
+                              # 并类会让该类 AUC 无从计算（= 直接丢该项分）。要翻此决定
+                              # 必须先拿到官方评测口径，不是配置偏好。
+  num_classes_clin_t: 2       # 0 非临床显著 / 1 临床显著
+
+train:
+  epochs: 120                # 120 Epochs for full convergence on server
+  lr: 0.0024                 # Tuned for batch size 128
+  weight_decay: 0.0005
+  amp: true                 # Automatic Mixed Precision
+  early_stopping_patience: 35
+  checkpoint_w_dice: 0.30
+  checkpoint_w_auc: 0.70
+  stage3_early_stopping_patience: 0   # 0 = disable Stage3 early stopping, run full 101-120
+  label_smoothing: 0.0        # Disabled to reduce training instability
+  cbm_dropout: 0.3
+  slr_beta: 0.99            # Supervised Label Rectification smoothing factor
+  slr_threshold: 2.0        # SLR gradient threshold
+  # Next-Gen Rebuilding Parameters
+  supcon_temperature: 0.07
+  slr_alpha: 0.1
+  prior_mlp_dim: 16
+  physical_kappa: 100.0
+
+  # ── 侵犯头（ETE）不平衡校正超参（Phase2 阶段 2.2）────────────────────────────
+  # ETE 是全项目最极端的不平衡任务：3906/267/67/5（无/包膜/软组织/血管），
+  # 最稀有类占 0.12%。裸 CE 下恒输出"无侵犯"即可拿 92% 准确率，三个有临床意义的
+  # 类全部学不到。下面两项是两种校正手段，实现见
+  # src/models/losses/components/extension.py。
+  #
+  # ⚠️ 二者是同一问题的两种解法（Menon 原文把 Logit Adjustment 作为重加权的*替代*
+  # 提出），**同时开满会过校正**。故当前只开 CB-Focal，la_tau 留 0。
+  ete_class_counts: [4459, 333, 81, 5]  # Q7 新表实测(2026-09-06 官方增补,回填 633 个 M 行 ETE 后;
+                                         # 旧值 [3906,267,67,5] 是 r7 前旧表,已作废。
+                                         # 换数据集/换划分后必须重算,否则先验与实际不符、
+                                         # 校正方向对但幅度错(不会报错)。
+  ete_cb_beta: 0.9          # 🔴 不要抄论文的 0.9999。实跑 class_balanced_weights 的权重比
+                            # （血管:无）：β=0.9→2.4:1  β=0.99→20.4:1  β=0.999→196.4:1
+                            # β=0.9999→646.9:1。n=5 时 0.9999 退化成近似逆频率加权，
+                            # 等于让 5 张图吃掉整个损失、必然过拟合。0.0 = 关闭加权。
+                            # 🔴 2026-08-16 由 0.99 降到 0.9：官方数据 35 epoch 实测
+                            # ete_kappa 在 ep1-25 恒 0（常数预测=全判"1无"），**ep26 起
+                            # 转负**（-0.027~-0.054，比常数预测更差）——加权 Kappa 按
+                            # 距离惩罚，转负是"系统性过度预测稀有类"的特征。20.4:1 叠加
+                            # 下面的 focal（实测再压 20~50 倍）形成双重放大。0.9 压到 2.4:1。
+  ete_focal_gamma: 0.0      # Focal 的 γ；0 = 退化为普通加权 CE
+                            # 🔴 2026-08-16 由 2.0 降到 0.0：JSONL 实测
+                            # loss_ete_focal 0.0015~0.084 vs loss_ete_ce 0.19~0.62，
+                            # **压制 20~50 倍** —— ETE 那一路几乎没有梯度可用。
+                            # ETE 是目标四（40% 权重）三项之一，不能这么烧。
+                            # ⚠️ 与上面的 cb_beta 同轮改（违反单变量对拍惯例）：云端一轮
+                            # ~24h、只能提交一次，没有 A/B 预算；两者证据方向一致（都指向
+                            # 稀有类被过度放大）。若只允许改一个，改这个 gamma。
+  ete_la_tau: 0.0           # Logit Adjustment 的 τ，**0 = 关闭**。>0 时训练损失用
+                            # CE(logits + τ·log π, y)（是**加**不是减；符号反了会放大
+                            # 不平衡且损失照常下降）。推理侧不得再调一次。
+                            # 待官方验证集到手后再调——官方数据只在云端，本地无从验证。
+
+  # 🔴 backlog #128 LA-SoftQWK-OD（2026-08-17，方案就绪未执行，见
+  # docs/项目现状总纲.md §7 #128 与 src/models/losses/components/extension.py
+  # 模块 docstring「Soft-QWK」节）。加权 CE/CB-Focal 优化逐样本似然，与官方
+  # 二次加权 Kappa 指标在本任务分布下**负相关**——已实测两次转负/垫底。
+  # `ete_qwk_weight=0`（当前默认）时逐位走上面的 CB-Focal 老路径，零回归。
+  # 🔴 **`la_tau` 必须与 `qwk_weight` 同时开，绝不能单独开**：LA 是推高稀有类
+  # 概率（实测 τ0→0.5 使类3 概率 ×21），单开会重演"过度预测稀有类→Kappa
+  # 转负"（见上面 ete_cb_beta 注释里 ep26 那次事故）；SoftQWK 才是压住它的那半。
+  # 计划分两跑验证（plan `sunny-shimmying-popcorn.md` 第2层）：
+  #   2-① 只关 CB（ete_cb_beta: 0.9→0，其余不动）—— 验 CB 的净贡献；
+  #   2-② 在①基础上开 la_tau=0.5 + ete_qwk_weight=1.0 —— 验 DR 主方案整体效果。
+  # 每层跑完看 JSONL 的 4 项监控（val_pred_hist 等，backlog #128 待补）再决定回滚。
+  ete_qwk_weight: 0.0       # SoftQWK 项权重，0=关（默认，CB-Focal 老路径）
+  ete_dist_weight: 0.2      # 有序距离正则权重，仅 ete_qwk_weight>0 时生效（DR 值，未调）
+
+  # ── 临床 T 头（Phase2 阶段 2.3）超参 ────────────────────────────────────
+  # 实现见 src/models/heads/clinical_t.py + losses/components/clinical_t.py。
+  clin_t_class_counts: [2410, 1831]  # 0无 / 1有，阳性率 35.7%（docs/训练与架构/训练数据定稿.md:87
+                                     # 旧表口径;Q7 回填"全部空白临床字段"后此数理论上已变,
+                                     # 但 clin_t_use_class_weights=false 权重根本不消费它,
+                                     # 留旧值零影响——真要开权重时先重算）
+  clin_t_use_class_weights: false    # 三头里唯一**不存在极端不平衡**的任务，默认不加权。
+                                     # 开启时用 inverse_frequency_weights（1.3162:1）。
+                                     # 🔴 **不要用 ete_cb_beta 那套 CB**：CB 的 1−β^n 在
+                                     # 千级计数上已饱和，β=0.99 给出的权重比是 **1.0000**
+                                     # ——配了等于没配，且不报错不告警（实测钉在
+                                     # tests/test_clinical_t_head.py）。CB 是给长尾的
+                                     # （ETE 血管 n=5 那里 β=0.99 才有 20.4:1）。
+  clin_t_label_smoothing: 0.0        # 🔴 保持 0。LS 把 P(T=1) 上界精确钳死在 1−ls/2
+                                     # （实测 ls=0.05→0.9750、ls=0.1→0.9500），而官方
+                                     # T_ClinSig.T_conf 读的正是这个数 —— 开了等于系统性
+                                     # 压缩交付置信度。要开之前先想清楚这个代价：
+                                     # 是拿概率校准换分类精度，不是白捡的正则。
+
+  # ── 官方新增维度头固定 λ 外挂权重(位置/ETE/临床T/TI-RADS,Phase2 阶段 2.4/E)────
+  # 这些损失**不进 FAMO**(理由见 src/models/losses/components/official_heads.py),
+  # 按固定 λ 外挂到总损失:total = famo_weighted + λ_loc·L_loc + λ_ete·L_ete
+  # + λ_t·L_t + λ_tirads·L_tirads。
+  # 由 scripts/train_official.py 组装进 MultiTaskLoss(official_head_config=...)。
+  # 默认各 1.0;上云观察各头相对收敛速率后再调(ETE 长尾若主导总损失可调低 λ_ete)。
+  # legacy train.py 路径永不读这些键(它的 targets 无这些键,外挂整体跳过)。
+  loc_loss_weight: 1.0
+  ete_loss_weight: 1.0
+  clin_t_loss_weight: 1.0
+  tirads_loss_weight: 1.0
+
+  # ── TI-RADS 头(backlog #124)超参 ────────────────────────────────────────
+  # 实现见 src/models/heads/tirads.py + losses/components/tirads.py。
+  # 真实 5 类计数未知(禁本地、待上云实测),`tirads_class_counts` 留空;
+  # `tirads_use_class_weights` 开关按上云拿到的真实分布再定(是否长尾决定用
+  # inverse_frequency_weights 还是 class_balanced_weights,见 tirads.py docstring)。
+  tirads_class_counts: null
+  tirads_use_class_weights: false
+  tirads_label_smoothing: 0.0
+  # 🔴 默认 0(关闭):二次有序项对齐官方"加权 Kappa"(quadratic)语义,但没有真实
+  # 数据无法调参(rules.md §5「先证后改」)。权重=0 时对 loss 精确无贡献。
+  tirads_ordinal_weight: 0.0
+
+  # ── Stage2 seg-only 微调(2026-09-13,17天冲刺阶段2)────────────────────
+  # Boundary Loss(Kervadec 2019)+ Lovász-Hinge(Berman 2018),外挂在
+  # compute_segmentation_loss(见该函数 docstring)。0(默认)= 老路径零回归。
+  # 量级实测(2026-09-14 三批专审 T8,mock 稀疏 GT 3% 覆盖):
+  #   lovasz/main ≈ 1.6-3.7(O(1) 同档成立);
+  #   boundary/main ≈ 0.03-0.08(⚠️ 比主项小 1-2 个数量级,且完美预测下
+  #   boundary→0——seg-only 起点 dice 已 0.65,实测比率只会更低)。
+  # 🔴 **起手权重必须现场反推,勿抄绝对数**:
+  #   w_b ≈ 0.2×loss_seg / loss_seg_boundary(实测原始项,JSONL 分项键);
+  #   w_l ≈ 0.2×loss_seg / loss_seg_lovasz。
+  #   旧版"起手 0.1-0.3"是 b/main≈1 假设下的数字,照抄 = boundary 只贡献
+  #   主项的 ~2%,近似空微调(r7 同型,权重非 0 硬门挡不住)。
+  #   对齐目标 = 加权后分项贡献 ≈ 0.2-1× 主项;先跑 1 epoch 读分项再定。
+  seg_boundary_weight: 0.0
+  # 🔴 2026-09-18 seg_only 调教(总纲 §6.4):boundary 标定实测 ≈-0.0007 零信号
+  #   → 0 剔除;lovasz 0.1→0.3(P0 轮 2 +1.07pt 是权重 0.1 的上限,非损失上限,
+  #   Lovász=IoU 优化正是漏检分账指向的欠分割药方)。
+  seg_lovasz_weight: 0.3
+  # plan 任务C CC-DiceCE(新架构线,2026-09-18):实例级局部 DiceCE,默认 0 关闭
+  # ——主 config 是**生产默认**,CC 实验用版本化实验配置
+  # (configs/thyroid_config_ccdice.yaml,Boundary/Lovász 保持 0 隔离变量)。
+  # 权重=0 时对 loss 精确零贡献,zero-weight 回归测试钉死。
+  # 起手权重按量级标定反推(先 1ep 读 loss_seg_ccdice 分项,对齐目标
+  # ≈0.2-1× 主项),勿抄绝对数(r7 事故同型)。
+  seg_ccdice_weight: 1.0  # ⚠️ 标定占位值(非最终权重)。CC-DiceCE 实验配置:
+                          # 相对主 config 仅此一项不同(lovasz 0.3 保持=ep16 已证有效配方)。
+                          # 流程:先 1ep 标定读 JSONL 的 loss_seg / loss_seg_ccdice 分项,
+                          # 按 w = 0.2 x loss_seg / loss_seg_ccdice 反推后改本值再开正式训练
+                          # (plan 任务C 预注册:对齐目标 0.2-1x 主项,禁抄绝对数)

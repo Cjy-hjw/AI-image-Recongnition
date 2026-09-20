@@ -69,7 +69,11 @@ STAGE_B_UNFREEZE = ("cls_backbone.blocks.6", "cls_backbone.blocks.5")
 # ── 分割前向链(2026-08-16 起 A/B/C 全程可训,理由见模块 docstring)───────────
 # 拆两组只为分配不同 lr,不是"部分解冻"——两组合起来即完整前向链,整块可训。
 # 解码器(up_stages/dec_stages/seg_head)是**随机初始化**的 → 与四头同待遇,取满 head_lr。
-SEG_TRAIN_DECODER = ("up_stages", "dec_stages", "seg_head")
+SEG_TRAIN_DECODER = ("up_stages", "dec_stages", "seg_head",
+                     # plan 任务D 深监督辅助头(2026-09-20):训练放行进解码器组
+                     # (随机初始化出身,@head_lr);前缀动态读
+                     # MultiTaskThyroidModel.SEG_AUX_PREFIXES 保持单源。
+                     *MultiTaskThyroidModel.SEG_AUX_PREFIXES)
 # 分割主干(convnext_nano)带 **ImageNet 预训练** → lr = head_lr × backbone_lr_scale,
 # 与 Stage B 的 blocks[6] 档**数值重合**,不新增第三档 lr。
 SEG_TRAIN_BACKBONE = ("seg_backbone",)

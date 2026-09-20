@@ -137,6 +137,10 @@ def build_official_head_config(config: dict) -> dict:
         # plan 任务C CC-DiceCE(新架构线):默认 0 零回归;权重非 0 时
         # 实例级局部损失生效(见 cc_dice_ce_per_sample docstring)。
         "seg_ccdice_weight": float(tr.get("seg_ccdice_weight", 0.0)),
+        # plan 任务D 深监督辅助头(2026-09-20):默认 0 零回归;权重非 0 时
+        # aux2/aux3 与 gt 同式 BCE+Dice 生效(见 compute_segmentation_loss
+        # docstring 的 deepsup 段)。
+        "seg_deepsup_weight": float(tr.get("seg_deepsup_weight", 0.0)),
     }
     return cfg
 
@@ -162,7 +166,14 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
         state = state["model"]
     result = model.load_state_dict(state, strict=False)
     head_pfx = MultiTaskThyroidModel.OFFICIAL_HEAD_PREFIXES
-    bad_missing = [k for k in result.missing_keys if not k.startswith(head_pfx)]
+    # 深监督辅助头(plan 任务D,2026-09-20):旧 checkpoint(r5/ep16/CC 快照)
+    # 无 aux 键属预期——从旧权重热启动深监督实验是**标准路径**(aux 头随机
+    # 初始化 + 主链继承)。列入白名单与四头同待遇;缺任何其他键仍 fail-loud。
+    aux_pfx = MultiTaskThyroidModel.SEG_AUX_PREFIXES
+    bad_missing = [
+        k for k in result.missing_keys
+        if not k.startswith(head_pfx) and not k.startswith(aux_pfx)
+    ]
     if bad_missing:
         raise RuntimeError(
             f"warm-start 底座缺失**非四头**键 {bad_missing[:8]}(共 {len(bad_missing)})"
@@ -170,7 +181,12 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
         )
     if result.unexpected_keys:
         print(f"--> [warm-start] 忽略 {len(result.unexpected_keys)} 个多余键(底座含已弃用字段)")
-    n_head_missing = len(result.missing_keys)
+    # 🔴 Gate2 P1 修复(2026-09-20 审查):只数四头前缀的 missing——旧权重
+    # 缺 aux 4 键(任务D 标准路径)会被 len(missing_keys) 混进"四头 N 键随机
+    # 初始化"的口径,stdout 事实错误(F1 审查防的"从 stdout 分不出真热启动"
+    # 同型雷)。aux 计数下方单独分口径打印。
+    n_head_missing = sum(
+        1 for k in result.missing_keys if k.startswith(head_pfx))
     # 🔴 ete_only 专属判读(Gate2 审查 F1,2026-09-12):r5 全量热启动时四头
     # missing=0(权重已覆盖),此时打"四头 0 键随机初始化"是**事实错误**且与
     # 纯分割底座(四头 32 键真随机)的日志格式相同——从 stdout 分不出哪个是
@@ -181,6 +197,13 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     else:
         print(f"--> [warm-start] 加载 {ckpt_path};四头 {n_head_missing} 键随机初始化"
               f"({'🔴 分割底座,四头为随机' if n_head_missing >= 30 else '部分命中,核对 checkpoint'})")
+    # 深监督 aux 键计数(任务D):旧权重缺 4 键(2头×w/b)属预期标准路径,
+    # 但必须打进日志——"aux 随机初始化"从 stdout 可见,防"以为热启动了
+    # aux 其实是随机"的误读(与四头计数同型但分口径打印)。
+    n_aux_missing = sum(1 for k in result.missing_keys if k.startswith(aux_pfx))
+    if n_aux_missing:
+        print(f"--> [warm-start] 深监督辅助头 {n_aux_missing} 键随机初始化"
+              f"(旧 checkpoint 无 aux 键,任务D 标准路径)")
 
 
 
@@ -761,7 +784,8 @@ def main():
     _hc = config["train"]
     print(f"[seg 损失配方] boundary_weight={_hc.get('seg_boundary_weight', 0.0)} "
           f"lovasz_weight={_hc.get('seg_lovasz_weight', 0.0)} "
-          f"ccdice_weight={_hc.get('seg_ccdice_weight', 0.0)}"
+          f"ccdice_weight={_hc.get('seg_ccdice_weight', 0.0)} "
+          f"deepsup_weight={_hc.get('seg_deepsup_weight', 0.0)}"
           f"{' (SEG_ONLY 实验变量)' if args.seg_only else ''}")
     # 🔴 ETE 小试的三个启动硬门(Gate2 审查 F1/F2/F4,2026-09-12):
     # ① --ete-only 必须配 --resume-from(r5 全量权重)——漏传则 ETE 头从随机
@@ -812,18 +836,20 @@ def main():
         bw = seg_cfg.get("seg_boundary_weight", 0.0)
         lw = seg_cfg.get("seg_lovasz_weight", 0.0)
         cw = seg_cfg.get("seg_ccdice_weight", 0.0)
+        dw = seg_cfg.get("seg_deepsup_weight", 0.0)
         # 🔴 量级标定豁免(2026-09-14 云端实证:标定=权重 0 跑 1ep 读分项基线,
         # 与此门"防全 0 空微调"冲突,原版把标定也拦了)。epochs==1 视为标定
         # 放行——空微调白烧至少要 2ep 才成立,1ep 的产物本就是丢弃的探针。
         if (args.smoke is False and epochs > 1
-                and bw == 0.0 and lw == 0.0 and cw == 0.0):
+                and bw == 0.0 and lw == 0.0 and cw == 0.0 and dw == 0.0):
             # 冒烟/标定允许全 0;真训全 0 = 空微调白烧(r7 同型)。
             parser.error("--seg-only 真训须 config.train.seg_boundary_weight / "
-                         "seg_lovasz_weight / seg_ccdice_weight 至少一项 > 0"
+                         "seg_lovasz_weight / seg_ccdice_weight / "
+                         "seg_deepsup_weight 至少一项 > 0"
                          "(全 0 = 空 微调白烧;"
                          "权重 0 的 1ep 量级标定放行)")
         print(f"[SEG-only 配方] boundary_weight={bw} lovasz_weight={lw} "
-              f"ccdice_weight={cw} "
+              f"ccdice_weight={cw} deepsup_weight={dw} "
               f"epochs={epochs} (门:mal/tirads/loc/t/ete "
               f"各不降超 0.01,对照 epoch=0 基线;🔴 dice 硬门已删 2026-09-18,"
               f"上线资格以训后快照官方口径筛为准)")

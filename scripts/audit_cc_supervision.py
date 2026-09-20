@@ -49,10 +49,21 @@ from src.dataset.official_loader import (  # noqa: E402
 )
 
 
-def _load_samples(samples_pkl: str) -> list:
+def _load_samples(samples_pkl: str):
+    """读 preextract_dynamic 的落盘 payload(🔴 是 dict 不是 list:
+    {"samples": [...], "_meta": {...}};旧版按裸 list 迭代会把 dict 键名
+    当样本,str 上 .get 直接 AttributeError——C0 首跑实崩)。"""
     import pickle
     with open(samples_pkl, "rb") as f:
-        return pickle.load(f)
+        payload = pickle.load(f)
+    if isinstance(payload, dict):
+        meta = payload.get("_meta") or payload.get("CACHE_META") or {}
+        if meta.get("partial"):
+            raise RuntimeError(
+                "[audit] 该 samples.pkl 是 --limit 冒烟残件(_meta.partial=True),"
+                "覆盖不全,禁止用于 C0 审计——用全量预抽取产物重跑。")
+        return payload["samples"], meta
+    return payload, {}
 
 
 def _static_mask(mask_path: str) -> np.ndarray:
@@ -199,8 +210,10 @@ def main():
                         help="只审前 N 个图聚合单元(0=全量;冒烟用)")
     args = parser.parse_args()
 
-    samples = _load_samples(args.samples_pkl)
-    print(f"[audit] samples={len(samples)} img_size={args.img_size}")
+    samples, meta = _load_samples(args.samples_pkl)
+    print(f"[audit] samples={len(samples)} img_size={args.img_size}"
+          + (f" (pkl meta: n_total={meta.get('n_total')}, "
+             f"n_dynamic={meta.get('n_dynamic')})" if meta else ""))
     if args.limit:
         # 截断但保持图聚合完整性:取前 limit 个聚合单元对应的样本
         seen = set()
@@ -220,14 +233,20 @@ def main():
 
     # 判读(预注册阈值:plan C0 的"宣称条款",不是开训门)
     k_ge2 = report["k_ge2_frac"]
+    vanish = report["vanish_frac"]
+    erosion = report["bg_erosion_frac"]
     report["verdict"] = {
         "cc_effective_note": (
             f"K≥2 图占比 {k_ge2:.1%}——"
             + ("多实例平权成立" if k_ge2 >= 0.20
                else "大量 K=1,CC=局部归一化 DiceCE,不得宣称多实例平权")),
         "bg_erosion_note": (
-            f"背景侵蚀平均相对倍数 {report['bg_erosion_frac']:.3f}×"
+            f"背景侵蚀平均相对倍数 {erosion:.2f}×"
             + "(其他已标注 GT/本实例面积;PU ω 降权的已标注下界,未标注不可测)"),
+        "vanish_note": (
+            f"小病灶 resize 消失比 {vanish:.2%}——"
+            + ("几乎无消失,512² 分辨率对小病灶安全" if vanish < 0.01
+               else "有消失,建议评估更高分辨率或保留原图")),
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

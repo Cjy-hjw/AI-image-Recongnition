@@ -97,6 +97,9 @@ class MultiTaskLoss(nn.Module):
         # plan 任务C CC-DiceCE(2026-09-18,新架构线):默认 0 = 老路径零回归,
         # 权重在 config.train.seg_ccdice_weight;门/横幅见 train_official。
         self.seg_ccdice_weight = float(cfg.get("seg_ccdice_weight", 0.0))
+        # plan 任务D 深监督辅助头(2026-09-20):默认 0 = 零回归,
+        # 权重在 config.train.seg_deepsup_weight;横幅见 train_official。
+        self.seg_deepsup_weight = float(cfg.get("seg_deepsup_weight", 0.0))
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
         # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径,零回归。
@@ -152,6 +155,7 @@ class MultiTaskLoss(nn.Module):
             boundary_weight=self.seg_boundary_weight,
             lovasz_weight=self.seg_lovasz_weight,
             ccdice_weight=self.seg_ccdice_weight,
+            deepsup_weight=self.seg_deepsup_weight,
         )
 
         # 2. Concept losses

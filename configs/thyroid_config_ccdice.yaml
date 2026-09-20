@@ -156,9 +156,10 @@ train:
   # 🔴 **`la_tau` 必须与 `qwk_weight` 同时开，绝不能单独开**：LA 是推高稀有类
   # 概率（实测 τ0→0.5 使类3 概率 ×21），单开会重演"过度预测稀有类→Kappa
   # 转负"（见上面 ete_cb_beta 注释里 ep26 那次事故）；SoftQWK 才是压住它的那半。
-  # 计划分两跑验证（plan `sunny-shimmying-popcorn.md` 第2层）：
-  #   2-① 只关 CB（ete_cb_beta: 0.9→0，其余不动）—— 验 CB 的净贡献；
-  #   2-② 在①基础上开 la_tau=0.5 + ete_qwk_weight=1.0 —— 验 DR 主方案整体效果。
+  # 历史注释(已判死勿执行):原"分两跑验证"计划出自旧 plan `sunny-shimmying-popcorn.md` 第2层,
+  # 该 plan 已被 2026-09-17 新 plan `goofy-sprouting-crane.md` 取代;且 #128 实验已于 2026-09-03
+  # r6 三连对拍判死(CB-Focal β=0.9 是 ETE 起飞必要条件,LA 替代后 kappa 不升)。ete_qwk_weight
+  # 保持 0 不动。
   # 每层跑完看 JSONL 的 4 项监控（val_pred_hist 等，backlog #128 待补）再决定回滚。
   ete_qwk_weight: 0.0       # SoftQWK 项权重，0=关（默认，CB-Focal 老路径）
   ete_dist_weight: 0.2      # 有序距离正则权重，仅 ete_qwk_weight>0 时生效（DR 值，未调）
@@ -235,3 +236,6 @@ train:
                           # 流程:先 1ep 标定读 JSONL 的 loss_seg / loss_seg_ccdice 分项,
                           # 按 w = 0.2 x loss_seg / loss_seg_ccdice 反推后改本值再开正式训练
                           # (plan 任务C 预注册:对齐目标 0.2-1x 主项,禁抄绝对数)
+  # 深监督(plan 任务D)生产默认 0:实验归 configs/thyroid_config_deepsup.yaml,
+  # 本实验 config 保持单变量(ccdice-only)。
+  seg_deepsup_weight: 0.0

@@ -13,17 +13,26 @@ def compute_segmentation_loss(
     boundary_weight: float = 0.0,
     lovasz_weight: float = 0.0,
     ccdice_weight: float = 0.0,
+    deepsup_weight: float = 0.0,
 ):
     """Compute BCE + Dice segmentation loss with NaN sentinel.
 
     When targets contains "valid_mask" (a [B] float tensor), applies
     per-sample segmentation validity masking with sum / (valid_count + eps).
     Samples with valid_mask=0 contribute zero gradient to the seg head.
-    boundary_weight/lovasz_weight/ccdice_weight > 0 时额外外挂三项
-    (阶段2 seg-only / plan 任务C):返回值变为 (loss_seg, extra_dict),
-    extra_dict 含 "seg_boundary"/"seg_lovasz"/"seg_ccdice" 分项(权重=0 时
-    仍返回 dict,键值为 0.0 张量——消费端无条件 update,不查权重,防
-    "接线被删 JSONL 静默丢分项";n_cc_* 计数键仅权重>0 时出现)。
+    boundary_weight/lovasz_weight/ccdice_weight/deepsup_weight > 0 时额外
+    外挂(阶段2 seg-only / plan 任务C / plan 任务D 深监督):返回值变为
+    (loss_seg, extra_dict),extra_dict 含 "seg_boundary"/"seg_lovasz"/
+    "seg_ccdice"/"seg_deepsup" 分项(权重=0 时仍返回 dict,键值为 0.0 张量
+    ——消费端无条件 update,不查权重,防"接线被删 JSONL 静默丢分项";
+    n_cc_* 计数键仅权重>0 时出现)。
+
+    deepsup(plan 任务D,2026-09-20):outputs 里的 "seg_aux2"/"seg_aux3"
+    (模型侧已上采样到与 "mask" 同 shape)各自与 gt 算 **与主头同式的
+    per-sample BCE+Dice**(同一对 bce/dice 数学,不经 bce_fn/dice_fn 的
+    nn 模块——那两个是带状态的训练期对象,复用会让辅助路径与主路径共享
+    可学习参数;此处主路径 masked 版本也是 F 直算,口径一致),两路等权
+    平均后乘权重。零权重时 aux 键存在与否不影响(loss 恒不加项)。
 
     Falls back to original scalar BCE+Dice path when "valid_mask" is absent.
     """
@@ -64,6 +73,32 @@ def compute_segmentation_loss(
             _c_per = torch.zeros_like(loss_per)
             _cc_diag = None
 
+        # 深监督辅助头(plan 任务D):aux logits 与 gt 同式 BCE+Dice,
+        # 两路等权平均。权重>0 但 aux 键缺席 = 模型/损失版本错配
+        # (新损失喂旧模型输出),fail-loud 而非静默跳过(r7 同型雷)。
+        if deepsup_weight > 0.0:
+            _aux_keys = ("seg_aux2", "seg_aux3")
+            _missing_aux = [k for k in _aux_keys if k not in outputs]
+            if _missing_aux:
+                raise ValueError(
+                    f"deepsup_weight>0 但 outputs 缺 aux 键 {_missing_aux}"
+                    f" —— 模型前向未产深监督 logits,新损失配旧模型输出,"
+                    "拒绝静默空算(检查 model 定义与 outputs 键)")
+            _d_per = torch.zeros_like(loss_per)
+            for _ak in _aux_keys:
+                _aux_logits = outputs[_ak].float()          # 脱 autocast,与主路径 float32 归约同口径
+                _aux_bce = F.binary_cross_entropy_with_logits(
+                    _aux_logits, gt, reduction="none").mean(dim=[1, 2, 3])
+                _aux_sig = torch.sigmoid(_aux_logits)
+                _inter = (_aux_sig * gt).sum(dim=[1, 2, 3])
+                _union = _aux_sig.sum(dim=[1, 2, 3]) + gt.sum(dim=[1, 2, 3])
+                _aux_dice = 1.0 - (2.0 * _inter + _eps) / (_union + _eps)
+                _d_per = _d_per + (_aux_bce + _aux_dice)    # 累加各路同式值
+            _d_per = _d_per / len(_aux_keys)                 # aux2/aux3 等权平均
+            loss_per = loss_per + deepsup_weight * _d_per
+        else:
+            _d_per = torch.zeros_like(loss_per)
+
         loss_seg = (loss_per * v).sum() / (v.sum() + _eps)
         extra = {
             "seg_boundary": (_b_per * v).sum() / (v.sum() + _eps),
@@ -72,6 +107,7 @@ def compute_segmentation_loss(
                            if _c_per is not None
                            else torch.zeros((), device=loss_seg.device,
                                             dtype=loss_seg.dtype)),
+            "seg_deepsup": (_d_per * v).sum() / (v.sum() + _eps),
         }
         # CC 覆盖诊断(权重>0 才记;JSONL extra 消费方=_step_diagnostics,
         # 对标量逐键 round;缺键=权重 0,操作者不会误读)。
@@ -87,10 +123,11 @@ def compute_segmentation_loss(
         loss_seg = loss_bce_seg + loss_dice_seg
         # legacy 无 valid_mask 路径不支持新损失项(官方训练恒有 valid_mask):
         # 静默丢变量 = 空微调被误读为损失无效(r7 事故同型),显式 raise。
-        if boundary_weight > 0.0 or lovasz_weight > 0.0 or ccdice_weight > 0.0:
+        if (boundary_weight > 0.0 or lovasz_weight > 0.0
+                or ccdice_weight > 0.0 or deepsup_weight > 0.0):
             raise ValueError(
-                "boundary/lovasz/ccdice 损失需要 valid_mask(官方训练路径);"
-                "legacy 无屏蔽路径不支持,勿在旧数据集上开这三项")
+                "boundary/lovasz/ccdice/deepsup 损失需要 valid_mask(官方训练路径);"
+                "legacy 无屏蔽路径不支持,勿在旧数据集上开这四项")
         extra = {
             "seg_boundary": torch.zeros((), device=loss_seg.device,
                                         dtype=loss_seg.dtype),
@@ -98,6 +135,8 @@ def compute_segmentation_loss(
                                       dtype=loss_seg.dtype),
             "seg_ccdice": torch.zeros((), device=loss_seg.device,
                                       dtype=loss_seg.dtype),
+            "seg_deepsup": torch.zeros((), device=loss_seg.device,
+                                       dtype=loss_seg.dtype),
         }
 
     if torch.isnan(loss_seg):

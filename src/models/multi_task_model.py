@@ -2,6 +2,7 @@ from typing import TypedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 from src.models.blocks import ConvBlock, TaskAlignmentAdaptor
 from src.models.mask_features import nodule_scale_from_mask
@@ -51,6 +52,11 @@ class ModelOutputs(TypedDict):
     # --- backlog #124:TI-RADS 总分类头输出 ---
     tirads_logits: torch.Tensor
     tirads_probs: torch.Tensor
+    # --- 深监督辅助 logits(plan 任务D 首攻扩展,2026-09-20)---
+    # 与 "mask" 同 shape [B,1,H,W](forward 内已上采样);训练侧
+    # compute_segmentation_loss 按 seg_deepsup_weight 消费,推理侧不读。
+    seg_aux2: torch.Tensor
+    seg_aux3: torch.Tensor
 
 
 class MultiTaskThyroidModel(nn.Module):
@@ -66,9 +72,20 @@ class MultiTaskThyroidModel(nn.Module):
     # 不训,由 schedule_official.py 接管。加载旧 checkpoint 时 missing_keys 的
     # 合法白名单也是这个集合(新头名一旦加进这里,warm-start/冻结/可训集自动生效,
     # 无需再改 `load_warm_start`/`schedule_official.py` —— 两处都动态读本元组)。
+    # 🔴 深监督辅助头(2026-09-20)**有意不进本元组**:进这里 = warm-start 加载
+    # r5/ep16 时 missing_keys 合法化 + 调度自动放行,但辅助头是"训练期梯度管道"
+    # 而非"计分头",它的 missing 应走 load_warm_start 的非头键 fail-loud 分支
+    # (旧 checkpoint 缺 aux 键 = 结构不匹配,静默随机初始化的辅助头会往解码器
+    # 中层注入噪声梯度)。实际放行在 train_official.load_warm_start 的 aux 白
+    # 名单(无条件放行 + n_aux_missing 分口径日志:旧权重热启动深监督实验是
+    # 标准路径);推理侧 strict 校验天然拦截旧权重(🔴 代码/权重成对耦合:
+    # cloud_infer 树的模型代码更新后,回退旧权重必须连 src 一起回退)。
     OFFICIAL_HEAD_PREFIXES = (
         "location_head", "extension_head", "clinical_t_head", "tirads_head",
     )
+    # 深监督辅助头前缀(训练侧放行/白名单用;与 OFFICIAL_HEAD_PREFIXES 分离,
+    # 理由见上)。
+    SEG_AUX_PREFIXES = ("seg_aux_head_2", "seg_aux_head_3")
     STAGE3_FROZEN_PREFIXES = (
         "seg_backbone",
         "cls_backbone",
@@ -187,6 +204,23 @@ class MultiTaskThyroidModel(nn.Module):
         )
         self.seg_head = nn.Conv2d(20, 1, kernel_size=1)
 
+        # ── 多尺度深监督辅助头(plan 任务D 首攻扩展,2026-09-20)──────────────────
+        # DR §3.1 首攻方案第三组件:对解码器 stage2/stage3 输出挂 1×1 辅助分割头,
+        # 辅助 logits 上采样到全分辨率后与主头同式损失(BCE+Dice per-sample),
+        # 权重 config.train.seg_deepsup_weight 控制(默认 0 = 零回归)。
+        # 🔴 设计约束(Fable 终审机制跳跃禁令的反面——本组件只加强现有语义
+        # logits 的中浅层监督,不换范式不换接口):
+        # - 辅助头是**纯推理旁路**:forward 恒算(结构稳定性,防"训练/推理前向
+        #   不一致"类 bug),但推理侧消费端(case_pipeline/v21_output)只读
+        #   outputs["mask"],aux 键多出无影响;损失侧 weight=0 时逐位零贡献。
+        # - 通道数动态取 dec_stages 输出(stage2→40ch@128²、stage3→20ch@256²,
+        #   512 输入下),不硬编码——分辨率改 640 时 spatial 尺寸随动。
+        # - 命名前缀 "seg_aux_head_*" 加入 SEG_TRAIN_DECODER 语义域(训练侧
+        #   requires_grad 由调度按前缀放行,见 schedule_official.py 同轮改动)。
+        self.seg_aux_head_2 = nn.Conv2d(40, 1, kernel_size=1)   # dec_stages[3] 出
+        self.seg_aux_head_3 = nn.Conv2d(20, 1, kernel_size=1)   # dec_stages[4] 出
+
+
         self.prior_extractor = DifferentiablePhysicalPriorExtractor(
             img_size=self.img_size
         )
@@ -284,11 +318,26 @@ class MultiTaskThyroidModel(nn.Module):
         d = self.up_stages[2](d)
         d = self.dec_stages[2](torch.cat([d, seg_features[0]], dim=1))
         d = self.up_stages[3](d)
-        d = self.dec_stages[3](d)
-        d = self.up_stages[4](d)
-        d = self.dec_stages[4](d)
-        logits_mask = self.seg_head(d)
+        d2 = self.dec_stages[3](d)          # 40ch @ H/4 —— 深监督 aux_2 挂点
+        d = self.up_stages[4](d2)
+        d3 = self.dec_stages[4](d)          # 20ch @ H/2 —— 深监督 aux_3 挂点
+        logits_mask = self.seg_head(d3)
         soft_mask = torch.sigmoid(logits_mask)
+
+        # 深监督辅助 logits:1×1 头后双线性上采样到全分辨率(与主头同 shape)。
+        # 恒算(推理旁路):结构稳定优先——训练/推理前向不一致是比算力更贵的 bug。
+        # aux 权重=0 时 loss 侧零消费,推理侧无人读这两个键。
+        aux2_logits = self.seg_aux_head_2(d2)
+        aux3_logits = self.seg_aux_head_3(d3)
+        if aux2_logits.shape[-2:] != logits_mask.shape[-2:]:
+            aux2_logits = F.interpolate(
+                aux2_logits, size=logits_mask.shape[-2:], mode="bilinear",
+                align_corners=False)
+        if aux3_logits.shape[-2:] != logits_mask.shape[-2:]:
+            aux3_logits = F.interpolate(
+                aux3_logits, size=logits_mask.shape[-2:], mode="bilinear",
+                align_corners=False)
+
 
         v_phys = self.prior_extractor(soft_mask, x)
         e_prior = self.prior_mlp(v_phys) * gamma_prior
@@ -361,6 +410,11 @@ class MultiTaskThyroidModel(nn.Module):
             # --- backlog #124:TI-RADS 头输出 ---
             "tirads_logits": tirads_out["tirads_logits"],
             "tirads_probs": tirads_out["tirads_probs"],
+            # --- 深监督辅助 logits(plan 任务D,2026-09-20)---
+            # 已上采样到与 "mask" 同 shape [B,1,H,W];训练侧由
+            # compute_segmentation_loss 按权重消费,推理侧无人读。
+            "seg_aux2": aux2_logits,
+            "seg_aux3": aux3_logits,
         }
 
         return outputs

@@ -103,6 +103,12 @@ python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-si
 # 无需改代码；--epochs 缺省仍是 STAGE_C_END=35，需显式传 24。
 python scripts/data/preextract_dynamic.py --data-root /2026aicompetition/datasets/training/annotation \
     --xlsx <标注.xlsx> --cache-dir /2026aicompetition/workspace/cache [--limit 3]  # 先 --limit 3 验管道，约 1 分钟，再全量约 35-45 分钟
+# 🔴 2026-09-20 cache 速副本：用户已把 workspace/cache 复制到 /root/cache（容器本地层，
+# 挂载盘 IO 慢是训练/诊断慢的根因，CC/深监督轮实锤）。换速方案（训练中禁换，副本缺文件
+# loader 会静默掉样本毁整轮）：mv 原目录让位 + ln -s /root/cache →
+# /2026aicompetition/workspace/cache，samples.pkl 及所有命令绝对路径零重写。
+# 🔴 /root 平台重启即清（实测两次），重启后 symlink 悬空须重拷+重建；快照等
+# /root 下产物训完顺手 cp 回挂载盘。详见 深监督任务书 3.5 步。
 python scripts/train_official.py --data-root /2026aicompetition/datasets/training/annotation \
     --xlsx <标注.xlsx> --resume-from checkpoints/best_model_mixtrain_xl_e40.pth \
     --samples-pkl /2026aicompetition/workspace/cache/samples.pkl \

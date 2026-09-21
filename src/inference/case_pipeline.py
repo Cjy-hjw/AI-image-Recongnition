@@ -228,6 +228,12 @@ def diagnose_static_case(model, img_np, config, calibrator, precision, device):
         tile, stride = _tiling_geometry()
         h_img, w_img = img_np.shape[:2]
         if tile_origins(h_img, w_img, tile, stride) != [(0, 0)]:
+            if _static_tta_enabled():
+                print(
+                    "--> [WARNING] AICOMP_STATIC_TILING 与 AICOMP_STATIC_TTA 同开: "
+                    "tiling 早退,TTA 被跳过(不组合)",
+                    flush=True,
+                )
             outputs, prob_fused = diagnose_static_case_tiled(
                 model, img_np, config, calibrator, precision, device,
                 tile, stride)

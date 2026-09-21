@@ -21,8 +21,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.inference.tiling import (  # noqa: E402
-    _tiling_enabled, _tiling_geometry, diagnose_static_case_tiled,
-    tile_origins)
+    _select_classification_tile, _tiling_enabled, _tiling_geometry,
+    diagnose_static_case_tiled, tile_origins)
 
 CONFIG = {"data": {"img_size": 512}, "model": {"backbone": "efficientnet_b2"},
           "environment": {"device": "cpu"}}
@@ -92,12 +92,18 @@ def test_tiling_geometry_bounds(monkeypatch):
     monkeypatch.delenv("AICOMP_TILING_TILE", raising=False)
     monkeypatch.delenv("AICOMP_TILING_STRIDE", raising=False)
     assert _tiling_geometry() == (512, 384)
-    monkeypatch.setenv("AICOMP_TILING_TILE", "50")     # <128 拒
+    monkeypatch.setenv("AICOMP_TILING_TILE", "abc")  # 非整数回默认
     assert _tiling_geometry() == (512, 384)
-    monkeypatch.setenv("AICOMP_TILING_TILE", "2048")   # >1024 拒
-    assert _tiling_geometry() == (512, 384)
-    monkeypatch.setenv("AICOMP_TILING_STRIDE", "600")  # >tile 拒
-    assert _tiling_geometry() == (512, 384)
+    monkeypatch.setenv("AICOMP_TILING_TILE", "640")  # ≠512 fail-loud
+    with pytest.raises(ValueError, match="TILING_TILE"):
+        _tiling_geometry()
+    monkeypatch.setenv("AICOMP_TILING_TILE", "512")
+    monkeypatch.setenv("AICOMP_TILING_STRIDE", "512")  # ==tile 零重叠
+    with pytest.raises(ValueError, match="TILING_STRIDE"):
+        _tiling_geometry()
+    monkeypatch.setenv("AICOMP_TILING_STRIDE", "100")  # < tile//2
+    with pytest.raises(ValueError, match="TILING_STRIDE"):
+        _tiling_geometry()
 
 
 # ── 零回归(env 关 = 旧路径)────────────────────────────────────────────
@@ -209,6 +215,57 @@ def test_tiled_fusion_is_max_not_mean(tiny_model):
     assert prob2.shape == (550, 1100)
     # 全图任何像素 ≥ min(sigmoid(1.5))≈0.818:证明 max 没把高 tile 平均掉
     assert float(prob2.min()) >= 0.818 - 1e-4
+
+
+def test_tiled_fusion_max_not_last_wins(monkeypatch):
+    """重叠区取 max,不是后写覆盖(Gate2 路A:旧测试两 tile 同值,杀不掉 last-wins)。"""
+    logits = [2.197, -0.847]  # sigmoid ≈ 0.90 / 0.30,按前向顺序
+    n = {"i": 0}
+
+    def fake_forward(model, img_tensor, precision, device):
+        logit = logits[min(n["i"], len(logits) - 1)]
+        n["i"] += 1
+        return {"mask": torch.full((1, 1, 512, 512), logit)}
+
+    monkeypatch.setattr("src.inference.tiling.run_forward", fake_forward)
+    img = np.zeros((512, 896), dtype=np.uint8)  # origins (0,0),(0,384)
+    _, prob = diagnose_static_case_tiled(
+        None, img, CONFIG, None, "fp32", torch.device("cpu"), 512, 384)
+    overlap = prob[:, 384:512]
+    assert float(overlap.min()) >= 0.90 - 1e-3  # max(0.90,0.30)=0.90,非 last=0.30
+    n["i"] = 0
+    logits[:] = [-0.847, 2.197]  # 顺序对调仍 max
+    _, prob2 = diagnose_static_case_tiled(
+        None, img, CONFIG, None, "fp32", torch.device("cpu"), 512, 384)
+    assert float(prob2[:, 384:512].min()) >= 0.90 - 1e-3
+
+
+def test_select_classification_tile_contains_pixel():
+    """stride==tile 时像素必须落在选中 tile 的 [oy,oy+tile)×[ox,ox+tile)。"""
+    origins = tile_origins(1199, 1199, 512, 512)
+    tagged = [(oy, ox, {"tag": f"T{oy},{ox}"}) for oy, ox in origins]
+    sel = _select_classification_tile(tagged, (512, 512), 512)
+    assert sel["tag"] == "T512,512"  # 旧实现选中 T0,0
+
+
+def test_select_classification_tile_nearest_not_first():
+    """重叠区取起点更近的 tile,不是先出现的。"""
+    tagged = [
+        (0, 0, {"tag": "T0,0"}),
+        (0, 384, {"tag": "T0,384"}),
+    ]
+    # (256,500) 在两 tile 内;距 T0,384 中心更近
+    sel = _select_classification_tile(tagged, (256, 500), 512)
+    assert sel["tag"] == "T0,384"
+    first_only = _select_classification_tile(tagged, (256, 100), 512)
+    assert first_only["tag"] == "T0,0"
+
+
+def test_diagnose_static_case_tiled_rejects_tile_neq_img_size():
+    img = np.zeros((600, 800), dtype=np.uint8)
+    with pytest.raises(ValueError, match="img_size"):
+        diagnose_static_case_tiled(
+            None, img, CONFIG, None, "fp32", torch.device("cpu"), 640, 320)
 
 
 def test_classification_single_source_not_fused():

@@ -126,12 +126,12 @@ def main():
     fresh = used - declared
     print("\n--- 与 scripts/pack_upload.py 的 _CLOSURE 对账 ---")
     if not stale and not fresh:
-        print("  ✅ 一致")
+        print("  [OK] 一致")
     else:
         for f in sorted(fresh):
-            print(f"  🔴 闭包新增但 _CLOSURE 未收录(上云会漏文件!): {f}")
+            print(f"  [NEW] 闭包新增但 _CLOSURE 未收录(上云会漏文件!): {f}")
         for f in sorted(stale):
-            print(f"  ⚠️  _CLOSURE 有但已不可达(可删): {f}")
+            print(f"  [STALE] _CLOSURE 有但已不可达(可删): {f}")
         raise SystemExit(1)
 
 

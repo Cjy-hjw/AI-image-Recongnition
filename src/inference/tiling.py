@@ -69,14 +69,13 @@ def _tiling_enabled() -> bool:
 
 
 def _tiling_geometry() -> tuple[int, int]:
-    """(tile, stride) 解析。畸形/越界回默认;stride 必须 ≤ tile(重叠 ≥0)。
+    """(tile, stride) 解析。非整数 env 回默认;数值越界 **fail-loud**(不静默钳)。
 
-    - tile 上界 1024:模型 `preprocess_image` 的 assert 只管 resize 后正方形,
-      但 tile>512 时每 tile 仍要 resize(违背"保留原分辨率"的目的,且显存
-      平方涨);tile<128 无意义(比 min_area 还小)。
-    - stride ≥ tile // 2:重叠至少一半。stride≥tile 时相邻 tile 零重叠,
-      边界病灶两半都只有半张上下文——这是"滑窗"变"分块",融合语义不同,
-      不允许。
+    Gate2 2026-09-21:tile∈[128,1024] 曾放行 640,preprocess 仍 resize 到 512,
+    fusion `region`(tile²) vs `prob`(512²) RuntimeError;stride==tile 零重叠
+    让 `_select_classification_tile` 缺上界时选中不含该像素的 tile。
+    合法窗口:tile 必须 == `_DEFAULT_TILE`(模型 img_size);stride ∈
+    [tile//2, tile)——重叠 >0,禁止滑窗退化成分块。
     """
     def _int_env(name: str, default: int) -> int:
         raw = os.environ.get(name)
@@ -90,12 +89,18 @@ def _tiling_geometry() -> tuple[int, int]:
 
     tile = _int_env(_ENV_TILE, _DEFAULT_TILE)
     stride = _int_env(_ENV_STRIDE, _DEFAULT_STRIDE)
-    if not (128 <= tile <= 1024):
-        tile = _DEFAULT_TILE
-    if not (tile // 2 <= stride <= tile):
-        stride = _DEFAULT_STRIDE if tile == _DEFAULT_TILE else tile // 2
-        if stride > tile:
-            stride = tile
+    if tile != _DEFAULT_TILE:
+        raise ValueError(
+            f"AICOMP_TILING_TILE must equal img_size={_DEFAULT_TILE}, got {tile}. "
+            "tile≠img_size is resized back to 512 (benefit=0) and crashes fusion "
+            "(region tile×tile vs prob 512×512)."
+        )
+    if not (_DEFAULT_TILE // 2 <= stride < _DEFAULT_TILE):
+        raise ValueError(
+            f"AICOMP_TILING_STRIDE must be in "
+            f"[{_DEFAULT_TILE // 2}, {_DEFAULT_TILE}), got {stride}. "
+            "stride>=tile is block-split (zero overlap)."
+        )
     return tile, stride
 
 
@@ -155,6 +160,11 @@ def diagnose_static_case_tiled(model, img_np, config, calibrator, precision,
     origins = tile_origins(h, w, tile, stride)
 
     img_size = config["data"]["img_size"]
+    if tile != img_size:
+        raise ValueError(
+            f"tiling tile={tile} != config img_size={img_size}; "
+            "preprocess resizes every tile to img_size, fusion then shape-mismatches."
+        )
     prob_full = torch.full((h, w), -1.0, dtype=torch.float32)
 
     # 第一遍:逐 tile 前向 → max 融合;outputs 缓存供分类 tile 选择复用
@@ -186,15 +196,15 @@ def diagnose_static_case_tiled(model, img_np, config, calibrator, precision,
 def _select_classification_tile(tile_outputs, argmax_px, tile: int) -> dict:
     """融合图全局 argmax 像素 (cy, cx) → 所属 tile 的 outputs。
 
-    所属判据:像素落在 tile 裁剪区内(非 pad 区)——多个 tile 重叠时取
-    **起点最靠近该像素的**(病灶中心视角的最小裁剪偏移,tile 内偏移越靠
-    中心上下文越完整)。
+    所属判据:像素落在 tile 半开区间 [oy, oy+tile) × [ox, ox+tile) 内
+    (非 pad 区;Gate2:缺上界时 stride==tile 会选中不含该像素的更早 tile)。
+    多个 tile 重叠时取**起点最靠近该像素的**(tile 内偏移越靠中心上下文越完整)。
     """
     cy, cx = argmax_px
     best = None
     best_d = None
     for oy, ox, outputs in tile_outputs:
-        if not (oy <= cy and ox <= cx):
+        if not (oy <= cy < oy + tile and ox <= cx < ox + tile):
             continue
         # 该像素在该 tile 内的相对偏移(取 tile 中心的距离,近者优先)
         dy = abs((cy - oy) - tile // 2)

@@ -72,6 +72,7 @@ src/inference/nifti_io.py
 src/inference/nodule_split.py
 src/inference/postprocess.py
 src/inference/prediction_json.py
+src/inference/tiling.py
 src/inference/v21_output.py
 src/inference/video_aggregate.py
 src/models/__init__.py

@@ -38,6 +38,7 @@ import torch
 from src.inference.model_runner import preprocess_image, run_forward
 from src.inference.postprocess import decode_predictions, build_tirads_breakdown
 from src.inference.video_aggregate import aggregate_frame_predictions
+from src.inference.tiling import _tiling_enabled
 # NonFiniteProbabilityError 逐帧兜底信号;AssertionError 为帧形状非法(preprocess 校验)。
 from src.inference.postprocess import NonFiniteProbabilityError
 
@@ -172,6 +173,24 @@ class DynamicCaseError(Exception):
         self.diagnostic = diagnostic
 
 
+def _rebuild_cls_tile_tensor(img_np, tile: int, device):
+    """tiling 分支的 img_tensor 兜底:分类 tile 中心裁剪的普通张量。
+
+    Grad-CAM(predit.py CLI 可选功能)需要一个可反传的输入张量;tiling 的
+    分类头消费"融合图 argmax 所属 tile"的 outputs,该 tile 由
+    `tiling._select_classification_tile` 内部决定——此处**中心 tile 近似**
+    (病灶绝大多数近中心;精确重建须把 tile 选择提到此层,收益不抵复杂度,
+    Grad-CAM 是不计分的 CLI 调试功能)。返回普通张量(非 inference 张量)。
+    """
+    from src.inference.model_runner import preprocess_image as _ppi
+    h, w = img_np.shape[:2]
+    oy = max(0, (h - tile) // 2)
+    ox = max(0, (w - tile) // 2)
+    from src.inference.tiling import _crop_tile, _pad_square
+    tile_img = _pad_square(_crop_tile(img_np, oy, ox, tile), tile)
+    return _ppi(tile_img, tile, device)
+
+
 def diagnose_static_case(model, img_np, config, calibrator, precision, device):
     """单张静态图的推理核心(输入已加载+已过 gatekeeper)。
 
@@ -197,6 +216,46 @@ def diagnose_static_case(model, img_np, config, calibrator, precision, device):
             由调用方转 ERROR —— 与原 `predict.main()` 的 except Exception 兜底一致。
     """
     img_size = config["data"]["img_size"]
+
+    # --- 静态滑窗 tiling(Z1,2026-09-21;默认关,env=AICOMP_STATIC_TILING)---
+    # 大图(任一维 > tile)时逐 tile 512 前向 + 概率域 max 融合;分类头取
+    # argmax 病灶所属 tile 的单前向输出(零融合,防 TTA 覆辙)。
+    # 小图/默认关 → 走原单前向路径,逐位零回归(回归测试钉死)。
+    mask_prob_override = None
+    if _tiling_enabled():
+        from src.inference.tiling import (
+            diagnose_static_case_tiled, tile_origins, _tiling_geometry)
+        tile, stride = _tiling_geometry()
+        h_img, w_img = img_np.shape[:2]
+        if tile_origins(h_img, w_img, tile, stride) != [(0, 0)]:
+            outputs, prob_fused = diagnose_static_case_tiled(
+                model, img_np, config, calibrator, precision, device,
+                tile, stride)
+            # 融合概率图 [H,W] 与原图同坐标系;decode 的 mask_prob_override
+            # 契约恰好是 [H,W](TTA 先例)——但 TTA 的 override 是 512 域、
+            # 靠后续 mask_resized resize 回原图;tiling 的 override 已在原图
+            # 域,mask_resized 的 INTER_NEAREST resize 变恒等(同尺寸)。
+            mask_prob_override = prob_fused
+            preds = decode_predictions(outputs, calibrator=calibrator,
+                                       mask_prob_override=mask_prob_override)
+            mask_resized = cv2.resize(
+                preds["mask_binary"], (img_np.shape[1], img_np.shape[0]),
+                interpolation=cv2.INTER_NEAREST)
+            breakdown = build_tirads_breakdown(
+                preds["comp_idx"], preds["echo_idx"],
+                preds["shape_idx"], preds["margin_idx"], preds["foci_prob"])
+            return {
+                "preds": preds,
+                # tiling 无单一输入张量。img_tensor 唯一消费方 = predict.py CLI
+                # 的可选 Grad-CAM(本地调试旁路,生产 runner/v21_output 不读);
+                # CLI 开 tiling + --enable-gradcam 时用分类 tile 的重建张量
+                # 退化(Grad-CAM 语义本就是"分类头激活",分类 tile 是正确输入)。
+                "img_tensor": _rebuild_cls_tile_tensor(img_np, tile, device),
+                "mask_resized": mask_resized,
+                "breakdown": breakdown,
+                "tiling_used": (tile, stride),
+            }
+
     img_tensor = preprocess_image(img_np, img_size, device)
     outputs = run_forward(model, img_tensor, precision, device)
 

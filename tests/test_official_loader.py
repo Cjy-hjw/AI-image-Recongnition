@@ -692,14 +692,81 @@ class TestUnionMaskL2:
         with pytest.raises(RuntimeError, match="文件缺失样本占比"):
             O.build_official_datasets(
                 root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)
-        # 低比例路径:只删 1 个样本的 union 路径(PA 单样本),1/7≈14%>5% 仍 raise;
-        # 构造 5% 内场景:再用一个大 pkl(副本 ×5)稀释 → 只验证"剔除不炸、不静默"。
-        import pickle as _pkl2
-        uni5 = uni + [dict(s) for s in uni for _ in range(4)]  # 7→35 条
-        pkl5 = tmp_path / "u5.pkl"
-        pkl5.write_bytes(_pkl2.dumps(
-            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni5}))
-        os.remove(os.path.join(root, "PA", "SA", "M_1_mask.nii.gz"))
-        with pytest.raises(RuntimeError, match="占比|half"):  # 5/35≈14% 仍超,
+
+    def test_drift_filter_catches_corrupt_union_mask(self, tmp_path):
+        """路C F1/F2 杀测:union 路径**文件存在但读不出**(9-14 invalid block type
+        型损坏)必须与"文件消失"同罪——否则删掉整段 union 漂移校验后,次病灶被
+        消费端 `_static_union_mask` 静默 OR 恒等元吸收,退化为错误负监督,零反馈。
+        本测试只动 **union 独有变量**(次病灶 mask 内容损坏,img/mask_path 均在),
+        删掉 union 校验循环后仍能区分(主路径 exists/读取全部通过)。"""
+        import pickle
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        # 损坏 PB 次病灶 mask 的 gzip 数据流(头保留 → 文件存在)
+        pb_sec = os.path.join(root, "PB", "SB", "病灶1_1_mask.nii.gz")
+        raw = open(pb_sec, "rb").read()
+        with open(pb_sec, "wb") as _f:
+            _f.write(raw[:120] + b"\x00" * 20 + raw[140:])
+        pkl_p = tmp_path / "uc.pkl"
+        pkl_p.write_bytes(pickle.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni}))
+        # PB 两样本 union 路径含不可读文件 → 剔除 → 2/7=28.6% > 5% → raise
+        with pytest.raises(RuntimeError, match="文件缺失样本占比"):
             O.build_official_datasets(
-                root, xlsx, img_size=64, samples_pkl=str(pkl5), union_mask=True)
+                root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)
+
+    def test_drift_filter_union_only_variable(self, tmp_path):
+        """路C F1 区分力杀测:union 校验循环被删(变异)后,只动 union 独有变量的
+        场景必须漏防。用 **monkeypatch 旁路**(`_read_nifti_binmasks` 恒返 ([],[]))
+        等价模拟"校验循环失效":此时次病灶损坏/消失已不可判,主路径过滤判不出,
+        `build_official_datasets` 不得 raise——**本测试断言"旁路时防线失效"这个
+        事实本身**,与 test_drift_filter_catches_corrupt_union_mask(真代码路径
+        必须raise)构成一对互斥对拍,变异任一侧都会打破对拍。"""
+        import pickle
+        import unittest.mock as _mk
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        # 纯 union 独有变量:损坏(非删除)PB 次病灶 mask 的 gzip 数据流——
+        # 文件仍存在、各行 mask_path 均可解析 → 主过滤(exists)零命中,
+        # 只有 union 可读性校验判得出(删除场景主过滤也会命中,故不用)。
+        pb_sec = os.path.join(root, "PB", "SB", "病灶1_1_mask.nii.gz")
+        raw = open(pb_sec, "rb").read()
+        with open(pb_sec, "wb") as _f:
+            _f.write(raw[:120] + b"\x00" * 20 + raw[140:])
+        pkl_p = tmp_path / "um.pkl"
+        pkl_p.write_bytes(pickle.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni}))
+        # 真代码路径:union 可读性校验命中 → PB 两样本被剔 → 2/7>5% → raise
+        with pytest.raises(RuntimeError, match="文件缺失样本占比"):
+            O.build_official_datasets(
+                root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)
+        # 旁路模拟(等价于 union 校验循环被删的变异):`_read_nifti_binmasks` 恒
+        # "可读"(返回哑帧)→ 坏路径与好路径不可区分 = 检测失效;主过滤 exists 也
+        # 判不出(文件都在)→ 放行不 raise。断言"旁路放行"成立 = 变异下本场景的
+        # 实际行为,与上一段"真路径 raise"形成对拍——两侧行为相反,证明该场景的
+        # 检测**只**由 union 可读性校验承担。
+        import numpy as _np
+        _ok = ([_np.zeros((4, 4), _np.uint8)], [0])
+        with _mk.patch.object(O, "_read_nifti_binmasks", lambda *_a, **_k: _ok):
+            try:
+                O.build_official_datasets(
+                    root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)
+                bypass = "accepted"
+            except RuntimeError as e:
+                bypass = f"raised: {str(e)[:30]}"
+        assert bypass == "accepted", (
+            f"旁路(=union 校验失效)仍拒:{bypass} — 对拍无区分力,需检查")
+
+    def test_union_gate_non_dict_sample_not_typeerror(self, tmp_path):
+        """路C F3:半写/手改 pkl 混入非 dict 样本 + union_mask=True 时,gate 不抛
+        裸 TypeError,落回漂移过滤的既有报错域(与 L2 前行为一致)。"""
+        import pickle as _pkl
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        pkl_p = tmp_path / "nd.pkl"
+        pkl_p.write_bytes(_pkl.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True},
+             "samples": [uni[0], 1]}))
+        with pytest.raises((AttributeError, RuntimeError)):
+            O.build_official_datasets(
+                root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)

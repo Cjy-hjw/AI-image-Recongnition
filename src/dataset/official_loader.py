@@ -948,7 +948,11 @@ def build_official_datasets(
         #   ② union_mask=False 但 meta 标记/样本带键(union 版 pkl) → 半开态:
         #      __getitem__ 见键即走 union 分支,操作者以为关了实际开着,拒;
         #   ③ 一致 → 放行(union pkl + union_mask=True 是合法组合)。
-        _has_ukey = any("union_mask_paths" in s for s in samples)
+        #   (路C F3,2026-09-22)isinstance 短路:非 dict 样本(手改/半写损坏 pkl)
+        #   不在此抛裸 TypeError——gate 的 RuntimeError 域是 union/pkl 一致性,
+        #   损坏 pkl 的报错落在既有漂移过滤(与 L2 前行为一致)。
+        _has_ukey = any(isinstance(s, dict) and "union_mask_paths" in s
+                        for s in samples)
         if union_mask and not _has_ukey:
             raise RuntimeError(
                 f"union_mask=True 但 {samples_pkl} 无 union_mask_paths 键(旧模式产物,"
@@ -981,7 +985,12 @@ def build_official_datasets(
         # 静默退化为未标注背景=错误负监督,污染 L1 归因基座);阈值仍按样本级
         # 5% 口径(分母不变,缺路径样本进分子——口径写进 docstring 见上方注释)。
         for _up in _s.get("union_mask_paths") or ():
-            if not os.path.exists(_up):
+            # 路C F1/F2(2026-09-22):exists 只拦"文件消失"型漂移;**存在但读不出**
+            # (9-14 invalid block type 型损坏)会被消费端 `_static_union_mask`/
+            # `_dynamic_union_mask_frame` 静默 OR 恒等元吸收 → 次病灶静默退化为
+            # 错误负监督,零反馈。漂移过滤是 pkl 载入时一次性成本(非每 epoch),
+            # 此处真解压一次即同时校验存在与可读;读失败视同文件缺失,进同一 5% 口径。
+            if not _read_nifti_binmasks(_up)[0]:
                 _bad = True
                 break
         if _bad:

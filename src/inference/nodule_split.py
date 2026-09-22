@@ -436,12 +436,18 @@ def _shrink_instances_2d(nodules: list) -> list:
     k = _env_shrink_k()
     out = []
     for inst in nodules:
-        m = inst["mask"]
+        # 🔴 入口压 {0,1}(路B审查 P2-1,2026-09-22):上游 `_split_2d` 出口
+        # 恒 {0,1}(当前不可达),但本函数是模块公共符号,未来复用方喂 0/255
+        # mask 时:①正常分支——erode 是 min 滤波,255 值会原样保留,`area`
+        # 键与前景数差 255 倍、`detection_confidence` 的 `mask != 0` 区域不
+        # 变但 sum 语义崩;②回退分支——255 透传同型。入口一次压域(每实例
+        # O(H×W) 一次比较,零成本),两分支同时免疫。
+        m = (np.asarray(inst["mask"]) != 0).astype(np.uint8)
         shrunk = cv2.erode(m, _SHRINK_KERNEL, iterations=k)
         if int(shrunk.sum()) == 0:
             # 腐蚀到空 = 丢该检测(AP 负涨路径,设计文档测试规格 3 的负例):
-            # 回退不腐蚀,保住实例(宁可偏大不丢检测)。
-            out.append(inst)
+            # 回退不腐蚀,保住实例(宁可偏大不丢检测)。mask 已在入口压域。
+            out.append({**inst, "mask": m})
             continue
         ys, xs = np.nonzero(shrunk)
         x0, x1 = int(xs.min()), int(xs.max())

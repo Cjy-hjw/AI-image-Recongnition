@@ -598,3 +598,29 @@ class TestStaticShrinkZ2:
         ys, xs = np.nonzero(n["mask"])
         assert n["centroid"] == (pytest.approx(xs.mean(), abs=1e-6),
                                  pytest.approx(ys.mean(), abs=1e-6))
+
+
+    def test_non_binary_mask_normalized_at_entry(self, monkeypatch):
+        """🔴 路B审查 P2-1(2026-09-22,主会话复核修正):_shrink_instances_2d
+        入口压 {0,1},正常分支与回退分支同时免疫 0/255 输入。
+
+        机制:erode 是 min 滤波,255 值原样保留——正常分支的 area 键会与
+        前景数差 255 倍(实测 3×4 块→area 510)。当前上游 _split_2d 出口恒
+        {0,1} 不可达,但本函数是模块公共符号,防御成本 O(H×W) 零。"""
+        import numpy as np
+        from src.inference.nodule_split import _shrink_instances_2d
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        # 正常分支:3×4 内部 255 块,erode 非空
+        inst = {"mask": np.zeros((12, 12), np.uint8), "area": 12,
+                "bbox": (4, 4, 4, 3), "centroid": (5.5, 5.0)}
+        inst["mask"][4:7, 4:8] = 255
+        out = _shrink_instances_2d([inst])
+        assert set(np.unique(out[0]["mask"]).tolist()) <= {0, 1}
+        assert out[0]["area"] == 2  # (4-2)×(3-2)=2 前景数,非 510
+        # 回退分支:2×3 内部 255 块,erode 空 → 回退原 mask(已压域)
+        inst2 = {"mask": np.zeros((12, 12), np.uint8), "area": 6,
+                 "bbox": (5, 5, 3, 2), "centroid": (6.0, 5.0)}
+        inst2["mask"][5:7, 5:8] = 255
+        out2 = _shrink_instances_2d([inst2])
+        assert set(np.unique(out2[0]["mask"]).tolist()) <= {0, 1}
+        assert out2[0]["area"] == 6

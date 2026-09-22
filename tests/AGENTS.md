@@ -192,7 +192,7 @@ GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)�
 
 ## 测试总数(单一权威,2026-09-22 实测)
 
-**全套 1297 collected**(2026-09-22 Z1 tiling 后,`Demo_D` 环境实测,
+**全套 1329 collected**(2026-09-22 Z2 入口压域 + L2 union 后,`Demo_D` 环境实测,
 `pytest tests/ --collect-only` 实跑;tiling 16 项另跑 16 passed;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
@@ -266,6 +266,13 @@ Boundary 用纯内部距离(内部为正)时对齐预测的 loss 反而大于偏
 ⚠️ val_loss 口径自本轮起与 r5/r6/r7 轮 JSONL 不可比(此前 train masked/
 val legacy 本就不同式);验证阶段权重非 0 时也会计算两项(EDT 75ms/批,
 val_loss 随实验权重漂移,选模用 composite 不受影响)。
+→1329(L2 union 监督,分支 feat/l2-union-supervision:`test_official_loader.py`
+26=20+**6** 新增 TestUnionMaskL2——默认关零键/K=1 图 union 与非 union 逐位一致
+(关键不变式)/K=2 静态 OR 语义(重叠区不重计、值域 {0,1})/无 mask 行不进
+union 列表(valid_mask=0 语义不变)/动态同帧 OR+异帧分立(样本帧 [1,1,3]
+=每病灶自己的非零帧,两帧1 样本共享同一 union mask)/四头标签+mask_path+
+frame_index 逐键不变;`test_preextract_parallel.py` fake_build 签名加
+union_mask=False 兼容。全量 1328 passed+1 skipped 实跑)
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`

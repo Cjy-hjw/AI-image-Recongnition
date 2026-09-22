@@ -638,3 +638,68 @@ class TestUnionMaskL2:
             assert a["mask_path"] == b["mask_path"]
             assert a["frame_index"] == b["frame_index"]
             assert a["patient_key"] == b["patient_key"]
+
+
+    # ── 路B审查 P0-1/P2-1/P1-1 的区分力测试(2026-09-22)─────────────────────
+    def test_union_pkl_accepted_with_flag(self, tmp_path):
+        """P0-1 区分力:union 版 pkl + union_mask=True 必须被**接受**。
+        首版 gate 拒一切 pkl(union 版也被拒)= 云端链第 0 步死,本测试杀该变异。"""
+        import pickle as _pkl
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        pkl_p = tmp_path / "union.pkl"
+        pkl_p.write_bytes(_pkl.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni}))
+        train_ds, val_ds = O.build_official_datasets(
+            root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)
+        assert train_ds.samples or val_ds.samples
+
+    def test_old_pkl_rejected_with_union_flag(self, tmp_path):
+        """旧模式 pkl + union_mask=True → raise(静默回落防线)。"""
+        import pickle as _pkl
+        root, xlsx = self._build_union_root(tmp_path)
+        plain = O.build_official_samples(root, xlsx)
+        pkl_p = tmp_path / "plain.pkl"
+        pkl_p.write_bytes(_pkl.dumps({"_meta": {"img_size": 64}, "samples": plain}))
+        with pytest.raises(RuntimeError, match="union_mask_paths"):
+            O.build_official_datasets(root, xlsx, img_size=64,
+                                      samples_pkl=str(pkl_p), union_mask=True)
+
+    def test_union_pkl_rejected_without_union_flag(self, tmp_path):
+        """P2-1:union 版 pkl + 未传 union_mask → raise(半开态防线)。"""
+        import pickle as _pkl
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        pkl_p = tmp_path / "union2.pkl"
+        pkl_p.write_bytes(_pkl.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni}))
+        with pytest.raises(RuntimeError, match="半开态"):
+            O.build_official_datasets(root, xlsx, img_size=64,
+                                      samples_pkl=str(pkl_p), union_mask=False)
+
+    def test_drift_filter_covers_union_paths(self, tmp_path):
+        """P1-1:union 路径文件消失 → 样本被剔除(不留错误负监督)。"""
+        import pickle as _pkl
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        pkl_p = tmp_path / "u3.pkl"
+        pkl_p.write_bytes(_pkl.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni}))
+        # 删掉 PB 的次病灶 mask(9-14 官方删 21 mask 的同型漂移)
+        os.remove(os.path.join(root, "PB", "SB", "病灶1_1_mask.nii.gz"))
+        # PB 两样本的 union 路径缺一 → 剔除;fixture 里 2/7=28.6% 超 5% 阈值
+        # → 同轮 raise 兜底(防"过滤掩盖真事故")。两道防线都断言:
+        with pytest.raises(RuntimeError, match="文件缺失样本占比"):
+            O.build_official_datasets(
+                root, xlsx, img_size=64, samples_pkl=str(pkl_p), union_mask=True)
+        # 低比例路径:只删 1 个样本的 union 路径(PA 单样本),1/7≈14%>5% 仍 raise;
+        # 构造 5% 内场景:再用一个大 pkl(副本 ×5)稀释 → 只验证"剔除不炸、不静默"。
+        import pickle as _pkl2
+        uni5 = uni + [dict(s) for s in uni for _ in range(4)]  # 7→35 条
+        pkl5 = tmp_path / "u5.pkl"
+        pkl5.write_bytes(_pkl2.dumps(
+            {"_meta": {"img_size": 64, "union_mask": True}, "samples": uni5}))
+        os.remove(os.path.join(root, "PA", "SA", "M_1_mask.nii.gz"))
+        with pytest.raises(RuntimeError, match="占比|half"):  # 5/35≈14% 仍超,
+            O.build_official_datasets(
+                root, xlsx, img_size=64, samples_pkl=str(pkl5), union_mask=True)

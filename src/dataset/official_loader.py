@@ -337,6 +337,27 @@ def parse_annotation_xlsx(
     return records, colmap
 
 
+def _row_img_dir(root: str, pid: str, rec: Dict,
+                patient_is_dynamic: bool) -> Tuple[bool, str]:
+    """行级 img_dir 解析(主循环与 L2 union 收集器共用,单一权威)。
+
+    判据与 build_official_samples 主循环逐位同源:患者级磁盘探测为主,
+    **行级 series 目录兜底**(患者同时有动态 nii 与静态 .dcm 时按静态)。
+    返回 (is_dynamic, img_dir)。
+    """
+    is_dynamic = patient_is_dynamic
+    if is_dynamic:
+        _series = _cell_str(rec.get("series_uid"))
+        if _series and glob.glob(os.path.join(root, pid, _series, "*.dcm")):
+            is_dynamic = False
+    if is_dynamic:
+        return True, os.path.join(root, pid, pid)
+    _series = _cell_str(rec.get("series_uid"))
+    img_dir = os.path.join(root, pid, _series) if _series else os.path.join(root, pid)
+    return False, img_dir
+
+
+
 # ── 样本构造 ────────────────────────────────────────────────────────────────
 def _is_lesion_roi(roi_name: str) -> bool:
     """是否为构成分类/分割样本的病灶行(M 或 病灶N);关键帧/开始/结束行返回 False。"""
@@ -504,24 +525,6 @@ def build_official_samples(
         # preextract_dynamic),mask_path 键本身不动 —— 诊断侧 GT 逐病灶装载零影响。
         # 动态帧号语义(预注册):样本的 frame_index 不变(各病灶自己的非零帧),
         # union 在"该帧实际有哪些病灶 mask"层面合成(同帧 OR;不同帧各帧各的并集)。
-        _union_by_dir: Dict[str, List[str]] = {}
-        if union_mask:
-            for rec in recs:
-                _roi = _cell_str(rec.get("roi_name"))
-                if not _is_lesion_roi(_roi):
-                    continue
-                _is_dyn = os.path.exists(os.path.join(root, pid, pid, f"{pid}.nii.gz"))
-                if _is_dyn:
-                    _img_dir = os.path.join(root, pid, pid)
-                else:
-                    _series = _cell_str(rec.get("series_uid"))
-                    _img_dir = (os.path.join(root, pid, _series) if _series
-                                else os.path.join(root, pid))
-                _mp = _mask_path_for_roi(_img_dir, _roi)
-                if _mp is not None:
-                    _union_by_dir.setdefault(_img_dir, [])
-                    if _mp not in _union_by_dir[_img_dir]:
-                        _union_by_dir[_img_dir].append(_mp)
         # 静动判据 = **磁盘文件扩展名**(定稿 §1.3:.dcm 静 / .nii.gz 动,全量互斥 0 混合)。
         # 不用表里的「图像性质」列:官方 74 列表头中没有该列(见 parse_annotation_xlsx 注释)。
         # 每患者探一次(静动是患者级属性),避免逐行重复 I/O。
@@ -535,6 +538,22 @@ def build_official_samples(
             _safe_print(f"--> [official_loader] ⚠️ 患者 {pid} 静动判据冲突:"
                         f"表列图像性质={patient_prop}(1静/2动) 但磁盘 {'有' if patient_is_dynamic else '无'} "
                         f"{pid}.nii.gz —— 以磁盘为准继续。")
+
+        _union_by_dir: Dict[str, List[str]] = {}
+        if union_mask:
+            for rec in recs:
+                _roi = _cell_str(rec.get("roi_name"))
+                if not _is_lesion_roi(_roi):
+                    continue
+                # 🔴 判据必须与主循环同源(_row_img_dir,单一权威):首版收集器
+                # 独立重判静动(漏行级 series 兜底),混合患者下归错 img_dir →
+                # union_mask_paths 静默为空(审查 P1-1,2026-09-22 修)。
+                _is_dyn, _img_dir = _row_img_dir(root, pid, rec, patient_is_dynamic)
+                _mp = _mask_path_for_roi(_img_dir, _roi)
+                if _mp is not None:
+                    _union_by_dir.setdefault(_img_dir, [])
+                    if _mp not in _union_by_dir[_img_dir]:
+                        _union_by_dir[_img_dir].append(_mp)
 
         for rec in recs:
             roi = _cell_str(rec.get("roi_name"))
@@ -894,23 +913,7 @@ def build_official_datasets(
     切分仍在此处按同一 `seed`/`val_frac` 现算,故换 seed 不必重跑预抽取。
     """
     if samples_pkl:
-        if union_mask:
-            # 🔴 L2 union 与既有 samples.pkl 不兼容:旧 pkl 的样本不带
-            # union_mask_paths 键(静默回落单病灶监督 = "号称 union 实际没开",
-            # 与 --limit 残件同类)。必须用 union 模式重跑 preextract_dynamic
-            # 生成新 pkl(frame_key 输入不同,物理隔离零污染旧缓存)。
-            raise RuntimeError(
-                f"union_mask=True 需要带 union_mask_paths 键的 samples.pkl: {samples_pkl}"
-                f" 是旧模式产物。用 scripts/data/preextract_dynamic.py --union-mask "
-                f"重新生成(frame_key 输入不同,不会覆盖旧缓存)。")
         samples, meta = _load_samples_pkl(samples_pkl)
-        if meta.get("partial"):
-            # 🔴 硬拒而非告警:`--limit N` 的 pkl 只覆盖 N 个动态影像文件,其余动态样本
-            # 没有缓存、会**静默回落**到全量解压的原路径 —— 既没提速又只验了一小部分,
-            # 而表面上训练照跑、日志照出。这正是"合法但全错"那一类,必须堵死在入口。
-            raise RuntimeError(
-                f"{samples_pkl} 是 --limit 模式产出的残件(_meta.partial=True),不能用于训练。"
-                f"去掉 --limit 重跑 scripts/data/preextract_dynamic.py 生成完整缓存")
         cached_size = meta.get("img_size")
         if cached_size is not None and int(cached_size) != int(img_size):
             # 🔴 2026-09-11 由 WARN 升级为 raise(分辨率实验教训,长期保留):
@@ -929,6 +932,34 @@ def build_official_datasets(
                 f"重跑预抽取: scripts/data/preextract_dynamic.py --img-size {img_size} "
                 f"(换分辨率须用全新 --cache-dir —— frame_key 不含 img_size,复用旧 "
                 f"frames/ 目录会静默保留旧分辨率 PNG 且 meta 谎报新分辨率)")
+        if meta.get("partial"):
+            # 🔴 硬拒而非告警:`--limit N` 的 pkl 只覆盖 N 个动态影像文件,其余动态样本
+            # 没有缓存、会**静默回落**到全量解压的原路径 —— 既没提速又只验了一小部分,
+            # 而表面上训练照跑、日志照出。这正是"合法但全错"那一类,必须堵死在入口。
+            raise RuntimeError(
+                f"{samples_pkl} 是 --limit 模式产出的残件(_meta.partial=True),不能用于训练。"
+                f"去掉 --limit 重跑 scripts/data/preextract_dynamic.py 生成完整缓存")
+        # 🔴 L2 union/pkl 一致性双向校验(2026-09-22 路B审查 P0-1/P2-1 修):
+        # 首版把 gate 写在载入前且条件是 union_mask 本身——union 版 pkl 也被拒,
+        # 云端链 --union-mask + --samples-pkl 第 0 步必炸,整线结构性不可达。
+        # 改为**载入后按内容判**:
+        #   ① union_mask=True 但 pkl 无任何样本带 union_mask_paths 键 → 旧模式
+        #      pkl,静默回落 = "号称 union 实际没开"(与 --limit 残件同类),拒;
+        #   ② union_mask=False 但 meta 标记/样本带键(union 版 pkl) → 半开态:
+        #      __getitem__ 见键即走 union 分支,操作者以为关了实际开着,拒;
+        #   ③ 一致 → 放行(union pkl + union_mask=True 是合法组合)。
+        _has_ukey = any("union_mask_paths" in s for s in samples)
+        if union_mask and not _has_ukey:
+            raise RuntimeError(
+                f"union_mask=True 但 {samples_pkl} 无 union_mask_paths 键(旧模式产物,"
+                f"静默回落单病灶监督 = 号称 union 实际没开)。用 scripts/data/"
+                f"preextract_dynamic.py --union-mask 重新生成 pkl(frame_key 输入不同,"
+                f"不会覆盖旧缓存)。")
+        if not union_mask and (_has_ukey or meta.get("union_mask")):
+            raise RuntimeError(
+                f"{samples_pkl} 是 union 版 pkl(meta.union_mask={bool(meta.get('union_mask'))}),"
+                f"但调用方未传 union_mask=True → 半开态:样本带键即走 union 分支,"
+                f"操作者以为关了实际开着。要么传 union_mask=True,要么用旧模式 pkl。")
     else:
         samples = build_official_samples(root, xlsx_path, sheet_name, union_mask=union_mask)
     if not samples:
@@ -945,6 +976,14 @@ def build_official_datasets(
     for _s in samples[:]:
         _ip, _mp = _s.get("img_path"), _s.get("mask_path")
         _bad = (_ip and not os.path.exists(_ip)) or (_mp and not os.path.exists(_mp))
+        # L2(路B P1-1,2026-09-22 修):union 样本的全部并集路径纳入 exists 校验。
+        # 缺任何一个 → 剔除**该样本**(该图 union 监督不完整,留用会把次病灶
+        # 静默退化为未标注背景=错误负监督,污染 L1 归因基座);阈值仍按样本级
+        # 5% 口径(分母不变,缺路径样本进分子——口径写进 docstring 见上方注释)。
+        for _up in _s.get("union_mask_paths") or ():
+            if not os.path.exists(_up):
+                _bad = True
+                break
         if _bad:
             _dropped.append(_s.get("patient_key", "?"))
             samples.remove(_s)

@@ -176,3 +176,78 @@ def test_probe_guard_fires_both_paths(real_data, tmp_path, workers):
     pex.extract(**kw)                                # 先以 SIZE 造全量缓存
     with pytest.raises(SystemExit, match="缓存 PNG"):
         pex.extract(**{**kw, "img_size": SIZE + 8})  # 复用 + 换分辨率 → 硬拦
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_union_export_matches_loader_union(real_data, tmp_path, workers):
+    """L2(路B P2-3,2026-09-22):union 导出端 e2e——缓存 PNG 与 loader 原路径
+    union 读取逐位一致(预注册不变式"cache miss 与无 cache 两条路径逐位一致")。
+
+    fake_build 的 union 版:同患者加第二个病灶 mask(帧 1 与 M 重叠、帧 3 独立),
+    每动态样本带 union_mask_paths → extract(union_mask=True) 走 worker OR 合成;
+    对照 = OfficialThyroidDataset._dynamic_union_mask_frame(无缓存原路径)。
+    """
+    import cv2
+    import numpy as _np
+
+    root = real_data
+    # 第二病灶 mask:帧 1 中央方块(与 M 的 fg_frames=(1,3) 部分同帧),帧 3 同位置
+    sec = _mk_vol(fg_frames=(1, 3))
+    sec_path = str(root / "pa_S.nii.gz")
+    nib.save(nib.Nifti1Image(sec, np.eye(4)), sec_path)
+    # M 的体素:换一个互补位置(左上角),保证 并集 != 任一单 mask(fixture 区分力,
+    # 路A P2-1 教训:并集恰等于某单 mask 时测试对"union 分支整体失效"零区分力)
+    m_alt = _mk_vol(fg_frames=(1, 3))
+    # _mk_vol 的前景位置不知,直接手造:取全 0 体 + 两个不同角块
+    vol_m = np.zeros(_mk_vol(fg_frames=None).shape, np.uint8)
+    vol_s = np.zeros_like(vol_m)
+    # NIfTI 存前需 transpose(2,1,0) —— 与 _save_image_nifti_3d 同约定
+    vm = np.zeros((4, SIZE, SIZE), np.uint8); vm[1, :16, :16] = 1; vm[3, :16, :16] = 1
+    vs = np.zeros((4, SIZE, SIZE), np.uint8); vs[1, 32:64, 32:64] = 1; vs[3, 32:64, 32:64] = 1
+    nib.save(nib.Nifti1Image(np.ascontiguousarray(
+        np.transpose(vm, (2, 1, 0))), np.eye(4)), str(root / "pa_M.nii.gz"))
+    nib.save(nib.Nifti1Image(np.ascontiguousarray(
+        np.transpose(vs, (2, 1, 0))), np.eye(4)), sec_path)
+
+    def fake_build_u(data_root, xlsx, sheet_name="ROI级别", union_mask=False):
+        samples = []
+        for fidx in (1, 3):
+            samples.append({
+                "img_path": str(root / "pa.nii.gz"),
+                "mask_path": str(root / "pa_M.nii.gz"),
+                "is_dynamic": True, "frame_index": fidx,
+                "patient_key": "pa", "label": 0,
+                "union_mask_paths": sorted([str(root / "pa_M.nii.gz"), sec_path]),
+            })
+        return samples
+
+    orig_build = pex.build_official_samples
+    pex.build_official_samples = fake_build_u
+    try:
+        cache = str(tmp_path / "ucache")
+        assert pex.extract(data_root=str(root), xlsx="f.xlsx", cache_dir=cache,
+                           sheet="ROI级别", img_size=SIZE, limit=0,
+                           workers=workers, union_mask=True) == 0
+    finally:
+        pex.build_official_samples = orig_build
+
+    payload = _load_pkl(cache)
+    assert payload["_meta"]["union_mask"] is True
+    dyn = [s for s in payload["samples"] if s["is_dynamic"]]
+    assert len(dyn) == 2
+    for s in dyn:
+        assert s["cache_msk"] and os.path.exists(s["cache_msk"])
+
+    # 对照:loader 原路径(无缓存)对同 union_paths 同帧的读取
+    from src.dataset import official_loader as OL
+    ds = OL.OfficialThyroidDataset(dyn, img_size=SIZE)
+    for i, s in enumerate(dyn):
+        png = _np.fromfile(s["cache_msk"], dtype=_np.uint8)
+        png = cv2.imdecode(png, cv2.IMREAD_GRAYSCALE)
+        expect = ds._dynamic_union_mask_frame(
+            s["union_mask_paths"], s["frame_index"])
+        assert _np.array_equal(png > 0, expect > 0), \
+            f"union 导出 PNG 与 loader 原路径 frame={s['frame_index']} 不一致"
+        # 区分力:并集必须严格大于任一单 mask(防"union 分支失效仍绿")
+        m_only = ds._dynamic_mask_frame(s["mask_path"], s["frame_index"])
+        assert (png > 0).sum() > (m_only > 0).sum(), "并集应大于单病灶 mask"

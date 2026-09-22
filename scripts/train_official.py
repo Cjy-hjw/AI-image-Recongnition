@@ -750,6 +750,10 @@ def main():
                              "前向链(decoder@head_lr + seg_backbone@×0.1),配 Boundary/"
                              "Lovász 损失(config.train.seg_boundary_weight/seg_lovasz_weight),"
                              "必须 --resume-from r5 + epoch≤20(γ_prior 边界)+ 版本化 --out")
+    parser.add_argument("--union-mask", action="store_true",
+                        help="L2 union 监督(plan 任务 L2):同图全部 GT 病灶 mask 并集"
+                             "作分割监督。须配 --samples-pkl 为 union 版 preextract 产物"
+                             "(loader 对旧 pkl + union 硬拒)")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--log-dir", default=OFFICIAL_LOG_DIR,
                         help=f"JSONL 日志目录;默认云端 {OFFICIAL_LOG_DIR},本地传 logs")
@@ -912,6 +916,7 @@ def main():
             args.data_root, args.xlsx, img_size=img_size, seed=seed,
             train_transform=get_train_transforms(), hflip_prob=args.hflip_prob,
             samples_pkl=args.samples_pkl,
+            union_mask=args.union_mask,
         )
     num_workers = 0 if (args.smoke or device.type == "cpu") else config["environment"]["num_workers"]
     # persistent_workers(2026-09-12):num_workers>0 时保持 worker 进程跨 epoch

@@ -14,6 +14,8 @@ nib = pytest.importorskip("nibabel")
 pd = pytest.importorskip("pandas")
 pytest.importorskip("openpyxl")
 
+import torch
+
 from src.dataset import official_loader as O
 from src.inference.nifti_io import save_binary_mask
 
@@ -500,3 +502,139 @@ def test_missing_image_property_column_does_not_crash(mini_root):
     # P1/P2 静态
     p12 = [s for s in samples if s["patient_key"] in ("P1", "P2")]
     assert p12 and not any(s["is_dynamic"] for s in p12)
+
+
+# ── L2 union 监督(plan 任务 L2,2026-09-22)────────────────────────────────────
+# 预注册不变式四类:K=1 图逐位一致 / K=2 静态 OR / K=2 动态同帧·异帧 / pkl 硬拒。
+class TestUnionMaskL2:
+    """union_mask=True 的样本构造 + Dataset 像素合成契约。"""
+
+    def _build_union_root(self, tmp_path):
+        """3 静态患者(M 单灶 / M+病灶1 双灶 / M 无 mask) + 1 动态双病灶(同帧)。"""
+        root = tmp_path / "annotation"
+        H = W = 64
+
+        # PA 静态单病灶:K=1,union 输出须与逐病灶读取逐位一致
+        pa = root / "PA" / "SA"
+        _make_dcm(str(pa / "img.dcm"), np.full((H, W), 120, np.uint8))
+        ma = np.zeros((H, W), np.uint8); ma[20:40, 20:40] = 1
+        save_binary_mask(ma, str(pa / "M_1_mask.nii.gz"))
+
+        # PB 静态双病灶:M + 病灶1(部分重叠,验证 OR 而非相加/覆盖)
+        pb = root / "PB" / "SB"
+        _make_dcm(str(pb / "img.dcm"), np.full((H, W), 100, np.uint8))
+        mb = np.zeros((H, W), np.uint8); mb[10:30, 10:30] = 1
+        sb = np.zeros((H, W), np.uint8); sb[20:40, 20:40] = 1   # 与 M 重叠 10×10
+        save_binary_mask(mb, str(pb / "M_1_mask.nii.gz"))
+        save_binary_mask(sb, str(pb / "病灶1_1_mask.nii.gz"))
+
+        # PC 静态:行有 M 但 mask 文件缺失 → union 列表不含、valid_mask=0 语义不变
+        pc = root / "PC" / "SC"
+        _make_dcm(str(pc / "img.dcm"), np.full((H, W), 90, np.uint8))
+
+        # PD 动态双病灶:5 帧,M 非零于帧 1;病灶1 非零于帧 1、3(同帧 OR + 异帧分立)
+        pd_dir = root / "PD" / "PD"
+        vol = np.stack([np.full((H, W), 40 + 10 * i, np.uint8) for i in range(5)])
+        _save_image_nifti_3d(str(pd_dir / "PD.nii.gz"), vol)
+        dm = np.zeros((5, H, W), np.uint8); dm[1, 10:30, 10:30] = 1
+        save_binary_mask(dm, str(pd_dir / "M_1_mask.nii.gz"))
+        ds = np.zeros((5, H, W), np.uint8); ds[1, 20:40, 20:40] = 1; ds[3, 30:50, 30:50] = 1
+        save_binary_mask(ds, str(pd_dir / "病灶1_1_mask.nii.gz"))
+
+        rows = [
+            ["PA", "SA", "1", "M", "2左中叶", "2甲状腺包膜", "1有", "恶", "", "V类"],
+            ["PB", "SB", "1", "M", "5右中叶", "1无", "0无", "良", "", "IV类"],
+            ["PB", "SB", "1", "病灶1", "5右中叶", "1无", "0无", "良", "", "IV类"],
+            ["PC", "SC", "1", "M", "4右上叶", "1无", "1有", "恶", "", "V类"],
+            ["PD", "", "2", "M", "7峡部", "1无", "1有", "恶", "", ""],
+            ["PD", "", "2", "病灶1", "7峡部", "1无", "1有", "良", "", ""],
+        ]
+        df = pd.DataFrame(rows, columns=[
+            "PatientId", "SeriesUid", "图像性质", "RoiName", "主病灶位置",
+            "甲状腺外侵犯", "临床T分期", "ROI良恶性", "ANNOTATION->SliceIndex", "ROI-TIRADS",
+        ])
+        xlsx = tmp_path / "labels_union.xlsx"
+        df.to_excel(xlsx, sheet_name="ROI级别", index=False, startrow=1)
+        return str(root), str(xlsx)
+
+    def test_union_off_by_default_no_key(self, tmp_path):
+        """默认 union_mask=False:样本无 union_mask_paths 键(零回归)。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        samples = O.build_official_samples(root, xlsx)
+        assert samples, "empty samples"
+        assert all("union_mask_paths" not in s for s in samples)
+
+    def test_union_k1_identical_to_single(self, tmp_path):
+        """K=1 图(单病灶):union 路径 mask 与非 union 逐位一致(关键不变式)。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        plain = [s for s in O.build_official_samples(root, xlsx)
+                 if s["patient_key"] == "PA"][0]
+        uni = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+               if s["patient_key"] == "PA"][0]
+        ds_plain = O.OfficialThyroidDataset([plain], img_size=64)
+        ds_uni = O.OfficialThyroidDataset([uni], img_size=64)
+        _, m_plain, _ = ds_plain[0]
+        _, m_uni, _ = ds_uni[0]
+        assert torch.equal(m_plain, m_uni)
+
+    def test_union_static_or_semantics(self, tmp_path):
+        """K=2 静态:union mask == M|病灶1(重叠区不重复计,值域 {0,1})。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+               if s["patient_key"] == "PB"]
+        assert len(uni) == 2
+        for s in uni:  # 两样本同图 → 同一 union 键
+            assert s["union_mask_paths"] == sorted([
+                os.path.join(root, "PB", "SB", "M_1_mask.nii.gz"),
+                os.path.join(root, "PB", "SB", "病灶1_1_mask.nii.gz")])
+        ds = O.OfficialThyroidDataset(uni, img_size=64)
+        masks = [ds[i][1].numpy()[0] for i in range(2)]     # [1,H,W] → [H,W]
+        m1 = np.zeros((64, 64), np.uint8); m1[10:30, 10:30] = 1
+        m2 = np.zeros((64, 64), np.uint8); m2[20:40, 20:40] = 1
+        expect = (m1 | m2).astype(np.float32)
+        for m in masks:
+            assert set(np.unique(m)) <= {0.0, 1.0}
+            assert np.array_equal(m, expect)
+
+    def test_union_no_mask_row_not_in_list(self, tmp_path):
+        """无 mask 的行(PC)不进 union 列表;valid_mask=0 语义不变。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+               if s["patient_key"] == "PC"]
+        assert len(uni) == 1
+        assert uni[0]["union_mask_paths"] == []
+        assert uni[0]["labels"]["valid_mask"] == 0
+
+    def test_union_dynamic_same_frame_or(self, tmp_path):
+        """K=2 动态同帧(帧1):M|病灶1 OR;异帧(帧3)只含病灶1。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        uni = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+               if s["patient_key"] == "PD"]
+        frames = sorted(s["frame_index"] for s in uni)
+        # 每病灶自己的非零帧一样本(union 不改样本结构):M→帧1;
+        # 病灶1→帧1、3 → 帧序列 [1,1,3](两个帧1 样本同帧、共享同一 union mask)。
+        assert frames == [1, 1, 3]
+        ds = O.OfficialThyroidDataset(uni, img_size=64)
+        by_f = {s["frame_index"]: ds[i][1].numpy()[0] for i, s in enumerate(uni)}
+        m_m = np.zeros((64, 64), np.uint8); m_m[10:30, 10:30] = 1
+        m_s = np.zeros((64, 64), np.uint8); m_s[20:40, 20:40] = 1
+        assert np.array_equal(by_f[1], (m_m | m_s).astype(np.float32))
+        m_s3 = np.zeros((64, 64), np.uint8); m_s3[30:50, 30:50] = 1
+        assert np.array_equal(by_f[3], m_s3.astype(np.float32))
+
+    def test_union_dynamic_labels_unchanged(self, tmp_path):
+        """union 不动样本结构:四头标签/is_main/lesion_id/样本数与 plain 一致。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        plain = O.build_official_samples(root, xlsx)
+        uni = O.build_official_samples(root, xlsx, union_mask=True)
+        assert len(plain) == len(uni)
+        for a, b in zip(plain, uni):
+            for k in a["labels"]:
+                va, vb = a["labels"][k], b["labels"][k]
+                if isinstance(va, torch.Tensor):
+                    assert torch.equal(va, vb), k
+                else:
+                    assert va == vb, k
+            assert a["mask_path"] == b["mask_path"]
+            assert a["frame_index"] == b["frame_index"]
+            assert a["patient_key"] == b["patient_key"]

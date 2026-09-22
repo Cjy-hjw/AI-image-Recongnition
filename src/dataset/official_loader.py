@@ -470,7 +470,8 @@ def _warn_missing_clinical_columns(colmap: Dict[str, Optional[str]]) -> None:
 
 
 def build_official_samples(
-    root: str, xlsx_path: str, sheet_name: str = "ROI级别"
+    root: str, xlsx_path: str, sheet_name: str = "ROI级别",
+    union_mask: bool = False,
 ) -> List[Dict]:
     """扫描官方标注 + 影像目录,构造样本列表(照 pathology_dataset 的 build_* 模式)。
 
@@ -482,7 +483,9 @@ def build_official_samples(
         list[sample dict],每项:
           img_path, mask_path(可 None), frame_index(动态为原始 0-based 帧号;静态 None),
           is_dynamic(bool), patient_key(=pid,供 patient_grouped_split), label(=malignancy,
-          供分层), labels(完整 labels dict)。
+          供分层), labels(完整 labels dict);
+          union_mask=True 时额外携带 union_mask_paths(list[str],同图全部病灶 mask 路径,
+          像素级并集由读取端合成 —— 静态在 __getitem__,动态在 preextract_dynamic 导出)。
     """
     records, colmap = parse_annotation_xlsx(xlsx_path, sheet_name)
     _warn_missing_clinical_columns(colmap)
@@ -495,6 +498,30 @@ def build_official_samples(
 
     samples: List[Dict] = []
     for pid, recs in by_patient.items():
+        # L2 union 监督(plan 任务 L2,2026-09-22):union_mask=True 时,同图全部 GT
+        # 病灶的分割监督合并为二值并集。本函数只负责"收集同图全部 mask 路径"写进样本
+        # (新增键 union_mask_paths);像素级 OR 合成在消费端(OfficialThyroidDataset/
+        # preextract_dynamic),mask_path 键本身不动 —— 诊断侧 GT 逐病灶装载零影响。
+        # 动态帧号语义(预注册):样本的 frame_index 不变(各病灶自己的非零帧),
+        # union 在"该帧实际有哪些病灶 mask"层面合成(同帧 OR;不同帧各帧各的并集)。
+        _union_by_dir: Dict[str, List[str]] = {}
+        if union_mask:
+            for rec in recs:
+                _roi = _cell_str(rec.get("roi_name"))
+                if not _is_lesion_roi(_roi):
+                    continue
+                _is_dyn = os.path.exists(os.path.join(root, pid, pid, f"{pid}.nii.gz"))
+                if _is_dyn:
+                    _img_dir = os.path.join(root, pid, pid)
+                else:
+                    _series = _cell_str(rec.get("series_uid"))
+                    _img_dir = (os.path.join(root, pid, _series) if _series
+                                else os.path.join(root, pid))
+                _mp = _mask_path_for_roi(_img_dir, _roi)
+                if _mp is not None:
+                    _union_by_dir.setdefault(_img_dir, [])
+                    if _mp not in _union_by_dir[_img_dir]:
+                        _union_by_dir[_img_dir].append(_mp)
         # 静动判据 = **磁盘文件扩展名**(定稿 §1.3:.dcm 静 / .nii.gz 动,全量互斥 0 混合)。
         # 不用表里的「图像性质」列:官方 74 列表头中没有该列(见 parse_annotation_xlsx 注释)。
         # 每患者探一次(静动是患者级属性),避免逐行重复 I/O。
@@ -558,6 +585,12 @@ def build_official_samples(
                 "label": labels["malignancy"],   # 分层键(patient_grouped_split)
                 "labels": labels,
             }
+            if union_mask:
+                # L2:同图全部病灶 mask 路径(含本病灶)。读取端见
+                # OfficialThyroidDataset.__getitem__ 的 _union_mask 静态分支与
+                # preextract_dynamic 的动态导出。mask_path=None 的行不进列表,
+                # 与 valid_mask=0 语义一致(无 mask 行不贡献分割监督)。
+                base["union_mask_paths"] = sorted(_union_by_dir.get(img_dir, []))
 
             if is_dynamic:
                 # 动态:从 mask 非零帧定位标注帧(主病灶 M 无 SliceIndex,定稿 §4.2 项6),
@@ -708,13 +741,27 @@ class OfficialThyroidDataset(Dataset):
             # num_workers=12 时瞬时占用 ~8.4GB —— 首轮真训的 `invalid block type`
             # 与步耗时 22 倍抖动即由此而来。缓存图是 resize 之后、增强之前的那一张,
             # 与原路径**数值等价**(见预抽取脚本 docstring),下面的 _resize_* 对它是 no-op。
+            # L2 union:动态缓存在导出端已合成并集 PNG(见 preextract_dynamic 的
+            # union 分支),这里读单文件即并集,无需再 OR。
             img, mask = _read_cached_pair(s["cache_img"], s["cache_msk"])
         elif s["is_dynamic"]:
             img = _read_nifti_frame_gray(s["img_path"], s["frame_index"])
-            mask = self._dynamic_mask_frame(s["mask_path"], s["frame_index"])
+            if s.get("union_mask_paths"):
+                # L2 union 动态原路径:逐 mask 读该帧,OR 合成(与缓存导出端同一
+                # 数学;cache miss 与无 cache 两条路径逐位一致是预注册不变式)。
+                mask = self._dynamic_union_mask_frame(
+                    s["union_mask_paths"], s["frame_index"])
+            else:
+                mask = self._dynamic_mask_frame(s["mask_path"], s["frame_index"])
         else:
             img = _read_dcm_gray(s["img_path"])
-            mask = self._static_mask(s["mask_path"])
+            if s.get("union_mask_paths"):
+                # L2 union 静态:读同图全部 mask(每个取首帧转 2D,同 _static_mask
+                # 语义),OR 合成。单病灶图(路径列表长度 1 且即本病灶 mask)结果与
+                # 非 union 路径逐位一致(回归测试钉死)。
+                mask = self._static_union_mask(s["union_mask_paths"])
+            else:
+                mask = self._static_mask(s["mask_path"])
 
         img = self._resize_img(img)
         mask = self._resize_mask(mask)
@@ -763,6 +810,41 @@ class OfficialThyroidDataset(Dataset):
         pos = idxs.index(frame_index) if frame_index in idxs else frame_index
         return binf[pos]
 
+    # ── L2 union 监督的像素合成(plan 任务 L2,2026-09-22)──────────────────────
+    def _static_union_mask(self, union_mask_paths: List[str]) -> np.ndarray:
+        """静态:同图全部病灶 mask 首帧 OR(与 _static_mask 同"3D 单帧取首帧"语义)。
+
+        空 mask 文件按全零处理(OR 恒等元),与单 mask 路径读失败返回零图的行为一致;
+        不 raise —— build 侧已保证列表非空且各文件存在,此处读到空属上游数据个案,
+        OR 语义天然吸收(其余病灶监督不受牵连)。
+        """
+        out = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        for mp in union_mask_paths:
+            binf, _ = _read_nifti_binmasks(mp)
+            if not binf:
+                continue
+            f = binf[0]
+            out = np.logical_or(out, (f > 0).astype(np.uint8)).astype(np.uint8)
+        return out
+
+    def _dynamic_union_mask_frame(self, union_mask_paths: List[str],
+                                  frame_index: int) -> np.ndarray:
+        """动态:逐 mask 取该帧,OR 合成(与 preextract 导出端同一数学,逐位一致)。
+
+        某个 mask 不含该帧(该病灶此帧无标注)→ 贡全零,OR 天然吸收;读失败同上。
+        帧定位复用 _dynamic_mask_frame 的 pos 语义(idxs.index 回退 frame_index)。
+        """
+        out = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        for mp in union_mask_paths:
+            binf, idxs = _read_nifti_binmasks(mp) if mp else ([], [])
+            if not binf:
+                continue
+            pos = idxs.index(frame_index) if frame_index in idxs else frame_index
+            if not (0 <= pos < len(binf)):
+                continue
+            out = np.logical_or(out, (binf[pos] > 0).astype(np.uint8)).astype(np.uint8)
+        return out
+
 
 def _load_samples_pkl(path: str) -> Tuple[List[Dict], Dict]:
     """加载预抽取产物 `samples.pkl` → (samples, meta)。
@@ -793,6 +875,7 @@ def build_official_datasets(
     sheet_name: str = "ROI级别",
     hflip_prob: float = 0.0,
     samples_pkl: Optional[str] = None,
+    union_mask: bool = False,
 ) -> Tuple["OfficialThyroidDataset", "OfficialThyroidDataset"]:
     """便捷入口:构样本 → 患者分组切分 → 建 train/val Dataset。返回 (train_ds, val_ds)。
 
@@ -811,6 +894,15 @@ def build_official_datasets(
     切分仍在此处按同一 `seed`/`val_frac` 现算,故换 seed 不必重跑预抽取。
     """
     if samples_pkl:
+        if union_mask:
+            # 🔴 L2 union 与既有 samples.pkl 不兼容:旧 pkl 的样本不带
+            # union_mask_paths 键(静默回落单病灶监督 = "号称 union 实际没开",
+            # 与 --limit 残件同类)。必须用 union 模式重跑 preextract_dynamic
+            # 生成新 pkl(frame_key 输入不同,物理隔离零污染旧缓存)。
+            raise RuntimeError(
+                f"union_mask=True 需要带 union_mask_paths 键的 samples.pkl: {samples_pkl}"
+                f" 是旧模式产物。用 scripts/data/preextract_dynamic.py --union-mask "
+                f"重新生成(frame_key 输入不同,不会覆盖旧缓存)。")
         samples, meta = _load_samples_pkl(samples_pkl)
         if meta.get("partial"):
             # 🔴 硬拒而非告警:`--limit N` 的 pkl 只覆盖 N 个动态影像文件,其余动态样本
@@ -838,7 +930,7 @@ def build_official_datasets(
                 f"(换分辨率须用全新 --cache-dir —— frame_key 不含 img_size,复用旧 "
                 f"frames/ 目录会静默保留旧分辨率 PNG 且 meta 谎报新分辨率)")
     else:
-        samples = build_official_samples(root, xlsx_path, sheet_name)
+        samples = build_official_samples(root, xlsx_path, sheet_name, union_mask=union_mask)
     if not samples:
         raise RuntimeError(f"未在 {root} + {xlsx_path} 构造出任何样本,检查路径/表头")
     # 🔴 pkl 加载路径的文件级漂移防御(2026-09-14 实证):pkl 是历史快照,生成

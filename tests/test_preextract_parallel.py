@@ -66,7 +66,7 @@ def real_data(tmp_path, monkeypatch):
     with open(p, "wb") as f:
         f.write(open(root / "pa.nii.gz", "rb").read()[:64])
 
-    def fake_build(data_root, xlsx, sheet_name="ROI级别"):
+    def fake_build(data_root, xlsx, sheet_name="ROI级别", union_mask=False):
         samples = []
         for pi, pid in enumerate(["pa", "pb"]):
             for fidx in (1, 3):                  # 每患者 2 帧 = 4 个动态样本

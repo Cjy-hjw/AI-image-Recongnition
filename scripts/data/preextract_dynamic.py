@@ -98,6 +98,12 @@ def frame_key(img_path: str, mask_path: str, frame_index: int) -> str:
 
     三者全进哈希:同一患者的不同病灶共用影像但 mask 不同,只哈希影像会撞车、
     让两个病灶读到同一张 mask(不报错,标签与像素静默错配)。
+
+    L2 union(plan 任务 L2,2026-09-22):union 模式下调用方把 mask_path 换成
+    **排序后的并集路径串**(见 extract 的 union 分支),同图多病灶样本共享同一键
+    —— 这是特性不是撞车:union 监督下该帧的 GT 本来就该是同一张并集 PNG,
+    一次导出、多样本命中。旧单病灶键与 union 键输入不同 → 物理隔离,复用同一
+    frames/ 目录也不会互读(幂等续跑对两种模式各自成立)。
     """
     raw = f"{img_path}|{mask_path}|{frame_index}".encode("utf-8", "replace")
     return hashlib.sha1(raw).hexdigest()[:20]
@@ -221,9 +227,30 @@ def _process_one_file(job):
                 result["fills"][e_["s_idx"]] = {"cache_img": None, "cache_msk": None}
                 continue
             img = _resize_img(np.asarray(frames[ip]), img_size)
-            # 0/1 → 0/255:PNG 里 0/1 肉眼不可查,排错时打开就是纯黑;
-            # loader 侧统一 `>0`,两种取值都正确,但 0/255 可目视核对。
-            msk = _resize_mask((np.asarray(binf[mp]) > 0).astype(np.uint8), img_size) * 255
+            # L2 union:该帧的 mask = 全部 union 路径在该帧的 OR(与本 mask 帧合成;
+            # loader 原路径同数学)。binf/mp 已是本 mask 该帧,OR 进累积体。
+            if e_.get("union_mask_paths"):
+                m_f = (np.asarray(binf[mp]) > 0).astype(np.uint8)
+                for ump in e_["union_mask_paths"]:
+                    if ump == mask_path:
+                        continue            # 本 mask 已并入,勿重复解压
+                    try:
+                        ub, ui = _read_nifti_binmasks(ump)
+                        if not ub:
+                            continue
+                        up = ui.index(fidx) if fidx in ui else fidx
+                        if 0 <= up < len(ub):
+                            m_f = np.logical_or(
+                                m_f, (np.asarray(ub[up]) > 0).astype(np.uint8)
+                            ).astype(np.uint8)
+                        del ub
+                    except Exception as ue:                # noqa: BLE001
+                        result["failures"].append(f"UNION-MSK {ump} frame={fidx}: {ue}")
+                msk = _resize_mask(m_f, img_size) * 255
+            else:
+                # 0/1 → 0/255:PNG 里 0/1 肉眼不可查,排错时打开就是纯黑;
+                # loader 侧统一 `>0`,两种取值都正确,但 0/255 可目视核对。
+                msk = _resize_mask((np.asarray(binf[mp]) > 0).astype(np.uint8), img_size) * 255
             if _write_png(e_["fi"], img) and _write_png(e_["fm"], msk):
                 result["done_frames"] += 1
                 result["fills"][e_["s_idx"]] = {"cache_img": e_["fi"], "cache_msk": e_["fm"]}
@@ -237,13 +264,14 @@ def _process_one_file(job):
 
 
 def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
-            img_size: int, limit: int, workers: int = 4) -> int:
+            img_size: int, limit: int, workers: int = 4,
+            union_mask: bool = False) -> int:
     frames_dir = os.path.join(cache_dir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
 
     t0 = time.time()
     _safe_print(f"[1/3] 扫描标注 + 定位动态非零帧(要解 343 个 mask,预计 10-25 分钟)...")
-    samples = build_official_samples(data_root, xlsx, sheet)
+    samples = build_official_samples(data_root, xlsx, sheet, union_mask=union_mask)
     n_dyn = sum(1 for s in samples if s["is_dynamic"])
     n_lesion = len({s["mask_path"] for s in samples if s["is_dynamic"]})
     _safe_print(
@@ -273,15 +301,24 @@ def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
     s_index = {id(s): i for i, s in enumerate(samples)}
     jobs = []
     for img_path, group in sorted(by_img.items()):
+        # L2 union:union_mask_paths 存在时键输入改为排序并集串(同图多病灶样本
+        # 共享同一键 → 第一条写盘、其余命中 worker 的"已存在即跳过"回填,天然去重
+        # 无需组装层特判);worker 按 union_mask_paths 合成该帧并集(与 loader
+        # 原路径同数学,cache miss 与无 cache 两条路径逐位一致是预注册不变式)。
         entries = []
         for s in group:
-            k = frame_key(img_path, s["mask_path"], s["frame_index"])
+            if union_mask and s.get("union_mask_paths"):
+                _ukey = "|".join(s["union_mask_paths"])
+            else:
+                _ukey = s["mask_path"]
+            k = frame_key(img_path, _ukey, s["frame_index"])
             fi = os.path.join(frames_dir, f"{k}_img.png")
             fm = os.path.join(frames_dir, f"{k}_msk.png")
             entries.append({
                 "k": k, "fi": fi, "fm": fm,
                 "mask_path": s["mask_path"], "frame_index": s["frame_index"],
                 "s_idx": s_index[id(s)],
+                "union_mask_paths": s.get("union_mask_paths"),
             })
         jobs.append({"img_path": img_path, "entries": entries, "img_size": img_size})
 
@@ -363,6 +400,7 @@ def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
             # 全量解压的原路径,拿它跑正式训练等于既慢又只覆盖了 N 个文件。
             # 打上标记,由 build_official_datasets 硬拒,别指望人记得住 docstring。
             "partial": bool(limit > 0),
+            "union_mask": bool(union_mask),
         },
         "samples": kept,
     }
@@ -393,6 +431,9 @@ def main() -> int:
     ap.add_argument("--sheet-name", default="ROI级别")
     ap.add_argument("--img-size", type=int, default=512,
                     help="必须与训练时 img_size 一致(默认 512)")
+    ap.add_argument("--union-mask", action="store_true",
+                    help="L2 union 监督:同图全部 GT 病灶 mask 并集导出"
+                         "(键输入不同,与旧单病灶缓存物理隔离)")
     ap.add_argument("--limit", type=int, default=0,
                     help=">0 时只处理前 N 个动态影像文件,用于快速验证管道")
     ap.add_argument("--workers", type=int, default=4,

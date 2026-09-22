@@ -192,7 +192,7 @@ GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)�
 
 ## 测试总数(单一权威,2026-09-22 实测)
 
-**全套 1329 collected**(2026-09-22 Z2 入口压域 + L2 union 后,`Demo_D` 环境实测,
+**全套 1335 collected**(2026-09-22 L2 Gate2 两路审查修复后,`Demo_D` 环境实测,
 `pytest tests/ --collect-only` 实跑;tiling 16 项另跑 16 passed;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
@@ -273,6 +273,12 @@ union 列表(valid_mask=0 语义不变)/动态同帧 OR+异帧分立(样本帧 [
 =每病灶自己的非零帧,两帧1 样本共享同一 union mask)/四头标签+mask_path+
 frame_index 逐键不变;`test_preextract_parallel.py` fake_build 签名加
 union_mask=False 兼容。全量 1328 passed+1 skipped 实跑)
+→1335(L2 Gate2 两路审查修复(commit d2577ae):路B P0-1 实锤——union/pkl 一致性
+gate 首版拒一切 pkl(union 版也被拒)→云端链第 0 步必炸,改载入后内容双向校验
+(union pkl 必须被接受/旧 pkl 拒/半开态拒,+3 区分力测试);路A P1-1 收集器静动
+判据抽 _row_img_dir 同源;路B P1-1 漂移过滤纳入 union 路径(缺→剔除+5% 阈值
+raise 语义断言);P2-3 preextract 导出端 union e2e(workers=1,2,'并集严格大于
+单 mask'区分力反例)。全量 1334 passed+1 skipped)
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`

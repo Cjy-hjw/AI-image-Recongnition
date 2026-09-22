@@ -190,10 +190,10 @@ BCE+Dice——实现期前两变异曾真实存活,朴素对拍当场杀出)。
 sigmoid==1.0 → log(p/(1-p))=inf → NaN/Inf,NaN×valid_mask 屏蔽失效、
 GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)。
 
-## 测试总数(单一权威,2026-09-19 实测)
+## 测试总数(单一权威,2026-09-22 实测)
 
-**全套 1271 collected**(2026-09-19 CC-DiceCE 合主树后,`Demo_D` 环境实测,
-全量 1270 passed + 1 skipped;
+**全套 1297 collected**(2026-09-22 Z1 tiling 后,`Demo_D` 环境实测,
+`pytest tests/ --collect-only` 实跑;tiling 16 项另跑 16 passed;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
 →1156(修复轮专审:`test_seg_only_gate.py` 新增 6——护栏纯函数终于有测试,
@@ -213,7 +213,11 @@ sidecar 逐位等价(含 group_cases 插入序绝对锚,变异 A 写序反转实
 `_SEG_SNAPSHOT_EPOCHS` 上限锚 SEG_ABORT_EPOCH;删 ep20 变异存活是已知测试力边界,
 由任务书 §2 的 6 产物清单兜底);单路审查 2026-09-18,P1×2 已修)
 →1271(CC-DiceCE 合主树:`test_ccdice_loss.py` **17** 新增,见上方专节;
-2026-09-19 零冲突合并 `7bb5e5a`,worktree/分支已删)。
+2026-09-19 零冲突合并 `7bb5e5a`,worktree/分支已删)
+→1281(深监督:`test_deepsup_loss.py` **10** 新增,2026-09-20)
+→1297(Z1 tiling:`test_tiling_inference.py` **16** 新增——恒等路径/max 融合
+last-wins/分类 tile 半开上界/tile≠512 与 stride==tile fail-loud/默认关 env
+矩阵/动态零触及;Gate2 四路 2026-09-21,修复 commit `0dd833a`)。
 判回归须同
 环境前后对拍。
 `test_seg_only_schedule.py`(新增,7):`configure_official_stage(seg_only=True)`

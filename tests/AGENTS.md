@@ -192,7 +192,7 @@ GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)�
 
 ## 测试总数(单一权威,2026-09-22 实测)
 
-**全套 1335 collected**(2026-09-22 L2 Gate2 两路审查修复后,`Demo_D` 环境实测,
+**全套 1338 collected**(2026-09-22 L2 路C修复轮后,`Demo_D` 环境实测,
 `pytest tests/ --collect-only` 实跑;tiling 16 项另跑 16 passed;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
@@ -279,6 +279,18 @@ gate 首版拒一切 pkl(union 版也被拒)→云端链第 0 步必炸,改载�
 判据抽 _row_img_dir 同源;路B P1-1 漂移过滤纳入 union 路径(缺→剔除+5% 阈值
 raise 语义断言);P2-3 preextract 导出端 union e2e(workers=1,2,'并集严格大于
 单 mask'区分力反例)。全量 1334 passed+1 skipped)
+→1338(L2 路C修复轮(commit 8630ca2,第三轮对抗审查专审 d2577ae):F1(P0)
+漂移过滤 union 路径只查 exists——**存在但读不出**(9-14 invalid block type 型
+损坏)被 `_static_union_mask` 静默 OR 恒等元吸收=次病灶退化错误负监督零反馈,
+且删整段 union 校验旧测试仍全绿(变异实测 rc=0,fixture 的 mask_path 分支
+混淆变量)。修=真解压可读性校验(读失败视同文件缺失,同一 5% 口径,pkl 载入
+一次性成本实测 12ms/路径)。F3(P2)gate `_has_ukey` 对非 dict 样本抛裸
+TypeError→isinstance 短路。TestUnionMaskL2 10→**13**:corrupt union mask
+杀测(union 独有变量)/区分力杀测(旁路 monkeypatch 恒可读,与真路径 raise
+互斥对拍——两侧行为相反证明检测只由 union 校验承担)/非 dict 样本 gate 域;
+删旧 drift 测试第二段模糊锚(match='占比|half' 单点锚伪装双覆盖)。变异实测:
+删 union 校验→2 测试 RED。全量 1337 passed+1 skipped;
+1 例 order-dependent flake(test_forward_deterministic,单跑/固定序均过))
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`

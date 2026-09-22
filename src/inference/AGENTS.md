@@ -19,7 +19,8 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `nifti_io.py` | **2026-08-01 新增,已接入(A1/V2.1 交付链路)**。NIfTI(.nii/.nii.gz)读写:`save_binary_mask`(交付 mask,值域强制 `{0,1}`)、`load_nifti_frames`(动图输入,签名与 `load_video_frames` 逐位对齐)、`scatter_frames_to_full_length`(抽样帧回填全帧序列)、`is_nifti_path`。A1 起 `entrypoint.sh` 按 `.nii.gz` 分发,`src/service/case_discovery.py`/`runner.py` 经本模块读写动态图输入与逐结节 mask 落盘。见 §8 |
 | `nodule_split.py` | **2026-08-01 新增,已接入(v21_output)**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`hysteresis_binarize`(阶段3 手段4 滞回阈值,默认恒等)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。A3 起 `v21_output.write_case_v21` 经 `split_nodules` 把整图 mask 拆成逐结节实例。见 §9 |
 | `prediction_json.py` | **2026-08-01 新增,已接入(A3)**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。V2.1 起 `StudyUID` 填 PatientId、`MaskFile` 为相对病例一级目录路径。见 §10 |
-| `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6 |
+| `tiling.py` | **Z1(2026-09-21)**。静态滑窗 tiling:tile=512/stride=384,概率域 **max** 融合(禁平均),分类头取融合图 argmax 像素所属单 tile。env `AICOMP_STATIC_TILING` **默认关**;tile 必须=512、stride∈[256,512) fail-loud。只接静态,动态不碰。 |
+| `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6。Z1 在 `diagnose_static_case` 早退接 tiling(env 开且图大于 tile)。 |
 | `v21_output.py` | **A3 新增**。**唯一 V2.1 写盘入口** `write_case_v21`:把 `case_pipeline` 结果落成官方 V2.1 逐结节交付形态(软/二值 mask resize 回原图 → `split_nodules` 逐实例 → 每结节 `.nii.gz` + `prediction.json` 原子写)。静/动两链路,动态逐结节 3D mask 跨帧关联(最简实现,@云TODO)。见 §12 |
 
 ---

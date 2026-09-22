@@ -223,6 +223,10 @@ sidecar 逐位等价(含 group_cases 插入序绝对锚,变异 A 写序反转实
 `test_diagnose_detection.py` 33=28+**5**——shrink_static 轴解析/越域拒/裸轴拦/
 透传区分力(n_pred 不变+env finally 恢复)/不拖动态池;conftest 哨兵删
 AICOMP_STATIC_SHRINK(_K))
+→1323(Z2 入口压 {0,1},路B P2-1 复核修正:`test_nodule_split.py` 83=82+**1**
+——正常/回退双分支 0/255 归一(正常分支 area 510→2 实测钉死);复核修正审查
+agent 的 fixture 瑕疵:贴图边触发 cv2 erode 边界效应,其"回退分支"反例实走
+正常分支,真问题在正常分支、修在入口)
 →1322(aux 键白名单:`test_model_runner.py` 19=16+**3**——恰好缺且仅缺 4 个
 seg_aux_head 键放行(打 WARNING+非 aux 参数逐值校验)/混合缺失(aux+非aux)
 仍 raise/unexpected(lora)并存仍 raise。动因=Z1 云端诊断实弹:ep16 旧权重在

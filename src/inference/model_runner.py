@@ -58,14 +58,31 @@ def build_model(config: dict, weights: str, device: torch.device):
         # backbone 实际只剩原始冻结预训练权重。改为硬校验——一旦有 missing/unexpected，
         # 说明 checkpoint 与模型结构不匹配（如喂了未合并的 LoRA checkpoint），直接报错，
         # 不允许静默降级为部分/随机权重进入生产推理。
+        # 🔴 唯一白名单例外(2026-09-22,Z1 tiling 云端诊断实弹炸出):**恰好缺且仅缺
+        # SEG_AUX_PREFIXES 的 4 个 aux 键**。深监督 aux 头是纯推理旁路(生产链只读
+        # outputs["mask"],aux 键零消费,4 个 1×1 Conv 随机初始化对预测无影响),
+        # 而 ep16/r5 等旧权重在 aux 头合入(c08f36c)之前训出——代码/权重成对耦合
+        # 红线的本意是拦"真不匹配"(LoRA 未合并/四头缺=静默垃圾),不是拦这种
+        # 前向兼容的纯加性结构。放行范围逐键比对(不是子串匹配,防误放),
+        # 混入其它 missing key 仍然 raise。
+        aux_prefixes = MultiTaskThyroidModel.SEG_AUX_PREFIXES
+        aux_only_missing = (not unexpected and missing
+                            and all(k.startswith(aux_prefixes) for k in missing))
         if missing or unexpected:
-            raise RuntimeError(
-                f"[FATAL] 权重与模型结构不匹配，拒绝静默部分加载：{weights}\n"
-                f"  missing keys ({len(missing)}): {missing[:10]}\n"
-                f"  unexpected keys ({len(unexpected)}): {unexpected[:10]}\n"
-                "  若 unexpected 中含 'lora_' 前缀：说明喂了未合并的 LoRA 训练 checkpoint，"
-                "先跑 scripts/merge_lora_checkpoint.py 合并后再用。"
-            )
+            if aux_only_missing:
+                print(
+                    f"[WARNING] 权重缺 {len(missing)} 个深监督 aux 键"
+                    f"({missing}),按纯推理旁路放行(随机初始化,预测零消费);"
+                    f"其余结构全部命中: {weights}"
+                )
+            else:
+                raise RuntimeError(
+                    f"[FATAL] 权重与模型结构不匹配，拒绝静默部分加载：{weights}\n"
+                    f"  missing keys ({len(missing)}): {missing[:10]}\n"
+                    f"  unexpected keys ({len(unexpected)}): {unexpected[:10]}\n"
+                    "  若 unexpected 中含 'lora_' 前缀：说明喂了未合并的 LoRA 训练 checkpoint，"
+                    "先跑 scripts/merge_lora_checkpoint.py 合并后再用。"
+                )
         print(f"Loaded model weights from {weights}")
     else:
         # 2026-08-11 #115: 主诊断模型(计分组件)权重文件缺失的分流——

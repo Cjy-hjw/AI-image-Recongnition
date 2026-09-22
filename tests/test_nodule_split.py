@@ -467,3 +467,134 @@ class TestHysteresisBinarize:
     def test_bad_ndim_raises(self):
         with pytest.raises(ValueError, match="2D"):
             hysteresis_binarize(np.zeros(8), 0.5, 0.3)
+
+
+class TestStaticShrinkZ2:
+    """Z2 实例级收缩(2026-09-22,新架构线零训练第二波,默认关)。
+
+    设计规格 = docs/新架构线_零训练Z1Z2设计.md Z2 节(预注册):
+    ① 默认关逐位零回归;② 收缩语义:bbox 不外扩、面积单调不增;
+    ③ 负例:腐蚀到空的实例不得消失(空实例=丢检测=AP 负涨);
+    ④ K 越预注册域 {1,2} fail-loud;⑤ 动态(3D)路径零触及。
+    env 哨兵隔离由 tests/conftest.py 的 autouse fixture 统一删除,
+    本类用 monkeypatch 自设(同 TestMinAreaEnv 模式)。
+    """
+
+    def test_default_off_bitwise_identical(self, monkeypatch):
+        monkeypatch.delenv("AICOMP_STATIC_SHRINK", raising=False)
+        m = np.zeros((200, 200), np.uint8)
+        m[20:40, 30:50] = 255
+        m[100:106, 100:106] = 255
+        base = split_nodules(m, min_area_ratio=0)
+        off = split_nodules(m, min_area_ratio=0)
+        assert [n["area"] for n in off] == [n["area"] for n in base]
+        assert [n["area"] for n in off] == [400, 36]
+
+    def test_shrink_k1_reduces_area_keeps_count(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        m = np.zeros((200, 200), np.uint8)
+        m[20:40, 30:50] = 255
+        m[100:106, 100:106] = 255
+        nodules = split_nodules(m, min_area_ratio=0)
+        assert [n["area"] for n in nodules] == [324, 16]  # 18×18 / 4×4
+
+    def test_shrink_k2(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK_K", "2")
+        m = np.zeros((200, 200), np.uint8)
+        m[20:40, 30:50] = 255
+        m[100:106, 100:106] = 255
+        nodules = split_nodules(m, min_area_ratio=0)
+        assert [n["area"] for n in nodules] == [256, 4]  # 16×16 / 2×2
+
+    def test_bbox_monotone_no_expand(self, monkeypatch):
+        """收缩语义 2:收缩后 bbox ⊆ 原 bbox(外扩=方向反了,变成膨胀)。"""
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        m = np.zeros((200, 200), np.uint8)
+        m[20:40, 30:50] = 255
+        shrunk = split_nodules(m, min_area_ratio=0)[0]
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "0")
+        orig = split_nodules(m, min_area_ratio=0)[0]
+        x0s, y0s, ws, hs = shrunk["bbox"]
+        x0o, y0o, wo, ho = orig["bbox"]
+        assert x0s >= x0o and y0s >= y0o, "左/上角点不得外移"
+        assert x0s + ws <= x0o + wo and y0s + hs <= y0o + ho, "右/下边界不得外移"
+
+    def test_one_pixel_instance_not_eroded_to_empty(self, monkeypatch):
+        """🔴 收缩语义 3 负例(设计文档测试规格 3):1px 实例腐蚀后为空
+        必须回退保留实例——空实例=丢检测=AP 负涨,比偏大更糟。"""
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        m = np.zeros((200, 200), np.uint8)
+        m[50, 50] = 255
+        m[100:130, 100:130] = 255
+        nodules = split_nodules(m, min_area_ratio=0)
+        areas = sorted(n["area"] for n in nodules)
+        assert areas == [1, 784]  # 1px 原样保留,30×30 → 28×28
+
+    def test_garbage_env_falls_back_off(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "garbage")
+        m = np.zeros((200, 200), np.uint8)
+        m[20:40, 30:50] = 255
+        nodules = split_nodules(m, min_area_ratio=0)
+        assert [n["area"] for n in nodules] == [400]  # 逐位=关
+
+    @pytest.mark.parametrize("bad_k", ["0", "3", "-1", "10"])
+    def test_k_out_of_domain_fail_loud(self, monkeypatch, bad_k):
+        """K 域 {1,2} 是预注册扫参域(设计文档 Z2 算法规格 2),越域
+        = 临场发明配方,照 tiling tile≠512 先例 raise 不静默钳。"""
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK_K", bad_k)
+        m = np.zeros((50, 50), np.uint8)
+        m[10:30, 10:30] = 255
+        with pytest.raises(ValueError, match="SHRINK_K"):
+            split_nodules(m, min_area_ratio=0)
+
+    def test_k_garbage_string_defaults_to_1(self, monkeypatch):
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK_K", "not-a-number")
+        m = np.zeros((200, 200), np.uint8)
+        m[20:40, 30:50] = 255
+        nodules = split_nodules(m, min_area_ratio=0)
+        assert [n["area"] for n in nodules] == [324]  # 回默认 k=1
+
+    def test_3d_zero_touch(self, monkeypatch):
+        """设计文档:动态不做(4.7% 占比,3D 收缩语义未定)——3D 输入
+        在 shrink 开/关两种 env 下必须逐位一致。"""
+        m3 = np.zeros((5, 100, 100), np.uint8)
+        m3[1:4, 20:40, 20:40] = 1
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        on = split_nodules(m3, min_area_ratio=0)
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "0")
+        off = split_nodules(m3, min_area_ratio=0)
+        assert on[0]["area"] == off[0]["area"] == 3 * 400
+
+    def test_shrink_reranks_by_new_area(self, monkeypatch):
+        """收缩后面积序重排:两个原本面积悬殊的实例,腐蚀等量像素后
+        大者仍居首(面积降序是 _split_2d 出口契约,收缩必须维持不变量)。"""
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        m = np.zeros((200, 300), np.uint8)
+        m[10:50, 10:50] = 255    # 40×40=1600
+        m[60:76, 200:216] = 255  # 16×16=256
+        nodules = split_nodules(m, min_area_ratio=0)
+        assert [n["area"] for n in nodules] == [38 * 38, 14 * 14]
+        assert nodules[0]["area"] >= nodules[1]["area"]
+
+    def test_mask_value_domain_and_full_size(self, monkeypatch):
+        """实例 mask 仍须全尺寸、值域 {0,1}(下游 save_binary_mask 契约)。"""
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        m = np.zeros((100, 100), np.uint8)
+        m[20:50, 20:50] = 255
+        n = split_nodules(m, min_area_ratio=0)[0]
+        assert n["mask"].shape == m.shape
+        assert set(np.unique(n["mask"]).tolist()) <= {0, 1}
+
+    def test_centroid_matches_shrunk_mask(self, monkeypatch):
+        """centroid 按收缩后 mask 重算(残留旧 centroid 会让 crop_nodule
+        裁偏,形状仍合法查不出来)。"""
+        monkeypatch.setenv("AICOMP_STATIC_SHRINK", "1")
+        m = np.zeros((100, 100), np.uint8)
+        m[20:60, 20:60] = 255
+        n = split_nodules(m, min_area_ratio=0)[0]
+        ys, xs = np.nonzero(n["mask"])
+        assert n["centroid"] == (pytest.approx(xs.mean(), abs=1e-6),
+                                 pytest.approx(ys.mean(), abs=1e-6))

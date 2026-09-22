@@ -18,3 +18,7 @@ def _isolate_split_envs(monkeypatch):
     monkeypatch.delenv("AICOMP_MIN_AREA_RATIO", raising=False)
     monkeypatch.delenv("AICOMP_SEG_GROW", raising=False)
     monkeypatch.delenv("AICOMP_SEG_GROW_DYNAMIC", raising=False)
+    # Z2(2026-09-22):实例级收缩同款哨兵——本机/云端设过 AICOMP_STATIC_SHRINK
+    # 时,不显式管的既有 nodule_split 测试会被收缩改面积/假红(或掩盖真回归)。
+    monkeypatch.delenv("AICOMP_STATIC_SHRINK", raising=False)
+    monkeypatch.delenv("AICOMP_STATIC_SHRINK_K", raising=False)

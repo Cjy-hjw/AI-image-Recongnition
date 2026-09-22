@@ -847,3 +847,67 @@ def test_diag_workers_env_clamping():
         got = _diag_workers()
         assert got == want, f"env={raw!r}: got {got} want {want}"
     os.environ.pop("AICOMP_DIAG_WORKERS", None)
+
+
+# ── Z2 实例级收缩扫参轴(shrink_static,2026-09-22)──────────────────────
+
+
+def test_sweep_shrink_axis_parsed(diag_root, patched_pipeline, tmp_path):
+    """shrink_static 进白名单、int 域 {0,1,2}、伴随 thr_static 派生进静态组合。"""
+    combos = DD._parse_sweep(["thr_static=0.35", "shrink_static=0,1,2"])
+    assert combos == [{"thr_static": 0.35, "shrink_static": 0},
+                      {"thr_static": 0.35, "shrink_static": 1},
+                      {"thr_static": 0.35, "shrink_static": 2}]
+    assert all(isinstance(c["shrink_static"], int) for c in combos)
+
+
+@pytest.mark.parametrize("bad", ["3", "-1", "20"])
+def test_sweep_shrink_out_of_domain_rejected(bad):
+    """k 越预注册域 {0,1,2} 入口即拦(设计文档 Z2 算法规格 2;越域=临场发明)。"""
+    with pytest.raises(ValueError, match="shrink_static"):
+        DD._parse_sweep(["thr_static=0.35", f"shrink_static={bad}"])
+
+
+def test_sweep_bare_shrink_axis_rejected(diag_root, patched_pipeline, tmp_path):
+    """裸 shrink_static 轴(无 thr 轴)须被派生空护栏拦下(白跑 54 分钟防线)。"""
+    root, xlsx = diag_root
+    with pytest.raises(ValueError, match="派生为空"):
+        DD.run_sweep(_Args(root, xlsx, tmp_path / "logs",
+                           sweep=["shrink_static=1"]))
+
+
+def test_sweep_shrink_reaches_split_nodules(diag_root, patched_pipeline,
+                                            tmp_path, monkeypatch):
+    """kw 透传的区分力:显式 shrink 必须真的改变静态实例面积。
+
+    fixture 块实心,split 出的实例经 k 次腐蚀面积必减;若 shrink 轴没接进
+    _combo_rows→post(镜像链),各组合 area 逐位相同,测试零区分力。
+    """
+    import os
+    for k in ("AICOMP_STATIC_SHRINK", "AICOMP_STATIC_SHRINK_K"):
+        os.environ.pop(k, None)
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.35", "shrink_static=0,1,2"]))
+    sta = [r for r in report["results"] if not r["is_dynamic"]]
+    by_k = {r["combo"]["shrink"]: r for r in sta}
+    assert set(by_k) == {0, 1, 2}
+    a0 = by_k[0]["n_pred"]
+    # 实例数不因收缩而变(设计:腐蚀只减面积;1px 空实例回退保留)
+    assert by_k[1]["n_pred"] == a0
+    assert by_k[2]["n_pred"] == a0
+    # 扫参后 env 不泄漏(显式盖 env 的 finally 恢复)
+    assert "AICOMP_STATIC_SHRINK" not in os.environ
+    assert "AICOMP_STATIC_SHRINK_K" not in os.environ
+
+
+def test_sweep_shrink_not_drag_dynamic(diag_root, patched_pipeline, tmp_path):
+    """纯静态 shrink 扫参不得拖起动态池(Z2 动态不做)。"""
+    root, xlsx = diag_root
+    report = DD.run_sweep(_Args(
+        root, xlsx, tmp_path / "logs",
+        sweep=["thr_static=0.5", "shrink_static=1"]))
+    assert not [r for r in report["results"] if r["is_dynamic"]]
+    sta = [r for r in report["results"] if not r["is_dynamic"]]
+    assert sta[0]["combo"]["shrink"] == 1

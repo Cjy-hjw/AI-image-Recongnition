@@ -92,6 +92,64 @@ def test_build_model_falls_back_to_random_init_when_file_missing(tmp_path):
     assert loaded is not None
 
 
+def test_build_model_allows_missing_aux_head_keys_only(tmp_path, capsys):
+    """🔴 2026-09-22 aux 键白名单(Z1 tiling 云端诊断实弹炸出):
+
+    ep16/r5 等**旧权重**在深监督 aux 头合入(c08f36c)之前训出,恰缺 4 个
+    seg_aux_head_2/3 键;aux 是纯推理旁路(生产链只读 outputs["mask"],
+    4 个 1×1 Conv 随机初始化对预测零影响),恰好缺且仅缺它们时放行
+    (打 WARNING)。这是 strict 红线的唯一例外——LoRA/真不匹配仍 raise
+    (由下两个既有测试守护)。"""
+    model = _tiny_model()
+    sd = {k: v for k, v in model.state_dict().items()
+          if not k.startswith(MultiTaskThyroidModel.SEG_AUX_PREFIXES)}
+    ckpt_path = tmp_path / "no_aux.pth"
+    torch.save(sd, ckpt_path)
+
+    loaded = build_model(CONFIG, str(ckpt_path), torch.device("cpu"))
+    assert loaded is not None
+    # 非 aux 参数必须全部真加载(不是随机)
+    loaded_sd = loaded.state_dict()
+    for k in sd:
+        assert torch.equal(loaded_sd[k], sd[k]), f"非 aux 参数 {k} 未加载"
+    out = capsys.readouterr().out
+    assert "aux" in out, "aux 放行必须打 WARNING(诚实记录,不是静默)"
+
+
+def test_build_model_rejects_aux_missing_plus_other_missing(tmp_path):
+    """白名单收紧性:aux 缺 + 其它键也缺(混合缺失)必须仍 raise——
+    白名单只放行"恰好缺且仅缺 aux",混合缺失说明权重与结构真不匹配。"""
+    model = _tiny_model()
+    sd = {k: v for k, v in model.state_dict().items()
+          if not k.startswith(MultiTaskThyroidModel.SEG_AUX_PREFIXES)}
+    sd.pop("seg_head.weight")  # 再删一个真键
+    ckpt_path = tmp_path / "mixed_missing.pth"
+    torch.save(sd, ckpt_path)
+
+    try:
+        build_model(CONFIG, str(ckpt_path), torch.device("cpu"))
+        assert False, "混合缺失(aux+非 aux)必须抛 RuntimeError"
+    except RuntimeError as e:
+        assert "不匹配" in str(e)
+
+
+def test_build_model_rejects_unexpected_with_aux_missing(tmp_path):
+    """白名单收紧性:unexpected 键(如 LoRA)与 aux missing 并存时必须仍
+    raise——`not unexpected` 是白名单前置条件,防"借 aux 名义混入垃圾"。"""
+    model = _tiny_model()
+    sd = {k: v for k, v in model.state_dict().items()
+          if not k.startswith(MultiTaskThyroidModel.SEG_AUX_PREFIXES)}
+    sd["some_module.lora_A"] = torch.randn(2, 2)
+    ckpt_path = tmp_path / "aux_plus_lora.pth"
+    torch.save(sd, ckpt_path)
+
+    try:
+        build_model(CONFIG, str(ckpt_path), torch.device("cpu"))
+        assert False, "unexpected(lora)并存时必须抛 RuntimeError"
+    except RuntimeError as e:
+        assert "不匹配" in str(e)
+
+
 def test_build_model_raises_on_missing_file_in_production(tmp_path, monkeypatch):
     """2026-08-11 #115: PRODUCTION=1 下主诊断模型权重文件缺失必须硬报错，不得随机初始化。
 

@@ -216,6 +216,17 @@ sidecar 逐位等价(含 group_cases 插入序绝对锚,变异 A 写序反转实
 2026-09-19 零冲突合并 `7bb5e5a`,worktree/分支已删)
 →1281(深监督:`test_deepsup_loss.py` **10** 新增,2026-09-20)
 →1297(Z1 tiling:`test_tiling_inference.py` **16** 新增——恒等路径/max 融合
+
+→1318(Z2 实例级收缩:`test_nodule_split.py` 82=70+**12** 新增 TestStaticShrinkZ2
+——默认关逐位零回归/k1/k2 面积/1px 空实例回退/garbage 回关/K 越域 {1,2} fail-loud
+(0/3/-1/10 参数化)/3D 零触及/面积序重排/值域全尺寸/centroid 重算;
+`test_diagnose_detection.py` 33=28+**5**——shrink_static 轴解析/越域拒/裸轴拦/
+透传区分力(n_pred 不变+env finally 恢复)/不拖动态池;conftest 哨兵删
+AICOMP_STATIC_SHRINK(_K))
+→1322(aux 键白名单:`test_model_runner.py` 19=16+**3**——恰好缺且仅缺 4 个
+seg_aux_head 键放行(打 WARNING+非 aux 参数逐值校验)/混合缺失(aux+非aux)
+仍 raise/unexpected(lora)并存仍 raise。动因=Z1 云端诊断实弹:ep16 旧权重在
+aux 头合入前训出,strict 硬拒炸诊断;aux 是纯推理旁路,唯一放行例外)
 last-wins/分类 tile 半开上界/tile≠512 与 stride==tile fail-loud/默认关 env
 矩阵/动态零触及;Gate2 四路 2026-09-21,修复 commit `0dd833a`)。
 判回归须同

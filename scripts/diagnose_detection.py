@@ -230,7 +230,8 @@ def run_dynamic_inference(model, config, calibrator, precision, device,
 def run_static_inference_from_result(case_result, *, seg_threshold=None,
                                      min_area_ratio=None,
                                      max_nodules=None,
-                                     grow=None) -> list:
+                                     grow=None,
+                                     shrink=None) -> list:
     """从 diagnose_static_case 的返回抽实例(与 load 环节解耦,供等价回归测试)。
 
     实例抽取逐行镜像 `_write_static`(v21_output.py:374-385):resize →
@@ -248,6 +249,11 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
     `mask_binary`(已走 hysteresis);显式传参时调**同一个**
     `hysteresis_binarize`(镜像同源,防"以为扫了实际没扫")。grow 必须伴随
     seg_threshold,裸 grow 入口报错。
+    `shrink`(Z2 2026-09-22,实例级收缩 k):None 时吃生产 env
+    (AICOMP_STATIC_SHRINK/K,镜像同源);显式传 int 时**临时盖 env**——
+    本函数是 sweep 的镜像消费点,扫参进程须确定性(与 min_area 同款
+    三层优先级语义)。域校验 {0,1,2} 在 nodule_split._env_shrink_k
+    fail-loud(0=显式关,便于"关 env 已设"的对照组)。
     """
     preds = case_result["preds"]
     hw = tuple(int(x) for x in case_result["orig_hw"])
@@ -270,6 +276,27 @@ def run_static_inference_from_result(case_result, *, seg_threshold=None,
     instances = split_nodules(binary_fullres,
                               min_area_ratio=min_area_ratio,
                               max_nodules=max_nodules)
+    if shrink is not None:
+        # Z2 显式扫参:临时盖 env(sweep 确定性;退出恢复,防污染同进程
+        # 其它组合的"未显式"路径)。0=显式关(对照组);1/2 越域在
+        # _env_shrink_k fail-loud(不在镜像层重复校验,保单源)。
+        _saved = (os.environ.get("AICOMP_STATIC_SHRINK"),
+                  os.environ.get("AICOMP_STATIC_SHRINK_K"))
+        try:
+            os.environ["AICOMP_STATIC_SHRINK"] = "1" if shrink > 0 else "0"
+            os.environ.pop("AICOMP_STATIC_SHRINK_K", None)
+            if shrink > 0:
+                os.environ["AICOMP_STATIC_SHRINK_K"] = str(int(shrink))
+            instances = split_nodules(binary_fullres,
+                                      min_area_ratio=min_area_ratio,
+                                      max_nodules=max_nodules)
+        finally:
+            for key, val in zip(("AICOMP_STATIC_SHRINK",
+                                 "AICOMP_STATIC_SHRINK_K"), _saved):
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
     out = []
     for inst in instances:
         out.append({
@@ -1116,6 +1143,10 @@ def _combo_rows(case_result, post, gts: list, is_dynamic: bool,
         # (hysteresis 恒等退化)。
         if combo.get("grow") is not None:
             kw["grow"] = combo["grow"]
+        # Z2(2026-09-22):shrink 只透传静态 post(动态不扫,设计文档明文)。
+        # 不传时生产 env 路径不变(镜像同源)。
+        if not is_dynamic and combo.get("shrink") is not None:
+            kw["shrink"] = combo["shrink"]
         if is_dynamic:
             preds, _n_total = post(case_result, **kw)
         else:
@@ -1160,22 +1191,27 @@ def _parse_sweep(specs: list) -> list:
 
     keys: `thr_static`/`thr_dynamic`(分割阈值)/`min_area`(静态最小面积占比,
     仅静态路径消费)/`max_nodules`(预测结节数上限,静/动两池都消费)/
-    `grow_static`/`grow_dynamic`(阶段3 手段4 生长阈值,须伴随同侧 thr 轴)。
-    交叉维度 = 静态阈值×min_area×max_nodules×grow_static(静态池)/动态阈值×
-    max_nodules×grow_dynamic(动态池,min_area 不扫——生产动态钉死 DEFAULT)。
-    实现上为简化:统一笛卡尔积,动态侧忽略 min_area 维度(`_combo_rows` 按
+    `grow_static`/`grow_dynamic`(阶段3 手段4 生长阈值,须伴随同侧 thr 轴)/
+    `shrink_static`(Z2 2026-09-22 实例级收缩 k,静态专用,须伴随 thr_static 轴)。
+    交叉维度 = 静态阈值×min_area×max_nodules×grow_static×shrink_static(静态池)/
+    动态阈值×max_nodules×grow_dynamic(动态池,min_area/shrink 不扫——生产动态
+    钉死 DEFAULT/Z2 设计文档明文动态不做)。
+    实现上为简化:统一笛卡尔积,动态侧忽略 min_area/shrink 维度(`_combo_rows` 按
     分支消费),组合数会略多于理论必要,CPU 段每组合 ~秒级,可接受。
 
     🔴 max_nodules 是 int 轴(阶段1三处联动之一):float 解析会产 20.0 →
     `nodules[:20.0]` TypeError,按键走 int 转换;非整数值入口报错(扫参拼错
     20.5 应该炸而不是静默回默认)。
+    🔴 shrink_static 同为 int 轴,域 {0,1,2} 预注册(设计文档 Z2 算法规格 2;
+    0=对照组显式关,1/2=腐蚀次数)。越域入口报错(与 _env_shrink_k 单源同域,
+    双侧改须同步)。
     """
     import itertools
     # 🔴 白名单校验(B路审查P1):未知键(如 thr= 漏写 _static)在派生后两侧皆空,
     # 会静默跑完全量 54 分钟推理再产出空报告——键名错误必须在入口就报。
     _ALLOWED = {"thr_static", "thr_dynamic", "min_area", "max_nodules",
-                "grow_static", "grow_dynamic"}
-    _INT_KEYS = {"max_nodules"}
+                "grow_static", "grow_dynamic", "shrink_static"}
+    _INT_KEYS = {"max_nodules", "shrink_static"}
     # int 轴上界与生产 _MAX_NODULES_CEILING 同源(数值改须两侧同步;数值引用
     # 见 src/inference/nodule_split.py:79)。fix-审查 F1:无上界时
     # --sweep max_nodules=500 走显式传参绕过 env 的 ceiling 直达 split_nodules,
@@ -1200,6 +1236,14 @@ def _parse_sweep(specs: list) -> list:
                 continue
             if key in _INT_KEYS:
                 iv = int(v)          # 非整数串直接 ValueError(入口报,好过下游炸)
+                if key == "shrink_static":
+                    # Z2 预注册域 {0,1,2}:0=对照组(显式关),1/2=腐蚀次数。
+                    if iv not in (0, 1, 2):
+                        raise ValueError(
+                            f"--sweep shrink_static 须在 {{0,1,2}}(预注册扫参域,"
+                            f"设计文档 Z2 算法规格 2),收到 {iv}")
+                    parsed.append(iv)
+                    continue
                 if iv < 1:
                     raise ValueError(
                         f"--sweep {key} 须为正整数,收到 {iv}")
@@ -1250,10 +1294,13 @@ def run_sweep(args) -> dict:
         if "thr_static" not in c:
             continue
         d = {k: v for k, v in c.items()
-             if k in ("thr_static", "min_area", "max_nodules", "grow_static")}
+             if k in ("thr_static", "min_area", "max_nodules", "grow_static",
+                      "shrink_static")}
         d["thr"] = d.pop("thr_static")
         if "grow_static" in d:
             d["grow"] = d.pop("grow_static")
+        if "shrink_static" in d:
+            d["shrink"] = d.pop("shrink_static")
         if d not in combos_static:
             combos_static.append(d)
     combos_dynamic = []
@@ -1272,11 +1319,12 @@ def run_sweep(args) -> dict:
     # 两侧皆空,白跑全量推理后产出空报告——入口即拦。min_area 是静态阈值的
     # 伴随参数;max_nodules 是阈值的伴随参数(两侧都是),单扫它对默认阈值
     # 基线没有对拍意义(饱和归因走 run_diagnosis + analyze_diag_sidecar)。
+    # shrink_static 同款(静态阈值的伴随参数;且 Z2 动态不做,无动态伴随语义)。
     if not combos_static and not combos_dynamic:
         raise ValueError(
             f"扫参组合派生为空(输入 {args.sweep}):至少需要一个 "
             "thr_static=... 或 thr_dynamic=... 轴;min_area/max_nodules/"
-            "grow_static/grow_dynamic 是阈值轴的伴随参数")
+            "grow_static/grow_dynamic/shrink_static 是阈值轴的伴随参数")
     # 🔴 grow≥thr 入口校验(lane3-4 审查 P1,2026-09-16):镜像函数内的
     # raise 发生在 per-case 循环里,run_sweep 的 except 会把整个 case 记
     # anomaly——已算好的合法组合行全部被毒化,烧完 54 分钟推理产出空报告
@@ -1424,6 +1472,9 @@ def run_sweep(args) -> dict:
                 "grow_static/grow_dynamic 同 max_nodules:须伴随同侧 thr 轴;"
                 "显式传参调 hysteresis_binarize(与生产 decode_predictions 同源);"
                 "不传 grow 时 thr 扫参走恒等路径(grow=thr)",
+                "shrink_static(Z2):静态专用,须伴随 thr_static 轴;显式传参"
+                "临时盖 AICOMP_STATIC_SHRINK(_K) env(镜像同源+扫参确定性);"
+                "k 域 {0,1,2} 预注册,0=对照组显式关;动态不扫(设计文档明文)",
                 "val 只含有 ROI 标注患者,阴性 FP 不在池(与 run_diagnosis 同盲区)",
                 "🔴 选阈值须看 match_rate 与 mean_dice 的联合,不能只看其一:"
                 "降阈值让临界带病例越过 0.5,同时让已匹配病例 IoU 下滑跌出 0.5",
@@ -1498,8 +1549,9 @@ def main():
     #   thr_static / thr_dynamic(分割二值化阈值)/ min_area(静态最小面积占比,
     #   只作用于静态池)/ max_nodules(预测结节数上限,静/动两池都消费,但
     #   须伴随同侧 thr 轴才扫该池)/ grow_static / grow_dynamic(阶段3 手段4
-    #   生长阈值,须伴随同侧 thr 轴)。给了 --sweep 就走 run_sweep(一次前向多
-    #   参数),否则走原 run_diagnosis(单参数全量诊断)。
+    #   生长阈值,须伴随同侧 thr 轴)/ shrink_static(Z2 2026-09-22 实例级收缩
+    #   k∈{0,1,2},静态专用,须伴随 thr_static 轴)。给了 --sweep 就走
+    #   run_sweep(一次前向多参数),否则走原 run_diagnosis(单参数全量诊断)。
     # plan 任务 A(2026-09-18):机制分账开关。默认关——v1 sidecar 行为
     # 逐位零回归;开启后 gts 行并入 sidecar v2 证据字段(gt_key/soft_*/
     # pred_ious/centroid/merge_pred_count)+ schema_version=2,preds 行加
@@ -1511,7 +1563,8 @@ def main():
                          "--sweep thr_dynamic=0.25,0.30,0.35 "
                          "--sweep min_area=2e-5,5e-5,1e-4 "
                          "--sweep max_nodules=20,30,50 "
-                         "--sweep grow_static=0.32,0.28,0.24")
+                         "--sweep grow_static=0.32,0.28,0.24 "
+                         "--sweep shrink_static=0,1,2")
     args = ap.parse_args()
     # 逐 case 完整行始终进 sidecar JSONL(崩溃保数据);--save-per-case 曾计划
     # 把行嵌进主报告,但会撑大 JSON 且与 sidecar 重复,已砍,参数不再收。

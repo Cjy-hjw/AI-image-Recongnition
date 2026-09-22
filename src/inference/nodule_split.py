@@ -78,6 +78,52 @@ _ENV_MAX_NODULES = "AICOMP_MAX_NODULES"
 # ceiling=100 ≈ 最坏写入量已验证量级,放开决策的候选值 30/50 远在其下)。
 _MAX_NODULES_CEILING = 100
 
+# ── Z2 实例级收缩(2026-09-22,新架构线零训练第二波,默认关)────────────────
+# 设计规格=docs/新架构线_零训练Z1Z2设计.md Z2 节(预注册,实现只从中选):
+#   算法 = 形态学腐蚀 3×3 ×k(k∈{1,2} 预注册扫参域)。
+#   为什么选腐蚀而非概率域截尾/实例级阈值重切(另外两个预注册候选):
+#   - 阈值重切在 hysteresis 恒等(grow 已判死默认关)下与全局 {soft>thr} 连通域
+#     逐位等价 = 踩"全局阈值扫参已判死"边界(阈值-AP 耦合),排除;
+#   - 截尾需要 soft 概率进 _split_2d(签名加参+生产调用点改),违反设计文档
+#     "消费端 v21_output._write_static 不重写"挂钩约束;腐蚀只需 binary,
+#     照 _clean_2d/_ENV_MIN_AREA_RATIO 先例纯 env 驱动,消费端零改动自动生效。
+#   判死线(预注册):Δ匹配≥+0.012 且 ΔAP≥+0.008 vs ep16(0.8478/0.8250);
+#   Dice 必须同看(收缩直接改 mask 尺寸,预检 r>1 占 61.4% 但集中 0.8~1.2 带)。
+# 🔴 边界(勿重蹈,设计文档 Z2 节):不碰 hysteresis grow 路径(滞回生长已判死)、
+#   不动二值化阈值(全局阈值扫参已判死)、只做**实例层面**收缩。
+_ENV_SHRINK = "AICOMP_STATIC_SHRINK"
+_ENV_SHRINK_K = "AICOMP_STATIC_SHRINK_K"
+_SHRINK_KERNEL = np.ones((3, 3), np.uint8)
+
+
+def _shrink_enabled() -> bool:
+    """AICOMP_STATIC_SHRINK 三态开关(畸形回关——未验证路径的安全侧=关)。
+
+    与 tiling/_clean_2d 同款解析:未设/"0"/垃圾串一律关,判死回退安全侧。
+    """
+    raw = os.environ.get(_ENV_SHRINK, "0").strip().lower()
+    return raw in ("1", "true", "on", "yes")
+
+
+def _env_shrink_k() -> int:
+    """开关开时的 K 解析:未设=1(最小腐蚀);垃圾串回 1;数值 ∉{1,2} fail-loud。
+
+    域 {1,2} 是预注册扫参域(设计文档 Z2 算法规格 2),越界=临场发明,
+    照 tiling tile≠512 先例 raise 不静默钳(静默钳会让未注册配方溜上测评)。
+    """
+    raw = os.environ.get(_ENV_SHRINK_K)
+    if raw is None:
+        return 1
+    try:
+        k = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    if k not in (1, 2):
+        raise ValueError(
+            f"AICOMP_STATIC_SHRINK_K 须在 {{1, 2}}(预注册扫参域,设计文档 Z2 节),"
+            f"收到 {k}——越域值须先扩预注册规格,不静默钳")
+    return k
+
 # ── 静态 2D 形态学清理(Fable 低成本点,2026-09-12;🔴 默认关,离线双升才开)──
 # 预测 mask 上的两类噪声:① 孤立小连通域(碎片)→ 变成假阳性结节拖检测 AP;
 # ② 结节内部孔洞(概率中间塌陷)→ 蚀 Dice 边缘。清理 = 填孔 + 小碎片剔除。
@@ -296,7 +342,7 @@ def split_nodules(
     if max_nodules is None:
         max_nodules = _env_max_nodules()
     if arr.ndim == 2:
-        return _split_2d(arr, min_area_ratio, max_nodules)
+        return _shrink_instances_2d(_split_2d(arr, min_area_ratio, max_nodules))
     if arr.ndim == 3:
         return _split_3d(arr, min_area_ratio, max_nodules, close_gap_frames)
     raise ValueError(
@@ -367,6 +413,50 @@ def _split_2d(arr, min_area_ratio, max_nodules):
 
     nodules.sort(key=lambda d: d["area"], reverse=True)
     return nodules[:max_nodules]
+
+
+def _shrink_instances_2d(nodules: list) -> list:
+    """Z2 实例级收缩(2026-09-22,默认关):对已成实例的 mask 做 3×3 腐蚀 ×k。
+
+    **实例化之后腐蚀**(而非 _split_2d 入口先腐蚀再连通域)的理由:
+    - 入口腐蚀会把贴邻的两实例接触面一起削、可能改变连通域数(n_pred 变),
+      而 Z2 的对症假设是"已检出实例尺寸偏大",实例数不应变——扫参对拍
+      ΔAP 时 n_pred 漂移会污染归因;
+    - 实例级腐蚀天然满足"1px 实例收缩后不得为空"(设计文档测试规格 3):
+      腐蚀后 area==0 的实例整例回退不腐蚀(空实例=丢检测=AP 负涨);
+    - 动态路径零触及:本函数只被 2D 消费链调用(设计文档"动态不做")。
+
+    与已判死手段的边界:不碰 hysteresis grow(滞回生长已判死)、不动
+    decode 的二值化阈值(全局阈值扫参已判死)——本函数在 split 之后、
+    纯实例层面。bbox/area/centroid 全部按收缩后 mask 重算(bbox 不外扩,
+    面积单调不增,设计文档测试规格 2)。
+    """
+    if not _shrink_enabled():
+        return nodules
+    k = _env_shrink_k()
+    out = []
+    for inst in nodules:
+        m = inst["mask"]
+        shrunk = cv2.erode(m, _SHRINK_KERNEL, iterations=k)
+        if int(shrunk.sum()) == 0:
+            # 腐蚀到空 = 丢该检测(AP 负涨路径,设计文档测试规格 3 的负例):
+            # 回退不腐蚀,保住实例(宁可偏大不丢检测)。
+            out.append(inst)
+            continue
+        ys, xs = np.nonzero(shrunk)
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        out.append({
+            "mask": shrunk.astype(np.uint8),
+            "area": int(shrunk.sum()),
+            "bbox": (x0, y0, x1 - x0 + 1, y1 - y0 + 1),
+            "centroid": (float(xs.mean()), float(ys.mean())),
+        })
+    # 面积降序须按收缩后 area 重排(排序截断消费面积序,原序会让大实例的
+    # 残影占位;_split_2d 出口契约就是面积降序,保持不变量)。
+    # (max_nodules 截断不在此重复:收缩只减面积不减实例数,截断集不变。)
+    out.sort(key=lambda d: d["area"], reverse=True)
+    return out
 
 
 def _split_3d(arr, min_area_ratio, max_nodules, close_gap_frames):

@@ -17,7 +17,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `video_io.py` | 动态图/视频(cine)抽帧:MP4/AVI/MOV/MKV via OpenCV + 多帧 DICOM cine via pydicom;复用 `io._PHI_FIELDS` 脱敏,经 `_to_gray` 统一灰度兜底(含彩色/多普勒 cine);OpenCV 视频帧传 `channel_order="bgr"`、DICOM cine 用默认 `"rgb"`。供 `video_predict.py`(根目录) |
 | `video_aggregate.py` | 视频推理纯逻辑:`uniform_sample_indices`(均匀抽样下标)+ `aggregate_frame_predictions`(帧级聚合,恶性概率取**最大帧**做最终判定,召回优先;**空输入安全返回 `keyframe_index=-1` 不抛**,由 `video_predict.py` 的显式守卫拦全帧失败,见下方「坏帧隔离」) |
 | `nifti_io.py` | **2026-08-01 新增,已接入(A1/V2.1 交付链路)**。NIfTI(.nii/.nii.gz)读写:`save_binary_mask`(交付 mask,值域强制 `{0,1}`)、`load_nifti_frames`(动图输入,签名与 `load_video_frames` 逐位对齐)、`scatter_frames_to_full_length`(抽样帧回填全帧序列)、`is_nifti_path`。A1 起 `entrypoint.sh` 按 `.nii.gz` 分发,`src/service/case_discovery.py`/`runner.py` 经本模块读写动态图输入与逐结节 mask 落盘。见 §8 |
-| `nodule_split.py` | **2026-08-01 新增,已接入(v21_output)**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`hysteresis_binarize`(阶段3 手段4 滞回阈值,默认恒等)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。A3 起 `v21_output.write_case_v21` 经 `split_nodules` 把整图 mask 拆成逐结节实例。见 §9 |
+| `nodule_split.py` | **2026-08-01 新增,已接入(v21_output)**。整图 mask → 逐结节实例:`split_nodules`(2D/3D 连通域)、`hysteresis_binarize`(阶段3 手段4 滞回阈值,默认恒等)、`crop_nodule`(带上下文边距裁剪)、`detection_confidence`(实例区域概率均值)。A3 起 `v21_output.write_case_v21` 经 `split_nodules` 把整图 mask 拆成逐结节实例。**Z2(2026-09-22):`_shrink_instances_2d` 实例级腐蚀收缩**(env `AICOMP_STATIC_SHRINK`/`_K`,默认关;k∈{1,2} 越域 fail-loud;1px 空实例回退;3D 零触及)。见 §9 |
 | `prediction_json.py` | **2026-08-01 新增,已接入(A3)**。官方 `prediction.json` schema 构造与校验:`build_nodule_entry`/`build_prediction_json`/`validate_prediction_json` + 三个新维度的类别映射常量。V2.1 起 `StudyUID` 填 PatientId、`MaskFile` 为相对病例一级目录路径。见 §10 |
 | `tiling.py` | **Z1(2026-09-21)**。静态滑窗 tiling:tile=512/stride=384,概率域 **max** 融合(禁平均),分类头取融合图 argmax 像素所属单 tile。env `AICOMP_STATIC_TILING` **默认关**;tile 必须=512、stride∈[256,512) fail-loud。只接静态,动态不碰。 |
 | `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6。Z1 在 `diagnose_static_case` 早退接 tiling(env 开且图大于 tile)。 |
@@ -428,6 +428,26 @@ loader 默认只抽 32 帧 —— 直接堆叠抽样帧的 mask 会让 Z 长度�
 > (单通道二值图不能靠"最近 seed 归属"分离——归属后仍 8/26 连通,必须删边界
 > 非 seed 像素)。接线点=`postprocess.decode_predictions` 的 `mask_binary`,
 > 默认关(grow=seed)。扫参轴 `grow_static`/`grow_dynamic` 见 `diagnose_detection`。
+
+**Z2 实例级收缩(2026-09-22,新架构线零训练第二波,默认关)**:
+`_shrink_instances_2d` 在 `_split_2d` 出口对每个实例 mask 做 3×3 腐蚀 ×k。
+- env `AICOMP_STATIC_SHRINK`(三态,畸形回关)+ `AICOMP_STATIC_SHRINK_K`
+  (域 {1,2} 预注册,**越域 raise 不静默钳**——越域=临场发明配方,须先扩
+  设计文档 Z2 节的预注册规格);K 未设/垃圾串回 1(最小腐蚀)。
+- **腐蚀到空的实例回退原样保留**(空实例=丢检测=AP 负涨,比偏大更糟)。
+- bbox/area/centroid 按收缩后 mask 重算,面积序重排(出口契约不变量);
+  **不重复截断 max_nodules**(收缩只减面积不减实例数,截断集不变)。
+- **3D 零触及**(动态不做,4.7% 占比、3D 收缩语义未定):`split_nodules`
+  分派在 ndim==2 分支才接收缩。
+- 与已判死手段的边界:不碰 hysteresis grow(滞回生长已判死,净收益<0.1
+  分)、不动二值化阈值(全局阈值扫参已判死,阈值-AP 耦合)——纯实例层。
+- 诊断镜像:扫参轴 `shrink_static`(须伴随 thr_static;显式传参临时盖
+  env + finally 恢复,镜像层不重实现腐蚀,直接复用 `_shrink_instances_2d`
+  ——与 grow 先例同款"镜像同源"纪律)。
+- 判死线(预注册):Δ匹配≥+0.012 且 ΔAP≥+0.008 vs ep16(0.8478/0.8250),
+  Dice 必须同看;测试 `tests/test_nodule_split.py::TestStaticShrinkZ2`(12 项)
+  + `tests/test_diagnose_detection.py` Z2 sweep 5 项;conftest 哨兵删
+  `AICOMP_STATIC_SHRINK(_K)`。
 > Gate2 四路审查(2026-09-16)定案的扫参判读注意事项:①grow 光环会让
 > sub-min_area 的小 seed 通过面积过滤(新 FP 面,grow 扫参须与 min_area
 > 联合判读);②`AICOMP_CLEAN_2D=1` 的 3×3 闭运算会把滞回切开的接触面

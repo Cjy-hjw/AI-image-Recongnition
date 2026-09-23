@@ -830,20 +830,36 @@ class OfficialThyroidDataset(Dataset):
         return binf[pos]
 
     # ── L2 union 监督的像素合成(plan 任务 L2,2026-09-22)──────────────────────
+    # 🔴 2026-09-23 云端实弹热修:OR 必须在**原始分辨率**下做。
+    # 首版把累积体初始化为 (img_size, img_size),与原尺寸帧(如 958×1303)OR
+    # 直接 broadcast ValueError —— 单病灶路径 _static_mask/_dynamic_mask_frame
+    # 返回原尺寸帧、由 __getitem__ 统一 _resize_mask,union 版漏了对齐这一顺序。
+    # 修法:惰性累积(None 起,按首帧尺寸建体),返回**原尺寸**并集,resize 完全
+    # 交给 __getitem__ 的统一出口(P1-1 修:分支内不 resize,与单病灶路径语义
+    # 严格一致,单一 resize 时点防两处口径漂移)。
+    # 语义与单病灶路径严格同式:__getitem__ 的 resize(OR(f1..fn)) vs
+    # resize(bin(f1)) —— 同一插值(INTER_NEAREST)同一时点(nearest 缩放与
+    # OR 可交换,审查 72 组实证含非整数比)。
     def _static_union_mask(self, union_mask_paths: List[str]) -> np.ndarray:
         """静态:同图全部病灶 mask 首帧 OR(与 _static_mask 同"3D 单帧取首帧"语义)。
 
         空 mask 文件按全零处理(OR 恒等元),与单 mask 路径读失败返回零图的行为一致;
         不 raise —— build 侧已保证列表非空且各文件存在,此处读到空属上游数据个案,
-        OR 语义天然吸收(其余病灶监督不受牵连)。
+        OR 语义天然吸收(其余病灶监督不受牵连)。返回**原分辨率**(与 _static_mask
+        同语义,resize 归 __getitem__ 统一出口)。
         """
-        out = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        out: Optional[np.ndarray] = None
         for mp in union_mask_paths:
             binf, _ = _read_nifti_binmasks(mp)
             if not binf:
                 continue
-            f = binf[0]
-            out = np.logical_or(out, (f > 0).astype(np.uint8)).astype(np.uint8)
+            f = (binf[0] > 0).astype(np.uint8)
+            if out is None:
+                out = f
+            else:
+                out = np.logical_or(out, f).astype(np.uint8)
+        if out is None:
+            return np.zeros((self.img_size, self.img_size), dtype=np.uint8)
         return out
 
     def _dynamic_union_mask_frame(self, union_mask_paths: List[str],
@@ -852,8 +868,9 @@ class OfficialThyroidDataset(Dataset):
 
         某个 mask 不含该帧(该病灶此帧无标注)→ 贡全零,OR 天然吸收;读失败同上。
         帧定位复用 _dynamic_mask_frame 的 pos 语义(idxs.index 回退 frame_index)。
+        返回**原分辨率**(与 _dynamic_mask_frame 同语义,resize 归统一出口)。
         """
-        out = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        out: Optional[np.ndarray] = None
         for mp in union_mask_paths:
             binf, idxs = _read_nifti_binmasks(mp) if mp else ([], [])
             if not binf:
@@ -861,7 +878,13 @@ class OfficialThyroidDataset(Dataset):
             pos = idxs.index(frame_index) if frame_index in idxs else frame_index
             if not (0 <= pos < len(binf)):
                 continue
-            out = np.logical_or(out, (binf[pos] > 0).astype(np.uint8)).astype(np.uint8)
+            f = (binf[pos] > 0).astype(np.uint8)
+            if out is None:
+                out = f
+            else:
+                out = np.logical_or(out, f).astype(np.uint8)
+        if out is None:
+            return np.zeros((self.img_size, self.img_size), dtype=np.uint8)
         return out
 
 
@@ -882,6 +905,18 @@ def _load_samples_pkl(path: str) -> Tuple[List[Dict], Dict]:
             f"samples.pkl 格式不对(缺 'samples' 键): {path}。"
             f"须由 scripts/data/preextract_dynamic.py 生成")
     return payload["samples"], payload.get("_meta", {})
+
+
+# 🔴 L2 漂移过滤的 memo 缓存(2026-09-23 启动提速):path → 是否可读。
+# 同图全部 union 样本共享同一 mask 集,逐样本真解压 = 同一文件解 N 遍
+# (K≥2 图 3.44 帧/病灶 × K)。**故意的全局可变缓存**:
+# - 无并发写(build_official_datasets 在 DataLoader worker fork 前的主进程
+#   单线程跑;fork COW 快照语义一致,spawn 只是缓存空=提速失效非错误);
+# - **仅单次构建内 memo,跨构建不失效**(审查 P1-2 实测:同进程二次 build
+#   会拿首次结论——"先坏后好"方向会误拒、报错指向被带偏)。build_official_datasets
+#   入口主动 clear 一次(见函数首行),同进程多次构建互不残留,单次构建内去重
+#   语义不变;勿改成 lru_cache/mtime 键(布尔结果同样适用但排查时更难 invalidate)。
+_UNION_READABLE_CACHE: Dict[str, bool] = {}
 
 
 def build_official_datasets(
@@ -912,6 +947,10 @@ def build_official_datasets(
     pkl 里的动态样本自带 `cache_img`/`cache_msk`,`__getitem__` 随之走 PNG 而非 .nii.gz。
     切分仍在此处按同一 `seed`/`val_frac` 现算,故换 seed 不必重跑预抽取。
     """
+    # P1-2 修(2026-09-23 审查):memo 缓存每次构建清零 —— "先坏后修好再二次
+    # 构建"场景不拿首次结论(残留会让报错指向"数据侧事故"而真因是缓存);
+    # 单次构建内去重语义不变(同图样本共享 mask 集,同文件解 N 遍 → 1 遍)。
+    _UNION_READABLE_CACHE.clear()
     if samples_pkl:
         samples, meta = _load_samples_pkl(samples_pkl)
         cached_size = meta.get("img_size")
@@ -985,12 +1024,26 @@ def build_official_datasets(
         # 静默退化为未标注背景=错误负监督,污染 L1 归因基座);阈值仍按样本级
         # 5% 口径(分母不变,缺路径样本进分子——口径写进 docstring 见上方注释)。
         for _up in _s.get("union_mask_paths") or ():
-            # 路C F1/F2(2026-09-22):exists 只拦"文件消失"型漂移;**存在但读不出**
+            # 路C F1/F2(2022-09-22):exists 只拦"文件消失"型漂移;**存在但读不出**
             # (9-14 invalid block type 型损坏)会被消费端 `_static_union_mask`/
             # `_dynamic_union_mask_frame` 静默 OR 恒等元吸收 → 次病灶静默退化为
             # 错误负监督,零反馈。漂移过滤是 pkl 载入时一次性成本(非每 epoch),
             # 此处真解压一次即同时校验存在与可读;读失败视同文件缺失,进同一 5% 口径。
-            if not _read_nifti_binmasks(_up)[0]:
+            # 🔴 2026-09-23 启动提速热修:同一图的全部 union 样本共享同一 mask 集
+            # (union_mask_paths 内容相同),逐样本真解压 = 同一文件解 N 遍(N=样本数,
+            # K≥2 图实测 3.44 帧/病灶 × K)。进程内 memo 缓存(path → bool 可读),
+            # 同一轮启动内重复路径零重复解压;**故意的全局可变缓存**(无并发写:
+            # build_official_datasets 在 DataLoader worker fork 前的主进程单线程跑),
+            # 勿改成 functools.lru_cache——它按参数哈希缓存,布尔结果同样适用但
+            # 排查路径时更难 invalidate。
+            if _up in _UNION_READABLE_CACHE:
+                if not _UNION_READABLE_CACHE[_up]:
+                    _bad = True
+                    break
+                continue
+            _readable = bool(_read_nifti_binmasks(_up)[0])
+            _UNION_READABLE_CACHE[_up] = _readable
+            if not _readable:
                 _bad = True
                 break
         if _bad:

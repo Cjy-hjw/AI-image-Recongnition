@@ -141,6 +141,10 @@ def build_official_head_config(config: dict) -> dict:
         # aux2/aux3 与 gt 同式 BCE+Dice 生效(见 compute_segmentation_loss
         # docstring 的 deepsup 段)。
         "seg_deepsup_weight": float(tr.get("seg_deepsup_weight", 0.0)),
+        # plan 任务L1 悬崖加权(2026-09-23,新架构线):默认 0 = 零回归;权重
+        # 非 0 时 train_step 按前代 IoU 缓存查表注入 targets["cliff_weights"]
+        # (见 compute_segmentation_loss docstring 的 cliff 段)。
+        "seg_cliff_weight": float(tr.get("seg_cliff_weight", 0.0)),
     }
     return cfg
 
@@ -316,6 +320,11 @@ def smoke_grad_health(model: nn.Module, criterion: nn.Module, device):
             "valid_clin_t_stage": torch.full((B,), valid, device=device),
             "tirads": torch.tensor([4, 0], device=device),              # 含 V 级
             "valid_tirads": torch.full((B,), valid, device=device),
+            # L1 悬崖权重(plan 任务L1):smoke 无 labels/lesion_id 通道,
+            # 权重>0 时手动补全 1 权重(等价"查表全 miss"路径)防 fail-loud
+            # 拦住冒烟;真训练的注入由 train_step 查表完成。
+            **({"cliff_weights": torch.ones(B, device=device)}
+               if getattr(criterion, "seg_cliff_weight", 0.0) > 0.0 else {}),
         }
         outputs = model(img)
         loss, loss_dict = criterion(outputs, targets, enable_mal_loss=True)
@@ -387,6 +396,77 @@ def run_official_epoch(
                        loss=float(loss.item()), lr=head_lr,
                        extra=_step_diagnostics(loss_dict, labels))
     return running / max(n, 1)
+
+
+# ── L1 悬崖加权:前代 IoU 采集(plan 任务L1,2026-09-23)──────────────────────
+def _collect_cliff_ious(model, loader, device, criterion=None) -> dict:
+    """epoch 尾对**本 epoch 刚训过的 train 池**逐样本采 hard IoU,作下一 epoch
+    的悬崖权重信号(L1 核心:前代 IoU = train 侧自采自用,非 val 池查表——
+    patient 分组互斥下 val→train 键空间零交集,v1 方案结构性空转已废弃)。
+
+    口径 = per-sample **hard IoU**(pred>0.5 二值化后 inter/(union−inter+eps),
+    与 validate_step 的 inter/union 同式但 IoU 而非 dice);GT 全零记 **-1 哨兵**
+    → _cliff_weight_of 判 w=1(阴性监督归主项)。
+
+    🔴 **BN/运行态**:`model.eval()` → 采完 `model.train()` 恢复。eval 期间 BN
+    running stats 冻结(采集不改统计);恢复 train 后,下一 epoch 头部
+    `run_official_epoch` 会再调 `set_frozen_modules_eval`(每 epoch 重调,
+    天然自愈)——本函数的切换不影响那条链(docstring 预注册说明)。
+
+    criterion 仅用于读 `seg_cliff_weight`(权重 0 时调用方根本不该调本函数,
+    此处仅防御性再判一次):不进 targets、不建损失图,与 validate_epoch 零耦合。
+
+    返回 dict[lesion_id -> iou]。同池自采自用 → 下一 epoch 查表 100% 命中
+    (loader shuffle 不改 lesion_id 键空间)。
+    """
+    if criterion is not None and getattr(criterion, "seg_cliff_weight", 0.0) <= 0.0:
+        return {}
+    was_training = model.training
+    model.eval()
+    ious: dict = {}
+    eps = 1e-8
+    with torch.no_grad():
+        for images, masks, labels in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            outputs = model(images, gamma_prior=1.0)
+            pred_mask = (torch.sigmoid(outputs["mask"]) > 0.5).float()
+            inter = (pred_mask * masks).sum(dim=(2, 3))
+            union = pred_mask.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
+            # IoU = 交 / (并 − 交)(并含两倍重叠,dice 分母是 union、IoU 分母是
+            # union−inter;与 validate_step:212-214 的 inter/union 同源两口径)
+            iou = inter / (union - inter + eps)
+            lids = labels.get("lesion_id")
+            if lids is None:
+                continue          # legacy 数据集无键:本函数不该被调(fail 上层)
+            for i, lid in enumerate(lids):
+                gt_area = float(masks[i].sum())
+                ious[lid] = -1.0 if gt_area == 0.0 else float(iou[i])
+    if was_training:
+        model.train()
+    return ious
+
+
+def _cliff_stats_from_ious(ious: dict) -> dict:
+    """缓存 dict → JSONL 观测标量(S5 预注册,权重>0 才调用)。
+
+    口径:分母 cliff_n_evaluated = iou_prev 非 -1 的样本数(有效 GT 样本,
+    与 boosted 分母同源);cliff_iou_prev_mean 只对被加压(w=4)样本算
+    (诊断"压的是不是真悬崖人口");无有效样本 → 全 None(调用方跳过,
+    不填 0,与 _epoch_metrics_extra 的 None 纪律一致)。
+    """
+    evaluated = [v for v in ious.values() if v > 0]
+    boosted = [v for v in evaluated if v < 0.5]
+    if not evaluated:
+        return {"cliff_n_boosted": 0, "cliff_n_evaluated": 0,
+                "cliff_frac_boosted": None, "cliff_iou_prev_mean": None}
+    return {
+        "cliff_n_boosted": len(boosted),
+        "cliff_n_evaluated": len(evaluated),
+        "cliff_frac_boosted": round(len(boosted) / len(evaluated), 6),
+        "cliff_iou_prev_mean": (round(sum(boosted) / len(boosted), 6)
+                                if boosted else None),
+    }
 
 
 # JSONL 诊断字段用到的 valid_* 键 → 输出键名(`n_valid_` 前缀)。
@@ -511,7 +591,8 @@ def _snapshot_path(out_path: str, epoch: int) -> str:
     return f"{root}_ep{epoch}.pth"
 
 
-def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss) -> dict:
+def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss,
+                         cliff_stats: "dict | None" = None) -> dict:
     """epoch 级 val 指标 → JSONL `extra` 字段。
 
     🔴 **为什么必须写 JSONL(2026-08-15 实证,勿删)**:这些指标此前**只走 stdout**
@@ -524,6 +605,12 @@ def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss) 
 
     None 值直接跳过(不填 0)—— 填 0 会把"这项算不出来"伪装成"分数是 0"。
     `JsonlLogger._drop_nonfinite` 另会兜掉 NaN/Inf。
+
+    cliff_stats(plan 任务L1,2026-09-23):权重>0 时调用方传入
+    `_cliff_stats_from_ious` 的产物(标量键,与 n_cc_* 惯例一致:权重>0 才
+    出现);🔴 开训硬判据之一:epoch≥2 起 cliff_frac_boosted>0,若 ep2-3 恒 0
+    = 采集/注入链断,20ep 空转须停机回报(ep1 全 w=1 属预期——首查无缓存,
+    但 cliff_n_evaluated 应 >0 供确认覆盖)。
     """
     out: dict = {
         "train_loss": round(float(train_loss), 6),
@@ -567,6 +654,13 @@ def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss) 
             continue  # 整项丢弃(不填 0)—— 与 _drop_nonfinite 同一取舍:缺字段
                       # 一眼看得出异常,填数字则永远发现不了
         out[k] = [round(x, 6) for x in vals]
+
+    # ── L1 悬崖加权观测(plan 任务L1,权重>0 才由调用方传非 None)────────
+    if cliff_stats:
+        for k, v in cliff_stats.items():
+            if v is None:
+                continue          # None 纪律同上:缺字段优于伪 0
+            out[k] = v
     return out
 
 
@@ -789,7 +883,8 @@ def main():
     print(f"[seg 损失配方] boundary_weight={_hc.get('seg_boundary_weight', 0.0)} "
           f"lovasz_weight={_hc.get('seg_lovasz_weight', 0.0)} "
           f"ccdice_weight={_hc.get('seg_ccdice_weight', 0.0)} "
-          f"deepsup_weight={_hc.get('seg_deepsup_weight', 0.0)}"
+          f"deepsup_weight={_hc.get('seg_deepsup_weight', 0.0)} "
+          f"cliff_weight={_hc.get('seg_cliff_weight', 0.0)}"
           f"{' (SEG_ONLY 实验变量)' if args.seg_only else ''}")
     # 🔴 ETE 小试的三个启动硬门(Gate2 审查 F1/F2/F4,2026-09-12):
     # ① --ete-only 必须配 --resume-from(r5 全量权重)——漏传则 ETE 头从随机
@@ -841,19 +936,21 @@ def main():
         lw = seg_cfg.get("seg_lovasz_weight", 0.0)
         cw = seg_cfg.get("seg_ccdice_weight", 0.0)
         dw = seg_cfg.get("seg_deepsup_weight", 0.0)
+        l1w = float(seg_cfg.get("seg_cliff_weight", 0.0))
         # 🔴 量级标定豁免(2026-09-14 云端实证:标定=权重 0 跑 1ep 读分项基线,
         # 与此门"防全 0 空微调"冲突,原版把标定也拦了)。epochs==1 视为标定
         # 放行——空微调白烧至少要 2ep 才成立,1ep 的产物本就是丢弃的探针。
         if (args.smoke is False and epochs > 1
-                and bw == 0.0 and lw == 0.0 and cw == 0.0 and dw == 0.0):
+                and bw == 0.0 and lw == 0.0 and cw == 0.0 and dw == 0.0
+                and l1w == 0.0):
             # 冒烟/标定允许全 0;真训全 0 = 空微调白烧(r7 同型)。
             parser.error("--seg-only 真训须 config.train.seg_boundary_weight / "
                          "seg_lovasz_weight / seg_ccdice_weight / "
-                         "seg_deepsup_weight 至少一项 > 0"
+                         "seg_deepsup_weight / seg_cliff_weight 至少一项 > 0"
                          "(全 0 = 空 微调白烧;"
                          "权重 0 的 1ep 量级标定放行)")
         print(f"[SEG-only 配方] boundary_weight={bw} lovasz_weight={lw} "
-              f"ccdice_weight={cw} deepsup_weight={dw} "
+              f"ccdice_weight={cw} deepsup_weight={dw} cliff_weight={l1w} "
               f"epochs={epochs} (门:mal/tirads/loc/t/ete "
               f"各不降超 0.01,对照 epoch=0 基线;🔴 dice 硬门已删 2026-09-18,"
               f"上线资格以训后快照官方口径筛为准)")
@@ -1011,6 +1108,10 @@ def main():
     prev_stage = None
     best_composite = -1.0
     saw_head_grad = False
+    # L1 悬崖加权(权重>0 才激活;_last_cliff_stats 进 epoch 级 JSONL extra)
+    _cliff_enabled = float(
+        build_official_head_config(config).get("seg_cliff_weight", 0.0)) > 0.0
+    _last_cliff_stats: dict = {}
 
     try:
         for epoch in range(1, epochs + 1):
@@ -1041,6 +1142,17 @@ def main():
             )
             saw_head_grad = True  # run_official_epoch 跑通即四头参与了 backward
 
+            # ── L1 悬崖加权:epoch 尾采前代 IoU 回填缓存(plan 任务L1)──────
+            # 顺序在 train 之后、validate 之前:本 epoch 刚训完的权重才是
+            # "前代";validate 的 model.eval 由 validate_epoch 自管。首 epoch
+            # 也采(resume-from ep16 的 ep1 训练结束后即可采,下一 epoch 用;
+            # ep1 训练中仍全 w=1,无损失)。权重 0 时零成本跳过。
+            if _cliff_enabled:
+                criterion.set_cliff_ious(
+                    _collect_cliff_ious(model, train_loader, device))
+                _last_cliff_stats = _cliff_stats_from_ious(
+                    criterion._cliff_iou_prev)
+
             metrics: dict = {}
             val_loss, val_dice, val_acc, _, val_auc = validate_epoch(
                 model, val_loader, criterion, device, epoch=epoch, official_metrics_out=metrics
@@ -1053,7 +1165,9 @@ def main():
             # timestamp/epoch/step/phase/mode/data_source,额外字段不禁止。
             logger.log(
                 epoch=epoch, step=0, phase="val", loss=float(val_loss), lr=head_lr,
-                extra=_epoch_metrics_extra(metrics, val_dice, val_acc, val_auc, avg_loss),
+                extra=_epoch_metrics_extra(metrics, val_dice, val_acc, val_auc,
+                                           avg_loss,
+                                           cliff_stats=_last_cliff_stats or None),
             )
             print(
                 f"Epoch {epoch:02d}/{epochs} [{stage_name}] train_loss={avg_loss:.4f} "

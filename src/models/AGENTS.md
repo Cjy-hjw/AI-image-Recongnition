@@ -34,14 +34,14 @@ Per project-wide modularity rules (`rules.md` §6), this folder is decomposed in
 | `losses/segmentation.py` | `DiceLoss` |
 | `losses/classification.py` | `AUCMLossApprox`, `SupervisedContrastiveLoss` |
 | `losses/concepts.py` | `symmetric_label_regression_loss`, `symmetric_label_regression_loss_bce` |
-| `losses/multitask.py` | `MultiTaskLoss` orchestrator (~183 lines) |
+| `losses/multitask.py` | `MultiTaskLoss` orchestrator (~210 lines);`official_head_config` 透传五条 seg 外挂权重(boundary/lovasz/ccdice/deepsup/**cliff**)+ `set_cliff_ious(dict)` L1 前代 IoU 缓存**整体覆盖写**(空 dict 即清空,train_official 每 epoch 尾调用,train_step 查 `_cliff_iou_prev` 注入 targets["cliff_weights"]) |
 
 ### losses/components/ Subpackage (MultiTaskLoss decomposition)
 
 | File | Contents |
 |:---|:---|
 | `components/__init__.py` | Re-exports all computation functions |
-| `components/segmentation.py` | `compute_segmentation_loss(bce_fn, dice_fn, outputs, targets, boundary_weight=0, lovasz_weight=0)` → `(loss, {"seg_boundary","seg_lovasz"})`(阶段2 seg-only 扩展;legacy 无 valid_mask 路径对非零新权重 raise)。含 `boundary_loss_per_sample`(带符号距离场,ThreadPool EDT)/`lovasz_hinge_per_sample`(Berman 官方 inclusive cumsum+**差分**,🔴首版漏差分步曾是 P1 bug) |
+| `components/segmentation.py` | `compute_segmentation_loss(bce_fn, dice_fn, outputs, targets, boundary_weight=0, lovasz_weight=0, ccdice_weight=0, deepsup_weight=0, cliff_weight=0)` → `(loss, {"seg_boundary","seg_lovasz","seg_ccdice","seg_deepsup","seg_cliff"})`(阶段2 seg-only / CC / deepsup / **L1 悬崖加权**逐轮扩展;legacy 无 valid_mask 路径对非零新权重 raise)。含 `boundary_loss_per_sample`(带符号距离场,ThreadPool EDT)/`lovasz_hinge_per_sample`(Berman 官方 inclusive cumsum+**差分**,🔴首版漏差分步曾是 P1 bug)/`cc_dice_ce_per_sample`(实例级局部 DiceCE,任务C,已判死留库)/**cliff(L1,2026-09-23)**:per-sample 权重从 `targets["cliff_weights"]` 读([B] float32,train_step mixup 后按 `_cliff_iou_prev` 查表注入),内核复用主项同式 BCE+Dice,归一与主项共用 `(x·v).sum()/(v.sum()+eps)`(🔴 muted 样本等效权重=w_i·B/v.sum() 非裸 w_i);权重>0 无键 raise(fail-loud)。权重函数在 `train_step._cliff_weight_of`(哨兵先于阶跃,-1/None/0→w=1) |
 | `components/concepts.py` | `resolve_mix_params(outputs, mix_info)`, `compute_concept_losses(outputs, targets, lam, index, mask_weight, label_smoothing, tirads_matrix)`;⚠️ 本组件把 `lam` 当**软插值系数**、`mask_weight` 当**门控系数**消费(2026-08-15 起四头监督闸门只能在 train_step 侧按阈值分派、**禁在 mixup.py 侧把软 lam 硬化成 0/1**——会连带改掉本组件的软插值数学,见 `src/training/AGENTS.md` 闸门红线) |
 | `components/malignancy.py` | `compute_malignancy_losses(mal_loss_fn, supcon_loss_fn, outputs, targets, mask_weight, slr_weights)` |
 | `components/famo_mix.py` | `apply_famo_weighting(famo, loss_seg, loss_concepts_ce, loss_prior, loss_mal, loss_supcon, update_famo_weights, is_training)` |

@@ -100,6 +100,14 @@ class MultiTaskLoss(nn.Module):
         # plan 任务D 深监督辅助头(2026-09-20):默认 0 = 零回归,
         # 权重在 config.train.seg_deepsup_weight;横幅见 train_official。
         self.seg_deepsup_weight = float(cfg.get("seg_deepsup_weight", 0.0))
+        # plan 任务L1 悬崖加权(2026-09-23,新架构线):默认 0 = 零回归,
+        # 权重在 config.train.seg_cliff_weight;前代 IoU 缓存由
+        # train_official 每 epoch 尾经 set_cliff_ious 整体覆盖写。
+        self.seg_cliff_weight = float(cfg.get("seg_cliff_weight", 0.0))
+        # L1 前代 hard IoU 缓存:键=lesion_id,值=上一 epoch 采集的
+        # per-sample hard IoU(GT 全零记 -1 哨兵)。train_step 查表注入
+        # targets["cliff_weights"];空 dict = 全 w=1 中性(epoch 1 预期)。
+        self._cliff_iou_prev: dict = {}
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
         # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径,零回归。
@@ -114,6 +122,17 @@ class MultiTaskLoss(nn.Module):
         self.register_buffer("ete_log_prior", cfg.get("ete_log_prior"))
         self.register_buffer("clin_t_class_weights", cfg.get("clin_t_class_weights"))
         self.register_buffer("tirads_class_weights", cfg.get("tirads_class_weights"))
+
+    def set_cliff_ious(self, ious: dict) -> None:
+        """L1 前代 IoU 缓存整体覆盖写(plan 任务L1,2026-09-23)。
+
+        语义是**整体覆盖**而非 merge:d 为空 dict 即清空(全 w=1 中性),
+        新 dict 完全替换旧 dict —— 每 epoch 尾 train_official 用本 epoch
+        刚采的 train 池 IoU 全量替换,残留在旧 dict 里的键不该跨 epoch
+        存活(前代 = 恰好上一 epoch,不是"历史最近一次")。同池自采自用,
+        lesion_id 命中率 100%,无需 miss 兜底。
+        """
+        self._cliff_iou_prev = dict(ious)
 
     def forward(
         self,
@@ -149,13 +168,16 @@ class MultiTaskLoss(nn.Module):
             if 'mask' in task_mask and 'valid_mask' not in targets:
                 targets = {**targets, 'valid_mask': task_mask['mask'].float()}
 
-        # 1. Segmentation Loss (自动应用valid_mask;Boundary/Lovász/CC-DiceCE 可选外挂)
+        # 1. Segmentation Loss (自动应用valid_mask;Boundary/Lovász/CC-DiceCE/
+        #    deepsup/cliff 可选外挂;cliff 的 [B] 权重张量由 train_step 从
+        #    self._cliff_iou_prev 查表注入 targets["cliff_weights"])
         loss_seg, seg_extra = compute_segmentation_loss(
             self.bce_seg, self.dice_seg, outputs, targets,
             boundary_weight=self.seg_boundary_weight,
             lovasz_weight=self.seg_lovasz_weight,
             ccdice_weight=self.seg_ccdice_weight,
             deepsup_weight=self.seg_deepsup_weight,
+            cliff_weight=self.seg_cliff_weight,
         )
 
         # 2. Concept losses

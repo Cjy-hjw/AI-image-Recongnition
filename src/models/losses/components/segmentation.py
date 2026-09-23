@@ -14,18 +14,36 @@ def compute_segmentation_loss(
     lovasz_weight: float = 0.0,
     ccdice_weight: float = 0.0,
     deepsup_weight: float = 0.0,
+    cliff_weight: float = 0.0,
 ):
     """Compute BCE + Dice segmentation loss with NaN sentinel.
 
     When targets contains "valid_mask" (a [B] float tensor), applies
     per-sample segmentation validity masking with sum / (valid_count + eps).
     Samples with valid_mask=0 contribute zero gradient to the seg head.
-    boundary_weight/lovasz_weight/ccdice_weight/deepsup_weight > 0 时额外
-    外挂(阶段2 seg-only / plan 任务C / plan 任务D 深监督):返回值变为
-    (loss_seg, extra_dict),extra_dict 含 "seg_boundary"/"seg_lovasz"/
-    "seg_ccdice"/"seg_deepsup" 分项(权重=0 时仍返回 dict,键值为 0.0 张量
-    ——消费端无条件 update,不查权重,防"接线被删 JSONL 静默丢分项";
-    n_cc_* 计数键仅权重>0 时出现)。
+    boundary_weight/lovasz_weight/ccdice_weight/deepsup_weight/cliff_weight
+    > 0 时额外外挂(阶段2 seg-only / plan 任务C / plan 任务D 深监督 /
+    plan 任务L1 悬崖加权):返回值变为 (loss_seg, extra_dict),extra_dict
+    含 "seg_boundary"/"seg_lovasz"/"seg_ccdice"/"seg_deepsup"/"seg_cliff"
+    分项(权重=0 时仍返回 dict,键值为 0.0 张量——消费端无条件 update,
+    不查权重,防"接线被删 JSONL 静默丢分项";n_cc_* 计数键仅权重>0 时出现)。
+
+    cliff(plan 任务L1,2026-09-23):per-sample 悬崖加权 hard-example
+    mining。权重张量从 `targets["cliff_weights"]` 读(**不进签名**——与
+    boundary 等标量权重不同,它是 per-batch 变的 [B] 向量,由 train_step
+    在 mixup 之后按 `criterion._cliff_iou_prev` 缓存查表注入):
+      L_cliff = cliff_weight * (cliff_w * (bce_per + dice_per) * v)
+                .sum() / (v.sum() + eps)
+    内核**复用主项同式 bce_per + dice_per**(与 boundary/lovasz/ccdice
+    各自独立数学不同——cliff 不引入新损失形,只对既有主项按样本重加权)。
+    🔴 归一口径与主项共用同一 `(x*v).sum()/(v.sum()+eps)`:cliff 项在
+    muted 样本下等效权重 = w_i·B/v.sum(),**不是裸 w_i**(标定公式按此
+    口径反推,勿低估分项占比)。
+    cliff_weights 必须 [B] 且与 batch 对齐;入口强制 `.float().detach()`
+    (default_collate 对 python float 列表产 float64,乘 bce_per 会把整个
+    分项升 dtype;detached 保证它是纯权重不建图)。
+    权重>0 但 targets 无 "cliff_weights" 键 → raise(fail-loud,deepsup
+    同型:接线被删/数据集无 lesion_id 时宁可开不了工也不静默空算)。
 
     deepsup(plan 任务D,2026-09-20):outputs 里的 "seg_aux2"/"seg_aux3"
     (模型侧已上采样到与 "mask" 同 shape)各自与 gt 算 **与主头同式的
@@ -99,7 +117,37 @@ def compute_segmentation_loss(
         else:
             _d_per = torch.zeros_like(loss_per)
 
+        # 悬崖加权(plan 任务L1):per-sample 权重从 targets 读,主项同式
+        # 重加权。权重>0 但键缺席 = train_step 注入链断了/数据集无
+        # lesion_id(fail-loud,deepsup 同型:静默空算 = 20ep 白烧)。
+        if cliff_weight > 0.0:
+            if "cliff_weights" not in targets:
+                raise ValueError(
+                    "cliff_weight>0 但 targets 无 cliff_weights 键 —— "
+                    "权重注入链断了(train_step 按 criterion._cliff_iou_prev "
+                    "查表注入;数据集无 lesion_id 时查表不可达)。"
+                    "拒绝静默空算(检查 MultiTaskLoss.set_cliff_ious 接线与 "
+                    "labels 是否含 lesion_id)")
+            _cw = targets["cliff_weights"]
+            if not torch.is_tensor(_cw) or _cw.shape[0] != pred.shape[0]:
+                raise ValueError(
+                    f"cliff_weights 必须是与 batch 对齐的 [B] 张量, "
+                    f"got {type(_cw).__name__} "
+                    f"{tuple(_cw.shape) if torch.is_tensor(_cw) else _cw}")
+            # 🔴 强制 float32 + detach(F12:default_collate 对 python float
+            # 产 float64,乘 bce_per 会把分项整体升 dtype;mixup 路径的注入
+            # 已 as_tensor(float32),此处兜底防其它调用方传 float64 list)
+            cliff_w = _cw.to(dtype=torch.float32, device=pred.device).detach()
+        else:
+            cliff_w = None
+
         loss_seg = (loss_per * v).sum() / (v.sum() + _eps)
+        # cliff 项与主项共用同一 (x*v).sum()/(v.sum()+eps) 归一(非自证
+        # 口径:v 含 0 样本时精确成立 L(w)−L(0) == w*(cliff_w*base*v)
+        # .sum()/(v.sum()+eps);muted 样本下等效权重 = w_i·B/v.sum())。
+        if cliff_w is not None:
+            loss_seg = loss_seg + cliff_weight * (
+                (cliff_w * (bce_per + dice_per) * v).sum() / (v.sum() + _eps))
         extra = {
             "seg_boundary": (_b_per * v).sum() / (v.sum() + _eps),
             "seg_lovasz": (_l_per * v).sum() / (v.sum() + _eps),
@@ -108,6 +156,10 @@ def compute_segmentation_loss(
                            else torch.zeros((), device=loss_seg.device,
                                             dtype=loss_seg.dtype)),
             "seg_deepsup": (_d_per * v).sum() / (v.sum() + _eps),
+            "seg_cliff": (((cliff_w * (bce_per + dice_per) * v).sum()
+                           / (v.sum() + _eps)) if cliff_w is not None
+                          else torch.zeros((), device=loss_seg.device,
+                                           dtype=loss_seg.dtype)),
         }
         # CC 覆盖诊断(权重>0 才记;JSONL extra 消费方=_step_diagnostics,
         # 对标量逐键 round;缺键=权重 0,操作者不会误读)。
@@ -124,10 +176,12 @@ def compute_segmentation_loss(
         # legacy 无 valid_mask 路径不支持新损失项(官方训练恒有 valid_mask):
         # 静默丢变量 = 空微调被误读为损失无效(r7 事故同型),显式 raise。
         if (boundary_weight > 0.0 or lovasz_weight > 0.0
-                or ccdice_weight > 0.0 or deepsup_weight > 0.0):
+                or ccdice_weight > 0.0 or deepsup_weight > 0.0
+                or cliff_weight > 0.0):
             raise ValueError(
-                "boundary/lovasz/ccdice/deepsup 损失需要 valid_mask(官方训练路径);"
-                "legacy 无屏蔽路径不支持,勿在旧数据集上开这四项")
+                "boundary/lovasz/ccdice/deepsup/cliff 损失需要 valid_mask"
+                "(官方训练路径);legacy 无屏蔽路径不支持,勿在旧数据集上"
+                "开这五项")
         extra = {
             "seg_boundary": torch.zeros((), device=loss_seg.device,
                                         dtype=loss_seg.dtype),
@@ -137,6 +191,8 @@ def compute_segmentation_loss(
                                       dtype=loss_seg.dtype),
             "seg_deepsup": torch.zeros((), device=loss_seg.device,
                                        dtype=loss_seg.dtype),
+            "seg_cliff": torch.zeros((), device=loss_seg.device,
+                                     dtype=loss_seg.dtype),
         }
 
     if torch.isnan(loss_seg):

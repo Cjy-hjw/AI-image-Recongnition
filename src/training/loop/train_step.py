@@ -9,6 +9,22 @@ from src.training.stages import compute_gamma_prior
 # 同一份语义,两侧都只是遍历顺序,不构成跨模块契约,故各自持有(避免 loop 子模块间横向依赖)。
 _OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage", "tirads")
 
+# L1 悬崖权重函数(plan 任务L1,2026-09-23,预注册不扫参):
+#   w = 1 + 3.0 * 1[iou_prev < 0.5]   (未匹配 w=4 / 匹配 w=1)
+# 0.5 = 官方匹配线语义(与 Focal γ≈2 等效增益同量级);A=3.0 预注册。
+# 🔴 **顺序约束(F13)**:先判哨兵再算阶跃 —— iou_prev ≤ 0(=None 未覆盖
+# / GT 全零记 -1)恒 w=1;若先算阶跃,-1 < 0.5 会把"未知/GT全零"误判成
+# 悬崖样本,阴性监督被 4× 放大(方向性错误)。
+_CLIFF_BOOST = 3.0
+_CLIFF_IOU_LINE = 0.5
+
+
+def _cliff_weight_of(iou_prev) -> float:
+    """单样本悬崖权重(纯函数,可单测)。iou_prev=None/负值哨兵 → 1.0。"""
+    if iou_prev is None or iou_prev <= 0:
+        return 1.0
+    return 1.0 + _CLIFF_BOOST if iou_prev < _CLIFF_IOU_LINE else 1.0
+
 
 def build_official_head_targets(labels, mix_info, batch_size, device):
     """组装官方新增维度头(位置/ETE/临床T/TI-RADS)的 targets 片段。键缺席 → 返回空 dict。
@@ -180,6 +196,24 @@ def train_batch(
     # label_validity is NOT mixed — validity flags are batch-level metadata,
     # not feature-space signals. We keep the original batch's validity unchanged.
     # (A mixed sample still has the same label availability as its primary sample.)
+
+    # ── L1 悬崖权重注入(plan 任务L1,2026-09-23)────────────────────────────
+    # 🔴 **必须在 mixup 之后**(与上方 targets["mask"]=masks 同一锚点):
+    # apply_mixup_or_cutmix 的 mixed_images = images.clone() 原位改 patch、
+    # **不重排样本序**(mixup.py 原序返回),labels 更是原样返回——故此处
+    # labels["lesion_id"](collate list[str] 原序)与 targets 样本 i 恒同序,
+    # 开/关 mixup 两组同 batch 权重逐位一致(测试钉死)。
+    # 查表:criterion._cliff_iou_prev(train_official 每 epoch 尾用本 epoch
+    # 刚训过的 train 池自采自填,键=lesion_id 同池 100% 命中);epoch 1 缓存
+    # 空 → 全 w=1 = 旧路径逐位等价。lid=None(legacy 数据集)→ w=1。
+    if getattr(criterion, "seg_cliff_weight", 0.0) > 0.0:
+        _lids = labels.get("lesion_id")
+        _cached = getattr(criterion, "_cliff_iou_prev", None) or {}
+        _ws = [_cliff_weight_of(_cached.get(lid)) for lid in _lids] \
+            if _lids is not None else None
+        if _ws is not None:
+            targets["cliff_weights"] = torch.as_tensor(
+                _ws, dtype=torch.float32, device=device)
 
     # 官方三头 targets —— **必须在 mixup 之后**,规则与理由见
     # `build_official_head_targets` docstring(硬标签无软化路径 / validity 顶层直传 /

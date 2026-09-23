@@ -6,6 +6,7 @@
 """
 import os
 
+import cv2
 import numpy as np
 import pytest
 
@@ -622,6 +623,60 @@ class TestUnionMaskL2:
         m_s3 = np.zeros((64, 64), np.uint8); m_s3[30:50, 30:50] = 1
         assert np.array_equal(by_f[3], m_s3.astype(np.float32))
 
+    def test_union_origres_or_no_broadcast_crash(self, tmp_path):
+        """2026-09-23 云端实弹热修回归钉:mask 原始分辨率 ≠ img_size 时,
+        union OR 不得 broadcast 崩(首版把累积体初始化为 (img_size,img_size),
+        与 958×1303 原尺寸帧 OR 直接 ValueError)。语义:OR 在原分辨率做、
+        resize 归 __getitem__ 统一出口(与单病灶路径 resize(bin(f)) 同式)。
+        🔴 审查 P1-1 修:断言形状只锁"别崩"不锁"值对"——值+形状同时钉
+        (K=2 静态 OR 期望、K=1 动态帧期望逐位),变异"分支内偷偷 resize"或
+        "丢 OR 只回单帧"都会打破值断言。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        # PB 双病灶(H=W=64 原尺寸),img_size=32 强制"原尺寸 ≠ img_size"
+        uni = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+               if s["patient_key"] == "PB"]
+        ds = O.OfficialThyroidDataset(uni, img_size=32)
+        # 期望:64² 上的 M|病灶1 OR 后 resize 到 32²(与单病灶路径同式:
+        # resize(OR 原分辨率))。直接构造 64² 期望再 cv2 nearest 缩。
+        m1 = np.zeros((64, 64), np.uint8); m1[10:30, 10:30] = 1
+        m2 = np.zeros((64, 64), np.uint8); m2[20:40, 20:40] = 1
+        expect = cv2.resize((m1 | m2), (32, 32), interpolation=cv2.INTER_NEAREST)
+        for i in range(len(uni)):
+            _, m, _ = ds[i]
+            assert m.shape == (1, 32, 32)          # 不炸、输出已 resize
+            assert np.array_equal(m.numpy()[0], expect.astype(np.float32))
+        # PD 动态同款:帧1 期望 = M|病灶1 OR;帧3 = 仅病灶1(逐位值断言)
+        uni_d = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+                 if s["patient_key"] == "PD"]
+        ds_d = O.OfficialThyroidDataset(uni_d, img_size=32)
+        d_m = np.zeros((64, 64), np.uint8); d_m[10:30, 10:30] = 1
+        d_s = np.zeros((64, 64), np.uint8); d_s[20:40, 20:40] = 1
+        d_s3 = np.zeros((64, 64), np.uint8); d_s3[30:50, 30:50] = 1
+        exp_f1 = cv2.resize((d_m | d_s), (32, 32),
+                            interpolation=cv2.INTER_NEAREST)
+        exp_f3 = cv2.resize(d_s3, (32, 32), interpolation=cv2.INTER_NEAREST)
+        got = {}
+        for i, s in enumerate(uni_d):
+            _, m, _ = ds_d[i]
+            assert m.shape == (1, 32, 32)
+            got.setdefault(s["frame_index"], m.numpy()[0])
+        assert np.array_equal(got[1], exp_f1.astype(np.float32))
+        assert np.array_equal(got[3], exp_f3.astype(np.float32))
+
+    def test_union_k1_origres_identical_to_single(self, tmp_path):
+        """审查 P2-2 补钉:K=1 且原尺寸≠img_size 时 union 与非 union 逐位一致
+        (test_union_k1_identical_to_single 用 64→64 恒等 fixture,resize 路径
+        未被触发;本测试 img_size=32 强制走 resize,两路径须同值)。"""
+        root, xlsx = self._build_union_root(tmp_path)
+        plain = [s for s in O.build_official_samples(root, xlsx)
+                 if s["patient_key"] == "PA"][0]
+        uni = [s for s in O.build_official_samples(root, xlsx, union_mask=True)
+               if s["patient_key"] == "PA"][0]
+        _, m_plain, _ = O.OfficialThyroidDataset([plain], img_size=32)[0]
+        _, m_uni, _ = O.OfficialThyroidDataset([uni], img_size=32)[0]
+        assert m_uni.shape == (1, 32, 32)
+        assert torch.equal(m_plain, m_uni)
+
     def test_union_dynamic_labels_unchanged(self, tmp_path):
         """union 不动样本结构:四头标签/is_main/lesion_id/样本数与 plain 一致。"""
         root, xlsx = self._build_union_root(tmp_path)
@@ -747,6 +802,10 @@ class TestUnionMaskL2:
         # 检测**只**由 union 可读性校验承担。
         import numpy as _np
         _ok = ([_np.zeros((4, 4), _np.uint8)], [0])
+        # 🔴 memo 缓存隔离(2026-09-23 提速热修):上一段真路径已把坏路径缓存为
+        # False,旁路段若不清缓存会直接命中缓存拒绝——那不是"旁路判不出",是
+        # 缓存残留,会假绿(看起来有区分力,实际旁路根本没跑)。清掉再旁路。
+        O._UNION_READABLE_CACHE.clear()
         with _mk.patch.object(O, "_read_nifti_binmasks", lambda *_a, **_k: _ok):
             try:
                 O.build_official_datasets(
@@ -754,6 +813,7 @@ class TestUnionMaskL2:
                 bypass = "accepted"
             except RuntimeError as e:
                 bypass = f"raised: {str(e)[:30]}"
+        O._UNION_READABLE_CACHE.clear()
         assert bypass == "accepted", (
             f"旁路(=union 校验失效)仍拒:{bypass} — 对拍无区分力,需检查")
 

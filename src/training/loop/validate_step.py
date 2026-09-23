@@ -176,6 +176,13 @@ def validate_batch(
                             dtype=torch.float32, device=device)
         )
     targets.update(_official_head_targets(labels, images.size(0), device))
+    # L1 悬崖权重(plan 任务L1,2026-09-23):val 侧全 1 中性权重——cliff 是
+    # 训练期 hard-example mining 信号,val 指标不消费它;但权重>0 时损失
+    # 的 fail-loud 要求键存在,这里补全 1(数学上 = 不加权的 val loss,语义
+    # 与"val 不做加权"一致;seg_cliff 分项照写,JSONL 可观测 val 侧口径)。
+    if getattr(criterion, "seg_cliff_weight", 0.0) > 0.0:
+        targets["cliff_weights"] = torch.ones(
+            images.size(0), dtype=torch.float32, device=device)
 
     # 验证期固定 gamma_prior=1.0(与最终部署一致),使各 epoch 的 val 指标在相同
     # 物理先验强度下计算,保证选模/早停判据的跨 epoch 可比性。训练期仍按 epoch 退火。

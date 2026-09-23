@@ -41,7 +41,9 @@
 
 ---
 
-## `test_official_loader.py` — 官方数据加载器契约(14 用例,2026-08-10 + 2026-08-12 阶段2.4 扩 + 2026-08-13 Phase E hflip RNG 防回归 + Gate2 mask 命名 glob 防回归;缓存依赖**另见** `test_dynamic_frame_cache.py`)
+## `test_official_loader.py` — 官方数据加载器契约(34 用例,2026-08-10 起 + 阶段2.4 扩 + Phase E hflip RNG 防回归 + Gate2 mask 命名 glob 防回归 + **L2 TestUnionMaskL2 14 项**(2026-09-22~23,末项=OR 广播崩热修回归钉);缓存依赖**另见** `test_dynamic_frame_cache.py`)
+
+## `test_cliff_loss.py` — L1 悬崖加权契约(27 项,2026-09-23;文件头 `import sklearn.metrics` 须在 torch 前,Windows OpenMP 冲突)
 
 合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
 
@@ -190,10 +192,10 @@ BCE+Dice——实现期前两变异曾真实存活,朴素对拍当场杀出)。
 sigmoid==1.0 → log(p/(1-p))=inf → NaN/Inf,NaN×valid_mask 屏蔽失效、
 GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)。
 
-## 测试总数(单一权威,2026-09-22 实测)
+## 测试总数(单一权威,2026-09-23 实测)
 
-**全套 1338 collected**(2026-09-22 L2 路C修复轮后,`Demo_D` 环境实测,
-`pytest tests/ --collect-only` 实跑;tiling 16 项另跑 16 passed;
+**全套 1366 collected**(2026-09-23 L1 悬崖加权 + L2 OR 广播热修后,`Demo_D` 环境实测,
+`pytest tests/ -q` 实跑 1365 passed+1 skipped;tiling 16 项另跑 16 passed;
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
 →1156(修复轮专审:`test_seg_only_gate.py` 新增 6——护栏纯函数终于有测试,
@@ -297,6 +299,26 @@ union gate 硬拒。+1 行透传,**测试计数不变**——union e2e 直调 ex
 main(),CLI→函数最后一跳零覆盖正是漏网根因,教训入订正史:接线审计清单必须含
 CLI 透传位,e2e 从 main()/CLI 层进。全量 1330 passed+1 skipped+preextract 16 项
 单跑通过(Demo_D))
+→1366(2026-09-23 L1 悬崖加权实现 + L2 云端实弹热修第二弹(OR 广播崩)两轮合计
+**+28**:
+**+27 = L1(plan 任务L1,lucky-nibbling-piglet v2)**:`test_cliff_loss.py` 新增
+27——零权重逐位回归/非自证分解(v 含 0:归一必须带 v,F3 变异杀测"不乘 v 直接
+mean")/fail-loud 两处(权重>0 无键 raise+legacy raise,文案含 seg_cliff)/
+权重方向(w=4 贡献 4×+梯度量级)/哨兵顺序(F13:-1/None/0 先判哨兵再算阶跃,
+变异"先算阶跃"对拍)/set_cliff_ious 覆盖写非 merge+空 dict 清空+外部 dict 隔离
+(F9)/config 透传全链(build_official_head_config→MultiTaskLoss)/mixup 对拍
+(开/关权重逐位一致,mixup 不重排样本序)/dtype(float64 注入→损失内强制
+float32,F12)/_cliff_stats_from_ious 口径(分母非-1/boosted<0.5/mean 只对
+boosted)/_collect_cliff_ious(采集+GT 全零哨兵 -1/train 模式恢复/eval 态采集
+hook 实证)。🔴 文件头必须 `import sklearn.metrics` 先于 torch(Windows OpenMP
+DLL 冲突炸 stack overflow,同型 test_train_step_head_targets.py;不 import
+sklearn 的 test_deepsup_loss.py 单跑正常、与本文件同 session 跑会互相炸,
+root cause 是 sklearn 在 torch 后加载)。
+**+1 = L2 热修回归钉**:`test_official_loader.py` TestUnionMaskL2 13→**14**——
+`test_union_origres_or_no_broadcast_crash`:mask 原始分辨率≠img_size 时 union
+OR 不得 broadcast 崩(云端实弹 958×1303 vs 512×512);img_size=32 强制错配,
+静态 K=2 + 动态双帧全断言 (1,32,32)。
+全量 1365 passed+1 skipped=1366 collected(Demo_D 实测,2026-09-23))
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`

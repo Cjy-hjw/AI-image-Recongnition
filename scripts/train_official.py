@@ -406,18 +406,23 @@ def _collect_cliff_ious(model, loader, device, criterion=None) -> dict:
 
     口径 = per-sample **hard IoU**(pred>0.5 二值化后 inter/(union−inter+eps),
     与 validate_step 的 inter/union 同式但 IoU 而非 dice);GT 全零记 **-1 哨兵**
-    → _cliff_weight_of 判 w=1(阴性监督归主项)。
+    → _cliff_weight_of 判 w=1(阴性监督归主项);**pred 全零/GT 非零记真 0.0**
+    (2026-09-24 审查 P0 修:完全漏检=最硬悬崖,w=4;旧版 `<=0` 把它和哨兵
+    一起吞成 w=1,恰好漏掉最该加压的人口)。
 
-    🔴 **BN/运行态**:`model.eval()` → 采完 `model.train()` 恢复。eval 期间 BN
-    running stats 冻结(采集不改统计);恢复 train 后,下一 epoch 头部
-    `run_official_epoch` 会再调 `set_frozen_modules_eval`(每 epoch 重调,
-    天然自愈)——本函数的切换不影响那条链(docstring 预注册说明)。
+    🔴 **BN/运行态**:`model.eval()` → 采完 `model.train()` 恢复,**try/finally**
+    (2026-09-24 审查 P1 修:采集循环任何异常炸出时模型不能永久停在 eval 态;
+    下一 epoch 头部 `run_official_epoch` 会再调 `set_frozen_modules_eval`,
+    但那只覆盖冻结子模块,不保证 dropout/整体态复原)。eval 期间 BN
+    running stats 冻结(采集不改统计)。
 
     criterion 仅用于读 `seg_cliff_weight`(权重 0 时调用方根本不该调本函数,
     此处仅防御性再判一次):不进 targets、不建损失图,与 validate_epoch 零耦合。
 
     返回 dict[lesion_id -> iou]。同池自采自用 → 下一 epoch 查表 100% 命中
-    (loader shuffle 不改 lesion_id 键空间)。
+    (loader shuffle 不改 lesion_id 键空间)。🔴 动态样本同病灶多帧共享同一
+    lesion_id,逐帧写入 dict 后值取**最后一帧**——非任意聚合口径,重读采集
+    数据请知悉(取 min/均值聚合是未做的改进,当前实测方向=少 boost 非反向错)。
     """
     if criterion is not None and getattr(criterion, "seg_cliff_weight", 0.0) <= 0.0:
         return {}
@@ -425,37 +430,48 @@ def _collect_cliff_ious(model, loader, device, criterion=None) -> dict:
     model.eval()
     ious: dict = {}
     eps = 1e-8
-    with torch.no_grad():
-        for images, masks, labels in loader:
-            images = images.to(device)
-            masks = masks.to(device)
-            outputs = model(images, gamma_prior=1.0)
-            pred_mask = (torch.sigmoid(outputs["mask"]) > 0.5).float()
-            inter = (pred_mask * masks).sum(dim=(2, 3))
-            union = pred_mask.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
-            # IoU = 交 / (并 − 交)(并含两倍重叠,dice 分母是 union、IoU 分母是
-            # union−inter;与 validate_step:212-214 的 inter/union 同源两口径)
-            iou = inter / (union - inter + eps)
-            lids = labels.get("lesion_id")
-            if lids is None:
-                continue          # legacy 数据集无键:本函数不该被调(fail 上层)
-            for i, lid in enumerate(lids):
-                gt_area = float(masks[i].sum())
-                ious[lid] = -1.0 if gt_area == 0.0 else float(iou[i])
-    if was_training:
-        model.train()
+    try:
+        with torch.no_grad():
+            for images, masks, labels in loader:
+                images = images.to(device)
+                masks = masks.to(device)
+                outputs = model(images, gamma_prior=1.0)
+                pred_mask = (torch.sigmoid(outputs["mask"]) > 0.5).float()
+                inter = (pred_mask * masks).sum(dim=(2, 3))
+                union = pred_mask.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
+                # IoU = 交 / (并 − 交)(并含两倍重叠,dice 分母是 union、IoU 分母是
+                # union−inter;与 validate_step:212-214 的 inter/union 同源两口径)
+                iou = inter / (union - inter + eps)
+                lids = labels.get("lesion_id")
+                if lids is None:
+                    continue      # legacy 数据集无键:本函数不该被调(fail 上层)
+                for i, lid in enumerate(lids):
+                    gt_area = float(masks[i].sum())
+                    # str(lid) 规整键(2026-09-24 审查路C P2):collate 对非 str
+                    # 的 lid(如 int)产 0-dim Tensor,str() 后是 "tensor(7)" 带壳
+                    # 字符串——取 .item() 值(0-dim 标量)再 str,干净且可哈希稳定。
+                    if torch.is_tensor(lid):
+                        lid = str(lid.item())
+                    else:
+                        lid = str(lid)
+                    ious[lid] = -1.0 if gt_area == 0.0 else float(iou[i])
+    finally:
+        if was_training:
+            model.train()
     return ious
 
 
 def _cliff_stats_from_ious(ious: dict) -> dict:
     """缓存 dict → JSONL 观测标量(S5 预注册,权重>0 才调用)。
 
-    口径:分母 cliff_n_evaluated = iou_prev 非 -1 的样本数(有效 GT 样本,
-    与 boosted 分母同源);cliff_iou_prev_mean 只对被加压(w=4)样本算
-    (诊断"压的是不是真悬崖人口");无有效样本 → 全 None(调用方跳过,
-    不填 0,与 _epoch_metrics_extra 的 None 纪律一致)。
+    口径:分母 cliff_n_evaluated = iou_prev 非哨兵(-1)的样本数(有效 GT
+    样本,含真 0——完全漏检是最硬悬崖,必须进分母与 boosted 人口,2026-09-24
+    审查 P0 修:旧版 `v > 0` 把真 0 连分母都排除,JSONL 对模型最差一档零观测);
+    clif_iou_prev_mean 只对被加压(w=4)样本算(诊断"压的是不是真悬崖人口");
+    无有效样本 → 全 None(调用方跳过,不填 0,与 _epoch_metrics_extra 的
+    None 纪律一致)。
     """
-    evaluated = [v for v in ious.values() if v > 0]
+    evaluated = [v for v in ious.values() if v != -1.0]
     boosted = [v for v in evaluated if v < 0.5]
     if not evaluated:
         return {"cliff_n_boosted": 0, "cliff_n_evaluated": 0,
@@ -627,6 +643,9 @@ def _epoch_metrics_extra(metrics: dict, val_dice, val_acc, val_auc, train_loss,
         # 2026-08-15 正是靠 `pred_prob` 全域 <0.5 才定位到"分割全程冻结"。
         # 此前它只在 `batch_idx==0` 打一行 stdout,JSONL 里完全没有。
         "seg_prob_mean", "seg_prob_max", "seg_over_half_frac",
+        # L1 cliff 分项 val 均值(2026-09-24 审查 P1 修):val 全 1 注入使
+        # val_loss 含 cliff 增量,与旧轮不可比——此键让回读可扣除。
+        "val_loss_seg_cliff",
     ):
         v = metrics.get(k)
         if v is None:
@@ -1152,6 +1171,20 @@ def main():
                     _collect_cliff_ious(model, train_loader, device))
                 _last_cliff_stats = _cliff_stats_from_ious(
                     criterion._cliff_iou_prev)
+                # 🔴 开训硬判据的执行物(2026-09-24 审查路C P0 修):任务书声称
+                # "ep≥2 起 frac 恒 0 = 链断停机",此前只写 JSONL 无人消费,20ep
+                # 空转零告警。frac=0.0(非 None)且分母>0 = 采集/注入链断的
+                # 确定性信号(lesion_id 同池自采自用 100% 命中,恒 0 只可能是
+                # 链路坏),按任务书停机。ep1 免检:首 epoch 训练中仍全 w=1,
+                # 但 ep1 尾已采完,frac 应非 0;None(全哨兵/空缓存)不判死刑。
+                if (epoch >= 2 and _last_cliff_stats.get("cliff_frac_boosted") == 0.0
+                        and (_last_cliff_stats.get("cliff_n_evaluated") or 0) > 0):
+                    _abort(logger, epoch, "cliff_chain_broken",
+                           "[cliff abort] epoch {ep} cliff_frac_boosted=0 但分母 "
+                           "{n}>0 —— 采集/注入链断(同池自采自用不应恒 0),"
+                           "20ep 会空转,停机排查 set_cliff_ious/lesion_id 接线"
+                           .format(ep=epoch,
+                                   n=_last_cliff_stats.get("cliff_n_evaluated")))
 
             metrics: dict = {}
             val_loss, val_dice, val_acc, _, val_auc = validate_epoch(

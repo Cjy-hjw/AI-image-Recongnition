@@ -29,8 +29,8 @@
 ## 开发命令（AI 无法从代码推断）
 
 ```bash
-# 完整测试套件（本地可跑，实测 1366 collected（1365 passed+1 skipped），2026-09-23
-# L1 悬崖加权(+27)+L2 OR 广播热修(+1)后复测，Demo_D 环境实测）。演进链 891→923→929→940→959→967→969→975→1002→1007→1016→1043→1059→1104→1124→1133→1150→1158→1180→1182→1250→1254→1271→1281→1297→1318→1322→1323→1329→1335→1338→1366，明细见 `tests/AGENTS.md`。
+# 完整测试套件（本地可跑，实测 1377 collected（1376 passed+1 skipped），2026-09-24
+# L1 三路审查修复(+10)后复测，Demo_D 环境实测）。演进链 891→923→929→940→959→967→969→975→1002→1007→1016→1043→1059→1104→1124→1133→1150→1158→1180→1182→1250→1254→1271→1281→1297→1318→1322→1323→1329→1335→1338→1366→1377，明细见 `tests/AGENTS.md`。
 # 精确计数以 pytest --collect-only 实跑为准；
 # ⚠️ 测试总数跨 Python 环境不可比，
 # torch2.8 预演环境待下次云端对拍重新确认，判回归须同环境前后对拍；
@@ -102,6 +102,9 @@ python scripts/train_official.py --mock-labels --smoke --log-dir logs --batch-si
 # 证实三头真的在学（val_dice+0.334/tirads_kappa+0.179），不砍。24 epoch 下四道护栏
 # （epoch>=绝对值 形式，见 train_official.py 顶部 SEG_*/COMPOSITE_WARN 常量）逐位适用，
 # 无需改代码；--epochs 缺省仍是 STAGE_C_END=35，需显式传 24。
+# 🔴 云端跑任何训练/诊断脚本必须先 export PYTHONPATH=/2026aicompetition/workspace/pylibs${PYTHONPATH:+:$PYTHONPATH}
+# （依赖 pip --target 装在 workspace 树 pylibs/，裸跑 import pandas 直接崩；诊断脚本从 workspace 树起跑——
+# 训练增量包落 /root/cloud_train_pkg 但依赖仍在 workspace pylibs；每次任务书都带,2026-09-24 用户点名入档）
 python scripts/data/preextract_dynamic.py --data-root /2026aicompetition/datasets/training/annotation \
     --xlsx <标注.xlsx> --cache-dir /2026aicompetition/workspace/cache [--limit 3]  # 先 --limit 3 验管道，约 1 分钟，再全量约 35-45 分钟
 # 🔴 2026-09-20 cache 速副本：用户已把 workspace/cache 复制到 /root/cache（容器本地层，

@@ -154,6 +154,14 @@ def validate_epoch(model, loader, criterion, device, epoch=1, official_metrics_o
             official_metrics_out["seg_over_half_frac"] = (
                 seg_prob_stats.get("over_half", 0) / n_px
             )
+        # L1 cliff 分项均值(2026-09-24 审查 P1 修):val 全 1 注入使 val_loss 含
+        # cliff 项增量,旧轮 JSONL 无字段可扣除 → 比较跨轮 val_loss 不可比。这里
+        # 把 epoch 均值写进 metrics,_epoch_metrics_extra 透传进 val 行,云端回读
+        # 时 val_loss − val_loss_seg_cliff 即与旧口径对齐。
+        _cliff_n = seg_prob_stats.get("cliff_n", 0)
+        if _cliff_n:
+            official_metrics_out["val_loss_seg_cliff"] = (
+                seg_prob_stats["cliff_sum"] / _cliff_n)
 
     if stage == 1:
         val_auc = None

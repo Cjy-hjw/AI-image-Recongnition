@@ -1,13 +1,18 @@
 name: CI
 
 # PR 到 main 时自动跑;push 到 main 也跑(合并后再保一道)。
+# 🔴 2026-09-24 补 push 到 feat/*:上云训练包全部产自功能分支
+# (feat/l2-union-supervision 六个 commit 零 CI 覆盖,L1/L2 包直接
+# 从未跑过 torch2.8 容器——上云实弹炸的 OR 广播崩本地环境测不出,
+# 每次都要烧一次人工审核上传窗口)。concurrency 按 ref 分组,功能分支
+# push 与 main PR 互不挤兑。
 on:
   pull_request:
     branches: [main]
     paths-ignore:
       - '**/*.md'
   push:
-    branches: [main]
+    branches: [main, 'feat/**', 'fix/**']
     paths-ignore:
       - '**/*.md'
 

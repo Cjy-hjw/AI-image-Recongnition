@@ -215,6 +215,16 @@ def validate_batch(
         seg_prob_out["count"] = seg_prob_out.get("count", 0) + n
         seg_prob_out["max"] = max(seg_prob_out.get("max", 0.0), pred_prob.max().item())
         seg_prob_out["over_half"] = seg_prob_out.get("over_half", 0) + int(pred_mask.sum().item())
+        # L1 cliff 分项累加(2026-09-24 审查 P1 修):val 全 1 注入使 val_loss
+        # 含 cliff 项 ≈ 主项量级增量,与旧轮不可比且无字段可扣除。同 dict 顺带
+        # 累加 loss_dict 的 seg_cliff 分项(权重 0 时 loss_dict 恒有 0.0 键,
+        # 零成本),validate_epoch 汇总后写 JSONL,val 行即可对拍扣除。
+        if "cliff_sum" not in seg_prob_out:
+            seg_prob_out["cliff_sum"] = 0.0
+            seg_prob_out["cliff_n"] = 0
+        seg_prob_out["cliff_sum"] += float(
+            loss_dict.get("seg_cliff", 0.0))
+        seg_prob_out["cliff_n"] += 1
 
     intersection = (pred_mask * targets["mask"]).sum(dim=(2, 3))
     union = pred_mask.sum(dim=(2, 3)) + targets["mask"].sum(dim=(2, 3))

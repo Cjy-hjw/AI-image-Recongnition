@@ -43,7 +43,7 @@
 
 ## `test_official_loader.py` — 官方数据加载器契约(34 用例,2026-08-10 起 + 阶段2.4 扩 + Phase E hflip RNG 防回归 + Gate2 mask 命名 glob 防回归 + **L2 TestUnionMaskL2 14 项**(2026-09-22~23,末项=OR 广播崩热修回归钉);缓存依赖**另见** `test_dynamic_frame_cache.py`)
 
-## `test_cliff_loss.py` — L1 悬崖加权契约(27 项,2026-09-23;文件头 `import sklearn.metrics` 须在 torch 前,Windows OpenMP 冲突)
+## `test_cliff_loss.py` — L1 悬崖加权契约(**37 项**,2026-09-23 初版 27 + **2026-09-24 三路审查修复 +10**;文件头 `import sklearn.metrics` 须在 torch 前,Windows OpenMP 冲突)
 
 合成 `.dcm`/`.nii.gz`/xlsx fixture(运行时生成,不入库二进制),依赖 pydicom/nibabel/pandas/openpyxl(缺则 skip)。
 
@@ -319,6 +319,14 @@ root cause 是 sklearn 在 torch 后加载)。
 OR 不得 broadcast 崩(云端实弹 958×1303 vs 512×512);img_size=32 强制错配,
 静态 K=2 + 动态双帧全断言 (1,32,32)。
 全量 1365 passed+1 skipped=1366 collected(Demo_D 实测,2026-09-23))
+→**1376 passed+1 skipped=1377** collected(2026-09-24 三路审查修复
+**+10**:`test_cliff_loss.py` 27→**37**——A-P0 **真 0.0 IoU=最硬悬崖 w=4**
+(pred 全零/GT 非零,旧 `<=0` 哨兵吞掉恰漏最该加压人口)/NaN 中性+一次性
+warning/str 数值转型+脏值 TypeError fail-loud(三分流);C-P0 abort 门 4 项
+(ep≥2 frac=0.0 且分母>0 停机/ep1 豁免/None 不判死刑/健康 frac 放行);
+C-P1 采集异常 try/finally 恢复 train 态(boom fixture);C-P2 lid 键 str
+规整(collate int→0-dim Tensor 键,str(.item()) 干净化);A-P0 stats 分母
+`v>0`→`v!=-1`(真 0.0 进分母进 boosted,JSONL 不再对最差一档零观测)。
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`

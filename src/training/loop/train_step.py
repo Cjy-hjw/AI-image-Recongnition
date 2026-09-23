@@ -12,16 +12,46 @@ _OFFICIAL_HEAD_TASKS = ("lesion_loc", "extrathy_ext", "clin_t_stage", "tirads")
 # L1 悬崖权重函数(plan 任务L1,2026-09-23,预注册不扫参):
 #   w = 1 + 3.0 * 1[iou_prev < 0.5]   (未匹配 w=4 / 匹配 w=1)
 # 0.5 = 官方匹配线语义(与 Focal γ≈2 等效增益同量级);A=3.0 预注册。
-# 🔴 **顺序约束(F13)**:先判哨兵再算阶跃 —— iou_prev ≤ 0(=None 未覆盖
-# / GT 全零记 -1)恒 w=1;若先算阶跃,-1 < 0.5 会把"未知/GT全零"误判成
-# 悬崖样本,阴性监督被 4× 放大(方向性错误)。
+# 🔴 **顺序约束(F13)**:先判哨兵再算阶跃 —— iou_prev 为 None(未覆盖)或
+# 负值哨兵(-1 = GT 全零)恒 w=1;若先算阶跃,-1 < 0.5 会把"未知/GT全零"
+# 误判成悬崖样本,阴性监督被 4× 放大(方向性错误)。
+# 🔴 **真 0.0 ≠ 哨兵(2026-09-24 审查 P0 修)**:pred 全零/GT 非零时采集端
+# IoU 恒为 0.0——这是**最硬悬崖**(完全漏检),必须 w=4。判据因此从 `<= 0`
+# 收窄为 `<= 0 且非 0.0`:`iou_prev == 0.0` 恰好是唯一越过哨兵的悬崖值。
+# NaN(缓存被污染)按哨兵中性处理 + 一次 warning,不硬崩不静默吞。
 _CLIFF_BOOST = 3.0
 _CLIFF_IOU_LINE = 0.5
+_CLIFF_NAN_WARNED = False
 
 
 def _cliff_weight_of(iou_prev) -> float:
-    """单样本悬崖权重(纯函数,可单测)。iou_prev=None/负值哨兵 → 1.0。"""
-    if iou_prev is None or iou_prev <= 0:
+    """单样本悬崖权重(纯函数,可单测)。
+
+    iou_prev=None(未覆盖)/ 负值哨兵(-1 = GT 全零)→ 1.0;真 0.0(完全漏检)
+    → 4.0;NaN → 1.0(中性,首次调用打一次 warning——缓存被污染该被看见而非
+    静默);str 等非数值 → float() 硬转,转不动就 TypeError 带上下文崩,
+    不让脏值流进权重(None 单独放行:查表 miss 的合法语义,非污染)。
+    """
+    global _CLIFF_NAN_WARNED
+    if iou_prev is None:
+        return 1.0
+    try:
+        iou_prev = float(iou_prev)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"cliff iou_prev 必须可转 float,got {type(iou_prev).__name__}:"
+            f"{iou_prev!r} —— set_cliff_ious 缓存被污染,检查采集端") from None
+    if iou_prev != iou_prev:  # NaN(唯一自身不等的浮点值)
+        if not _CLIFF_NAN_WARNED:
+            print("[cliff WARN] iou_prev 含 NaN —— 缓存被污染,该样本按 w=1 "
+                  "中性处理(仅告警一次)", flush=True)
+            _CLIFF_NAN_WARNED = True
+        return 1.0
+    if iou_prev <= 0.0:
+        # 0.0 是"GT 非零但 pred 全零"的完全漏检(最硬悬崖,越过哨兵往下走);
+        # 负值(-1 哨兵/未知)才是阴性监督归主项。二者在此分流。
+        if iou_prev == 0.0:
+            return 1.0 + _CLIFF_BOOST
         return 1.0
     return 1.0 + _CLIFF_BOOST if iou_prev < _CLIFF_IOU_LINE else 1.0
 

@@ -36,9 +36,10 @@ def compute_segmentation_loss(
                 .sum() / (v.sum() + eps)
     内核**复用主项同式 bce_per + dice_per**(与 boundary/lovasz/ccdice
     各自独立数学不同——cliff 不引入新损失形,只对既有主项按样本重加权)。
-    🔴 归一口径与主项共用同一 `(x*v).sum()/(v.sum()+eps)`:cliff 项在
-    muted 样本下等效权重 = w_i·B/v.sum(),**不是裸 w_i**(标定公式按此
-    口径反推,勿低估分项占比)。
+    🔴 归一口径与主项共用同一 `(x*v).sum()/(v.sum()+eps)`:muted 样本被 v
+    挡在分子分母外,cliff 项的等效样本权重就是**裸 w_i**(2026-09-24 审查
+    B路实测:构造 v.sum()=1/B=4/w=4,impl Δ 恰 = 4×base₀,旧 docstring 的
+    "等效权重 = w_i·B/v.sum()"说法错误,勿照抄进标定公式——那会高估 4×)。
     cliff_weights 必须 [B] 且与 batch 对齐;入口强制 `.float().detach()`
     (default_collate 对 python float 列表产 float64,乘 bce_per 会把整个
     分项升 dtype;detached 保证它是纯权重不建图)。
@@ -136,15 +137,23 @@ def compute_segmentation_loss(
                     f"{tuple(_cw.shape) if torch.is_tensor(_cw) else _cw}")
             # 🔴 强制 float32 + detach(F12:default_collate 对 python float
             # 产 float64,乘 bce_per 会把分项整体升 dtype;mixup 路径的注入
-            # 已 as_tensor(float32),此处兜底防其它调用方传 float64 list)
-            cliff_w = _cw.to(dtype=torch.float32, device=pred.device).detach()
+            # 已 as_tensor(float32),此处兜底防其它调用方传 float64 list)。
+            # 用 `.float()` 而非 `.to(dtype=..., device=...)`(2026-09-24 审查
+            # B路 F1 修):autocast 的 promote 表只放行**显式 dtype** 的 to 变体,
+            # `_cw.to(dtype=torch.float32, device=pred.device)` 两个都 kwarg 传
+            # 会被 autocast 强制 cast 回 bf16;`.float()`(=to(torch.float32)
+            # 位置参数)命中 promote 真脱 autocast,与上方 deepsup 同式。设备
+            # 移动交给通用 tensor 语义(loss 与 pred 同 device,cliff_w 注入端
+            # 已 as_tensor(device=))。
+            cliff_w = _cw.float().to(pred.device).detach()
         else:
             cliff_w = None
 
         loss_seg = (loss_per * v).sum() / (v.sum() + _eps)
         # cliff 项与主项共用同一 (x*v).sum()/(v.sum()+eps) 归一(非自证
         # 口径:v 含 0 样本时精确成立 L(w)−L(0) == w*(cliff_w*base*v)
-        # .sum()/(v.sum()+eps);muted 样本下等效权重 = w_i·B/v.sum())。
+        # .sum()/(v.sum()+eps);muted 样本被 v 挡在分子分母外,
+        # 等效样本权重 = 裸 w_i——见 docstring 归一段,勿用 w_i·B/v.sum())。
         if cliff_w is not None:
             loss_seg = loss_seg + cliff_weight * (
                 (cliff_w * (bce_per + dice_per) * v).sum() / (v.sum() + _eps))

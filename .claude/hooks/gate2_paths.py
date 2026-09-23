@@ -49,6 +49,12 @@ HIGH_RISK_SCRIPT_PATTERNS = (
     re.compile(r"^merge_lora.*\.py$"),
     re.compile(r"^retrain_.*\.py$"),
     re.compile(r"^seal_container\.py$"),  # 防篡改密封脚本，src树聚合哈希算法单一事实源
+    # 2026-09-24 补（L2 第一弹热修实弹教训）：preextract_dynamic.py 的 main()
+    # 漏传 --union-mask 正是被这组模式漏掉——basename `preextract_dynamic`
+    # 不命中任何旧模式，改动绕过了 Gate2 提醒链直达云端。数据管道脚本
+    # （重建 samples.pkl / 缓存导出）改错代价=整轮训练 gate 硬拒或数据口径
+    # 静默漂移，与 train_* 同级。
+    re.compile(r"^preextract_.*\.py$"),
 )
 
 # 非 .py 但同样高风险的精确文件路径（2026-07-11 补，修复"仅 .py 才判高风险"的

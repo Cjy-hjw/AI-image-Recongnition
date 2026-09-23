@@ -202,12 +202,25 @@ class TestCliffWeightSentinel:
     def test_none_is_neutral(self):
         assert _cliff_weight_of(None) == 1.0
 
-    def test_zero_is_neutral(self):
-        # iou=0(空预测、GT 非零)按哨兵口径 w=1 —— 哨兵用 <=0,
-        # 真零 IoU 无 GT 全零以外的到达路径(union-inter=union>0 时 iou=0
-        # 意味 inter=0,即预测全空;此为"极端悬崖"但采集端不会产出 0.0
-        # 之外的信息,保守归中性)。
-        assert _cliff_weight_of(0.0) == 1.0
+    def test_zero_is_hardest_cliff(self):
+        # 🔴 2026-09-24 审查 P0 修:真 0.0(pred 全零/GT 非零,完全漏检)= 最硬
+        # 悬崖,w=4。旧版 `<=0` 把它与 -1 哨兵一起吞成 w=1——最需要加压的人口
+        # 恰好漏掉(旧注释还声称"采集端不会产出 0.0 之外的信息",实跑证伪:
+        # pred 全零时 iou = 0/(union-0+eps) 恒 0.0)。
+        assert _cliff_weight_of(0.0) == 4.0
+
+    def test_nan_is_neutral_with_warning(self):
+        # NaN = 缓存被污染的中性处理(方向安全 + 一次性 warning,不硬崩不静默吞)
+        assert _cliff_weight_of(float("nan")) == 1.0
+
+    def test_str_numeric_coerced(self):
+        # 数值 str(float 可转)→ 4.0:公开 API 面的容错,与 None/NaN 分流。
+        assert _cliff_weight_of("0.2") == 4.0
+
+    def test_str_garbage_raises(self):
+        # 非数值脏值 → TypeError 带上下文崩(fail-loud,不让脏值流进权重)
+        with pytest.raises(TypeError, match="cliff iou_prev"):
+            _cliff_weight_of("garbage")
 
     def test_cliff_below_line_boosted(self):
         assert _cliff_weight_of(0.49) == 4.0
@@ -333,6 +346,17 @@ class TestCliffStats:
         assert s["cliff_frac_boosted"] is None
         assert s["cliff_iou_prev_mean"] is None
 
+    def test_true_zero_counts_in_denominator(self):
+        """🔴 2026-09-24 审查 P0 修:真 0.0(完全漏检)必须进分母与 boosted
+        人口 —— 旧版 `v > 0` 把它连分母都排除,JSONL 对模型最差一档零观测,
+        cliff_frac_boosted 系统性偏低。"""
+        from scripts.train_official import _cliff_stats_from_ious
+        s = _cliff_stats_from_ious({"a": 0.0, "b": -1.0, "c": 0.8})
+        assert s["cliff_n_evaluated"] == 2     # 0.0 与 0.8,-1 哨兵除外
+        assert s["cliff_n_boosted"] == 1       # 0.0 < 0.5 命中
+        assert s["cliff_frac_boosted"] == pytest.approx(0.5, abs=1e-6)
+        assert s["cliff_iou_prev_mean"] == pytest.approx(0.0, abs=1e-6)
+
     def test_no_boosted_mean_none(self):
         from scripts.train_official import _cliff_stats_from_ious
         s = _cliff_stats_from_ious({"a": 0.8, "b": 0.9})
@@ -399,6 +423,50 @@ class TestCollectCliffIous:
         assert captured.get("training") is False, \
             "采集前向不在 eval 态"
 
+    def test_train_mode_restored_on_exception(self):
+        """🔴 2026-09-24 审查路C P1 修:采集循环内异常炸出时,模型不得永久
+        停在 eval 态(try/finally)。旧版无 finally,任何前向异常都跳过
+        model.train() —— 同型坑:_assert_finite 单帧 NaN 拖垮整段视频。"""
+        _fn, model, loader = self._mock_setup()
+        model.train()
+
+        class _Boom(torch.utils.data.Dataset):
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, i):
+                raise RuntimeError("boom during collection")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _fn(model, torch.utils.data.DataLoader(_Boom(), batch_size=1),
+                torch.device("cpu"))
+        assert model.training, \
+            "采集异常后模型停在 eval 态:丢 try/finally 回归"
+
+    def test_key_coerced_to_str(self):
+        """🔴 2026-09-24 审查路C P2 修:lid 统一 str(lid) 写键。collate 对
+        int 型 lesion_id 产 0-dim Tensor,当 dict 键哈希不稳且未来 dump
+        jsonl 会 TypeError —— 采集端入口就是唯一的规整点。"""
+        class _DS(torch.utils.data.Dataset):
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, i):
+                return (torch.zeros(1, 8, 8), torch.zeros(1, 8, 8),
+                        {"lesion_id": 7})      # int,非 str
+
+        from scripts.train_official import _collect_cliff_ious
+
+        class _M(torch.nn.Module):
+            def forward(self, x, gamma_prior=1.0):
+                return {"mask": torch.zeros_like(x)}
+
+        ious = _collect_cliff_ious(
+            _M(), torch.utils.data.DataLoader(_DS(), batch_size=1),
+            torch.device("cpu"))
+        assert list(ious.keys()) == ["7"], \
+            f"int lid 未转 str 键: {list(ious.keys())}"
+
 
 # ── 12. 全链冒烟:train_batch 注入 + criterion 消费 ─────────────────────
 def test_train_batch_injection_end_to_end():
@@ -433,3 +501,35 @@ def test_train_batch_injection_end_to_end():
     ws = [_cliff_weight_of({"mock::0": 0.2, "mock::1": 0.8}.get(k))
           for k in ("mock::0", "mock::1")]
     assert ws == [4.0, 1.0]
+
+
+# ── 13. 开训硬判据执行物(2026-09-24 审查路C P0 修)──────────────────────
+class TestCliffChainAbortGate:
+    """ep≥2 frac=0.0 且分母>0 → abort(链断);此前只写 JSONL 无人消费,
+    变异实验:把 stats 换成恒返 frac=0,训练循环行为逐位不变 = 门不存在。"""
+
+    def _gate_should_abort(self, stats: dict, epoch: int) -> bool:
+        """复刻 train_official epoch 循环里新加的门条件(与源同步的判定式)。"""
+        return (epoch >= 2
+                and stats.get("cliff_frac_boosted") == 0.0
+                and (stats.get("cliff_n_evaluated") or 0) > 0)
+
+    def test_ep2_zero_frac_with_denominator_aborts(self):
+        from scripts.train_official import _cliff_stats_from_ious
+        stats = _cliff_stats_from_ious({"a": 0.8, "b": 0.9})   # 全过线,frac=0
+        assert self._gate_should_abort(stats, 2)
+
+    def test_ep1_exempt(self):
+        from scripts.train_official import _cliff_stats_from_ious
+        stats = _cliff_stats_from_ious({"a": 0.8, "b": 0.9})
+        assert not self._gate_should_abort(stats, 1)
+
+    def test_none_frac_not_death_row(self):
+        # None = 全哨兵/空缓存,判据是"算得出且一个没压",不是"算不出"
+        stats = {"cliff_frac_boosted": None, "cliff_n_evaluated": 0}
+        assert not self._gate_should_abort(stats, 5)
+
+    def test_healthy_frac_passes_gate(self):
+        from scripts.train_official import _cliff_stats_from_ious
+        stats = _cliff_stats_from_ious({"a": 0.2, "b": 0.8})
+        assert not self._gate_should_abort(stats, 3)

@@ -441,8 +441,14 @@ def main() -> int:
                          "纯 CPU 解压不占 GPU;单 job 峰值内存 ~700MB,"
                          "64G 机器 4-8 安全")
     a = ap.parse_args()
+    # 🔴 L2 热修(2026-09-23,云端实弹):此调用曾漏传 a.union_mask —— CLI 收了
+    # 旗标但 extract 默认参 False,pkl 按旧模式写出,训练侧 union gate
+    # (build_official_datasets 双向校验)在启动时硬拒。路B/路C 两轮审查审了
+    # extract/worker/loader 三处消费端,唯独漏了 main() 这第五处接线位——
+    # "接线被删/漏,产物静默丢字段"正是 L2 审查自定的红线,打脸入档。
     return extract(a.data_root, a.xlsx, a.cache_dir, a.sheet_name,
-                   a.img_size, a.limit, a.workers)
+                   a.img_size, a.limit, a.workers,
+                   union_mask=a.union_mask)
 
 
 if __name__ == "__main__":

@@ -291,6 +291,12 @@ TypeError→isinstance 短路。TestUnionMaskL2 10→**13**:corrupt union mask
 删旧 drift 测试第二段模糊锚(match='占比|half' 单点锚伪装双覆盖)。变异实测:
 删 union 校验→2 测试 RED。全量 1337 passed+1 skipped;
 1 例 order-dependent flake(test_forward_deterministic,单跑/固定序均过))
+→1338 维持(2026-09-23 L2 云端实弹热修 commit 7e336a5:preextract `main()` 漏传
+`--union-mask` 给 `extract()`(默认参 False)→首版 zip 云端 pkl 无 union 键,训练
+union gate 硬拒。+1 行透传,**测试计数不变**——union e2e 直调 extract() 绕过
+main(),CLI→函数最后一跳零覆盖正是漏网根因,教训入订正史:接线审计清单必须含
+CLI 透传位,e2e 从 main()/CLI 层进。全量 1330 passed+1 skipped+preextract 16 项
+单跑通过(Demo_D))
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`

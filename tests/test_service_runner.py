@@ -136,10 +136,11 @@ def mock_heavy(monkeypatch):
                       "enforcement_mode": "soft", "reason": "", "soft_flags": []}
 
     def _fake_write_case_v21(case_dir, patient_id, subdir_uid, case_result, kind,
-                             processing_ms, interpretation=None):
+                             processing_ms, interpretation=None, roi_ctx=None):
         box["written"].append({
             "case_dir": case_dir, "patient_id": patient_id, "subdir_uid": subdir_uid,
-            "kind": kind, "processing_ms": processing_ms, "case_result": case_result})
+            "kind": kind, "processing_ms": processing_ms, "case_result": case_result,
+            "roi_ctx": roi_ctx})
 
     monkeypatch.setattr(model_runner_mod, "build_model", _fake_build_model)
     monkeypatch.setattr(model_runner_mod, "load_config", _fake_load_config)

@@ -144,6 +144,7 @@ def configure_official_stage(
     freeze_legacy: bool = False,
     ete_only: bool = False,
     seg_only: bool = False,
+    roi_heads: bool = False,
 ) -> Tuple[List[Dict], float, str]:
     """配置官方三头训练的当前阶段:设 requires_grad + 建 param_groups。
 
@@ -175,6 +176,15 @@ def configure_official_stage(
             "三组",实测 len(groups)==4)。
             前提:--resume-from r5 权重(分类头全冻,基线才有意义);预算
             ≤20 epoch(γ_prior 在 ep≤20 恒 0 的单变量窗口)。
+        roi_heads: True → **ROI 范式训练**(债3b,2026-09-25 训练侧接线):
+            ROI 头(`MultiTaskThyroidModel.ROI_HEAD_PREFIXES`,随机初始化出身)
+            并入恒可训集,挂满 head_lr 档(与整图四头同待遇);其余调度
+            (四头/分割链/Stage B LLRD)零变化。False(默认)逐字零回归
+            (always_train 不加前缀、`_head_lr_prefixes` 不扩——
+            test_official_schedule 既有断言按此写死)。
+            🔴 与 ete_only/seg_only 互斥(防线在 train_official 入口的
+            parser.error,本函数不重复 raise——单一防线,报错指向用户操作
+            而非调度内部)。
 
     Returns:
         `(param_groups, head_lr, stage_name)`。head_lr 是调度基准 lr;stage_name 形如
@@ -294,7 +304,11 @@ def configure_official_stage(
     unfreeze_extra = STAGE_B_UNFREEZE if stage == "B" else ()
     # 恒可训集:四头 + 分割前向链。分割整块解冻(解码器 + 主干同时放行),
     # 避免 bn_freeze 的"兄弟 BN 仍被更新"病态。
-    always_train = tuple(_HEAD_PREFIXES) + SEG_TRAIN_PREFIXES
+    # roi_heads(债3b,2026-09-25):ROI 头并入恒可训集(随机初始化出身与
+    # 整图四头同待遇);False 时 tuple 拼接零长 → always_train 逐字与旧版
+    # 相同(零回归——参数集合、param_groups 组数与内容均不变)。
+    _roi_pfx = tuple(MultiTaskThyroidModel.ROI_HEAD_PREFIXES) if roi_heads else ()
+    always_train = tuple(_HEAD_PREFIXES) + SEG_TRAIN_PREFIXES + _roi_pfx
     for name, p in model.named_parameters():
         if "vclub" in name:
             p.requires_grad = True
@@ -310,7 +324,9 @@ def configure_official_stage(
 
     # ── 2. 建 param_groups ───────────────────────────────────────────────
     # 满 head_lr 组:四头 + 分割解码器(都是随机初始化,同待遇)。
-    _head_lr_prefixes = tuple(_HEAD_PREFIXES) + SEG_TRAIN_DECODER
+    # roi_heads:ROI 头同挂满 head_lr(随机初始化新头,与四头同待遇——
+    # 若挂 backbone 档则学习率低 10 倍,冷启头几乎不动)。
+    _head_lr_prefixes = tuple(_HEAD_PREFIXES) + SEG_TRAIN_DECODER + _roi_pfx
     head_named = [
         (n, p) for n, p in model.named_parameters()
         if p.requires_grad and "vclub" not in n
@@ -368,4 +384,6 @@ def configure_official_stage(
         "B": "Official Stage B: heads+seg + LLRD unfreeze cls Top-2",
         "C": "Official Stage C: heads+seg low-lr calibration",
     }[stage]
+    if roi_heads:
+        stage_name += " + ROI heads (cold-start, head_lr)"
     return param_groups, head_lr, stage_name

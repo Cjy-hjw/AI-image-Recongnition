@@ -265,13 +265,18 @@ def _process_one_file(job):
 
 def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
             img_size: int, limit: int, workers: int = 4,
-            union_mask: bool = False) -> int:
+            union_mask: bool = False, roi_meta: bool = False) -> int:
     frames_dir = os.path.join(cache_dir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
 
     t0 = time.time()
     _safe_print(f"[1/3] 扫描标注 + 定位动态非零帧(要解 343 个 mask,预计 10-25 分钟)...")
-    samples = build_official_samples(data_root, xlsx, sheet, union_mask=union_mask)
+    # 🔴 R3 review P0-1 修(2026-09-26):roi_meta 曾漏传——CLI/extract 均无该参,
+    # build_official_samples 用缺省 False ⇒ pkl 无 roi_lesions 键 ⇒ ROI train
+    # loader 0 样本(结构性,失败 rc=0 全自洽)。与 L2 首版 main() 漏传 union_mask
+    # 同一文件同一条链第二次。透传 + _meta 记录 + loader 侧正向断言三件套。
+    samples = build_official_samples(
+        data_root, xlsx, sheet, union_mask=union_mask, roi_meta=roi_meta)
     n_dyn = sum(1 for s in samples if s["is_dynamic"])
     n_lesion = len({s["mask_path"] for s in samples if s["is_dynamic"]})
     _safe_print(
@@ -401,6 +406,9 @@ def extract(data_root: str, xlsx: str, cache_dir: str, sheet: str,
             # 打上标记,由 build_official_datasets 硬拒,别指望人记得住 docstring。
             "partial": bool(limit > 0),
             "union_mask": bool(union_mask),
+            # 🔴 R3 P0-1:roi_meta 进 _meta——build_official_datasets 侧的正向
+            # 断言(pkl 声称带 roi_lesions 却无键 → raise)靠它区分新旧产物。
+            "roi_meta": bool(roi_meta),
         },
         "samples": kept,
     }
@@ -434,6 +442,14 @@ def main() -> int:
     ap.add_argument("--union-mask", action="store_true",
                     help="L2 union 监督:同图全部 GT 病灶 mask 并集导出"
                          "(键输入不同,与旧单病灶缓存物理隔离)")
+    # 🔴 R3 review P0-1(2026-09-26):--roi-meta 此前不存在——roi 版 pkl 在
+    # 当前代码下结构性不可产出。真训路径 train_official --roi-heads 只走
+    # --samples-pkl 展开(建图扫描 10-25 分钟/每次启动),pkl 无 roi_lesions
+    # → ROI loader 0 样本 → 启动守卫报"旧产物"(那是训练侧兜底,晚且误导)。
+    ap.add_argument("--roi-meta", action="store_true",
+                    help="ROI 范式:样本携带 roi_lesions(per-lesion 元数据,"
+                         "ROI train loader 展开;与 --samples-pkl 组合时 "
+                         "build_official_datasets 做内容级正向断言)")
     ap.add_argument("--limit", type=int, default=0,
                     help=">0 时只处理前 N 个动态影像文件,用于快速验证管道")
     ap.add_argument("--workers", type=int, default=4,
@@ -446,9 +462,12 @@ def main() -> int:
     # (build_official_datasets 双向校验)在启动时硬拒。路B/路C 两轮审查审了
     # extract/worker/loader 三处消费端,唯独漏了 main() 这第五处接线位——
     # "接线被删/漏,产物静默丢字段"正是 L2 审查自定的红线,打脸入档。
+    # 🔴 R3 P0-1(2026-09-26)同型二次:--roi-meta 也在这里透传(上一版就是
+    # 只加了 extract 形参没加 CLI,同一处坑连踩两轮——接线审计清单必须
+    # 含 CLI→入口→函数全链,一处断=结构性不可达)。
     return extract(a.data_root, a.xlsx, a.cache_dir, a.sheet_name,
                    a.img_size, a.limit, a.workers,
-                   union_mask=a.union_mask)
+                   union_mask=a.union_mask, roi_meta=a.roi_meta)
 
 
 if __name__ == "__main__":

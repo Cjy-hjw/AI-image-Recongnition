@@ -309,6 +309,20 @@ def _inference_workers():
     return max(1, int(_config.INFERENCE_WORKERS))
 
 
+# ── ROI 分流(2026-09-25 新架构第五波,默认关)─────────────────────────────
+# env 开关("1"/"true"/"on"/"yes" 为真,其余含未设全假)。**inline 镜像
+# `roi_pipeline.roi_heads_enabled` 的解析而不 import**——关时 sys.modules 对
+# roi_pipeline 零污染(torch+cv2 import 链都不进);权威解析在 roi_pipeline,
+# 此处为避免加载而镜像,两处必须同步改(测试有 env 解析对齐断言)。
+# v21_output 内部不读 env——开关状态只经 roi_ctx dict 流入(单一来源)。
+_ENV_ROI_HEADS = "AICOMP_ROI_HEADS"
+
+
+def _roi_heads_on() -> bool:
+    raw = os.environ.get(_ENV_ROI_HEADS, "0").strip().lower()
+    return raw in ("1", "true", "on", "yes")
+
+
 def _process_case(case, output_dir, state, precision, max_frames):
     """单病例流水线:计时 → 分派静/动 → write_case_v21;独立 try/except 失败隔离。"""
     patient_id = case["patient_id"]
@@ -337,7 +351,20 @@ def _process_case(case, output_dir, state, precision, max_frames):
             _write_case_rejected(case_dir, case, processing_ms,
                                  case_result.get("reason", "gatekeeper rejected"))
         else:
-            _write_via_v21(case_dir, case, case_result, kind, processing_ms)
+            # ROI 分流(2026-09-25):env 开时构建 roi_ctx 传给 v21_output
+            # (模型句柄缺口:write_case_v21/v21_output 层没有 model,ROI 前向
+            # 又裁定在实例所在的 v21_output 层跑——由本层持模型句柄的这里构建
+            # 传入,是该解法的落点)。关时 roi_ctx=None = 逐位走整图共享(零回归)。
+            roi_ctx = None
+            if _roi_heads_on():
+                roi_ctx = {
+                    "model": state["model"],
+                    "precision": precision,
+                    "device": state["device"],
+                    "img_size": int(state["config"]["data"]["img_size"]),
+                }
+            _write_via_v21(case_dir, case, case_result, kind, processing_ms,
+                           roi_ctx=roi_ctx)
         logger.info(
             "[runner] 病例完成 patient_id=%s kind=%s 耗时=%dms",
             patient_id, kind, processing_ms)
@@ -376,6 +403,12 @@ def _run_static_case(case, case_dir, state, precision):
     # 尺寸≠原图,拿它冒充会让结节 mask 尺寸与原图不符→官方判尺寸不一致整例失分。
     # 故在此透传加载时的原图尺寸(img_np 已在手,零成本)。
     result["orig_hw"] = tuple(img_np.shape[:2])
+    # ROI 分流(2026-09-25):env 开时透传原分辨率灰度原图(v21_output 的 ROI
+    # 裁剪消费;与 orig_hw 同源同点,img_np 就在手零成本)。**关时不加任何键**
+    # ——case_result 键集逐位不变是零回归的一部分(旧测试 fixture 断键集)。
+    # 动态侧不注入:per_frame[*]["frame_np"] 就是原图帧(v21_output 自取)。
+    if _roi_heads_on():
+        result["orig_img_np"] = img_np
     return result
 
 
@@ -477,12 +510,15 @@ def _rejection_result(audit):
     }
 
 
-def _write_via_v21(case_dir, case, case_result, kind, processing_ms):
-    """经 A3 的 write_case_v21 落盘(唯一 V2.1 写盘入口,原子写 + 校验)。"""
+def _write_via_v21(case_dir, case, case_result, kind, processing_ms, roi_ctx=None):
+    """经 A3 的 write_case_v21 落盘(唯一 V2.1 写盘入口,原子写 + 校验)。
+
+    roi_ctx:None(默认)= 整图共享四头;dict = ROI 分流开(见 _process_case)。
+    """
     from src.inference.v21_output import write_case_v21
     write_case_v21(
         case_dir, case["patient_id"], case["subdir_uid"], case_result, kind,
-        processing_ms)
+        processing_ms, roi_ctx=roi_ctx)
 
 
 def _write_case_error(case_dir, case, processing_ms, reason):

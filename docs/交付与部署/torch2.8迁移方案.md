@@ -126,7 +126,7 @@
 
 ## 5. CI 同步(关键,别漏) —— 🔴 **未完成的有效待办**
 
-- `.github/workflows/ci.yml` 的 test job **现仍是 `container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime`**(2026-08-12 主会话实读 `ci.yml:39` 核实),**必须同步换** torch2.8 base,否则 CI 测的不是交付环境(违反铁律2)。**本条是本文档唯一未落地的实质待办,勿因 §4 作废就以为整篇存档。**
+- ~~`.github/workflows/ci.yml` 的 test job **现仍是 `container: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime`**~~(2026-09-25 核实:`ci.yml:48` 已是 `pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime`,本条已过时,迁移完成) torch2.8 base,否则 CI 测的不是交付环境(违反铁律2)。**本条是本文档唯一未落地的实质待办,勿因 §4 作废就以为整篇存档。**
 - **docker-build-smoke / entrypoint-dispatch-smoke**:换 base 后重验。
 - 🔴 **权重 COPY(#111)是必做项,不是"若加了"**:交付 backlog #111 明确要求 Dockerfile 补权重 COPY(见 `docs/项目现状总纲.md` §7),换 base 后冒烟步骤须相应调整。此处与 §4 存档中的 sshd 不同 —— **sshd 已随自建镜像方案一起作废,权重 COPY 没有**。
 - push 后 `gh run list`(走代理)核 headSha + success。

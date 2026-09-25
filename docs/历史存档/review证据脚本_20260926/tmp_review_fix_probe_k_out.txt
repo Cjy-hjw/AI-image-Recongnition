@@ -1,0 +1,30 @@
+======================================================================
+Probe K1: fake 全零 roi_mask 是否让 ETE band 恒 0(对比无键)
+======================================================================
+无 roi_mask: band_ratio = [[0.0], [0.0], [0.0], [0.0]]  d_mm = [[0.0], [0.0], [0.0], [0.0]]
+全1 roi_mask: band_ratio = [[0.0], [0.0], [0.0], [0.0]]  d_mm = [[0.0], [0.0], [0.0], [0.0]]
+→ 真实训练(mask_path 非空)下 d_mm/band 由真 mask 驱动;mock 恒 0/0(初版缺陷已修)
+
+======================================================================
+Probe K2: precision/scaler 混用风险(run_roi_epoch 用未 scale 的 loss?)
+======================================================================
+  OK  scaler.scale(loss).backward()
+  OK  scaler.unscale_(optimizer)
+  OK  clip_grad_norm_
+  OK  scaler.step(optimizer)
+  OK  scaler.update()
+  整图 train_batch 同样模式: True
+
+======================================================================
+Probe K3: RoiDataset 真样本 batch 里 roi_mask 的 device/dtype(CPU 冒烟)
+======================================================================
+img: (1, 32, 32) torch.float32 meta keys: 22
+roi_mask in meta: False (mock/无 mask 病灶 = 缺键)
+mask_path 指向不存在文件 → roi_mask in meta: False
+
+======================================================================
+Probe K4: forward_roi 对 roi_mask 与 roi_images 的 device 一致性要求
+======================================================================
+同设备(CPU/CPU): OK, d_mm = [[0.0], [0.0]]
+说明:_move_roi_masks_to_device 只按 device.type 比较 → CPU-only 环境 no-op 正确;
+     CUDA 环境将 CPU mask 迁到 cuda,与 roi_images 同设备(R1 P0-1 修复点)。

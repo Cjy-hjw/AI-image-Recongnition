@@ -7,6 +7,11 @@ nvidia-smi
 ps aux | grep python
 ```
 * **Rule**: 确认无其他用户高占用（高 VRAM/高计算）后再提交训练任务；有活跃任务则通知团队或等待资源释放。
+* 🔴 **本机测试消耗分级(2026-09-25 实证入档,两次整机死机/断电式重启的根因)**:
+  - **轻(可并行)**:pytest 单文件/纯 CPU 短跑(<2min);
+  - **重(必须串行,同一时间只允许一个进程)**:全量 `pytest tests/`、`verify_model.py`、GPU/torch 大前向、任何 >2min 的命令;不确定是否消耗大 → 当大的串行。
+  - 死机证据链:两次 Kernel-Power 41(BugcheckCode=0,非蓝屏=整机冻结)均发生在多 agent 并发 pytest 窗口,事件日志同窗口 python.exe `arrow.dll 0xc0000005`(pyarrow 访问违例)三连崩;多进程同时炸 pyarrow 共享内存映射会拖垮内核。
+  - **派多 agent 并行写代码时,prompt 必须带上本分级**(已在用);新测试文件 import 序守卫(先 sklearn 后 torch,防 OpenMP 栈溢出)见 `tests/test_cliff_loss.py:29` 先例。
 
 ## 2. Compile & Shape Verification & Code Review (Pre-flight Checks)
 Before deploying or starting full training, you **MUST** execute the double-gate pre-flight checks:
@@ -16,7 +21,7 @@ Before deploying or starting full training, you **MUST** execute the double-gate
 *   **Gate2 审查搭配规范（通用 8 角度 × `QA_VP.md` 清单，二者互补，缺一都漏）**:
     - **对抗性审计前提(2026-08-11 新增,统摄两步)**: 所有 review 子agent 一律以「**这段代码有 bug,我的任务是找出来**」为默认前提,而非「确认它没问题」——举证责任反转、主动构造反例对拍、不采信注释/文档声称、判 PASS 也要给「试过什么反例才排除」的依据。细则见 `QA_VP.md §2.0`,派 reviewer 时必须把该心态写进其 prompt。
     - **第一步 → 通用 8 角度扫描（独立子agent,路由/思考强度/禁 haiku 按 §8 审查规则组执行,**必须分多路并行、每路只管 1-2 个角度,禁单 agent 包揽 8 角度 —— 见 §8 同名规则与实证**）**: 8 角度(行级 / 移除行为 / 跨文件调用 / 复用 / 简化 / 效率 / altitude / CLAUDE.md 约定)——擅长抓通用缺陷(反转条件/off-by-one/调用契约破坏/死代码),但**不懂本项目领域红线**。**2026-08-11 起改用独立子agent,不再用 `/code-review` skill**(skill forked 后台执行太慢、易 API 中断,本 session 连续两次异常);独立 agent 可控/可并行/可 SendMessage 追问。见 `memory/code-review-skill-too-slow-use-independent-agent.md`。
-    - **第二步 → `QA_VP.md §1/§2` 领域清单**: 第一步扫完后，对照 §1.1 梯度隔离 / §1.2 优化器绑定 / §1.3 FP16 数值 / §1.4 患者泄漏 / §1.5 损失维度 / §1.6 DICOM 脱敏 / **§1.7 推理侧红线**（误报/维度契约/降级路径） / §2.1 符号极性 / §2.2 广播，逐条核对**改动触及的**项（未触及的跳过）。
+    - **第二步 → `QA_VP.md §1/§2` 领域清单**: 第一步扫完后，对照 §1.1 梯度隔离 / §1.2 优化器绑定 / §1.3 FP16 数值 / §1.4 患者泄漏 / §1.5 损失维度 / §1.6 DICOM 脱敏 / **§1.7 推理侧红线**（误报/维度契约/降级路径）/ **§1.8 权重键契约与云端运行红线**（strict 拒 unexpected/两棵树/PYTHONPATH/官方口径坑/对拍 sidecar 口径/CLI→main 透传） / §2.1 符号极性 / §2.2 广播，逐条核对**改动触及的**项（未触及的跳过）。
     - **谁做**: 高风险改动（梯度路由/优化器绑定/损失数学/gatekeeper 降级路径）→ 派子 agent 审(路由按 §8);低风险改动 → 主会话自审。**Gate2 禁用 haiku**（能力不足,见 §8）。
     - **反例（本次教训）**: 只跑第一步(独立 agent 8 角度)跳过 QA 清单 = 漏领域红线；只走清单跳过第一步 = 漏通用缺陷。
     - **🔴 审查 agent 的证据必须不可伪造（2026-08-12 新增，本轮 6 条误报实证）**：审查 agent 报的 finding **不得直接采信**。这轮独立 sonnet 报 5 条，**3 条误报**；memory 整理 agent 又误判 1 条。归类后病根有三：① **读片段就外推**（说「gamma 不在优化器」但没读排除条件是 `"vclub" in name`；说「opencv 要 numpy≥2 会冲突」但只看本地已装版本的元数据、没跑 pip 解析；说「runner.py 已加 encoding」但 grep 实为零命中）② **概念性误解**（说 `_seed_worker` 在 `persistent_workers` 下「压窄训练多样性」——设种子不减少单次运行内的随机性）③ 🔴 **声称验证但结论相反**（说「`WeightedRandomSampler` 不消费 generator」，**自称读过 torch2.8 源码**，而源码 `__iter__` 明写 `torch.multinomial(..., generator=self.generator)`）。第三类最危险：**要求 agent 写「你做了什么验证」，反而给了它编造证据的模板**。

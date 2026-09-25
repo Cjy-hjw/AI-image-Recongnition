@@ -38,7 +38,25 @@ def collect_official_records(outputs, labels, targets):
     `src/training/metrics_official.py`,本函数只负责搬运、不做筛选。
 
     三头键缺席(legacy 数据集)→ 返回空 list,调用方跳过官方指标。
+
+    🔴 **ROI 范式分支(2026-09-25 P0 尺子先行)**:outputs 含 `roi_outputs` 键
+    (list[dict],一图 K 条,每 dict 一病灶)时**不走本函数的整图路径**,由
+    `collect_roi_records.roi_records_from_batch` 走 per-lesion 收集(分流逻辑
+    见 `validate_batch` 内调用点,本函数保持整图语义不嵌 ROI 分支)。无该键时
+    逐位走本函数原路径 —— **零回归铁律**。
     """
+    # 🔴 ROI 分支(2026-09-25 P0):outputs 含 `roi_outputs` 键 → per-lesion 收集
+    # (一图 K 条记录,每病灶一条)。无该键 → 逐位走下方整图路径(零回归铁律:
+    # 整图模型的 val 指标不得因本次改造改变任何一位数字)。
+    # 分流判据用**键存在性**而非真值:roi_outputs 恒为非空 list(ROI 范式下模型
+    # 必产 per-lesion 输出;空 list 属上游契约违规,交给 collect_roi_records 的
+    # 长度对齐校验去 fail-loud,不在这里静默回退整图路径 —— 那会把"ROI 模型
+    # 却产出 0 记录"伪装成"整图指标")。
+    if "roi_outputs" in outputs:
+        from src.training.collect_roi_records import roi_records_from_batch
+
+        return roi_records_from_batch(outputs, labels)
+
     if "lesion_loc" not in targets:
         return []
 
@@ -135,6 +153,13 @@ def validate_batch(
             只能对着 `dice=0.000` 盲等。
             用出参而非加返回值:本函数返回 8 元组,`trainer.py:117` 按位解包,
             加宽会破坏既有调用点。
+        labels: loader 给的 labels dict(collate 后)。**ROI 范式下形态不同**:
+            当模型 outputs 含 `roi_outputs` 键时,本函数把 labels 原样转交
+            `collect_roi_records`(期望 per-lesion 标签 list,与 roi_outputs
+            逐条对齐;形态不符会在那里 fail-loud)。整图路径下 labels 仍是
+            tensor dict,本函数的 mal_correct/mal_targets 等**整图统计字段照旧
+            从 `outputs["malignancy"]` / `targets["malignancy"]` 计算**(ROI 模型
+            仍须产出整图级 malignancy logits 供这些统计,该契约由模型侧保证)。
     Returns:
         loss: 损失
         loss_dict: 损失字典
@@ -143,7 +168,10 @@ def validate_batch(
         batch_size: 批次大小
         mal_probs: 恶性概率 (CPU tensor)
         mal_targets: 恶性标签 (CPU tensor)
-        official_records: list[dict] 逐样本官方指标字段(三头键缺席时为空 list)
+        official_records: list[dict] 官方指标字段。**两条口径**:
+            整图模型(无 `roi_outputs` 键)→ 逐样本一条(三头键缺席时为空 list);
+            ROI 模型(有键)→ per-lesion 一条(一图 K 条,字段集与整图记录
+            逐键一致,由 `collect_roi_records` 保证)。
     """
     images = images.to(device)
     masks = masks.to(device)
@@ -183,13 +211,34 @@ def validate_batch(
     if getattr(criterion, "seg_cliff_weight", 0.0) > 0.0:
         targets["cliff_weights"] = torch.ones(
             images.size(0), dtype=torch.float32, device=device)
+    # ROI 键注入(债1/债4,2026-09-25 训练侧接线;与 train_step 同型):整图
+    # val 走 K=0 空批(ROI 范式的 val 指标由独立 validate_roi_epoch 算,主线
+    # 拍板双 loader;整图 outputs 不产 roi_outputs → outputs 侧同补空 list,
+    # 见下方 outputs 组装)。val 的 ROI 观测键只进 epoch 级 extra(roi_* 前缀),
+    # 不进本函数的 loss/records。
+    if getattr(criterion, "roi_head_weight", 0.0) > 0.0:
+        targets["roi_labels"] = targets.get("roi_labels") or []
 
     # 验证期固定 gamma_prior=1.0(与最终部署一致),使各 epoch 的 val 指标在相同
     # 物理先验强度下计算,保证选模/早停判据的跨 epoch 可比性。训练期仍按 epoch 退火。
     outputs = model(images, gamma_prior=1.0)
+    # ROI outputs 键(债4,与 train_step 同型):整图前向不产 roi_outputs,权重>0
+    # 时损失层 fail-loud——补 **K=0 空 list**(合法早退)。🔴 疑虑"空 list 触发
+    # collect_official_records 的 ROI 分流"在此不成立:分流在**本函数末尾**的
+    # collect_official_records(outputs, ...) 消费 outputs——见下方,ROI 范式
+    # 的 val 收集走 validate_roi_epoch 独立链,本处 outputs 注空 list 后
+    # collect_official_records 会走 per-lesion 分支产 0 records → 整图官方指标
+    # 消失!故**在此处把键摘掉再交收集**(收集层读的 outputs 是本函数局部
+    # 变量;摘键 = 保持整图收集语义,损失层已算完)。
+    _roi_injected = False
+    if getattr(criterion, "roi_head_weight", 0.0) > 0.0:
+        outputs = {**outputs, "roi_outputs": []}
+        _roi_injected = True
     loss, loss_dict = criterion(
         outputs, targets, update_famo_weights=False, enable_mal_loss=(stage > 1)
     )
+    if _roi_injected:
+        outputs = {k: v for k, v in outputs.items() if k != "roi_outputs"}
 
     batch_size = images.size(0)
 

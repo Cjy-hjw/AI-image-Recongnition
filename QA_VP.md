@@ -91,6 +91,14 @@ All deep learning implementations MUST be verified by quantifiable automated tes
 
 ---
 
+### 1.8 训练-交付权重键契约与云端运行环境红线(2026-09-25 新增,近期实弹教训集中区)
+
+*   **权重 strict 拒 unexpected 键——换权重前必核键集**: 训练树模型代码会先于交付容器合入新头(如深监督 `seg_aux_head_2/3`),训出的 ckpt 因此**多出交付旧代码没有的键**,`build_model` `load_state_dict(strict=True)` 当场 raise(Z1 云端实弹)。**Rule**: ① 训练侧产物进交付/诊断容器前,必须核对键集(期望键数+前后 diff);② 键集不符时走**显式白名单例外**(现仅 `SEG_AUX_PREFIXES` 4 键,`model_runner.build_model`,"恰好缺且仅缺"才放行)或**云端剥键存副本**(python 现场剥,零上传);③ 白名单只能"恰好缺且仅缺已知旁路键"逐条放行,**不得放宽成模糊匹配**(放过真不匹配=随机初始化静默零分)。
+*   **诊断/对拍与训练不共用同一棵 src 树**: 云端 `cloud_infer/`(测评容器读)与 `workspace` 根散树(诊断/训练用)是两棵树,增量包落错树=白跑(memory: cloud-infer-directory-is-what-eval-container-reads)。诊断命令一律从 workspace 树起跑 + `PYTHONPATH=/2026aicompetition/workspace/pylibs`(依赖 pip --target 在 pylibs,裸跑 import pandas 直接崩,2026-09-24 用户点名入档)。
+*   **本地测试测不出的官方口径坑,逐条预验**: 预测目录白名单只认 `.nii/.json`(混 `.dcm` 整批判零)/GT 静态 mask 是 3D 单帧(写纯 2D 整批判零)/conf 值域 [0,1] 越界=排序类指标静默垫底/8h 硬时限+OOM 整批作废。**任何新增写盘/前向路径改动,commit 前对照本条逐项核对**;66 项契约验收(干净目录解压+真跑)是最后一道闸。
+*   **诊断对拍的固定人口/sidecar 口径**: `compare_detection_runs` 吃 sidecar `.cases.jsonl`(非 report.json,参数 `--baseline/--candidate`);对拍哨兵=复跑基线应逐位复现旧报告(Δ=0=环境零漂移,对不上=整对拍作废)。🔴 已知 off-by-one: `compare_detection_runs.py` 对已 0-based 的 `lesion_loc` 又减 1(位置 AUC 0.614 vs 训练侧 0.948)——云端 sed 已修;**本地修复+测试 fixture(沿用同一错误假设)须走 Gate2 一起改,生产链 `v21_output` 不受影响历史不翻案**(证据链:`docs/Opus战略咨询_冲80分_20260924.md` 附录A)。
+*   **CLI→入口函数最后一跳必须进接线审计**: `preextract_dynamic.main()` 收了 `--union-mask` 却没透传 `extract()`(默认参 False)——三轮审查全盯消费端漏了 main(),union e2e 测试直调 `extract()` 绕过 main() 故全绿(L2 第一弹实弹)。**Rule**: 任何"参数透传链"改动,审查清单与 e2e 测试必须覆盖 **main()/CLI 层进**,不能只测函数级;`gate2_paths` hook 已加 `^preextract_*.py$` 同源防漏。
+
 ## 2. SUBAGENT CODE REVIEW CHECKLIST (NON-QUANTIFIABLE LOGIC GATES)
 
 Audit all PyTorch/training code changes against this checklist:

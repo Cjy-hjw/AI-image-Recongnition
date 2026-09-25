@@ -232,8 +232,22 @@ def _parse_tirads(v) -> Optional[int]:
 def _parse_concept(v) -> Optional[int]:
     """CBM 概念(成分/回声/形状/边缘)→ 0-based 类索引 = 数字前缀-1。无前缀→None。
 
-    ⚠️ 编码映射待真实 xlsx 复核:此处仅做"数字前缀-1"的通用转换,真实列若非此编码
-       需在此调整。缺列/空 → 上游置 valid=0,masked-loss 跳过,不喂错标签。
+    🔴 **2026-09-26 R2 review P0-1 定案:官方表无独立概念列,此函数在生产
+    xlsx 上恒 None(监督结构性恒空)**。实测依据(数据探查证据链第13轮,
+    真实表头列 40-51 全序列):`ROI->CLINICAL->良恶性(40) / ROI->CLINICAL->
+    TI-RADS(41) / 主病灶标记(42) / 甲状腺癌存在标签(43) / ACR-TI-RADS分类(44)
+    / 病理结果-组织学(45) / 甲状腺外侵犯(46) / 主病灶位置(47) / 临床T分期(48)
+    / 临床N分期(49) / 临床M分期(50) / TI-RADS详细评分(51)`——**没有**
+    成分/回声/形状/边缘 独立列;`_FIELD_ALIASES` 候选名归一化永不命中 →
+    valid_*=0 全程静默。概念信息只存在于 `TI-RADS详细评分` 的复合串
+    (`成分:2分,回声:2分,形态:0分,边缘:0分,强回声:0分`,全表缺失 84.4%),
+    复合串格式 `成分:2分` 经数字前缀解析得 None(实测)。
+    → **ROI 概念监督(concepts_roi/债6)在官方数据上当前不可开**;
+    roi_concept_weight 保持 0;若将来要开,须:① 拆复合串解析(非数字前缀
+    列);② 与 TN3K 公开集口径对齐类索引(R2 P0-2:TN3K shape 用 h>w,
+    官方"形态:0分"=宽>高,两条链同类号反义;echo TN3K 仅 2 类,
+    官方 3/4 档公开集恒不存在)。二者都是数据侧前置,不是本函数内改
+    一个映射能解决的。
     """
     d = _digit_prefix(v)
     return None if d is None or d < 1 else d - 1
@@ -450,8 +464,15 @@ def _build_labels(rec: Dict, patient_id: str, lesion_id: str = "") -> Dict:
 # 三头 + TI-RADS 训练监督的实际来源列;命中列名候选表(_FIELD_ALIASES)全数缺失
 # 就等于该任务零监督——`_resolve_columns` 是精确字符串匹配、缺列不报错、只让
 # valid_*=0 全程静默。上云后第一时间用这个诊断确认列名候选是否命中真实表头。
+# 🔴 R2 review P1-2 修(2026-09-26):四概念并入告警名单——ROI 概念监督
+# (concepts_roi,债6)的标签来源就是这四个逻辑字段,列名 miss = 概念监督
+# 恒空静默(比四头更隐蔽:损失恒 0 与"概念简单已收敛"不可分)。实测(证据链
+# 第13轮,列40-51 全序列):官方表**无**独立 成分/回声/形状/边缘 列,概念
+# 信息只在 TI-RADS详细评分(列51)复合串里(缺 84.4%)→ 告警必响,恰好
+# 是"监督不可开"的正确首屏信号。
 _CLINICAL_LOGICAL_FIELDS = (
     "malignancy", "lesion_loc", "extrathy_ext", "clin_t_stage", "tirads",
+    "composition", "echogenicity", "shape", "margin",
 )
 
 
@@ -493,6 +514,7 @@ def _warn_missing_clinical_columns(colmap: Dict[str, Optional[str]]) -> None:
 def build_official_samples(
     root: str, xlsx_path: str, sheet_name: str = "ROI级别",
     union_mask: bool = False,
+    roi_meta: bool = False,
 ) -> List[Dict]:
     """扫描官方标注 + 影像目录,构造样本列表(照 pathology_dataset 的 build_* 模式)。
 
@@ -506,7 +528,24 @@ def build_official_samples(
           is_dynamic(bool), patient_key(=pid,供 patient_grouped_split), label(=malignancy,
           供分层), labels(完整 labels dict);
           union_mask=True 时额外携带 union_mask_paths(list[str],同图全部病灶 mask 路径,
-          像素级并集由读取端合成 —— 静态在 __getitem__,动态在 preextract_dynamic 导出)。
+          像素级并集由读取端合成 —— 静态在 __getitem__,动态在 preextract_dynamic 导出);
+          roi_meta=True 时额外携带 roi_lesions(list[dict]):该样本**影像**(同 img_dir
+          下全部 GT 病灶)的 per-lesion 元数据,每 dict =
+          {bbox_xyxy(原图像素,半开区间)/orig_w/orig_h/spacing_mm(恒 None,见下)/
+          lesion_id/label 子集(loc/ete/t/tirads/malignancy 的值+valid_*)/is_main/
+          frame_indices(动态病灶全部非零帧;静态 None)}。🔴 默认 False:旧调用
+          (preextract/train_official 等)零变化,旧 samples.pkl 无该键,消费端
+          (`roi_dataset.py`)判键存在再用。**旧 pkl + roi_meta=True 的组合不会
+          重建 pkl——roi_meta 只影响 build 路径,pkl 路径载入的旧样本无键,
+          下游判 `"roi_lesions" not in s` 降级,允许(与 union 的硬拒不同:
+          roi_lesions 是元数据增强不是监督语义,半开态只会让 ROI 采样器跳过
+          无键样本,不会让监督"号称开了实际没开")。**
+
+    spacing_mm 说明:官方影像侧无 spacing 可读(NIfTI 仿射是单位阵,nifti_io.py
+    `save_binary_mask` 注释;DICOM PixelSpacing 未在训练消费链出现过,云端
+    亦未实测报告)——**不得编造**(推断不得进硬失败路径,2026-08-14 教训),
+    恒 None 透传,物理 mm 尺度留给消费端(如 physical_diameter_from_mask)
+    在拿到真实 spacing 来源后再接。
     """
     records, colmap = parse_annotation_xlsx(xlsx_path, sheet_name)
     _warn_missing_clinical_columns(colmap)
@@ -554,6 +593,70 @@ def build_official_samples(
                     _union_by_dir.setdefault(_img_dir, [])
                     if _mp not in _union_by_dir[_img_dir]:
                         _union_by_dir[_img_dir].append(_mp)
+
+        # ROI 范式数据面(2026-09-25):同图全部 GT 病灶的 per-lesion 元数据,
+        # 按 img_dir 作用域收集(与 _union_by_dir 同构)。病灶行 → labels 由
+        # _build_labels 构造(与主循环同一次调用,零重复解析);bbox/原图尺寸/
+        # 非零帧由 _roi_lesion_meta 从 mask 文件算出。**每个 mask 文件只解压
+        # 一次**(进程内 memo,与 _UNION_READABLE_CACHE 同款考量:同图样本共享
+        # mask 集,逐病灶真解压 = 同一文件解 N 遍;这里无"跨构建失效"问题——
+        # build_official_samples 单次调用内构造、结果直接进样本 dict,不落
+        # 全局缓存,函数返回即释放)。
+        _roi_by_dir: Dict[str, List[Dict]] = {}
+        if roi_meta:
+            _meta_memo: Dict[str, Optional[Dict]] = {}
+            for rec in recs:
+                _roi = _cell_str(rec.get("roi_name"))
+                if not _is_lesion_roi(_roi):
+                    continue
+                _is_dyn, _img_dir = _row_img_dir(root, pid, rec, patient_is_dynamic)
+                _mp = _mask_path_for_roi(_img_dir, _roi)
+                # lesion_id 与主循环同式(:596 mask_path or img_dir::roi),
+                # 同一病灶多帧(动态)共享同一 id——键唯一性是病灶级聚合前提。
+                _lid = _mp or f"{_img_dir}::{_roi}"
+                _existed = any(d["lesion_id"] == _lid
+                               for d in _roi_by_dir.get(_img_dir, []))
+                if _existed:
+                    continue          # 同 img_dir 同病灶去重(动态多帧只进一次)
+                _labels = _build_labels(rec, pid, lesion_id=_lid)
+                if _mp is None:
+                    # 无 mask 文件:元数据无 bbox 可算,仍进列表(labels 可供
+                    # ROI 分类训练,valid_mask=0 语义与主循环一致)。
+                    # mask_path/patient_id(债2/债5,2026-09-25 训练侧接线):
+                    # mask_path=None → RoiDataset 不产 roi_mask 键(forward_roi
+                    # 全零兜底);patient_id 供 forward_roi 输出侧透传(数据面
+                    # 原本只产 patient_key,改名成本为零一并带上)。
+                    _entry = {
+                        "bbox_xyxy": None, "orig_w": None, "orig_h": None,
+                        "spacing_mm": None, "lesion_id": _lid,
+                        "frame_indices": None,
+                        "mask_path": None, "patient_id": pid,
+                        **{k: _labels[k] for k in _ROI_LABEL_KEYS},
+                    }
+                    _roi_by_dir.setdefault(_img_dir, []).append(_entry)
+                    continue
+                _m = _meta_memo.get(_mp, 0) if _mp in _meta_memo else None
+                if _mp not in _meta_memo:
+                    _meta_memo[_mp] = _roi_lesion_meta(_mp, _is_dyn)
+                    _m = _meta_memo[_mp]
+                if _m is None:
+                    # mask 读失败/全零:跳过该病灶的元数据(与 _static_mask
+                    # 容错语义一致,不阻塞其余病灶)。
+                    continue
+                _entry = {
+                    "bbox_xyxy": _m["bbox_xyxy"],
+                    "orig_w": _m["orig_w"], "orig_h": _m["orig_h"],
+                    "spacing_mm": None, "lesion_id": _lid,
+                    "frame_indices": _m["frame_indices"],
+                    # 债2/债5(2026-09-25 训练侧接线):GT mask 路径与患者 id
+                    # 随元数据下发——RoiDataset.__getitem__ 据此裁"该样本帧"的
+                    # roi_mask(与图像同一几何管线),forward_roi 输出侧读 patient_id。
+                    # pkl 路径注意:roi_lesions 只在 build 路径产出,旧 pkl 无键
+                    # (半开态由 roi_dataset 判键跳过,语义见 build docstring)。
+                    "mask_path": _mp, "patient_id": pid,
+                    **{k: _labels[k] for k in _ROI_LABEL_KEYS},
+                }
+                _roi_by_dir.setdefault(_img_dir, []).append(_entry)
 
         for rec in recs:
             roi = _cell_str(rec.get("roi_name"))
@@ -610,6 +713,13 @@ def build_official_samples(
                 # preextract_dynamic 的动态导出。mask_path=None 的行不进列表,
                 # 与 valid_mask=0 语义一致(无 mask 行不贡献分割监督)。
                 base["union_mask_paths"] = sorted(_union_by_dir.get(img_dir, []))
+            if roi_meta:
+                # ROI 范式数据面:同图全部病灶的元数据(收集器已按 img_dir 归好)。
+                # 浅拷贝共享 list 是**故意的**:同一 img_dir 的 N 个样本(动态多帧)
+                # 共享同一份元数据,病灶级语义不随样本帧变;消费端(roi_dataset)
+                # 只读不改。静态样本的 "orig_w/orig_h" 与该样本影像同栅格
+                # (mask 与影像同体素数)。
+                base["roi_lesions"] = _roi_by_dir.get(img_dir, [])
 
             if is_dynamic:
                 # 动态:从 mask 非零帧定位标注帧(主病灶 M 无 SliceIndex,定稿 §4.2 项6),
@@ -655,6 +765,87 @@ def _nonzero_mask_frames(mask_path: str) -> List[int]:
     """动态 mask 的非零帧原始帧号(0-based)——主病灶标注帧定位口径(定稿 §4.2 项6)。"""
     binf, idxs = _read_nifti_binmasks(mask_path)
     return [idx for idx, m in zip(idxs, binf) if m.any()]
+
+
+# ── per-lesion ROI 元数据(两阶段 ROI 范式 · 数据面,2026-09-25)─────────────────
+# ROI 范式(方案一)第二阶段需要在**原分辨率**逐病灶裁 ROI:每条样本额外携带
+# 该影像全部 GT 病灶的 bbox / 原图尺寸 / spacing / 四头标签子集,供
+# `src/dataset/roi_dataset.py`(per-lesion 采样器)消费。与 L2 union 同一收集
+# 范式(img_dir 作用域),但产出的是**元数据**而非像素并集——bbox 计算把每个
+# mask 只解压一次(build 级 memo),动态病灶的 frame_indices 与
+# `_nonzero_mask_frames` 同源同值。
+def _roi_lesion_meta(mask_path: str, is_dynamic: bool) -> Optional[Dict]:
+    """单个 GT mask → ROI 元数据(bbox/原图尺寸/动态非零帧)。mask 全零或读失败→None。
+
+    bbox 口径(🔴 勿改):
+    - **原图像素坐标、半开区间 xyxy**:`(x0, y0, x1, y1)` 即 `img[y0:y1, x0:x1]`
+      恰为外接框(x1/y1 = 最大非零列/行 + 1)。切片语义免 ±1 歧义,ROI 裁剪端
+      零换算。
+    - 静态:2D mask(实为 3D 单帧,`_read_nifti_binmasks` 转回 (1,H,W))唯一非零
+      帧的外接框。
+    - **动态:该病灶全部非零帧的外接框之并集**(病灶在视频里的空间总幅面)。
+      理由:ROI 范式按"病灶"裁,一个动态病灶的标注跨 3-5 帧,逐帧各出一个 bbox
+      会让同一 lesion_id 产出多个互相矛盾的 ROI 元数据;取并集幅面是唯一与
+      "per-lesion"粒度自洽的口径。消费端若需逐帧精确框,可据 `frame_indices`
+      自行重算(本函数已把非零帧号一并交出)。
+    - 坐标系 = `load_nifti_frames` 转置后的 (H,W) 帧坐标系(行=H、列=W),与
+      `_read_dcm_gray`/`_read_nifti_frame_gray` 读出的影像帧同栅格(mask 与影像
+      同体素数,定稿 §1.3),裁剪端 img[y0:y1, x0:x1] 直接可用。
+
+    `frame_indices`:动态病灶的全部非零帧号(与 `_nonzero_mask_frames` 逐位同值,
+    同一次解压的复用产物);静态恒 None(静态无帧维)。读失败(空 binf)→None,
+    与 `_static_mask` 读失败返回零图的容错语义一致——收集端跳过该病灶,不阻塞
+    其余病灶的元数据产出。
+    """
+    binf, idxs = _read_nifti_binmasks(mask_path)
+    if not binf:
+        return None
+    h, w = binf[0].shape[:2]
+    y0 = y1 = x0 = x1 = None          # None = 尚未见非零帧
+    frames: List[int] = []
+    for m, idx in zip(binf, idxs):
+        if not m.any():
+            continue
+        rows = np.where(m.any(axis=1))[0]     # 非零行
+        cols = np.where(m.any(axis=0))[0]     # 非零列
+        ry0, ry1 = int(rows[0]), int(rows[-1])
+        cx0, cx1 = int(cols[0]), int(cols[-1])
+        if y0 is None:
+            y0, y1, x0, x1 = ry0, ry1, cx0, cx1
+        else:
+            y0, y1 = min(y0, ry0), max(y1, ry1)
+            x0, x1 = min(x0, cx0), max(x1, cx1)
+        frames.append(int(idx))
+    if y0 is None:
+        return None                      # mask 存在但全零:无外接框可言
+    return {
+        "bbox_xyxy": (x0, y0, x1 + 1, y1 + 1),   # 半开区间:切片直接用
+        "orig_w": int(w),
+        "orig_h": int(h),
+        "frame_indices": frames if is_dynamic else None,
+    }
+
+
+# ROI 元数据携带的四头标签子集(值 + valid_*;与 _build_labels 同键同口径,
+# 训练侧 0-based 编码——lesion_loc 0..6 / extrathy_ext 0..3 / tirads 0..4)。
+# is_main 一并携带:ROI 头损失加权按官方口径筛主病灶(评审规则:三新维度仅
+# 针对匹配成功的主病灶)。
+# 债6(2026-09-25,概念监督):CBM 四概念键(composition/echogenicity/
+# shape/margin + valid_*)一并随元数据下发——ROI 概念头监督(concepts_roi)
+# 的标签来源;foci 官方无标注恒不携带。🔴 _ROI_SCALAR_KEYS
+# (roi_dataset.py)/_ROI_LABEL_RENAME 同步扩(键名单源三处同批改)。
+_ROI_LABEL_KEYS = (
+    "malignancy", "valid_malignancy",
+    "lesion_loc", "valid_lesion_loc",
+    "extrathy_ext", "valid_extrathy_ext",
+    "clin_t_stage", "valid_clin_t_stage",
+    "tirads", "valid_tirads",
+    "is_main",
+    "composition", "valid_composition",
+    "echogenicity", "valid_echogenicity",
+    "shape", "valid_shape",
+    "margin", "valid_margin",
+)
 
 
 def _read_nifti_frame_gray(path: str, frame_index: int) -> np.ndarray:
@@ -930,6 +1121,7 @@ def build_official_datasets(
     hflip_prob: float = 0.0,
     samples_pkl: Optional[str] = None,
     union_mask: bool = False,
+    roi_meta: bool = False,
 ) -> Tuple["OfficialThyroidDataset", "OfficialThyroidDataset"]:
     """便捷入口:构样本 → 患者分组切分 → 建 train/val Dataset。返回 (train_ds, val_ds)。
 
@@ -946,6 +1138,14 @@ def build_official_datasets(
     xlsx 并为定位动态非零帧解压 343 个 mask,实测 10-25 分钟,每次启动都付一遍。
     pkl 里的动态样本自带 `cache_img`/`cache_msk`,`__getitem__` 随之走 PNG 而非 .nii.gz。
     切分仍在此处按同一 `seed`/`val_frac` 现算,故换 seed 不必重跑预抽取。
+
+    `roi_meta`(2026-09-25 训练侧接线,债4 数据半):True 时 build 路径带
+    `roi_meta=True`(样本携带 `roi_lesions`,供 ROI train loader 经
+    `expand_roi_samples` 展开)。🔴 **与 samples_pkl 组合时做内容级双向校验**
+    (2026-09-26 R3 P0-1 修,与 union 同型):roi_meta=True 但 pkl 无键 → 拒
+    (旧模式产物);roi_meta=False 但 pkl 带键 → 拒(半开态)。**重建 roi 版
+    pkl 的命令 = `preextract_dynamic --roi-meta`**(此前该旗标不存在,roi 版
+    pkl 结构性不可产出,是 R3 P0-1 的根因)。默认 False 零回归。
     """
     # P1-2 修(2026-09-23 审查):memo 缓存每次构建清零 —— "先坏后修好再二次
     # 构建"场景不拿首次结论(残留会让报错指向"数据侧事故"而真因是缓存);
@@ -1003,8 +1203,30 @@ def build_official_datasets(
                 f"{samples_pkl} 是 union 版 pkl(meta.union_mask={bool(meta.get('union_mask'))}),"
                 f"但调用方未传 union_mask=True → 半开态:样本带键即走 union 分支,"
                 f"操作者以为关了实际开着。要么传 union_mask=True,要么用旧模式 pkl。")
+        # 🔴 R3 review P0-1 修(2026-09-26):roi_meta 的**内容级正向断言**
+        # (与 union 的①②同型,补齐 roi 侧的不对称)。三种组合:
+        #   ① roi_meta=True 但 pkl 无任何 roi_lesions 键 → 旧模式 pkl,
+        #      ROI loader 0 样本 = "号称开了 ROI 实际没开",拒(比训练启动期
+        #      的 len==0 守卫更早、指向产物本身);
+        #   ② roi_meta=False 但样本带 roi_lesions(roi 版 pkl) → 半开态:
+        #      下游按需读键不受影响,但操作者认知与产物不符 → 拒(同 union ②);
+        #   ③ 一致 → 放行。直建路径(else 分支)不经过本断言——build 时
+        #      roi_meta 即真实参,无"产物声称"可漂移。
+        _has_rkey = any(isinstance(s, dict) and "roi_lesions" in s
+                        for s in samples)
+        if roi_meta and not _has_rkey:
+            raise RuntimeError(
+                f"roi_meta=True 但 {samples_pkl} 无 roi_lesions 键(旧模式产物,"
+                f"ROI train loader 将 0 样本)。用 scripts/data/preextract_dynamic.py "
+                f"--roi-meta 重新生成 pkl。")
+        if not roi_meta and _has_rkey:
+            raise RuntimeError(
+                f"{samples_pkl} 是 roi_meta 版 pkl(样本带 roi_lesions 键),"
+                f"但调用方未传 roi_meta=True → 半开态。要么传 roi_meta=True,"
+                f"要么用旧模式 pkl。")
     else:
-        samples = build_official_samples(root, xlsx_path, sheet_name, union_mask=union_mask)
+        samples = build_official_samples(
+            root, xlsx_path, sheet_name, union_mask=union_mask, roi_meta=roi_meta)
     if not samples:
         raise RuntimeError(f"未在 {root} + {xlsx_path} 构造出任何样本,检查路径/表头")
     # 🔴 pkl 加载路径的文件级漂移防御(2026-09-14 实证):pkl 是历史快照,生成

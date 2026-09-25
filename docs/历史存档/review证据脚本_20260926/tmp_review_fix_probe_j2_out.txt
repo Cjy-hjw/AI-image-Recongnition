@@ -1,0 +1,14 @@
+======================================================================
+Probe J2: 整图 run_official_epoch → run_roi_epoch 串行(真 train_batch)
+======================================================================
+整图 epoch RAISE ValueError Target size (torch.Size([2])) must be the same as input size (torch.Size([2, 4]))
+整图 epoch 后 frozen 模块数: 519
+ROI epoch OK avg=2.6471142768859863 n=1
+第二轮整图 RAISE ValueError Target size (torch.Size([2])) must be the same as input size (torch.Size([2, 4]))
+
+======================================================================
+Probe J3: 两轮 ROI epoch(真 optimizer)→ ROI 头权重变化 + legacy 权重不动
+======================================================================
+ROI 头变化数: 27
+非 ROI(整图支路)参数变化数(同两轮内): 0
+示例 legacy 变化: []

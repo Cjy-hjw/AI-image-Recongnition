@@ -192,10 +192,27 @@ BCE+Dice——实现期前两变异曾真实存活,朴素对拍当场杀出)。
 sigmoid==1.0 → log(p/(1-p))=inf → NaN/Inf,NaN×valid_mask 屏蔽失效、
 GradScaler 静默跳步(r5 日志 seg_prob_max=1.0 证明饱和可达;Gate2 P0)。
 
-## 测试总数(单一权威,2026-09-23 实测)
+## 测试总数(单一权威,2026-09-26 实测)
 
-**全套 1366 collected**(2026-09-23 L1 悬崖加权 + L2 OR 广播热修后,`Demo_D` 环境实测,
-`pytest tests/ -q` 实跑 1365 passed+1 skipped;tiling 16 项另跑 16 passed;
+**全套 1555 collected**(**1554 passed + 1 skipped**,Demo_D 实测,2026-09-26
+硬前置 4 条落地后;主会话独立复跑 211.34s)。构成:基线 1377(2026-09-23)+
+ROI 训练侧四文件 77(`test_roi_records` 16+`test_roi_dataset` 12+`test_roi_model`
+23+`test_roi_losses` 24,收编主树)+推理侧 `test_roi_inference.py` 40(波5 39+
+P0-1 回归 1:静态路 mal confidence 必须 softmax——`test_static_mal_confidence_is_softmaxed_not_raw_logit`,
+裸 logit 直通=越界 [0,1] 官方按 0 垫底,静态 ON 路此前无数值断言)+
+**训练侧接线 `test_roi_train_wiring.py` 24**(2026-09-25 深夜,五债逐条:桥改名/
+roi_mask 四态+几何对拍/loader 键/调度 True+False 零回归/run_roi_epoch 真模型梯度/
+硬门三态/warm-start 白名单/mock 样本/roi_meta kwarg)+
+**推理侧 `test_roi_inference.py` +1(E2 P0-1)=41**:`test_run_roi_forward_real_model_contract`
+(真 MultiTaskThyroidModel 锚 run_roi_forward×forward_roi 契约——fake 签名曾把生产
+调用错位写进契约致 40 项全绿真模型必崩,此锚防同型错位再犯)+
+**硬前置 A/B 两路(2026-09-26,J.8)**:+36 = **A 路 test_roi_losses 24→40**
+(债6 概念监督 9:默认零回归/学习信号/valid 屏蔽/foci 零梯度/窄 dict raise/
+λ 可加性/变异杀测;k_ref 4:n≥4 逐位不变/n=1 压 4×/v=0 恒 0/eps 语义;
+§J.5b 三债 3:gt_ 桥源/LS>0 覆盖/device 断言)+**B 路 test_roi_ruler.py 13**
+(双实例 0.9975/0.0025 不摊平/动态帧均值与推理同构/整图链对拍)+
+**test_roi_ruler_geometry.py 7**(真 split_nodules 逐轴半开框相等断言 2D×3+3D×2+
+轴翻转 monkeypatch 变异收编×2——M2 坐标零区分力债清偿,CI 常态重放)。
 演进链 1104→1124→1133(阶段1方向A轮,详见下方历史条)→1150(阶段2 seg-only:
 `test_seg_only_schedule.py` 7 + `test_seg_only_losses.py` 10)→1151(Gate2 修复轮:`test_seg_only_losses.py` +1 接线断言/官方对拍/legacy-masked 等价)
 →1156(修复轮专审:`test_seg_only_gate.py` 新增 6——护栏纯函数终于有测试,
@@ -299,7 +316,7 @@ union gate 硬拒。+1 行透传,**测试计数不变**——union e2e 直调 ex
 main(),CLI→函数最后一跳零覆盖正是漏网根因,教训入订正史:接线审计清单必须含
 CLI 透传位,e2e 从 main()/CLI 层进。全量 1330 passed+1 skipped+preextract 16 项
 单跑通过(Demo_D))
-→1366(2026-09-23 L1 悬崖加权实现 + L2 云端实弹热修第二弹(OR 广播崩)两轮合计
+→1377(2026-09-23 L1 悬崖加权实现 + L2 云端实弹热修第二弹(OR 广播崩)两轮合计
 **+28**:
 **+27 = L1(plan 任务L1,lucky-nibbling-piglet v2)**:`test_cliff_loss.py` 新增
 27——零权重逐位回归/非自证分解(v 含 0:归一必须带 v,F3 变异杀测"不乘 v 直接
@@ -318,7 +335,7 @@ root cause 是 sklearn 在 torch 后加载)。
 `test_union_origres_or_no_broadcast_crash`:mask 原始分辨率≠img_size 时 union
 OR 不得 broadcast 崩(云端实弹 958×1303 vs 512×512);img_size=32 强制错配,
 静态 K=2 + 动态双帧全断言 (1,32,32)。
-全量 1365 passed+1 skipped=1366 collected(Demo_D 实测,2026-09-23))
+全量 1365 passed+1 skipped=1377 collected(Demo_D 实测,2026-09-23))
 →**1376 passed+1 skipped=1377** collected(2026-09-24 三路审查修复
 **+10**:`test_cliff_loss.py` 27→**37**——A-P0 **真 0.0 IoU=最硬悬崖 w=4**
 (pred 全零/GT 非零,旧 `<=0` 哨兵吞掉恰漏最该加压人口)/NaN 中性+一次性
@@ -327,6 +344,41 @@ warning/str 数值转型+脏值 TypeError fail-loud(三分流);C-P0 abort 门 4 
 C-P1 采集异常 try/finally 恢复 train 态(boom fixture);C-P2 lid 键 str
 规整(collate int→0-dim Tensor 键,str(.item()) 干净化);A-P0 stats 分母
 `v>0`→`v!=-1`(真 0.0 进分母进 boosted,JSONL 不再对最差一档零观测)。
+→**+77 ROI 四波(2026-09-25,新架构 §J;全量数未实跑,单文件合计 53+24)**:
+主树三波 `test_roi_records.py` 16(波1 尺子:整图路径逐位一致/K=1 等价/K=3
+不折叠/valid 过滤/病灶级聚合/Gate2 修复后补 dict-labels 守卫与 K=0 早退
+覆盖)+`test_roi_dataset.py` 12(波2 数据:roi_meta 默认关逐位一致/bbox=GT
+mask 外接框/collate lesion_id 保 list[str]/动态逐帧展开/ROI 裁剪可逆)+
+`test_roi_model.py` 23(波3 模型:forward_roi 键完整/**loc 搬运对拍
+diff=0**(范式开关)/坐标通道全局位置/physical_diameter 圆形反推/旧 forward
+逐位回归)+`test_roi_losses.py` 24(波4 损失:零权重逐位
+回归/四头手算对拍(location 已改条件分布口径)/分解测试/变异杀测/fail-loud;
+2026-09-25 已收编主树)+
+`test_roi_inference.py` 40(波5 推理:开关关 golden 逐字节 diff=0/sys.modules
+零污染/两结节四头独立(hot/cold 分支 FakeModel)/裁剪坐标可逆/动态 chunk 串行
+不展开/validate_roi_probs NaN/Inf/长度错三 raise/env 解析 6 值/无 forward_roi
+fail-loud/帧均值≠关键帧/缺 orig_img_np fail-loud/meta 键集契约/tiling 互斥 raise;
+FakeModel bound-method 坑=forward_roi 首参吃 model 自身;+1 P0-1 回归:静态路 mal
+confidence 必须 softmax 化,裸 logit 直通越界——2026-09-25 模型面 review 修)。
+**+36 硬前置两路(2026-09-26,J.8,全量 1554+1=1555 实测)**:
+`test_roi_losses.py` 24→40(+16:概念监督 9[默认零回归/学习信号/valid 屏蔽/
+foci 零梯度/窄 dict raise/λ 可加性/独立于 lambda_roi/变异杀测/shape 两类]/
+k_ref 4[n≥4 逐位不变/n=1 压 4×/v=0 恒 0/eps 语义注]/J.5b 三债 3)+
+**`test_roi_ruler.py` 13 新**(B 路尺子:同帧双实例 0.9975/0.0025 不摊平×6/
+动态帧均值与推理同构×2/两层组合×2/整图链零回归×3)+
+**`test_roi_ruler_geometry.py` 7 新**(M2 坐标债清偿:真 split_nodules 逐轴
+半开框**相等断言**(轴序+off-by-one 双杀)2D×3+3D×2+轴翻转 monkeypatch
+变异收编×2——CI 常态重放不依赖一次性证据)。
+
+**2026-09-26 训练端 review 修复轮(R1/R2/R3 三路,全量 1553+1+1flaky=1555)**:
+修复不新增测试文件,只**改既有断言**:`test_roi_train_wiring.py`
+validate_roi_epoch 键集断言 6→7 键(+`roi_size` 口径哨兵)、`_mock_roi_samples`
+断言改 bbox 渐变(16+i%8,恒 64² 内方形——R1 P2:mock 恒定 bbox 使 loc 头
+CoordConv 坐标通道零区分力);`test_preextract_parallel.py` 两个 fake_build
+签名加 `roi_meta` 形参(extract 透传新参,fixture 形参不齐会 TypeError)。
+**全量口径说明:1553 passed+1 skipped+1 failed=flaky**(`test_smoke_entrypoints
+::test_single_frame_dicom_passes` 的 subprocess 日志线程 GBK UnicodeDecodeError,
+单独复跑/整文件复跑均 pass,与改动零交集——Windows 间歇性,勿当回归)。
 
 (历史)1133 collected(2026-09-13 阶段1方向A轮,max_nodules env 化 +
 扫参轴三处联动):1104→1124(TTA 默认值翻转 +0/归因脚本扩展 +4/`conftest.py`
@@ -519,3 +571,4 @@ python -m pytest tests/test_phase_refactor.py -q
 ```
 
 所有 test 函数既可加入 `pytest`,也可作为 `python tests/test_xxx.py` 独立运行(每个文件底部有 `if __name__ == "__main__": pytest.main(...)`)。
+- 2026-09-26 推理侧 review 修复轮(J.10):test_roi_inference.py fixture  修(亮/暗块位置对齐 fullres 实例框+暗块 30→5;根因=ROI_PAD_RATIO 0.25→0 后旧 pad 几何下的区分力失效,41 passed)。**本机全量 pytest 不再跑**(两次蓝屏,pyarrow/OpenMP 内核崩,纪律 rules §1);判回归用邻域文件集(本 ROI 链=41+157+39+147)或 CI。

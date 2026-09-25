@@ -93,6 +93,72 @@ def aggregate_by_lesion(records: List[Dict]) -> List[Dict]:
     return out
 
 
+def aggregate_by_roi_instance(records: List[Dict]) -> List[Dict]:
+    """🔴 E1-F1(2026-09-25,ROI 上云硬前置②):**实例级**两层聚合 —— 与推理
+    ROI 路同构(`v21_output._run_roi_static/_run_roi_dynamic`)。
+
+    与 `aggregate_by_lesion`(帧级,整图链专属,**一字不动**)的差异:
+
+    - **层 1(实例内跨帧,动态)**:聚合键从 `lesion_id` 升为
+      `(lesion_id, instance_idx)` —— 同一实例跨多帧的记录按帧取均值
+      (malignancy 逐帧 softmax 后对**概率**取均值,与推理侧
+      `_aggregate_roi_frame_rows` 同式;其余四头概率/t_conf 逐帧算术平均)。
+    - **层 2(实例间独立)**:同帧/同 lesion 的多个实例(如 CCL 把同一 GT
+      病灶 split 出的多实例)**各自独立成记录,互相之间绝不平均** ——
+      推理侧同帧两实例得 0.9975/0.0025 两个独立置信度,尺子若摊平成 0.5
+      就是 E1 review F1 实锤的"本地 val 系统性乐观"。
+
+    `instance_idx` 由记录携带(`collect_roi_records` 从 roi_outputs/labels
+    dict 读取,生产方=模型输出侧)。**未携带的记录流(整图链/旧 GT 流)
+    在本函数下逐位等价于 `aggregate_by_lesion`**(缺省 instance_idx=0,
+    单实例语义)—— 退化保证有对拍测试钉死(`tests/test_roi_ruler.py`)。
+
+    均值字段集与 `aggregate_by_lesion` 完全同键(mal_prob/t_conf/
+    location_probs/ete_probs/ete_logits/tirads_probs/n_frames),供下游
+    同一套指标函数直接消费;`instance_idx` 一并保留在输出行里
+    (回读/诊断用,指标函数不消费它)。
+    """
+    order: List[tuple] = []
+    buckets: Dict[tuple, List[Dict]] = {}
+    for r in records:
+        key = (r["lesion_id"], int(r.get("instance_idx", 0)))
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(r)
+
+    out = []
+    for key in order:
+        group = buckets[key]
+        head = dict(group[0])
+        # 🔴 聚合键第二元必须是 int(与 dict(group[0]) 抄出的原值统一类型):
+        # 测试按 by_idx[r["instance_idx"]] 查行、回读按 int 比对,str/int
+        # 混型会让哈希查找静默 miss(不报错、查不到)。
+        head["instance_idx"] = int(key[1])
+        head["n_frames"] = len(group)
+        head["mal_prob"] = float(np.mean([g["mal_prob"] for g in group]))
+        head["t_conf"] = float(np.mean([g["t_conf"] for g in group]))
+        head["location_probs"] = np.mean(
+            [g["location_probs"] for g in group], axis=0
+        ).tolist()
+        head["ete_probs"] = np.mean(
+            [g["ete_probs"] for g in group], axis=0
+        ).tolist()
+        # ete_logits 的"组内全有才聚合"判据与 aggregate_by_lesion 逐字同款
+        # (见其注释:拦混合来源 records 的部分帧缺键,不猜不填零)。
+        if all("ete_logits" in g for g in group):
+            head["ete_logits"] = np.mean(
+                [g["ete_logits"] for g in group], axis=0
+            ).tolist()
+        else:
+            head.pop("ete_logits", None)
+        head["tirads_probs"] = np.mean(
+            [g["tirads_probs"] for g in group], axis=0
+        ).tolist()
+        out.append(head)
+    return out
+
+
 def _safe_auc(y_true, y_score) -> Optional[float]:
     """单类/空集返回 None 而非抛异常 —— 早期 epoch 的 val 子集常只剩一类。"""
     if len(y_true) < 2 or len(set(y_true)) < 2:
@@ -350,7 +416,7 @@ def _sanitize_seg_dice(seg_dice) -> Optional[float]:
 
 
 def compute_official_metrics(
-    records: List[Dict], seg_dice=None
+    records: List[Dict], seg_dice=None, *, aggregation=None
 ) -> Dict[str, Optional[object]]:
     """从 `collect_official_records` 的逐样本记录算全部官方口径指标。
 
@@ -360,6 +426,12 @@ def compute_official_metrics(
             **并入 composite**;None(默认)则 composite 仍是纯分类均值,老调用点零回归。
             **只接受 [0,1] 内的有限值**,越界/NaN/Inf 一律整体丢弃(`seg_dice` 键写
             None、不进 composite)。
+        aggregation: 聚合函数(keyword-only,2026-09-25 E1-F1 硬前置②)。
+            None(默认)= `aggregate_by_lesion` —— **整图链调用点零改动、逐位
+            不变**(整图链判线依赖 1519 全绿基线,是本参数的硬红线);
+            ROI 记录流传 `aggregate_by_roi_instance`(实例级两层聚合,与
+            推理侧同构:同实例跨帧均值 + 实例间绝不平均)。接口契约:
+            `list[dict] → list[dict]`,输出行含指标函数消费的全部字段。
     Returns:
         dict:`malignancy_auc_pr` / `location_weighted_auc` / `ete_weighted_kappa`
         / `clinical_t_auc` / `tirads_weighted_kappa` / `seg_dice` / `n_lesions`。任一
@@ -394,7 +466,7 @@ def compute_official_metrics(
             "ete_logit_mean_per_class": None,
         }
 
-    rows = aggregate_by_lesion(records)
+    rows = (aggregation or aggregate_by_lesion)(records)
     # 值类型是 `object`(不是 `float`):除评分指标外还要并入 backlog #128 的诊断
     # 监控,其中 `ete_pred_hist`/`ete_logit_mean_per_class` 是 list[float]。
     metrics: Dict[str, Optional[object]] = {

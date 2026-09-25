@@ -365,7 +365,7 @@ def run_dynamic_inference_from_result(case_result, *, seg_threshold=None,
     del binary_frames, soft_frames
     out = []
     for inst in instances:
-        # 镜像生产 _build_entries_and_save_masks:稀疏实例逐个 restore,
+        # 镜像生产 _build_entries_and_save_slices:稀疏实例逐个 restore,
         # conf 与 IoU 消费共用,用完即弃(峰值恒 1 份全尺寸)。
         if "mask_sparse" in inst:
             full_mask = restore_instance_mask(inst["mask_sparse"], full_shape)
@@ -1126,7 +1126,7 @@ def _combo_rows(case_result, post, gts: list, is_dynamic: bool,
     ②动态例 soft 驻留估算按**原图分辨率**算(resize 后),750 帧×802×1442×4B
     ≈3.47GB/例,不是 512² 的 0.75GB;③case 级生命周期(循环完即弃),不跨 case
     缓存。另外 post() 返回的动态实例是逐实例 restore 的全尺寸 mask(N 份同时
-    驻留,生产 _build_entries_and_save_masks 才是逐个用完即弃)。
+    驻留,生产 _build_entries_and_save_slices 才是逐个用完即弃)。
     """
     rows = []
     for combo in combos:

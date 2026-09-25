@@ -80,6 +80,114 @@ def _grow_threshold(dynamic: bool, thr_seed: float) -> float:
     return t
 
 
+def _to_np(v) -> np.ndarray:
+    """标量/向量 → 一维 numpy(先 `.detach().cpu()`——CUDA 张量直接 `np.asarray`
+    会炸 "can't convert cuda tensor";torch/np/list 输入统一到 np 路径)。
+    🔴 `.float()` 先行(2026-09-26 R-B F2 修):bf16 张量 `.numpy()` 直接
+    TypeError("Got unsupported ScalarType BFloat16");生产 precision 默认 fp16
+    可转,但 bf16 是合法配置值(runner `_VALID_PRECISIONS`)且 `run_roi_forward`
+    无 autocast/无 `.float()` 补偿(model_runner 整图路径 :168-172 有)——
+    谁切 bf16 谁当场崩在 `_to_np`。统一在此收口,零成本防御。"""
+    if isinstance(v, torch.Tensor):
+        v = v.detach().cpu().float()
+        v = v.numpy()
+    return np.asarray(v, dtype=np.float64).reshape(-1)
+
+
+def assert_finite(task: str, prob) -> bool:
+    """概率含 NaN/Inf 即硬报错,拒绝导出"看起来正常"的无效分布。
+
+    (2026-09-25 ROI 接线:由 `decode_predictions` 的内嵌闭包 `_assert_finite`
+    **原样提升为模块级**——ROI 路径(`validate_roi_probs`)与 decode 共用同一条
+    有限性防线;逐位行为不变:同 `torch.isfinite(...).all()` 判据、同
+    `NonFiniteProbabilityError`、同消息文案。)
+
+    两个后果都不可接受(2026-07-29 /code-review 实测复现):
+    ① `torch.argmax` 对全 NaN 向量**静默返回 0** —— logits=[0.2, nan, 1.5, -0.3]
+       时真实最大值在 idx=2,却报 idx=0,报告会打印一个错误的 TI-RADS 分项;
+    ② `json.dumps` 把 NaN 写成字面量 `NaN`,这是 **非标准 JSON**,严格解析器
+       (Go/Rust/Jackson 默认)会拒绝**整个** result.json —— 等于该样本零输出,
+       比预测错更严重。
+    与 `report_generator.generate_report` 对 malignancy_prob 的既定处置同范式
+    (硬拦截、交上层 except 转 ERROR),但覆盖面扩到全部分类头——generate_report
+    只校验恶性标量,管不到四个概念头。**2026-07-30 起连 mask 也罩**(sigmoid 后):
+    NaN logits 经 sigmoid 得 NaN,`(NaN > 0.5)` 恒 False 会静默产出全零分割图,
+    而 status=PASSED、报告正常——比报错更隐蔽,评测只看 JSON 察觉不到分割已废。
+
+    校验的是**激活后的概率**而非输入 logits:`-inf` 经 softmax/sigmoid 得 0,
+    分布仍有限、仍和为 1(数学含义即"该类概率为 0"),属合法输出不该拦。
+
+    抛 `NonFiniteProbabilityError`(`ValueError` 子类):视频逐帧循环靠这个**专属
+    类型**区分「概率无效可丢帧」与「其它 ValueError 是故障须冒泡」——若抛基类
+    ValueError,cv2/numpy 在畸形帧上抛的同类型异常会被误当可丢帧吞掉。
+    """
+    if not torch.isfinite(prob).all():
+        raise NonFiniteProbabilityError(
+            f"decode_predictions: {task} 概率含 NaN/Inf(logits 数值异常或权重损坏)"
+            f"——拒绝导出无效分布(argmax 会静默返回 0,NaN 还会写出非标准 JSON)"
+        )
+    return prob
+
+
+# ROI 单条输出的逐键长度契约(与 `collect_roi_records` docstring 逐字对齐;
+# 类别数常量取自 label_schema/heads,单一权威,不抄数字)。
+_ROI_LEN_MALIGNANCY = 2
+
+
+def validate_roi_probs(roi_out: dict) -> None:
+    """ROI 单条输出(`run_roi_forward` 返回的一条)的维度/有限性硬校验。
+
+    - `malignancy` 长度 2 → 过 finite(**原始 logits,不 softmax 也拦**:NaN logits
+      是上游数值故障的信号,提前拦比留到 softmax 后拦报错点更靠近根因);
+    - `location_probs`(7) / `ete_probs`(4) / `ete_logits`(4) / `tirads_probs`(5)
+      → 长度硬校验 + finite;
+    - `t_conf` 标量 → finite。
+
+    维度错 raise `ValueError`(长度错 = 上游取错头,静默继续会 argmax 出错误编码
+    ——理由与 `decode_predictions._head_probs` 212-220 行同款:下游一律 argmax+1,
+    长度错时若 argmax 恰落在合法值域内,就会**静默产出错误编码**,JSON 完全合法、
+    该维度按错值计分,本地永远查不出来)。finite 错抛 `NonFiniteProbabilityError`
+    (与 decode 同一条防线,消息同源)。
+
+    torch 张量/list 输入均可(张量先 `.detach().cpu().numpy()`——CUDA 张量直接
+    `np.asarray` 会崩,`_to_np` 小助手)。
+    """
+    if not isinstance(roi_out, dict):
+        raise ValueError(
+            f"validate_roi_probs 期望 dict(per-lesion 输出),得到 {type(roi_out).__name__}"
+        )
+
+    def _check_len(key, n_expect):
+        v = _to_np(roi_out[key])
+        if v.shape != (n_expect,):
+            raise ValueError(
+                f"{key} 维度契约不符:期望 ({n_expect},),实得 {tuple(v.shape)}。"
+                f"说明 ROI 头类别数与交付 schema 不一致,或上游取错了头——"
+                f"继续下去会 argmax 出错误编码且不报错。"
+            )
+        assert_finite(key, torch.from_numpy(v))
+
+    mal = _to_np(roi_out["malignancy"])
+    if mal.shape != (_ROI_LEN_MALIGNANCY,):
+        raise ValueError(
+            f"malignancy 维度契约不符:期望 ({_ROI_LEN_MALIGNANCY},),"
+            f"实得 {tuple(mal.shape)} —— 良恶性头是二分类。"
+        )
+    assert_finite("malignancy", torch.from_numpy(mal))
+
+    _check_len("location_probs", NUM_LOCATIONS)
+    _check_len("ete_probs", len(ETE_CODES))
+    _check_len("ete_logits", len(ETE_CODES))
+    _check_len("tirads_probs", NUM_TIRADS_CLASSES)
+
+    t_conf = _to_np(roi_out["t_conf"])
+    if t_conf.shape != (1,):
+        raise ValueError(
+            f"t_conf 期望标量,实得 shape {tuple(t_conf.shape)}"
+        )
+    assert_finite("t_conf", torch.from_numpy(t_conf))
+
+
 def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False,
                        mask_prob_override=None) -> dict:
     """Extract all prediction fields from raw model outputs.
@@ -109,34 +217,11 @@ def decode_predictions(outputs: dict, calibrator=None, *, dynamic: bool = False,
     def _cal(task, logits):
         return calibrator.apply(task, logits) if calibrator is not None else logits
 
+    # 2026-09-25 ROI 接线:原内嵌闭包 `_assert_finite` 提升为模块级
+    # `assert_finite`(ROI 路径 `validate_roi_probs` 共用同一条防线),
+    # 此处仅保留薄代理——判据/异常/消息逐位不变。
     def _assert_finite(task, prob):
-        """概率含 NaN/Inf 即硬报错,拒绝导出"看起来正常"的无效分布。
-
-        两个后果都不可接受(2026-07-29 /code-review 实测复现):
-        ① `torch.argmax` 对全 NaN 向量**静默返回 0** —— logits=[0.2, nan, 1.5, -0.3]
-           时真实最大值在 idx=2,却报 idx=0,报告会打印一个错误的 TI-RADS 分项;
-        ② `json.dumps` 把 NaN 写成字面量 `NaN`,这是 **非标准 JSON**,严格解析器
-           (Go/Rust/Jackson 默认)会拒绝**整个** result.json —— 等于该样本零输出,
-           比预测错更严重。
-        与 `report_generator.generate_report` 对 malignancy_prob 的既定处置同范式
-        (硬拦截、交上层 except 转 ERROR),但覆盖面扩到全部分类头——generate_report
-        只校验恶性标量,管不到四个概念头。**2026-07-30 起连 mask 也罩**(sigmoid 后):
-        NaN logits 经 sigmoid 得 NaN,`(NaN > 0.5)` 恒 False 会静默产出全零分割图,
-        而 status=PASSED、报告正常——比报错更隐蔽,评测只看 JSON 察觉不到分割已废。
-
-        校验的是**激活后的概率**而非输入 logits:`-inf` 经 softmax/sigmoid 得 0,
-        分布仍有限、仍和为 1(数学含义即"该类概率为 0"),属合法输出不该拦。
-
-        抛 `NonFiniteProbabilityError`(`ValueError` 子类):视频逐帧循环靠这个**专属
-        类型**区分「概率无效可丢帧」与「其它 ValueError 是故障须冒泡」——若抛基类
-        ValueError,cv2/numpy 在畸形帧上抛的同类型异常会被误当可丢帧吞掉。
-        """
-        if not torch.isfinite(prob).all():
-            raise NonFiniteProbabilityError(
-                f"decode_predictions: {task} 概率含 NaN/Inf(logits 数值异常或权重损坏)"
-                f"——拒绝导出无效分布(argmax 会静默返回 0,NaN 还会写出非标准 JSON)"
-            )
-        return prob
+        return assert_finite(task, prob)
 
     def _softmax_head(task, logits):
         """→ (完整概率向量 np.ndarray, argmax 索引 int)。

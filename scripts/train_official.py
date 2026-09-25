@@ -60,7 +60,7 @@ from src.training.schedule_official import (
     get_official_stage,
 )
 from src.training.loop.bn_freeze import set_frozen_modules_eval
-from src.training.loop.train_step import train_batch
+from src.training.loop.train_step import train_batch, _roi_labels_from_meta
 from src.training.trainer import validate_epoch
 
 
@@ -145,6 +145,14 @@ def build_official_head_config(config: dict) -> dict:
         # 非 0 时 train_step 按前代 IoU 缓存查表注入 targets["cliff_weights"]
         # (见 compute_segmentation_loss docstring 的 cliff 段)。
         "seg_cliff_weight": float(tr.get("seg_cliff_weight", 0.0)),
+        # 🔴 ROI 范式损失组(2026-09-25,Gate2 A 路 P1-2 修复):默认 0 零回归;
+        # 此前 yaml 写了键但本函数不组装 → config→MultiTaskLoss 透传链断裂,
+        # yaml 层开关永远到不了损失层(r7 config 静默不读事故同型)。权重非 0
+        # 时 compute_roi_head_losses(四头 ROI 损失)生效。
+        "roi_head_weight": float(tr.get("roi_head_weight", 0.0)),
+        # 债6(2026-09-25,方案 A 简化版):ROI 概念头监督,默认 0 零回归。
+        # 同上透传链——漏此行 = yaml 开关到不了损失层。
+        "roi_concept_weight": float(tr.get("roi_concept_weight", 0.0)),
     }
     return cfg
 
@@ -174,9 +182,17 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     # 无 aux 键属预期——从旧权重热启动深监督实验是**标准路径**(aux 头随机
     # 初始化 + 主链继承)。列入白名单与四头同待遇;缺任何其他键仍 fail-loud。
     aux_pfx = MultiTaskThyroidModel.SEG_AUX_PREFIXES
+    # ROI 头(2026-09-25 训练侧接线,债3):旧底座(分割/四头全量权重)不含
+    # ROI 头 46 键属**预期冷启**(新头随机初始化,`--roi-heads` 的设计语义:
+    # backbone 热启 + ROI 头冷启)。列入白名单——这兑现了
+    # multi_task_model.py:275-279 注释"合法化点在 train_official 的 ROI
+    # 白名单(训练侧挂)"的声称(注释在 models 领地不改,由本处代码兑现)。
+    # 缺任何其他键(白名单外)仍 fail-loud。
+    roi_pfx = MultiTaskThyroidModel.ROI_HEAD_PREFIXES
     bad_missing = [
         k for k in result.missing_keys
         if not k.startswith(head_pfx) and not k.startswith(aux_pfx)
+        and not k.startswith(roi_pfx)
     ]
     if bad_missing:
         raise RuntimeError(
@@ -208,6 +224,13 @@ def load_warm_start(model: nn.Module, ckpt_path: str, device) -> None:
     if n_aux_missing:
         print(f"--> [warm-start] 深监督辅助头 {n_aux_missing} 键随机初始化"
               f"(旧 checkpoint 无 aux 键,任务D 标准路径)")
+    # ROI 头键计数(债3,分口径同 aux):旧底座缺全部 ROI 键 = 预期冷启,
+    # 但同样必须打进日志(stdout 可见,防"以为 ROI 头热启动了其实是随机"的
+    # 误读;G1 挡不住"认知与事实错位"这一类,日志是唯一防线)。
+    n_roi_missing = sum(1 for k in result.missing_keys if k.startswith(roi_pfx))
+    if n_roi_missing:
+        print(f"--> [warm-start] ROI 头 {n_roi_missing} 键随机初始化"
+              f"(冷启动新头,预期行为;backbone 由本 checkpoint 热启)")
 
 
 
@@ -325,8 +348,20 @@ def smoke_grad_health(model: nn.Module, criterion: nn.Module, device):
             # 拦住冒烟;真训练的注入由 train_step 查表完成。
             **({"cliff_weights": torch.ones(B, device=device)}
                if getattr(criterion, "seg_cliff_weight", 0.0) > 0.0 else {}),
+            # ROI 范式(债4,2026-09-25):整图前向无 ROI 键,权重>0 时
+            # compute_roi_head_losses 会 fail-loud 拒空算(整图冒烟不产
+            # roi_outputs/roi_labels)。冒烟里 ROI 支路由 run_roi_epoch 的
+            # MockROI loader 真跑(见 main 的 roi_train_loader),本函数只验
+            # **整图头**梯度健康——故此处把 ROI 键以空 list 显式注入
+            # (K=0 空批合法路径,损失侧同型早退返回 0)——而非关权重:
+            # 关权重会让"配置非 0"这件事在冒烟日志里隐形。
+            "roi_labels": [],
         }
         outputs = model(img)
+        if getattr(criterion, "roi_head_weight", 0.0) > 0.0:
+            # K=0 空批:损失侧合法早退(与 smoke_grad_health 的整图职责一致,
+            # 理由见 targets 组装段的 ROI 注释)
+            outputs = {**outputs, "roi_outputs": []}
         loss, loss_dict = criterion(outputs, targets, enable_mal_loss=True)
         loss.backward()
         return float(loss.item())
@@ -836,6 +871,267 @@ def _abort(logger, epoch: int, reason: str, message: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ROI 范式训练支路(债4 的执行半,2026-09-25 训练侧接线)
+# ─────────────────────────────────────────────────────────────────────────────
+# 设计(2026-09-26 R1 审查订正,勿改):ROI 训练用**独立 RoiDataset train loader**
+# (与整图 train_loader 并行、各自 DataLoader),`train_step.train_batch` 不动(整图
+# 支路照旧);epoch 内**先整图 run_official_epoch → 再 run_roi_epoch**。
+# 🔴 梯度语义(此前注释写"两次 backward 之间无 zero_grad,梯度累积"——与代码
+# 相反,订正):两支路是**串行两套独立 step**——train_batch 在每个整图 batch 内
+# 自完成 zero_grad→backward→clip→scaler.step;run_roi_epoch 每个 ROI batch 同样
+# 自完整一套。整图 epoch 结束时整图梯度已被消费,不存在跨支路累积;两支路
+# 各自 clip(clip_grad_norm_ 都对 optimizer.param_groups 全参数集,对方支路
+# 参数 p.grad is None 时天然跳过,范数分母只计本支路活跃梯度——语义安全,
+# 但"梯度范数口径不独立"是事实,记录于此)。改这条时序(如真做累积)属
+# 改变优化轨迹的行为改动,须单独立项+对拍。
+# 损失只算 ROI 四头(整图损失在整图 epoch 已算)。
+
+# ROI 支路 batch 大小(病灶数/batch)。K 量级:每图 1-3 病灶、约 6.6k 样本
+# → 数千 ROI 条;224² 单通道前向远轻于整图 512²,batch 32 无显存压力。
+_ROI_BATCH_SIZE = 32
+
+# 🔴 E2 review P2-1 修复(2026-09-25):ROI 训练尺寸单源。此前 4 处硬编码
+# 224 + 横幅误印 config.data.img_size(512)——训练 224 vs 推理 512 的口径
+# 差由此被横幅掩盖。推理侧 build_roi_batch 吃 runner 的 config img_size
+# (512);两侧尺寸不同是**已知域差异**(encoder+头跨尺寸未对拍),冻结前
+# 若要对齐须改这里+runner 一处并跑 224-vs-512 对拍,勿只改一侧。
+_ROI_TRAIN_SIZE = 224
+
+
+def _meta_rows_from_collate(metas):
+    """roi_collate 的 dict-of-lists → list[dict](forward_roi 契约形态)。
+
+    债4 转置桥:collate 把数值键堆 [K] tensor、str/list 键保 list;forward_roi
+    逐条 `.get()` 读每病灶的 dict。转置逻辑与
+    `roi_dataset.roi_labels_from_meta` 的批形态分支同式(单源复用其转置,
+    这里只是显式入口——两处必须同步,改一处查另一处)。
+    """
+    from src.dataset.roi_dataset import roi_labels_from_meta
+
+    return roi_labels_from_meta(metas)      # 转置(无 gt_ 改名语义也无害:
+    #   改名只作用于 5 个 label 键的键名,值原样;forward_roi 不读 gt_* 键)
+
+
+def _move_roi_masks_to_device(metas, device):
+    """R1 review P0-1 修(2026-09-26):meta 里的 roi_mask(CPU,RoiDataset 产)
+    → device。forward_roi 的 ETE band/d_mm 消费 roi_masks 时与 roi_images
+    (已 to(device))相乘——设备不一致 = RuntimeError,ROI 支路在 CUDA 上 100%
+    起不来(本机真 CUDA 已复现:RoiExtensionHead(spatial_cuda, mask_cpu) 必崩)。
+    测试 fixture 全 CPU + mock 无 roi_mask 键 → 全仓此前无一处让此路径在 GPU
+    上跑过。**只迁 cpu 张量**(已在 device 的 no-op,防重复搬运);None/非张量
+    原样跳过(缺键 = forward_roi 全零兜底语义,不是搬运失败)。
+    run_roi_epoch 与 validate_roi_epoch 两处同修(共用本助手)——单修训练漏
+    验证,val 同一 loader 同崩。"""
+    for m in metas:
+        rm = m.get("roi_mask")
+        if isinstance(rm, torch.Tensor) and rm.device.type != device.type:
+            m["roi_mask"] = rm.to(device)
+
+
+def run_roi_epoch(model, roi_loader, optimizer, criterion, scaler, device,
+                  epoch, logger, log_every, head_lr, amp_enabled=True):
+    """跑一个 ROI epoch(债4:逐 batch forward_roi → 四头损失 → backward)。
+
+    损失编排:`compute_roi_head_losses(outputs, targets, lambda_roi=...)` 只准
+    import 不准改(领地红线);超参从 criterion 读(ete_focal_gamma 等——
+    MultiTaskLoss 已持有同键,单一配置源)。targets 只装 `roi_labels`(桥自
+    collate 后的 meta dict);outputs 只装 `roi_outputs`——本支路**直连**
+    compute_roi_head_losses 而不走 criterion.forward(整图损失组件需要整图
+    outputs 键,本支路不产;良恶性不在 ROI 编排内是**契约**(该 docstring),
+    ROI 头的 cbm 消费链由整图支路的 malignancy 损失继续监督)。
+
+    AMP:与整图支路同款 autocast+scaler;CPU 时调用方传 amp_enabled=False
+    (train_batch 的 autocast(device_type="cuda") 在 CPU 上须关,同款约束)。
+
+    梯度观测:返回 (avg_loss, n_batches);首个 ROI epoch 后的梯度检查在
+    main 循环里做(打印 FATAL 但不停,照 cliff abort 门型但只打不停)。
+    """
+    from src.models.losses.components.roi_heads import compute_roi_head_losses
+
+    model.train()
+    set_frozen_modules_eval(model)
+    running, n = 0.0, 0
+    for batch_idx, (imgs, metas) in enumerate(roi_loader):
+        imgs = imgs.to(device)
+        # collate 后的 metas 是 dict-of-lists;forward_roi 契约吃 **list[dict]**
+        # (multi_task_model.py docstring:roi_meta 逐条 dict,数值键解包归
+        # 调用方)——用桥函数转置(债1 的同一条转置路径,meta 逐条重建)。
+        _metas = _meta_rows_from_collate(metas)
+        # R1 P0-1:roi_mask 上设备(见 _move_roi_masks_to_device docstring)
+        _move_roi_masks_to_device(_metas, device)
+        roi_labels = _roi_labels_from_meta(_metas)
+        targets = {"roi_labels": roi_labels}
+        optimizer.zero_grad()
+        with torch.autocast(device_type="cuda", enabled=amp_enabled,
+                            dtype=torch.bfloat16):
+            outputs = model.forward_roi(imgs, _metas)
+            # 债6(2026-09-25):传**完整**返回 dict——四头只读 roi_outputs 键
+            # (多传无害),概念监督(concepts_roi)读顶层 roi_concepts 键;
+            # 旧窄化 {"roi_outputs": ...} 会在 roi_concept_weight>0 时被
+            # concepts_roi fail-loud 拒掉(概念 logits 在顶层,不在逐病灶 dict)。
+            loss, detail = compute_roi_head_losses(
+                outputs, targets,
+                lambda_roi=float(getattr(criterion, "roi_head_weight", 0.0)),
+                ete_class_weights=getattr(criterion, "ete_class_weights", None),
+                ete_focal_gamma=float(getattr(criterion, "ete_focal_gamma", 2.0)),
+                tirads_class_weights=getattr(criterion, "tirads_class_weights", None),
+                tirads_label_smoothing=float(getattr(criterion, "tirads_label_smoothing", 0.0)),
+                tirads_ordinal_weight=float(getattr(criterion, "tirads_ordinal_weight", 0.0)),
+                concept_weight=float(getattr(criterion, "roi_concept_weight", 0.0)),
+            )
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            [p for g in optimizer.param_groups for p in g["params"]],
+            max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        running += float(loss.item())
+        n += 1
+        if logger is not None and batch_idx % log_every == 0:
+            logger.log(epoch=epoch, step=batch_idx, phase="train",
+                       loss=float(loss.item()), lr=head_lr,
+                       extra={"roi_branch": True, **_roi_detail_extra(detail)})
+    return running / max(n, 1), n
+
+
+def _roi_detail_extra(detail: dict) -> dict:
+    """ROI 损失分项 → JSONL extra(键恒在的子集,round 6;非标量跳过)。"""
+    out = {}
+    for k, v in (detail or {}).items():
+        try:
+            out[f"loss_{k}"] = round(float(v.item() if hasattr(v, "item") else v), 6)
+        except (TypeError, ValueError, RuntimeError):
+            continue
+    return out
+
+
+def validate_roi_epoch(model, roi_val_loader, device):
+    """ROI val:逐 batch forward_roi → collect_roi_records → roi_metrics(债4)。
+
+    🔴 **ROI 指标只观测不进选模**(注释即防自作主张):composite/选模逻辑
+    照旧只消费整图 val 指标(val_dice/分类五项)——ROI 指标是新头冷启的
+    **观测面**(roi_* 键进 epoch 级 JSONL 供回读),掺进 composite 会让
+    "整图不退化"的选模语义被未标定的新量污染(与 ete_monitor_metrics 不进
+    composite 同一纪律)。
+
+    返回 dict:`roi_loc_auc/roi_ete_kappa/roi_t_auc/roi_tirads_kappa/
+    roi_mal_auc_pr/roi_n_records/roi_size`(None 透传——"算不出"不填 0,与
+    _epoch_metrics_extra 的 None 纪律一致;roi_size 恒数值=训练域尺寸哨兵,
+    224 域指标与 512 推理不可比,见返回处注释)。空 loader → 全 None + n=0。
+    """
+    from src.training.collect_roi_records import collect_roi_records, roi_metrics
+
+    # 🔴 R1 P1 修(2026-09-26):逐模块记 training 态——只还原顶层布尔会把
+    # set_frozen_modules_eval 置 eval 的冻结 BN 翻回 train,running stats 被
+    # 本 val 的前向污染(ROI+L1 同开时,紧随其后的 _collect_cliff_ious 在
+    # 污染态下采集)。全量快照逐模块还原,与 _collect_cliff_ious 同级防御。
+    prev_modes = {id(m): m.training for m in model.modules()}
+    model.eval()
+    records: list = []
+    try:
+        with torch.no_grad():
+            for imgs, metas in roi_val_loader:
+                imgs = imgs.to(device)
+                _metas = _meta_rows_from_collate(metas)
+                # R1 P0-1 同修:val loader 同一 RoiDataset 产 CPU roi_mask
+                _move_roi_masks_to_device(_metas, device)
+                roi_labels = _roi_labels_from_meta(_metas)
+                outputs = model.forward_roi(imgs, _metas)
+                records.extend(
+                    collect_roi_records(outputs["roi_outputs"], roi_labels))
+    finally:
+        for m in model.modules():
+            m.training = prev_modes.get(id(m), m.training)
+    m = roi_metrics(records)
+    # 🔴 R1 P1 修(2026-09-26):口径哨兵——roi_* 六键在 224 训练域算出,
+    # 与推理 512 域数值不可比(t_auc 由 d_mm 驱动/ete 由 band 驱动,均随
+    # ROI 尺寸漂移)。研究者在 JSONL 侧判"ROI 头是否可用"时若拿它当
+    # 512 推理一致性判据会拿到系统性偏移结论。字段钉死口径,判读免歧义。
+    return {
+        "roi_loc_auc": m.get("location_weighted_auc"),
+        "roi_ete_kappa": m.get("ete_weighted_kappa"),
+        "roi_t_auc": m.get("clinical_t_auc"),
+        "roi_tirads_kappa": m.get("tirads_weighted_kappa"),
+        "roi_mal_auc_pr": m.get("malignancy_auc_pr"),
+        "roi_n_records": len(records),
+        "roi_size": _ROI_TRAIN_SIZE,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MockROI(债4 mock 半):手构小 RoiDataset,bbox 给在 64² 图上(20:40),
+# 不依赖 MockOfficialDataset 改造(整图 mock 零改动)。无 GT mask 文件 →
+# 无 mask_path → roi_mask 缺键 → forward_roi 全零兜底(契约仍真实可验:
+# 四头前向真跑、损失真算,mask 语义=阴性)。冒烟就是验真模型前向。
+# ─────────────────────────────────────────────────────────────────────────────
+def _mock_roi_samples(n: int = 12, img_size: int = 64, seed: int = 0):
+    """手构 roi_samples list(expand_roi_samples 产物形态)。"""
+    rng = np.random.RandomState(seed)
+    s = img_size
+    out = []
+    for i in range(n):
+        # R1 P2 修(2026-09-26):bbox/global_loc 按 i 渐变——此前恒 (20,20,40,40)
+        # / (30/s,30/s),loc 头的全局位置通道在 mock 冒烟里恒定,坐标分支
+        # (bbox→CoordConv)的真实接线零区分力。渐变保持 64² 内、mask 语义不变
+        # (无 GT mask,bbox 只驱动裁剪几何与 loc 头输入)。
+        _b = 16 + (i % 8)
+        x0 = y0 = _b
+        x1 = y1 = _b + 20
+        out.append({
+            "img_path": f"mock::roi::{i}",
+            "is_dynamic": False,
+            "frame_index": None,
+            "patient_key": f"mockpid::{i % 4}",
+            "patient_id": f"mockpid::{i % 4}",
+            "lesion_id": f"mockroi::{i}",
+            "bbox_xyxy": (x0, y0, x1, y1),
+            "orig_w": s, "orig_h": s,
+            "spacing_mm": None,
+            "global_loc": ((x0 + x1) / 2.0 / s, (y0 + y1) / 2.0 / s),
+            "mask_path": None,      # mock 无 GT mask → 键缺失路(forward_roi 兜底)
+            "malignancy": int(rng.randint(0, 2)), "valid_malignancy": 1,
+            "lesion_loc": int(rng.randint(0, 7)), "valid_lesion_loc": 1,
+            "extrathy_ext": int(rng.randint(0, 4)), "valid_extrathy_ext": 1,
+            "clin_t_stage": int(rng.randint(0, 2)), "valid_clin_t_stage": 1,
+            "tirads": int(rng.randint(0, 5)), "valid_tirads": 1,
+            "is_main": 1 if i % 4 != 3 else 0,
+        })
+    return out
+
+
+def _write_mock_dcm(path: str, arr: np.ndarray):
+    """写最小可读 MONOCHROME2 8bit DICOM(测试侧 _make_dcm 同型,内联防 import)。
+
+    mock RoiDataset 的 `_read_frame` 走 `_read_dcm_gray`(pydicom),PNG/裸字节
+    会被当坏 DICOM 拒读——mock 图像必须是真 DICOM。
+    """
+    from pydicom.dataset import Dataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+
+    ds = Dataset()
+    ds.Rows, ds.Columns = int(arr.shape[0]), int(arr.shape[1])
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.PixelRepresentation = 0
+    ds.PixelData = arr.astype(np.uint8).tobytes()
+    fm = FileMetaDataset()
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    fm.MediaStorageSOPClassUID = generate_uid()
+    fm.MediaStorageSOPInstanceUID = generate_uid()
+    ds.file_meta = fm
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
+    try:
+        ds.save_as(path, write_like_original=False)          # pydicom 2.x
+    except TypeError:                                        # pydicom 3.x
+        ds.save_as(path, enforce_file_format=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -867,6 +1163,13 @@ def main():
                         help="L2 union 监督(plan 任务 L2):同图全部 GT 病灶 mask 并集"
                              "作分割监督。须配 --samples-pkl 为 union 版 preextract 产物"
                              "(loader 对旧 pkl + union 硬拒)")
+    parser.add_argument("--roi-heads", action="store_true",
+                        help="ROI 范式训练:独立 RoiDataset train/val loader + "
+                             "forward_roi 支路(epoch 内先整图后 ROI),ROI 头冷启 "
+                             "46 键(warm-start 白名单)。须重建 roi 版 samples.pkl"
+                             "(build_official_datasets roi_meta=True;旧 pkl 无 "
+                             "roi_lesions 键 → ROI loader 0 样本,入口硬拒)或走 "
+                             "直建路径(不传 --samples-pkl)")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--log-dir", default=OFFICIAL_LOG_DIR,
                         help=f"JSONL 日志目录;默认云端 {OFFICIAL_LOG_DIR},本地传 logs")
@@ -899,11 +1202,16 @@ def main():
     # ——阶段2 把 config 权重改成非 0 后,任何不带 --seg-only 的重训也会静默
     # 消费它们(r7 同型泄漏),必须横幅可见。
     _hc = config["train"]
+    # 🔴 R2 P1-2 修(2026-09-26):roi_concept_weight 必须进横幅——它是 ROI 支路
+    # 第二个实验变量,漏印 = "yaml 改错无人见"(r7 config 静默不读事故同型;
+    # 且概念监督当前**结构性恒空**,见下方 ROI 门提示,横幅是唯一首屏防线)。
     print(f"[seg 损失配方] boundary_weight={_hc.get('seg_boundary_weight', 0.0)} "
           f"lovasz_weight={_hc.get('seg_lovasz_weight', 0.0)} "
           f"ccdice_weight={_hc.get('seg_ccdice_weight', 0.0)} "
           f"deepsup_weight={_hc.get('seg_deepsup_weight', 0.0)} "
-          f"cliff_weight={_hc.get('seg_cliff_weight', 0.0)}"
+          f"cliff_weight={_hc.get('seg_cliff_weight', 0.0)} "
+          f"roi_head_weight={_hc.get('roi_head_weight', 0.0)} "
+          f"roi_concept_weight={_hc.get('roi_concept_weight', 0.0)}"
           f"{' (SEG_ONLY 实验变量)' if args.seg_only else ''}")
     # 🔴 ETE 小试的三个启动硬门(Gate2 审查 F1/F2/F4,2026-09-12):
     # ① --ete-only 必须配 --resume-from(r5 全量权重)——漏传则 ETE 头从随机
@@ -974,6 +1282,48 @@ def main():
               f"各不降超 0.01,对照 epoch=0 基线;🔴 dice 硬门已删 2026-09-18,"
               f"上线资格以训后快照官方口径筛为准)")
 
+    # ── --roi-heads 四硬门(债4 接线,2026-09-25;照 seg_only 门型)──────────
+    # ① 与 --seg-only/--ete-only 互斥:两个 only 模式冻结一切只留单链,
+    #    ROI 头 requires_grad=False → forward_roi 支路零梯度 = 白烧;
+    # ② 须 --resume-from:ROI 头冷启但 **backbone 必须热启**(随机 backbone
+    #    上冷启 46 键新头,整轮白烧)。mock 冒烟豁免(合成数据无真底座可热启,
+    #    冒烟只验管道数值健康——豁免理由与 ETE/seg_only 门对 mock 的处理同型);
+    # ③ 须版本化 --out(basename 判,反斜杠/绝对路径不绕过);
+    # ④ 真训(非 smoke 非 1ep)须 config.train.roi_head_weight > 0:
+    #    全 0 = ROI 支路算了损失但 λ=0(精确零梯度)= 空 ROI 微调白烧
+    #    (compute_roi_head_losses 权重 0 早退,照 seg_only 全 0 门同型)。
+    if args.roi_heads:
+        if args.seg_only or args.ete_only:
+            parser.error("--roi-heads 与 --seg-only/--ete-only 互斥"
+                         "(两 only 模式冻结一切只留单链,ROI 头无梯度 = 白烧)")
+        if not args.resume_from and not args.mock_labels:
+            parser.error("--roi-heads 必须配 --resume-from(ROI 头冷启但 backbone "
+                         "必须热启,否则整轮白烧);mock 冒烟豁免(合成数据无真底座)")
+        if os.path.basename(args.out) == "official_heads_best.pth":
+            parser.error("--roi-heads 必须显式传版本化 --out(默认路径是冒烟产物名,"
+                         "与真实产物分不出来)")
+        roi_w = float(config["train"].get("roi_head_weight", 0.0))
+        if args.smoke is False and epochs > 1 and roi_w <= 0.0:
+            parser.error("--roi-heads 真训须 config.train.roi_head_weight > 0"
+                         "(全 0 = 空 ROI 微调白烧:损失早退 λ=0 精确零梯度;"
+                         "权重 0 的 1ep 量级标定放行,照 seg_only 门型)")
+        # 🔴 R2 P1-2 修(2026-09-26):概念监督健康判据进启动面——
+        # roi_concept_weight>0 时,训练 JSONL 的 concept_n_valid_* 恒 0
+        # = 概念标签链断(当前**已知结构性恒空**:官方表无独立概念列,
+        # 信息只在 TI-RADS详细评分 复合串里,详见 official_loader
+        # _parse_concept 注释)。首屏提示判据,防 20ep 白烧无人知。
+        concept_w = float(config["train"].get("roi_concept_weight", 0.0))
+        if concept_w > 0.0:
+            print(f"[ROI-heads 配方] ⚠️ roi_concept_weight={concept_w}>0:"
+                  "官方表无独立概念列(成分/回声/形状/边缘 候选名实测不命中),"
+                  "概念监督大概率恒空——concept_n_valid_* 恒 0 即坐实,"
+                  "20ep 概念头零学习,建议权重归 0 再发轮")
+        print(f"[ROI-heads 配方] roi_head_weight={roi_w} "
+              f"roi_concept_weight={concept_w} "
+              f"roi_size={_ROI_TRAIN_SIZE}(训练;推理=512 已知域差异) "
+              f"epochs={epochs}"
+              f"(ROI 头冷启46键,债3白名单;epoch 内先整图后 ROI 双支路)")
+
     # ── --out 可写性预检(fail-fast,必须在任何耗时操作之前)──────────────────
     # 为什么要有:`torch.save` 失败会抛异常直接中断训练,而保存只发生在每轮 val
     # 之后 —— 35 epoch 跑到第 30 轮才发现写不进去,前面全部白跑。
@@ -1023,17 +1373,30 @@ def main():
         n_val = 8 if args.smoke else 24
         train_ds = MockOfficialDataset(n=n_train, img_size=img_size, seed=seed)
         val_ds = MockOfficialDataset(n=n_val, img_size=img_size, seed=seed + 100)
+        # ROI 支路 mock(债4):手构 MockROI(64² 图 bbox 按 i 渐变,无 GT mask →
+        # roi_mask 缺键 forward_roi 兜底)。冒烟就是验真模型前向,故用真
+        # MultiTaskThyroidModel 的 forward_roi 跑(不用 FakeModel)。
+        roi_train_samples = _mock_roi_samples(
+            n=(12 if args.smoke else 32), img_size=64, seed=seed)
+        roi_val_samples = _mock_roi_samples(
+            n=(6 if args.smoke else 16), img_size=64, seed=seed + 100)
     else:
         if not args.data_root or not args.xlsx:
             parser.error("非 --mock-labels 模式必须给 --data-root 与 --xlsx")
         from src.dataset.augmentation import get_train_transforms
         from src.dataset.official_loader import build_official_datasets
+        # roi_meta=True(债4 数据半):样本携带 roi_lesions,供 ROI loader 展开。
+        # 🔴 与 samples_pkl 组合时 pkl 载入不重建 → 无 roi_lesions 键 →
+        # ROI loader 0 样本(下方硬拒,不静默空跑)。
         train_ds, val_ds = build_official_datasets(
             args.data_root, args.xlsx, img_size=img_size, seed=seed,
             train_transform=get_train_transforms(), hflip_prob=args.hflip_prob,
             samples_pkl=args.samples_pkl,
             union_mask=args.union_mask,
+            roi_meta=args.roi_heads,
         )
+        roi_train_samples = None      # 真数据路径:ROI 样本从 val_ds/train_ds 提取
+        roi_val_samples = None
     num_workers = 0 if (args.smoke or device.type == "cpu") else config["environment"]["num_workers"]
     # persistent_workers(2026-09-12):num_workers>0 时保持 worker 进程跨 epoch
     # 存活,省每轮的进程池重建(12 workers ≈ 每 epoch 2-5s × 35ep)。
@@ -1049,6 +1412,65 @@ def main():
         pin_memory=(device.type == "cuda"), worker_init_fn=seed_worker,
         persistent_workers=_persist,
     )
+
+    # ── ROI 支路 loader(债4;--roi-heads 才建,默认 None 零回归)────────────
+    roi_train_loader = None
+    roi_val_loader = None
+    if args.roi_heads:
+        from src.dataset.roi_dataset import RoiDataset, roi_collate, expand_roi_samples
+        if args.mock_labels:
+            # 🔴 mock RoiDataset 需要真实可读 img_path:_read_frame 走
+            # _read_dcm_gray(pydicom)——PNG 会被当 DICOM 读崩。mock 图像内容
+            # 无关紧要,直接写**最小可读 DICOM**(复用测试侧 _make_dcm 同型
+            # 手构,但测试文件不可 import——此处内联最小版)到 log 目录旁。
+            _mock_roi_dir = os.path.join(args.log_dir, "mock_roi_imgs")
+            os.makedirs(_mock_roi_dir, exist_ok=True)
+            roi_train_samples = _mock_roi_samples(
+                n=(12 if args.smoke else 32), img_size=64, seed=seed)
+            roi_val_samples = _mock_roi_samples(
+                n=(6 if args.smoke else 16), img_size=64, seed=seed + 100)
+            for _s in roi_train_samples + roi_val_samples:
+                _p = _s["img_path"]
+                if not _p.startswith("mock::"):
+                    continue
+                _fp = os.path.join(_mock_roi_dir, _p.split("::")[-1] + ".dcm")
+                if not os.path.exists(_fp):
+                    _write_mock_dcm(_fp, np.full((64, 64), 120, np.uint8))
+                _s["img_path"] = _fp
+            roi_train_ds = RoiDataset(roi_train_samples, roi_size=_ROI_TRAIN_SIZE)
+            roi_val_ds = RoiDataset(roi_val_samples, roi_size=_ROI_TRAIN_SIZE)
+        else:
+            # 真数据:整图 train/val Dataset 的 samples 经 expand_roi_samples
+            # 展开(患者分组切分已在 build_official_datasets 内做,ROI 样本
+            # 继承同一切分 → 无跨集泄漏)。
+            roi_train_ds = RoiDataset(
+                expand_roi_samples(train_ds.samples), roi_size=_ROI_TRAIN_SIZE)
+            roi_val_ds = RoiDataset(
+                expand_roi_samples(val_ds.samples), roi_size=_ROI_TRAIN_SIZE)
+            # 🔴 旧 pkl 硬拒(任务书:不是静默空跑):0 样本 = pkl 无
+            # roi_lesions 键(半开态)——"号称开了 ROI 实际 0 样本"与
+            # --limit 残件同类,须重建 roi 版 samples.pkl 或走直建路径。
+            if len(roi_train_ds) == 0:
+                parser.error(
+                    "--roi-heads 但 ROI train loader 0 样本 —— "
+                    f"{'--samples-pkl ' + str(args.samples_pkl) + ' 是旧产物(无 roi_lesions 键)' if args.samples_pkl else '样本构造为空'};"
+                    "重建 roi 版 samples.pkl(preextract 重跑)或去 pkl 用直建路径")
+        _roi_workers = 0 if (args.smoke or device.type == "cpu") else num_workers
+        roi_train_loader = DataLoader(
+            roi_train_ds, batch_size=_ROI_BATCH_SIZE, shuffle=True,
+            num_workers=_roi_workers, pin_memory=(device.type == "cuda"),
+            worker_init_fn=seed_worker, generator=loader_gen,
+            collate_fn=roi_collate,
+            persistent_workers=_roi_workers > 0,
+        )
+        roi_val_loader = DataLoader(
+            roi_val_ds, batch_size=_ROI_BATCH_SIZE, shuffle=False,
+            num_workers=_roi_workers, pin_memory=(device.type == "cuda"),
+            worker_init_fn=seed_worker, collate_fn=roi_collate,
+            persistent_workers=_roi_workers > 0,
+        )
+        print(f"--> [ROI loader] train={len(roi_train_ds)} 条 / "
+              f"val={len(roi_val_ds)} 条病灶级样本(batch={_ROI_BATCH_SIZE})")
 
     # ── 模型 + 损失 ───────────────────────────────────────────────────────
     # mock/冒烟不加载 ImageNet 预训练(省时,合成数据无意义);真训按 config.
@@ -1127,6 +1549,11 @@ def main():
     prev_stage = None
     best_composite = -1.0
     saw_head_grad = False
+    # ROI 支路状态(债4):权重从 config 透传读(criterion 同源);梯度检查
+    # 只在首个 ROI epoch 后做一次;前缀动态读模型常量(单源)。
+    _roi_weight = float(build_official_head_config(config).get("roi_head_weight", 0.0))
+    _roi_grad_checked = False
+    _ROI_PFX = MultiTaskThyroidModel.ROI_HEAD_PREFIXES
     # L1 悬崖加权(权重>0 才激活;_last_cliff_stats 进 epoch 级 JSONL extra)
     _cliff_enabled = float(
         build_official_head_config(config).get("seg_cliff_weight", 0.0)) > 0.0
@@ -1137,7 +1564,7 @@ def main():
             param_groups, head_lr, stage_name = configure_official_stage(
                 model, criterion, epoch, lr_base, config["train"]["weight_decay"],
                 freeze_legacy=args.freeze_legacy, ete_only=args.ete_only,
-                seg_only=args.seg_only,
+                seg_only=args.seg_only, roi_heads=args.roi_heads,
             )
             cur_stage = get_official_stage(epoch)
             if args.ete_only:
@@ -1160,6 +1587,41 @@ def main():
                 logger, log_every, head_lr,
             )
             saw_head_grad = True  # run_official_epoch 跑通即四头参与了 backward
+
+            # ── ROI 支路(债4,--roi-heads 且权重>0 才跑;先整图后 ROI)──────
+            # 梯度语义见 :876 设计注释(2026-09-26 订正):两支路串行两套
+            # 独立 step,无跨支路累积。ROI 头梯度观测:首个 ROI epoch 后检查
+            # 任一 roi_*_head 参数 .grad 非空(零 = 接线断,打印 FATAL 但不停
+            # ——照 cliff abort 门型但只打不停,云上人判)。
+            # 🔴 R1 P0-1 已修(2026-09-26):run/validate_roi_epoch 内
+            # _move_roi_masks_to_device(此前 roi_mask 恒 CPU,ROI 支路在 CUDA
+            # 上 100% 必崩,测试 fixture 全 CPU 测不出)。
+            # 🔴 mock 冒烟下 ROI 支路权重=0(config 默认)→ 不跑 ROI epoch,
+            # 冒烟只验整图管道 + ROI loader/前向冒烟在 smoke_grad_health 外
+            # 不覆盖——专门验前向的入口是 --roi-heads 真训;mock 冒烟要跑
+            # ROI 支路须临时改 config 权重(冒烟不走 0 权重硬门)。
+            roi_extra = None
+            if roi_train_loader is not None and _roi_weight > 0.0:
+                roi_avg_loss, _n_roi = run_roi_epoch(
+                    model, roi_train_loader, optimizer, criterion, scaler,
+                    device, epoch, logger, log_every, head_lr,
+                    amp_enabled=bool(config["train"].get("amp", True))
+                    and device.type == "cuda")
+                if not _roi_grad_checked and epoch >= 1:
+                    _roi_grad_checked = True
+                    _grads_ok = any(
+                        p.grad is not None and p.grad.abs().sum().item() > 0
+                        for n, p in model.named_parameters()
+                        if n.startswith(_ROI_PFX))
+                    if not _grads_ok:
+                        print(f"[FATAL] ROI 头梯度全零(epoch {epoch})——"
+                              f"forward_roi/损失/optimizer 接线断,后续 epoch "
+                              f"全部白烧;不自动停机(云上人判),排查 "
+                              f"ROI_HEAD_PREFIXES/param_groups/run_roi_epoch")
+                # ROI val(只观测不进选模,见 validate_roi_epoch docstring)
+                roi_extra = validate_roi_epoch(model, roi_val_loader, device)
+                print(f"  [ROI] ep{epoch} loss={roi_avg_loss:.4f} "
+                      + " ".join(f"{k}={v}" for k, v in roi_extra.items()))
 
             # ── L1 悬崖加权:epoch 尾采前代 IoU 回填缓存(plan 任务L1)──────
             # 顺序在 train 之后、validate 之前:本 epoch 刚训完的权重才是
@@ -1196,11 +1658,15 @@ def main():
             # 刷新,全程等于瞎跑。JsonlLogger 逐行 flush、不受管道缓冲影响。
             # V2.1 契约核对(`赛事开发规范-赛道七V2.1提取.md:10-65`):必填仅
             # timestamp/epoch/step/phase/mode/data_source,额外字段不禁止。
+            _extra = _epoch_metrics_extra(metrics, val_dice, val_acc, val_auc,
+                                          avg_loss,
+                                          cliff_stats=_last_cliff_stats or None)
+            if roi_extra is not None:
+                # ROI 指标(None 透传;只观测不进选模,见 validate_roi_epoch)
+                _extra.update(roi_extra)
             logger.log(
                 epoch=epoch, step=0, phase="val", loss=float(val_loss), lr=head_lr,
-                extra=_epoch_metrics_extra(metrics, val_dice, val_acc, val_auc,
-                                           avg_loss,
-                                           cliff_stats=_last_cliff_stats or None),
+                extra=_extra,
             )
             print(
                 f"Epoch {epoch:02d}/{epochs} [{stage_name}] train_loss={avg_loss:.4f} "

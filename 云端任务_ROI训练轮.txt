@@ -1,0 +1,132 @@
+云端任务:ROI 支路训练轮(1ep 标定 → 20ep → 快照诊断判线)
+
+做 4 件事:传包 → 标定 → 训练 → 回报。**不要改代码、不要调超参、不要动
+cloud_infer 交付权重**(训练树与交付树无关)。有疑问就停下来问。
+输出**原样**回报,不要总结。
+
+════════════════════════════════════════════════════════════════
+
+## 0. 部署包(训练树,解压覆盖)
+
+`cloud_train_roi.zip` 含 21 文件(训练编排/数据管线/ROI 损失组/模型面/config):
+
+```bash
+cd /root/cloud_train_pkg
+unzip -o /2026aicompetition/workspace/cloud_train_roi.zip
+sha256sum -c SHA256SUMS.txt        # 应全 OK,报错就停
+# 核对 config(必须看到 roi_head_weight 一行):
+grep -n "roi_head_weight\|roi_concept_weight" configs/thyroid_config.yaml
+# 预期:roi_head_weight: 0.0(标定前占位)/ roi_concept_weight: 0.0
+```
+
+🔴 云端 config 是可变状态(r7 事故)。grep 不对就停,别开训。
+
+════════════════════════════════════════════════════════════════
+
+## 1. 重建 roi 版 samples.pkl(必须,旧 pkl 无 roi_lesions 键)
+
+旧 samples.pkl 无 roi_lesions → ROI loader 0 样本,训练启动守卫会拒。
+用**全新 cache-dir**(物理隔离,勿复用旧 frames/):
+
+```bash
+export PYTHONPATH=/2026aicompetition/workspace/pylibs${PYTHONPATH:+:$PYTHONPATH}
+python -u scripts/data/preextract_dynamic.py \
+    --data-root /2026aicompetition/datasets/training/annotation \
+    --xlsx /2026aicompetition/datasets/training/annotation/甲状腺_标注结果_训练集.xlsx \
+    --cache-dir /root/cache_roi \
+    --roi-meta \
+    --workers 8
+# 先跑 --limit 3 验管道(约 1 分钟),确认输出有 "[ROI] ..." 相关无报错后再全量。
+# 全量约 35-45 分钟。完成后:
+ls /root/cache_roi/samples.pkl && grep -c roi_lesions /dev/null 2>/dev/null; echo "下一步验键"
+python -c "
+import pickle
+d = pickle.load(open('/root/cache_roi/samples.pkl','rb'))
+n = sum(1 for s in d['samples'] if 'roi_lesions' in s)
+print('带 roi_lesions 样本数:', n, '/', len(d['samples']))
+print('meta:', d['_meta'].get('roi_meta'))
+# 预期:动态样本全部带键(>1000);meta.roi_meta=True。n=0 → 停,回报。
+"
+```
+
+════════════════════════════════════════════════════════════════
+
+## 2. 1ep 标定 λ_roi(先跑这个,不烧 20ep)
+
+λ_roi 标定协议(DR 决策点 2,预注册):**η=0.15-0.25 目标占比**,
+λ = η × L̄_seg / L̄_roi_raw(L̄ = 1ep 各自平均损失,从 JSONL/日志尾部取)。
+
+```bash
+mkdir -p /2026aicompetition/workspace/logs/roi_calib_backup
+mv /2026aicompetition/workspace/logs/*.jsonl /2026aicompetition/workspace/logs/roi_calib_backup/ 2>/dev/null
+
+cd /root/cloud_train_pkg
+PYTHONPATH=/2026aicompetition/workspace/pylibs nohup python -u scripts/train_official.py \
+    --data-root /2026aicompetition/datasets/training/annotation \
+    --xlsx /2026aicompetition/datasets/training/annotation/甲状腺_标注结果_训练集.xlsx \
+    --samples-pkl /root/cache_roi/samples.pkl \
+    --resume-from checkpoints/official_heads_seg_best.pth \
+    --roi-heads \
+    --epochs 1 \
+    --out checkpoints/roi_calib_1ep.pth \
+    > /2026aicompetition/workspace/train_roi_calib.log 2>&1 &
+tail -f /2026aicompetition/workspace/train_roi_calib.log
+```
+
+盯启动横幅(判据,全中才继续):
+- `[ROI-heads 配方] roi_head_weight=... roi_size=224(训练;推理=512 已知域差异)`
+- `[warm-start] ROI 头 46 键随机初始化(冷启动新头,预期行为)`
+- `--> [ROI loader] train=... 条`(样本数 >5000;**0 条=旧 pkl,停**)
+- ep1 结束打 `[ROI] ep1 loss=... roi_size=224`
+
+**标定计算**(训完 1ep 后):
+从日志/JSONL 取:整图 `loss`(或 seg 主项)均值 L̄_seg;`[ROI] ep1 loss=` 的
+L̄_roi_raw。算 λ = 0.2 × L̄_seg / L̄_roi_raw(η 取 0.2 居中),回报三个数
+(L̄_seg / L̄_roi_raw / 算出的 λ)等确认后进 20ep。
+
+════════════════════════════════════════════════════════════════
+
+## 3. 20ep 正式训练(标定 λ 确认后)
+
+```bash
+# 改 config(只改这一行,λ 用标定值):
+sed -i "s/roi_head_weight: 0.0/roi_head_weight: <标定λ>/" configs/thyroid_config.yaml
+# grep 核对生效:
+grep -n "roi_head_weight" configs/thyroid_config.yaml
+
+cd /root/cloud_train_pkg
+PYTHONPATH=/2026aicompetition/workspace/pylibs nohup python -u scripts/train_official.py \
+    --data-root /2026aicompetition/datasets/training/annotation \
+    --xlsx /2026aicompetition/datasets/training/annotation/甲状腺_标注结果_训练集.xlsx \
+    --samples-pkl /root/cache_roi/samples.pkl \
+    --resume-from checkpoints/official_heads_seg_best.pth \
+    --roi-heads \
+    --epochs 20 \
+    --out checkpoints/roi_heads_ep20.pth \
+    > /2026aicompetition/workspace/train_roi_20ep.log 2>&1 &
+```
+
+健康判据(每条不中=停机回报):
+- ep1-3:loss 有限无 NaN;`[ROI] epN loss=` 在降或稳;
+- ep1 后**无** `[FATAL] ROI 头梯度全零`(有=接线断,停);
+- JSONL 逐 ep 有 `roi_branch` 行 + `roi_size=224` 键;
+- ⚠️ 看到 `⚠️ roi_concept_weight=...>0` 警告 = config 被人改过,概念监督
+  在官方数据上恒空(已知限制),**roi_concept_weight 保持 0** 别动。
+
+快照在 ep4/8/12/16/20 自动落(--out 同名 _epN 后缀,seg_only 同款)。
+
+════════════════════════════════════════════════════════════════
+
+## 4. 回报清单(原样贴回)
+
+1. §0 的 sha256 全 OK + config grep 输出
+2. §1 的"带 roi_lesions 样本数"两行
+3. §2 启动横幅全文 + `[ROI] ep1 loss=` 行 + **L̄_seg / L̄_roi_raw / 算出 λ**
+4. 20ep 后:`ls -lh checkpoints/ | grep roi` + 最后 3 个 `[ROI] epN` 行 +
+   JSONL 尾部 2 行(epoch 级,含 roi_* 键)
+
+回滚:训练树任何问题不影响交付(cloud_infer 旧代码旧权重 69.64 独立)。
+
+════════════════════════════════════════════════════════════════
+附:判线(20ep 训完后做,另行任务书):快照诊断 vs L2 ep16 基线
+(静态匹配 0.8702/AP 0.8488),晋级线 Δ匹配≥+0.012 且 ΔAP≥+0.008 AND 门。

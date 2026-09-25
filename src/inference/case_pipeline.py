@@ -217,6 +217,29 @@ def diagnose_static_case(model, img_np, config, calibrator, precision, device):
     """
     img_size = config["data"]["img_size"]
 
+    # --- ROI 分流开关记录(2026-09-25 第五波,ROI 两阶段范式推理面) ---
+    # 路由裁决(交接文档 §2.3):ROI 前向放 v21_output(实例所在层,split_nodules
+    # 在 _write_static/_write_dynamic 内才跑);本层**只记开关** + tiling 互斥守卫,
+    # 绝不在此重跑 split_nodules(两次分割的实例序无保证对齐,四头值会错挂且不报错)。
+    # 开关解析与 roi_pipeline.roi_heads_enabled 同款("1"/"true"/"on"/"yes" 为真,
+    # 其余含未设全假);**inline 镜像而非 import**——关时 sys.modules 零污染
+    # (roi_pipeline import torch + cv2 链,测试断言 sys.modules 无它,先例
+    # test_roi_records.py::test_roi_module_not_imported_on_whole_image_path)。
+    # v21_output 内部也**不读 env**——开关状态只经 roi_ctx 流入(runner 构建)。
+    _roi_raw = os.environ.get("AICOMP_ROI_HEADS", "0").strip().lower()
+    _roi_on = _roi_raw in ("1", "true", "on", "yes")
+    if _roi_on and _tiling_enabled():
+        # tiling 分支早退:返回的 pred_mask 是原图域、img_tensor 是重建的中心 tile
+        # 张量(不是原图)——本层没有原图可传给 ROI 裁剪;且 ROI 与 tiling 都是未验证
+        # 新路径,叠加态失败模式无法归因。故**显式 raise 而非 warning**(与
+        # TTA+tiling 同开打 warning 早退的处置不同——那是"两条已各自验证的路径
+        # 不组合",这里是"两条都未验证",取确定性优先,交接文档处置①)。
+        raise RuntimeError(
+            "AICOMP_ROI_HEADS 与 AICOMP_STATIC_TILING 同开:tiling 分支早退后本层"
+            "无原图可传给 ROI 裁剪,且两条均为未验证新路径,叠加态失败不可归因"
+            "——显式拒绝(需 ROI 时请关 tiling,反之亦然)"
+        )
+
     # --- 静态滑窗 tiling(Z1,2026-09-21;默认关,env=AICOMP_STATIC_TILING)---
     # 大图(任一维 > tile)时逐 tile 512 前向 + 概率域 max 融合;分类头取
     # argmax 病灶所属 tile 的单前向输出(零融合,防 TTA 覆辙)。
@@ -304,12 +327,18 @@ def diagnose_static_case(model, img_np, config, calibrator, precision, device):
     breakdown = build_tirads_breakdown(
         preds["comp_idx"], preds["echo_idx"],
         preds["shape_idx"], preds["margin_idx"], preds["foci_prob"])
-    return {
+    result = {
         "preds": preds,
         "img_tensor": img_tensor,
         "mask_resized": mask_resized,
         "breakdown": breakdown,
     }
+    if _roi_on:
+        # 只在开时加键(关时不新增任何键 = 零回归,照
+        # test_tiling_inference.py::test_diagnose_static_case_default_path_unchanged
+        # 的验收模式):让"这次跑的是哪条路"在产物里有痕迹,运维/诊断可 grep。
+        result["roi_heads"] = True
+    return result
 
 
 def _diagnose_frame(model, frame_np, precision, device, img_size, calibrator=None,

@@ -73,7 +73,7 @@ from src.inference.nodule_split import DEFAULT_MIN_AREA_RATIO
 from src.inference.nodule_split import restore_instance_mask
 from src.inference.nodule_split import detection_confidence, split_nodules
 
-__all__ = ["write_case_v21"]
+__all__ = ["write_case_v21", "V21OutputError"]
 
 
 class V21OutputError(RuntimeError):
@@ -179,6 +179,70 @@ def _mask_filename(index: int) -> str:
     return f"nodule_{index:03d}.nii.gz"
 
 
+def _lesion_id_for(patient_id, subdir_uid, i) -> str:
+    """推理侧 lesion_id 构造:`f"{patient_id}::{subdir_uid}::N{i}"`(i 1-based)。
+
+    为何用 (patient_id, subdir_uid, NoduleID) 三元组而**不用 bbox**:
+    - bbox 在不同帧/不同图上会撞(两个病例的病灶可以落在同一相对位置),
+      且动态实例的 bbox 是**全帧并集框**(语义上不是病灶身份,同一病灶的
+      并集框随抽样帧集变化);
+    - lesion_id 的消费语义是"病灶级聚合键"(动态多帧同 id 才能正确取均值),
+      必须同病例内不撞、跨病例不撞;
+    - i 与 `NoduleID=f"N{i}"` 一致(1-based 结节序号,与本文件逐实例循环
+      `enumerate(instances, start=1)` 同源),一眼能定位到是哪条。
+    """
+    return f"{patient_id}::{subdir_uid}::N{i}"
+
+
+def _to_np(v):
+    """ROI 输出的张量/标量 → 一维 numpy(先 `.detach().cpu()`,CUDA 张量直接
+    `np.asarray` 会崩;与 postprocess._to_np 同款,本文件独立保留一份——
+    v21_output 不该 import postprocess 仅为这个小助手,两处各自演化)。
+    🔴 `.float()` 先行(2026-09-26 R-B F2 修,bf16 兼容;理由见 postprocess 版
+    docstring,两处同步)。"""
+    import torch as _torch
+    if isinstance(v, _torch.Tensor):
+        v = v.detach().cpu().float()
+        v = v.numpy()
+    return np.asarray(v, dtype=np.float64).reshape(-1)
+
+
+def _roi_nodule_context(roi_out) -> dict:
+    """`run_roi_forward` 单条输出 → 与 `_shared_nodule_context` **完全同键同编码**的
+    per-nodule context。
+
+    🔴 编码换算逐字复刻 `_shared_nodule_context`(本文件最易错处,错了不报错):
+    - ETE / TI-RADS = `_qwk_round`(期望取整,lo=1 → idx0→码1);
+    - Location = `argmax+1`(宏 AUC 吃分布,argmax 是天然点估计);
+    - 🔴 **T 不 +1**(T∈{0,1} 与 0-based 同值;ROI 输出只有 t_conf 标量,
+      t_clin_sig = int(t_conf > 0.5) —— 与整图 argmax(t_probs) 在两类时等价:
+      argmax([p0,p1])==1 ⟺ p1>p0 ⟺ t_conf>0.5,平局时两者都取低类)。
+    - malignancy 是 [2] **logits** → 此处逐条 softmax 后由调用方对**概率**取均值
+      (与 `_lesion_level_head_preds` 的概率均值口径一致,不是 logits 均值再
+      softmax——两条路径数学不等价,后者会系统性压扁置信度);本函数收到的是
+      **已均值后的概率形态**(见 `_run_roi_static/_run_roi_dynamic` 的聚合),
+      `malignancy_confidence` 取 [1](正类)。
+    - 对冲键 tirads_probs/ete_probs 同样输出 list[float](#116a 防御性下注,
+      与整图 context 同款)。
+    """
+    loc_probs = [float(x) for x in _to_np(roi_out["location_probs"])]
+    tirads_probs = [float(x) for x in _to_np(roi_out["tirads_probs"])]
+    ete_probs = [float(x) for x in _to_np(roi_out["ete_probs"])]
+    mal_p = _to_np(roi_out["malignancy"])
+    t_conf = float(_to_np(roi_out["t_conf"])[0])
+    return {
+        "malignancy_confidence": float(mal_p[1]),
+        "tirads_class": _qwk_round(tirads_probs),          # idx0→码1(I类)
+        "ete_code": _qwk_round(ete_probs),                 # idx0→码1(无侵犯)
+        "location_probs": loc_probs,
+        "location": int(np.argmax(loc_probs)) + 1,          # idx0→码1(左上叶)
+        "t_clin_sig": int(t_conf > 0.5),                    # 🔴 0/1,**不 +1**
+        "t_confidence": t_conf,
+        "tirads_probs": tirads_probs,
+        "ete_probs": ete_probs,
+    }
+
+
 def _atomic_write_json(path: str, payload: dict) -> None:
     """原子写 JSON(先写 `.{pid}.tmp` 再 `os.replace`),防半写文件。
 
@@ -241,10 +305,15 @@ def _dynamic_det_conf(inst: dict, soft_by_frame: dict, mask3d) -> float:
     return float(np.clip(mean, 0.0, 1.0))
 
 
-def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
-                                  nodule_base_context, soft_by_frame=None,
-                                  full_shape=None):
+def _build_entries_and_save_slices(instances, soft_fullres, case_dir, subdir_uid,
+                                   nodule_base_context, soft_by_frame=None,
+                                   full_shape=None, per_nodule_contexts=None):
     """公共尾段:逐结节落 mask + 组装 build_nodule_entry。
+
+    名称说明(2026-09-25 R-A 审查):原名 `_build_entries_and_save_masks` 描述能力
+    过宽——**本函数只落 `nodule_NNN.nii.gz` 实例掩膜,不落检测器的二值切片**;
+    `Detection.confidence`(检测 AP 的排序键)另由 `detection_confidence`/
+    `_dynamic_det_conf` 从整图分割软图算,与 roi_ctx 无关。
 
     Args:
         instances: `split_nodules` 的实例列表。**2D**:含 `mask`(全尺寸);**3D**:
@@ -267,12 +336,27 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
             `ete_code` / `location_probs` / `location` / `t_clin_sig` / `t_confidence`
             等每结节共享的预测值(2026-08-17 起**全部为四头真实预测**,不再有占位);
             另含可选的 #116a 对冲键 `tirads_probs` / `ete_probs`(缺席则不写出)。
+        per_nodule_contexts: 2026-09-25 ROI 接线新增。list[dict] 与 `instances`
+            逐条对齐(每结节**自己**的四头 context,由 `_roi_nodule_context` 产出,
+            键集与 nodule_base_context 相同)。None(默认)= 逐位走现状整图共享
+            (零回归唯一保证);非 None 时长度必须与 instances 相等,**不齐 raise
+            V21OutputError**(错位会让四头值挂到别的结节上,不报错)。
 
     Returns:
         nodule_entries — 供 build_prediction_json;阴性时为空列表。
     """
+    if per_nodule_contexts is not None and len(per_nodule_contexts) != len(instances):
+        raise V21OutputError(
+            f"per_nodule_contexts({len(per_nodule_contexts)}) 与 instances"
+            f"({len(instances)}) 长度不齐 —— ROI context 与实例必须逐条对齐,"
+            f"错位会让四头值挂到别的结节上且不报错"
+        )
     entries = []
     for i, inst in enumerate(instances, start=1):
+        # ROI 分流(2026-09-25):per_nodule_contexts 非 None 时第 i 个结节用
+        # 它自己的 context;None(默认)时逐位走现状整图共享 —— 零回归唯一保证。
+        context = (per_nodule_contexts[i - 1] if per_nodule_contexts is not None
+                   else nodule_base_context)
         name = _mask_filename(i)
         abs_path = os.path.join(case_dir, subdir_uid, name)
         # 写进 JSON 的相对路径强制正斜杠(官方 Linux 评测按 `/` 解析,见模块 docstring)。
@@ -308,17 +392,17 @@ def _build_entries_and_save_masks(instances, soft_fullres, case_dir, subdir_uid,
             nodule_id=f"N{i}",
             mask_file=rel_path,
             detection_confidence=det_conf,
-            malignancy_confidence=nodule_base_context["malignancy_confidence"],
-            tirads_class=nodule_base_context["tirads_class"],
-            ete_code=nodule_base_context.get("ete_code", pj.ETE_NONE),
-            location_probs=nodule_base_context.get("location_probs"),
-            location=nodule_base_context.get("location"),
-            t_clin_sig=nodule_base_context.get("t_clin_sig", 0),
-            t_confidence=nodule_base_context.get("t_confidence", 0.0),
+            malignancy_confidence=context["malignancy_confidence"],
+            tirads_class=context["tirads_class"],
+            ete_code=context.get("ete_code", pj.ETE_NONE),
+            location_probs=context.get("location_probs"),
+            location=context.get("location"),
+            t_clin_sig=context.get("t_clin_sig", 0),
+            t_confidence=context.get("t_confidence", 0.0),
             # #116a 对冲键。用 `.get()` 而非 `[]`:CLI 调试等不产四头概率的
             # 调用方拿到 None → build_nodule_entry 不写出该键,向后兼容。
-            tirads_probs=nodule_base_context.get("tirads_probs"),
-            ete_probs=nodule_base_context.get("ete_probs"),
+            tirads_probs=context.get("tirads_probs"),
+            ete_probs=context.get("ete_probs"),
         )
         entries.append(entry)
     return entries
@@ -477,8 +561,193 @@ def _lesion_level_head_preds(per_frame, kf_preds) -> dict:
     return out
 
 
+# ROI 动态分块批量前向的 chunk 大小(内存红线 vs kernel 开销的折中):
+# 全展开(实例×全帧)是 OOM 历史事故(单动态例几十 GB);逐帧单前向则 kernel
+# 启动开销 × N。16 = 一窗 16 帧 ROI 一批前向,单窗 [16,1,S,S] 常驻(几 MB 级),
+# 用完即弃。非 env 化(确定性优先,调优走代码改+对拍,勿临场发明)。
+_ROI_DYNAMIC_CHUNK = 16
+
+
+def _run_roi_static(orig_img_np, instances, patient_id, subdir_uid, roi_ctx):
+    """静态 ROI 分流:逐实例裁 ROI → **整例一次批量前向** → per-nodule contexts。
+
+    设计约束(交接文档 §2.1-3):实例维度堆批、一次前向(逐实例一次前向会把
+    kernel 启动开销 × N,N 上限受 AICOMP_MAX_NODULES(静/动共用 env 键,上限 100)
+    约束,最坏 100 次)。每实例 1 张 patch(静态无帧维),总数 ≤ max_nodules,
+    内存 O(N·S²) 几 MB 级,无红线。
+
+    Returns:
+        list[dict](与 instances 逐条对齐;**零实例时返回 [] 且不跑前向**——
+        build_roi_batch 对空列表 raise,调用方也不该为零实例付前向成本)。
+    """
+    from src.inference.roi_pipeline import (
+        build_roi_batch, iter_instance_frames_static, run_roi_forward)
+    from src.inference.postprocess import validate_roi_probs
+
+    patches, metas = [], []
+    for i, inst in enumerate(instances, start=1):
+        lid = _lesion_id_for(patient_id, subdir_uid, i)
+        # 生成器接口(与动态侧逐字同链路):静态恰 yield 1 项。
+        for patch, meta in iter_instance_frames_static(
+                orig_img_np, inst, lid, patient_id=patient_id):
+            patches.append(patch)
+            metas.append(meta)
+    if not patches:
+        return []
+    img_tensor = build_roi_batch(patches, metas, roi_ctx["img_size"],
+                                 roi_ctx["device"])
+    roi_outputs = run_roi_forward(roi_ctx["model"], img_tensor, metas,
+                                  roi_ctx["precision"], roi_ctx["device"])
+    return _roi_contexts_from_outputs(roi_outputs)
+
+
+def _softmax_mal_logits(roi_out):
+    """静态 ROI 路:`malignancy` 裸 logits → softmax 概率(2026-09-25 模型面
+    审查 P0-1 修复)。
+
+    `_roi_nodule_context` 的契约是"收到已均值后的概率形态"(其 docstring 明写),
+    动态路由 `_aggregate_roi_frame_rows` 逐帧 softmax 后均值满足;静态路此前
+    **漏了这一步**——裸 logit 直接当 `malignancy_confidence` 写进
+    prediction.json,logit≥1 即越界 [0,1],官方置信度判罚 = 按 0 处理、
+    AUC-PR 排序垫底(总纲 §1「置信度字段失效判罚」;`validate_roi_probs`
+    只查长度+finite 不查值域,本地测不出)。
+
+    浮点路径与 `_aggregate_roi_frame_rows` 同款 numpy exp/sum(float64,
+    减 max 防溢出)——两条链同一条数值路径,勿一处 torch 一处 numpy。
+    返回浅拷贝(malignancy 键替换为概率),原 dict 不动。
+    """
+    x = _to_np(roi_out["malignancy"])
+    e = np.exp(x - x.max())
+    p = e / e.sum()
+    out = dict(roi_out)
+    out["malignancy"] = p
+    return out
+
+
+def _roi_contexts_from_outputs(roi_outputs):
+    """run_roi_forward 输出 list[dict] → 逐条 validate + **malignancy
+    概率化** + 转成 nodule context(🔴 先 softmax 再取 [1],logit 直通
+    = confidence 越界、官方按 0 垫底)。"""
+    from src.inference.postprocess import validate_roi_probs
+    contexts = []
+    for r in roi_outputs:
+        validate_roi_probs(r)
+        contexts.append(_roi_nodule_context(_softmax_mal_logits(r)))
+    return contexts
+
+
+def _run_roi_dynamic(frame_by_index, instances, patient_id, subdir_uid, roi_ctx):
+    """动态 ROI 分流:逐实例串行 + 生成器逐帧在线消费 + chunk 分块批量前向。
+
+    🔴 内存红线(交接文档 §2.1-3):**禁止**把 (实例 × 全帧) 展开预裁(单动态例
+    750 帧原分辨率 float32 ROI 是几十 GB 级,worker=1 也 OOM 的历史事故同源)。
+    故逐实例串行,`iter_instance_frames_dynamic` 逐帧 yield、读一帧裁一帧,
+    patch 只在当前 chunk(≤16)内驻留。
+
+    chunk=16 分块批量前向:内存红线(禁全展开)vs kernel 开销(逐帧单前向
+    ×750 帧)的折中,见 `_ROI_DYNAMIC_CHUNK` 注释。
+
+    帧级概率**先各自归一化再均值**(malignancy:逐帧 softmax 后取均值,与
+    `_lesion_level_head_preds` 的概率均值口径一致,不是 logits 均值再 softmax);
+    其余四头概率/t_conf 逐帧取算术平均 → 实例级均值 → context
+    (官方 :215 病灶级汇总口径)。
+
+    Returns:
+        list[dict](与 instances 逐条对齐;零实例 → [] 不跑前向)。
+
+    Raises:
+        V21OutputError: 实例零可用帧(拒绝编造四头值——ROI 路径的语义是
+            "每结节一份自己的四头",没有帧就没有证据,占位值会伪装成预测)。
+            ROI 前向本身的异常**整例冒泡**(绝不静默把帧摘出 per_frame——
+            那会改变四头均值的分母,均值分母红线,见 case_pipeline 的
+            failed_frames 语义条)。
+    """
+    from src.inference.roi_pipeline import (
+        build_roi_batch, iter_instance_frames_dynamic, run_roi_forward)
+
+    contexts = []
+    for i, inst in enumerate(instances, start=1):
+        lid = _lesion_id_for(patient_id, subdir_uid, i)
+        # 帧在线消费:生成器逐帧 yield,攒 chunk ≤ _ROI_DYNAMIC_CHUNK 即前向、
+        # 用完即弃;跨 chunk 的逐帧概率累积进 per-frame list(概率本身几 KB 级,
+        # 与几十 GB 的 patch 展开红线不同量级,允许驻留到实例聚合完成)。
+        frame_rows = []
+        chunk_patches, chunk_metas = [], []
+        n_frames_this_inst = 0
+        for patch, meta in iter_instance_frames_dynamic(
+                frame_by_index, inst, lid, patient_id=patient_id):
+            n_frames_this_inst += 1
+            chunk_patches.append(patch)
+            chunk_metas.append(meta)
+            if len(chunk_patches) >= _ROI_DYNAMIC_CHUNK:
+                frame_rows.extend(_roi_forward_chunk(
+                    chunk_patches, chunk_metas, roi_ctx))
+                chunk_patches, chunk_metas = [], []
+        if chunk_patches:
+            frame_rows.extend(_roi_forward_chunk(
+                chunk_patches, chunk_metas, roi_ctx))
+        if n_frames_this_inst == 0:
+            raise V21OutputError(
+                f"ROI 动态实例 {lid} 零可用帧(frame_indices 与 per_frame 无交集)"
+                f"——拒绝编造四头值;实例帧应来自有预测的抽样帧,出现此错说明"
+                f"上游契约已破,须排查而非静默占位"
+            )
+        # 🔴 E2 review P1-2(2026-09-25):单帧实例静默退化为单帧预测(帧方差
+        # =0,与多帧病例逐字段不可区分)。不拒绝(整图路径也把该实例当全帧
+        # 病灶计一次 AP,裁剪要两侧一起裁),但**显式打点**进 stdout——离线
+        # 侧回读可统计单帧实例人口,判定线口径时不再盲。
+        if n_frames_this_inst == 1:
+            print(f"--> [ROI-dynamic] 单帧实例 {lid}(n=1/{len(frame_by_index)}"
+                  f" 抽样帧):病灶级均值退化为单帧值", flush=True)
+        contexts.append(
+            _roi_nodule_context(_aggregate_roi_frame_rows(frame_rows, lid)))
+    return contexts
+
+
+def _roi_forward_chunk(patches, metas, roi_ctx):
+    """一窗 ROI patch → 批量前向 → list[dict](逐条过 validate_roi_probs)。"""
+    from src.inference.roi_pipeline import build_roi_batch, run_roi_forward
+    from src.inference.postprocess import validate_roi_probs
+    img_tensor = build_roi_batch(patches, metas, roi_ctx["img_size"],
+                                 roi_ctx["device"])
+    roi_outputs = run_roi_forward(roi_ctx["model"], img_tensor, metas,
+                                  roi_ctx["precision"], roi_ctx["device"])
+    for r in roi_outputs:
+        validate_roi_probs(r)
+    return roi_outputs
+
+
+def _aggregate_roi_frame_rows(frame_rows, lesion_id) -> dict:
+    """同实例多帧 ROI 输出 → 病灶级均值(官方 :215)→ 单条 context 形态的
+    中间聚合(供 `_run_roi_dynamic` 转成 `_roi_nodule_context` 的输入形态:
+    malignancy 已是均值后的概率 [p0,p1],其余键保持逐键 list)。"""
+    import numpy as _np
+    # malignancy:逐帧 softmax 后对概率取均值(口径 = _lesion_level_head_preds)。
+    mal_probs = _np.zeros(2, dtype=_np.float64)
+    for r in frame_rows:
+        x = _to_np(r["malignancy"])
+        e = _np.exp(x - x.max())
+        mal_probs += e / e.sum()
+    mal_probs /= len(frame_rows)
+    mean_rows = {}
+    for key in ("location_probs", "ete_probs", "tirads_probs"):
+        mean_rows[key] = _np.mean(
+            [_np.asarray(_to_np(r[key]), dtype=_np.float64) for r in frame_rows],
+            axis=0)
+    t_conf_mean = float(_np.mean([float(_to_np(r["t_conf"])[0])
+                                  for r in frame_rows]))
+    return {
+        "lesion_id": lesion_id,
+        "malignancy": mal_probs,      # 已是概率(均值后);_roi_nodule_context 取 [1]
+        "location_probs": mean_rows["location_probs"],
+        "ete_probs": mean_rows["ete_probs"],
+        "tirads_probs": mean_rows["tirads_probs"],
+        "t_conf": t_conf_mean,
+    }
+
+
 def _write_static(case_dir, patient_id, subdir_uid, case_result,
-                  processing_ms, interpretation):
+                  processing_ms, interpretation, roi_ctx=None):
     preds = case_result["preds"]
     hw = _static_orig_hw(case_result)
 
@@ -489,8 +758,29 @@ def _write_static(case_dir, patient_id, subdir_uid, case_result,
     # max_nodules 同理不传(None→AICOMP_MAX_NODULES env→20,阶段1方向A)。
     instances = split_nodules(binary_fullres)
     context = _shared_nodule_context(preds)
-    entries = _build_entries_and_save_masks(
-        instances, soft_fullres, case_dir, subdir_uid, context)
+
+    # --- ROI 分流(2026-09-25):roi_ctx 非 None(= 开关开,由 runner 构建、
+    # 本文件不读 env)时逐结节跑自己的四头;None 时逐位走现状(零回归)。---
+    per_nodule_contexts = None
+    if roi_ctx is not None:
+        # 🔴 静态原图来源缺口:`_write_static` 手上有 soft_fullres/binary_fullres
+        # (概率图/二值图),但 ROI 裁剪要的是**原分辨率灰度原图**——拿概率图
+        # 冒充会让 ROI 头吃错误域的输入,输出合法但全错,本地测不出。故
+        # `case_result["orig_img_np"]` 缺失时 fail-loud(判据只在开关开分支内
+        # 求值:关时旧 fixture 不带该键不受影响,零回归的一部分)。
+        orig_img = case_result.get("orig_img_np")
+        if orig_img is None:
+            raise V21OutputError(
+                "静态 ROI 分流需要 case_result['orig_img_np'](原分辨率灰度原图),"
+                "调用方(runner._run_static_case)未透传——不得拿概率图冒充原图"
+                "(那会让 ROI 头吃错误域输入,输出合法但全错,本地测不出)"
+            )
+        per_nodule_contexts = _run_roi_static(
+            np.asarray(orig_img), instances, patient_id, subdir_uid, roi_ctx)
+
+    entries = _build_entries_and_save_slices(
+        instances, soft_fullres, case_dir, subdir_uid, context,
+        per_nodule_contexts=per_nodule_contexts)
 
     payload = pj.build_prediction_json(
         study_uid=patient_id,
@@ -503,7 +793,7 @@ def _write_static(case_dir, patient_id, subdir_uid, case_result,
 
 
 def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
-                   processing_ms, interpretation):
+                   processing_ms, interpretation, roi_ctx=None):
     if not HAS_CV2:
         raise V21OutputError("动态 V2.1 落盘需要 cv2(resize),但 cv2 未安装")
 
@@ -590,9 +880,23 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
     # 详见 `_lesion_level_head_preds` docstring。
     context = _shared_nodule_context(
         _lesion_level_head_preds(per_frame, kf_preds))
-    entries = _build_entries_and_save_masks(
+
+    # --- ROI 分流(2026-09-25):动态侧原图来源 = per_frame[*]["frame_np"]
+    # (原分辨率灰度帧,无需上游透传)。ROI 前向异常整例冒泡(绝不静默把帧
+    # 摘出 per_frame——那会改变 `_lesion_level_head_preds` 的均值分母,
+    # 均值分母红线);`_dynamic_det_conf` 的逐帧概率均值口径不受影响
+    # (soft_by_frame 消费点在 ROI 改造之前已定)。---
+    per_nodule_contexts = None
+    if roi_ctx is not None:
+        frame_by_index = {int(f["frame_index"]): f["frame_np"]
+                          for f in per_frame}
+        per_nodule_contexts = _run_roi_dynamic(
+            frame_by_index, instances, patient_id, subdir_uid, roi_ctx)
+
+    entries = _build_entries_and_save_slices(
         instances, None, case_dir, subdir_uid, context,
-        soft_by_frame=soft_by_frame, full_shape=full_shape)
+        soft_by_frame=soft_by_frame, full_shape=full_shape,
+        per_nodule_contexts=per_nodule_contexts)
 
     payload = pj.build_prediction_json(
         study_uid=patient_id,
@@ -605,7 +909,7 @@ def _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
 
 
 def write_case_v21(case_dir, patient_id, subdir_uid, case_result, kind,
-                   processing_ms, interpretation=None) -> None:
+                   processing_ms, interpretation=None, *, roi_ctx=None) -> None:
     """把单病例推理结果落成官方 V2.1 交付形态(逐结节 .nii.gz + prediction.json)。
 
     Args:
@@ -620,6 +924,20 @@ def write_case_v21(case_dir, patient_id, subdir_uid, case_result, kind,
         kind: `"static"` | `"dynamic"`。
         processing_ms: 推理总耗时(毫秒),透传进 `ProcessingTime_ms`(int)。
         interpretation: 可选 CBM 报告 `{"Conclusion": str, "KeyFindings": [str]}`。
+        roi_ctx: 2026-09-25 ROI 接线新增(keyword-only)。None(默认)= 整图共享
+            四头(逐位零回归);dict = ROI 分流开,键 `{"model","precision","device",
+            "img_size"}`(由 service runner 构建——本函数**不读 env**,开关状态只经
+            此参数流入;内部会调 `model.forward_roi`,模型无该属性即
+            `RoiPipelineError` 冒泡,不静默回退整图路径)。
+
+            🔴 **本函数只写四头单值,不写 `Detection.confidence`** —— 后者仍由
+            `_build_entries_and_save_slices` 从**整图分割软图**的实例区域均值算
+            (`detection_confidence` / `_dynamic_det_conf`)。官方 :218 对「结节
+            检测AP」的排序键就是它,而本轮 ROI(第二阶段)只覆盖四头分类、**未**按
+            ROI 精修 mask;故开了 ROI 后 `Detection.confidence` 与 ROI 四头来自
+            **两个不同的处理器**,二者不自洽不构成 bug,但「ROI 支路整体上线」
+            这句话在检测项上不成立。改 ROI 消费 before/after 对比时勿把检测项的
+            变化归因到 ROI 支路(它逐位不变)。
 
     Returns:
         None。产物写在磁盘上。
@@ -627,6 +945,8 @@ def write_case_v21(case_dir, patient_id, subdir_uid, case_result, kind,
     Raises:
         V21OutputError: case_result 契约不满足 / 依赖缺失 / 维度不符。
         PredictionSchemaError: 组装出的 payload 不合规(应由 build/validate 自拦)。
+        RoiPipelineError: roi_ctx 非 None 且模型缺 forward_roi / 前向条数不齐
+            (ROI 路径自身不成立,fail-loud 不静默回退)。
     """
     if not HAS_CV2:
         raise V21OutputError("V2.1 落盘需要 cv2(mask resize 回原图),但 cv2 未安装")
@@ -642,9 +962,9 @@ def write_case_v21(case_dir, patient_id, subdir_uid, case_result, kind,
 
     if kind == "static":
         _write_static(case_dir, patient_id, subdir_uid, case_result,
-                      processing_ms, interpretation)
+                      processing_ms, interpretation, roi_ctx=roi_ctx)
     elif kind == "dynamic":
         _write_dynamic(case_dir, patient_id, subdir_uid, case_result,
-                       processing_ms, interpretation)
+                       processing_ms, interpretation, roi_ctx=roi_ctx)
     else:
         raise V21OutputError(f"未知 kind={kind!r},只支持 'static'/'dynamic'")

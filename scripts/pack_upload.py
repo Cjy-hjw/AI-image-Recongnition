@@ -72,6 +72,7 @@ src/inference/nifti_io.py
 src/inference/nodule_split.py
 src/inference/postprocess.py
 src/inference/prediction_json.py
+src/inference/roi_pipeline.py
 src/inference/tiling.py
 src/inference/v21_output.py
 src/inference/video_aggregate.py
@@ -89,6 +90,8 @@ src/models/mask_features.py
 src/models/multi_task_model.py
 src/models/physical_prior.py
 src/models/pretrained_loader.py
+src/models/roi_encoder.py
+src/models/roi_heads.py
 src/service/__init__.py
 src/service/app.py
 src/service/case_discovery.py

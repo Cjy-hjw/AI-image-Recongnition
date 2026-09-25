@@ -1,0 +1,52 @@
+======================================================================
+M1: _collect_cliff_ious 的 training 态自管
+======================================================================
+def _collect_cliff_ious(model, loader, device, criterion=None) -> dict:
+    """epoch 尾对**本 epoch 刚训过的 train 池**逐样本采 hard IoU,作下一 epoch
+    的悬崖权重信号(L1 核心:前代 IoU = train 侧自采自用,非 val 池查表——
+    patient 分组互斥下 val→train 键空间零交集,v1 方案结构性空转已废弃)。
+
+    口径 = per-sample **hard IoU**(pred>0.5 二值化后 inter/(union−inter+eps),
+    与 validate_step 的 inter/union 同式但 IoU 而非 dice);GT 全零记 **-1 哨兵**
+    → _cliff_weight_of 判 w=1(阴性监督归主项);**pred 全零/GT 非零记真 0.0**
+    (2026-09-24 审查 P0 修:完全漏检=最硬悬崖,w=4;旧版 `<=0` 把它和哨兵
+    一起吞成 w=1,恰好漏掉最该加压的人口)。
+
+    🔴 **BN/运行态**:`model.eval()` → 采完 `model.train()` 恢复,**try/finally**
+    (2026-09-24 审查 P1 修:采集循环任何异常炸出时模型不能永久停在 eval 态;
+    下一 epoch 头部 `run_official_epoch` 会再调 `set_frozen_modules_eval`,
+    但那只覆盖冻结子模块,不保证 dropout/整体态复原)。eval 期间 BN
+    running stats 冻结(采集不改统计)。
+
+    criterion 仅用于读 `seg_cliff_weight`(权重 0 时调用方根本不该调本函数,
+    此处仅防御性再判一次):不进 targets、不建损失图,与 validate_epoch 零耦合。
+
+    返回 dict[lesion_id -> iou]。同池自采自用 → 下一 epoch 查表 100% 命中
+    (loader shuffle 不改 lesion_id 键空间)。🔴 动态样本同病灶多帧共享同一
+    lesion_id,逐帧写入 dict 后值取**最后一帧**——非任意聚合口径,重读采集
+    数据请知悉(取 min/均值聚合是未做的改进,当前实测方向=少 boost 非反向错)。
+    """
+    if criterion is not None and getattr(criterion, "seg_cliff_weight", 0.0) <= 0.0:
+        return {}
+    was_training = model.training
+    model.eval()
+    ious: dict = {}
+    eps = 1e-8
+    try:
+        with torch.no_grad():
+            for images, masks, labels in loader:
+ 
+
+======================================================================
+M3: validate_roi_epoch 在 eval 入参下逐位还原(不强行置 train)
+======================================================================
+入参 model.training = False (期望保持 False)
+eval 入参下逐位还原: True | roi_n_records = 2
+
+======================================================================
+M2: run_roi_epoch 的 train()/set_frozen_modules_eval 与 legacy 路径一致性
+======================================================================
+run_roi_epoch 后 model.training = True (与整图 run_official_epoch 同款:置 train)
+frozen 模块被置 eval 的数量: 0
+两条路径 training 态逐位一致: True
+差异模块数: 0 []

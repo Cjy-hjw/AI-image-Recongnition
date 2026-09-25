@@ -5,11 +5,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from src.models.blocks import ConvBlock, TaskAlignmentAdaptor
-from src.models.mask_features import nodule_scale_from_mask
+from src.models.mask_features import nodule_scale_from_mask, physical_diameter_from_mask
 from src.models.physical_prior import DifferentiablePhysicalPriorExtractor
 from src.models.cbm_head import ConceptEmbeddingCBMHead, VariationalCLUBMean
 from src.models.heads import ClinicalTHead, ExtensionHead, LocationHead, TiradsHead
 from src.models.pretrained_loader import load_local_safetensors
+from src.models.roi_heads import (
+    RoiClinicalTHead,
+    RoiConceptHead,
+    RoiExtensionHead,
+    RoiLocationHead,
+    RoiTiradsHead,
+)
 
 
 class ModelOutputs(TypedDict):
@@ -253,6 +260,29 @@ class MultiTaskThyroidModel(nn.Module):
         self.clinical_t_head = ClinicalTHead(in_channels=self.CLS_POOLED_DIM)
         self.tirads_head = TiradsHead(in_channels=self.CLS_POOLED_DIM)
 
+        # ── ROI 范式波3·模型面(2026-09-25,两阶段 ROI 范式第二阶段)─────────
+        # ROI 头与整图头并存:整图 forward 一律不触 ROI 头(零回归铁律);
+        # ROI 训练/推理只走 `forward_roi`。loc 头结构同构 LocationHead
+        # (state_dict 可互载,零训练搬运载体);ete/tirads 新结构;clin_t 同构
+        # (scale 语义 [d_mm, log d_mm])。ROI 头的调度/冻结由 schedule_official
+        # 按 `ROI_HEAD_PREFIXES` 前缀接管(与 OFFICIAL_HEAD_PREFIXES 同语义)。
+        self.roi_location_head = RoiLocationHead(in_channels=self.CLS_POOLED_DIM)
+        self.roi_extension_head = RoiExtensionHead(in_channels=self.CLS_POOLED_DIM)
+        self.roi_clinical_t_head = RoiClinicalTHead(in_channels=self.CLS_POOLED_DIM)
+        self.roi_tirads_head = RoiTiradsHead(in_channels=self.CLS_POOLED_DIM)
+        self.roi_concept_head = RoiConceptHead(in_channels=self.CLS_POOLED_DIM)
+
+    # ROI 头前缀(调度/冻结/白名单消费;与 OFFICIAL_HEAD_PREFIXES 同语义)。
+    # 🔴 **不进 OFFICIAL_HEAD_PREFIXES**:旧 checkpoint 无这些键,加进那里会让
+    # `load_warm_start` 把 missing 合法化——但 ROI 头缺键 = 随机初始化是**预期
+    # 行为**(冷启动新头),合法化点在 train_official 的 ROI 白名单(训练侧
+    # 挂),不在模型常量。推理侧 build_model 的 strict 校验天然拦截"旧权重+
+    # ROI 头"组合(代码/权重成对耦合红线,同 aux 头的 Z1 教训)。
+    ROI_HEAD_PREFIXES = (
+        "roi_location_head", "roi_extension_head",
+        "roi_clinical_t_head", "roi_tirads_head", "roi_concept_head",
+    )
+
     def is_param_trainable(self, name: str, stage: int) -> bool:
         if "vclub" in name:
             return True
@@ -418,3 +448,148 @@ class MultiTaskThyroidModel(nn.Module):
         }
 
         return outputs
+
+    # ── ROI 范式波3·模型面:第二前向入口(2026-09-25)────────────────────────
+    def forward_roi(self, roi_images, roi_meta, seg_features=None):
+        """ROI 级前向第二入口 —— 复用**同一 backbone/头实例**,输出键对齐
+        `collect_roi_records` 的消费形态(每病灶一条 dict)。
+
+        🔴 零回归铁律:本方法**新增**,不改 `forward` 任何一行;整图路径
+        的 outputs 不含 `roi_outputs` 键(分流判据 = 键存在性,
+        `validate_step.collect_official_records` 同款约定)。
+
+        Args:
+            roi_images: [K,1,S,S] ROI 图像 batch(RoiDataset/roi_collate 产出,
+                K = 病灶数;整图训练循环外的独立 ROI batch)。
+            roi_meta: per-lesion 元数据 list[dict](长度 K),每条含
+                `bbox_xyxy`/`orig_w`/`orig_h`/`spacing_mm`/`roi_mask`(
+                [1,H',W'] ROI 域 soft/二值 mask,ETE band 与 d_mm 消费;
+                训练侧由 collate 侧装,推理侧由 ROI pipeline 装)/
+                `lesion_id`/`patient_id`/`is_main`。
+                ⚠️ 这里吃 **list[dict]** 而非 batch tensor dict——collate 后的
+                roi_meta tensor 化键(bbox/label)由调用方解包;单一职责,
+                本方法不做 collate 逆操作。
+            seg_features: None 或分割侧特征(见 `roi_encoder.forward_roi_features`;
+                推理 ROI pipeline 传"分割器在同 ROI 上的特征",训练数据面
+                单 ROI 路传 None 由 encoder 现算+detach)。
+
+        Returns:
+            dict:
+              - `"roi_outputs"`: list[dict](长度 K),每条 =
+                {lesion_id, patient_id, is_main, malignancy [2],
+                location_probs [7], ete_probs [4], ete_logits [4],
+                t_conf 标量, tirads_probs [5]} —— 逐键对齐
+                `collect_roi_records` 的 roi_outputs 消费契约。
+              - `"roi_pooled"` [K,352] / `"roi_spatial"` [K,352,h,w]:
+                backbone ROI 特征(下游损失/诊断可复用)。
+              - `"roi_concepts"`: 概念头五键 dict(K 维)。
+        """
+        from src.models.roi_encoder import forward_roi_features
+
+        K = int(roi_images.shape[0])
+        feats = forward_roi_features(self, roi_images, seg_features)
+        spatial, pooled = feats["spatial"], feats["pooled"]
+
+        # ROI 域 mask:各条 meta 自带 [1,H',W'](H' 不必统一——ETE band/d_mm 都
+        # 是 per-ROI 消费,mask 与 ROI 图像同栅格时物理语义最准)。缺失 →
+        # 全零(阴性/无 mask 语义,band=0 → ETE 局部特征全 0、d_mm=0,与整图头
+        # 阴性语义一致)。**不 stack**(H' 可不同;逐条消费,零广播坑)。
+        H = int(roi_images.shape[-1])
+        masks = []
+        for i in range(K):
+            m = roi_meta[i].get("roi_mask")
+            if m is None:
+                m = torch.zeros(1, H, H, dtype=torch.float32,
+                                device=roi_images.device)
+            masks.append(m.detach().float())
+        # ETE 头吃 [K,1,H,W] 堆叠:缺省补到统一 H(有 mask 的条保持原栅格,
+        # 无 mask 的条补零图)。各条 H' 不齐时以**第一条**为准 pad/crop——
+        # ETE band 内部 adaptive_avg_pool 到特征分辨率,栅格差异只影响 band
+        # 分辨率不影响语义;pad 用零(带外区域,零=无证据)。
+        if K:
+            target_hw = masks[0].shape[-2:]
+            stackable = []
+            for m in masks:
+                if m.shape[-2:] != target_hw:
+                    mm = torch.zeros(1, *target_hw, dtype=m.dtype, device=m.device)
+                    hh, ww = min(m.shape[-2], target_hw[0]), min(m.shape[-1], target_hw[1])
+                    mm[:, :hh, :ww] = m[:, :hh, :ww]
+                    m = mm
+                stackable.append(m)
+            roi_masks = torch.stack(stackable, dim=0)
+        else:
+            roi_masks = torch.zeros(
+                0, 1, H, H, dtype=torch.float32, device=roi_images.device)
+
+        # d_mm:spacing None → 0(官方无 spacing,物理头走离群点语义,
+        # 见 physical_diameter_from_mask 的"不得编造"条)。
+        spacings = []
+        for i in range(K):
+            sp = roi_meta[i].get("spacing_mm")
+            spacings.append(0.0 if sp is None else float(sp))
+        spacing_t = torch.tensor(spacings, dtype=torch.float32,
+                                 device=roi_images.device).unsqueeze(-1)  # [K,1]
+        d_mm = physical_diameter_from_mask(roi_masks, spacing_t)          # [K,1]
+
+        # 逐头前向。loc 按病灶逐条(坐标通道 per-ROI;K 条小循环,K=每图病灶数,
+        # 实测量级 1-3,批级向量化收益为零、代码复杂度翻倍,不做)。
+        loc_probs_rows, side_rows, level_rows = [], [], []
+        for i in range(K):
+            m = roi_meta[i]
+            out = self.roi_location_head(
+                spatial[i:i + 1],
+                bbox_xyxy=m.get("bbox_xyxy"),
+                orig_w=m.get("orig_w") or 0,
+                orig_h=m.get("orig_h") or 0,
+            )
+            loc_probs_rows.append(out["location_probs"][0])
+            side_rows.append(out["side_logits"][0])
+            level_rows.append(out["level_logits"][0])
+        if K:
+            location_probs = torch.stack(loc_probs_rows, dim=0)
+            location_side_logits = torch.stack(side_rows, dim=0)
+            location_level_logits = torch.stack(level_rows, dim=0)
+        else:
+            location_probs = torch.zeros(0, 7, device=roi_images.device)
+            location_side_logits = torch.zeros(0, 3, device=roi_images.device)
+            location_level_logits = torch.zeros(0, 3, device=roi_images.device)
+
+        ete_out = self.roi_extension_head(spatial, roi_masks)
+        t_out = self.roi_clinical_t_head(spatial, d_mm, ete_out["ete_logits"])
+        concepts = self.roi_concept_head(pooled)
+        tirads_out = self.roi_tirads_head(spatial, concepts)
+
+        # 良恶性:ROI pooled 过整图 CBM(同一 cbm_head 实例——它是"主干表征
+        # →良恶性"的既有通路,ROI 域复用表征、复用头,这是 scoping §C.2
+        # "可复用的是主干表征"的直接落点;物理先验 e_prior 给 None 走 CBM
+        # 内部零兜底,ROI 域无整图物理量,不编造)。
+        cbm = self.cbm_head(pooled, None)
+        malignancy = cbm.logits_malignancy                                     # [K,2]
+
+        roi_outputs = []
+        for i in range(K):
+            m = roi_meta[i]
+            roi_outputs.append({
+                "lesion_id": m.get("lesion_id"),
+                "patient_id": m.get("patient_id"),
+                "is_main": int(m.get("is_main", 1)),
+                "malignancy": malignancy[i],
+                "location_probs": location_probs[i],
+                "ete_probs": ete_out["ete_probs"][i],
+                "ete_logits": ete_out["ete_logits"][i],
+                "t_conf": t_out["t_conf"][i],
+                "tirads_probs": tirads_out["tirads_probs"][i],
+            })
+        return {
+            "roi_outputs": roi_outputs,
+            "roi_pooled": pooled,
+            "roi_spatial": spatial,
+            "roi_concepts": concepts,
+            "roi_location_side_logits": location_side_logits,
+            "roi_location_level_logits": location_level_logits,
+            "roi_t_logits": t_out["t_logits"],
+            "roi_tirads_logits": tirads_out["tirads_logits"],
+            "roi_ete_logits": ete_out["ete_logits"],
+            "roi_band_ratio": ete_out["band_ratio"],
+            "roi_d_mm": d_mm,
+        }

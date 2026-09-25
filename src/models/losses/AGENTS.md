@@ -71,6 +71,61 @@
   [2410,1831]` / `clin_t_use_class_weights: false` / `clin_t_label_smoothing:
   0.0`）。
 
+### 🆕 ROI 四头损失组(2026-09-25 波4,新架构 §J,默认关;🟢 已收编主树)
+
+- `location_roi.py`/`extension_roi.py`/`clinical_t_roi.py`/`tirads_roi.py`:
+  现有四头损失的 **per-lesion 版**(复用同式数学:location 双分支 masked CE/ETE
+  CB-Focal/clin_t 概率域 BCE/tirads CE+ordinal),输入 [K] 变病灶数,valid 过滤
+  +is_main 门(官方口径只主病灶)同判据。接线器 `components/roi_heads.py`
+  `compute_roi_head_losses(roi_outputs, labels)` 消费 forward_roi 输出+gt_ 前缀标签。
+  `multitask.py` 加 `roi_head_weight`(默认 0 零回归;>0 编入,无 ROI 键 raise
+  fail-loud,extra 加 roi_* 恒 0 键两分支都写);🟢 收编时 cliff 块(set_cliff_ious/
+  seg_cliff_weight)与 ROI 块**并存**于 multitask.py(worktree 版基于旧基线,主会话
+  手工合并三处 diff,勿再按 worktree 版整文件覆盖)。
+- 🔴 **两条已修+三条待接线(Gate2 A/B 路,处置全录 scoping §J.2)**:
+  1. **location level 边缘已归一**(B-P1-3 修):`_edge_log_probs` level_p 除以
+     非峡部总概率(条件分布 P(level|非峡部))——因子分解联合分布下不归一则
+     level CE 系统性偏高 −log(1−P_峡部)+梯度耦合 side 峡部通道,与整图双 softmax
+     版不等价(docstring 原"完全等价"声称被实测证伪);
+  2. **config 透传已修**(A-P1-2):`train_official.build_official_head_config`
+     补组 `roi_head_weight`(此前 yaml 写了键不组装=透传链断裂,r7 config 静默
+     不读事故同型);
+  3. ~~待接线三条~~ → **全部已解(2026-09-25 深夜接线五债,scoping §J.6)**:
+     `gt_` 桥=`roi_dataset.roi_labels_from_meta`(`_ROI_LABEL_RENAME` 单源+collate
+     dict-of-lists 转置)/roi_mask 生产=`RoiDataset.__getitem__` 四态+统一栅格
+     (roi_size 单源+INTER_NEAREST+值域 assert)/labels 形态守卫=损失侧
+     `_scalar` 的 batch 张量 numel≠1 raise。**四头数学经损失组 review 逐位同构**
+     (location/ETE 精确相等,T 1.2e-7,TI-RADS ≤4.8e-7;LS 4.2e-2 归因 torch CE
+     weight×ls 已知交互、ROI 版才是对的——J.5b)。
+- ~~**损失组 review(J.5b)遗留 3 条测试债**~~ → **已清偿(2026-09-26 硬前置 A 路,J.8)**:
+  ①gt_ 源级对拍=`test_j5b_gt_fixture_source_level_bridge`;②LS>0 分支覆盖=
+  `test_j5b_tirads_label_smoothing_positive_coverage`;③device 断言=
+  `test_j5b_zero_weight_detail_device`。
+  `_scalar` 的 `int()` 对 float 标签截断(0.5→0)是 J.5b P1-1 复核降级 P2 的
+  残余面——真实链路 label 走 int64 tensor 无损,勿在 float 路接标签。
+- **债6 概念监督已落地(2026-09-26 硬前置 A 路,方案 A 纯真值版,DR 终审)**:
+  `components/concepts_roi.py`——`ROI_CONCEPT_KEYS` 四键映射(logits_comp/echo/
+  shape/margin ↔ gt_composition/echogenicity/shape/margin+valid_*);🔴 **概念
+  logits 在 forward_roi 顶层 `roi_concepts` 不在 per-lesion dict**,run_roi_epoch
+  停传窄 dict(窄 dict 被 fail-loud 拒,r7 同型防);foci 不入表=零梯度(无官方
+  标注);is_main 门不加(整图概念损失同口径);`roi_concept_weight` 默认 0 全链
+  透传(config/multitask/train_official)。**k_ref 分母平滑同批**:四头归一分母
+  `clamp(v.sum()+eps, min=4.0)`(`_K_REF` 单点可调;n≥4 逐位不变/n∈(0,4) 压
+  4×/v=0 精确 0)。
+- **🔴 2026-09-26 训练端 review 修复(R1/R2/R3 三路,主会话独立复核)**:
+  ①concepts_roi 加**有限性门**(logits 含 NaN/Inf → raise;`0×NaN=NaN` 不被
+  valid 屏蔽,会经共享 total 毒成全 NaN、GradScaler 静默跳 step=训练卡死无报错,
+  fail-loud 而非 nan_to_num);②**R2 P0-1 定案:官方表无独立概念列**(证据链
+  第13轮真实列名序 40-51 无 成分/回声/形状/边缘;信息只在 TI-RADS详细评分
+  复合串,缺 84.4%)→ 概念监督在官方数据上**结构性恒空**,roi_concept_weight
+  保持 0 直到数据侧解锁(拆复合串+类索引与 TN3K 对齐——TN3K shape 用 h>w、
+  官方"形态:0分"=宽>高,同类号反义;echo TN3K 仅 2 类)。数学/梯度路径已
+  对拍正确(R2 PASS),数据解锁即用;③is_main 注释订正(不因 lambda_roi=0
+  而变,纯概念标定仍是全 ROI 样本面板)。
+- 测试 `tests/test_roi_losses.py` **40 项**(2026-09-26 A 路 24→40:概念监督 9/
+  k_ref 4/J.5b 三债 3;手算对拍/零权重逐位回归/变异杀测/fail-loud;变异实弹
+  主会话独立复现[去 k_ref clamp→2 failed RED→还原 40 绿])。
+
 ---
 
 ## 2. PHASE 4 新增：掩膜多任务损失

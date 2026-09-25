@@ -56,6 +56,20 @@ def _cliff_weight_of(iou_prev) -> float:
     return 1.0 + _CLIFF_BOOST if iou_prev < _CLIFF_IOU_LINE else 1.0
 
 
+def _roi_labels_from_meta(roi_meta_list):
+    """ROI meta list → roi_labels(债1 桥,转发 `roi_dataset.roi_labels_from_meta`)。
+
+    转发而非重写:改名映射(lesion_loc→gt_lesion_loc 等 5 键)单源在
+    `src/dataset/roi_dataset.py` 的 `_ROI_LABEL_RENAME`(数据面模块,与键名
+    生产处同文件);训练循环从本模块 import 是既有习惯(此转发让
+    `from src.training.loop.train_step import _roi_labels_from_meta` 与
+    其余训练件同路径)。validate 侧同样经本转发。
+    """
+    from src.dataset.roi_dataset import roi_labels_from_meta
+
+    return roi_labels_from_meta(roi_meta_list)
+
+
 def build_official_head_targets(labels, mix_info, batch_size, device):
     """组装官方新增维度头(位置/ETE/临床T/TI-RADS)的 targets 片段。键缺席 → 返回空 dict。
 
@@ -252,6 +266,20 @@ def train_batch(
         build_official_head_targets(labels, mix_info, images.shape[0], device)
     )
 
+    # ── ROI 键注入(债1/债4,2026-09-25 训练侧接线)────────────────────────
+    # 整图 train_batch 的 criterion 会无条件调 compute_roi_head_losses——权重>0
+    # 而无 roi_labels 即 fail-loud(r7 同型雷的防线,不能为冒烟削弱)。整图支路
+    # **不产 ROI 监督**(per-lesion 损失由 run_roi_epoch 独立支路算,主线拍板:
+    # 双 loader 双前向,train_batch 不动)——故 targets 恒注 **K=0 空 list**:
+    # 合法早退路径(损失侧同型支持,detail 键恒 0),等于"整图批不含 ROI 病灶"
+    # 的真语义,而非绕过校验。**outputs 侧不注键**:train 路无
+    # collect_official_records 分流消费,但保持与 validate_step 同型(键 =
+    # 分流判据,整图前向不该带)——损失层对 "targets 有/outputs 无" 的组合
+    # 会在 missing 里报 roi_outputs……故 train 侧**两侧都注**(outputs 空 list
+    # 仅损失层消费;train 路无收集层,不会触发 ROI 收集分支)。与 val 侧的不
+    # 对称(只注 targets)是各自的消费面决定的,见 validate_step 同名注释。
+    if getattr(criterion, "roi_head_weight", 0.0) > 0.0:
+        targets["roi_labels"] = targets.get("roi_labels") or []
     # vCLUB 独立优化：使用前一批次的 detached 输出，在 autocast 外执行独立 backward
     vclub_learning_step(model, vclub_optimizer, prev_z_latent, prev_concept_vector)
 
@@ -261,6 +289,11 @@ def train_batch(
     amp_enabled = config["train"].get("amp", True)
     with torch.autocast(device_type="cuda", enabled=amp_enabled, dtype=torch.bfloat16):
         outputs = model(images, gamma_prior=gamma_prior)
+        # ROI 键(债1/债4):整图前向不产 roi_outputs——权重>0 时补 K=0 空批
+        # (与 targets["roi_labels"]=[] 成对,损失侧合法早退;理由见上方 targets
+        # 组装段注释)。此处加在 outputs 上,模型 forward 零改动。
+        if getattr(criterion, "roi_head_weight", 0.0) > 0.0:
+            outputs = {**outputs, "roi_outputs": []}
 
         # SLR 鲁棒标签校正
         if slr_beta < 1.0:

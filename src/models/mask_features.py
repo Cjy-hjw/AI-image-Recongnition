@@ -13,10 +13,16 @@
 Stage2 崩塌的四因之一——物理先验通路梯度由 0 到满强度）。
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 
-__all__ = ["nodule_scale_from_mask", "boundary_band_from_mask"]
+__all__ = [
+    "nodule_scale_from_mask",
+    "boundary_band_from_mask",
+    "physical_diameter_from_mask",
+]
 
 
 def nodule_scale_from_mask(soft_mask: torch.Tensor) -> torch.Tensor:
@@ -136,3 +142,51 @@ def boundary_band_from_mask(
     # 结构性防御（万一将来换非 max_pool 的实现），**不要因为"它从没触发过"就当成
     # 需要清理的死代码**；同样也别指望它兜住什么真实的数值问题。
     return (dilated - eroded).clamp(min=0.0)
+
+
+def physical_diameter_from_mask(soft_mask: torch.Tensor, spacing_mm=None) -> torch.Tensor:
+    """由 soft mask 导出**物理等效直径 d_mm**(ROI 范式波3·模型面,2026-09-25 新增)。
+
+    定义:d_mm = 2·sqrt(A/π) × spacing —— 与 `nodule_scale_from_mask` 的关系:
+    后者是**归一化**等效直径 sqrt(面积占比),前者乘 `spacing_mm` 后落在物理 mm 域,
+    供 ROI 版临床 T 头消费(scale 通道 `[d_mm, log d_mm]`,T 分期判据 T1≤2cm/T2 2-4cm
+    关心的是直径**倍数**,log 域才等距,见 `heads/clinical_t.py` 的同款论证)。
+
+    Args:
+        soft_mask: [B, 1, H, W] sigmoid 后的概率图(或任意非负权重图)。
+        spacing_mm: None / float / [B] / [B,1] tensor。**None → 恒返回 0**
+        (官方影像侧无 spacing 可读,`official_loader.build_official_samples` 的
+        roi_meta 恒传 None;**不得编造**,2026-08-14 教训)。下游 T 头 scale_proj
+        对 0 走 `log(clamp(0,min=1e-4))` 兜底,与空 mask 阴性病例同一量级,
+        "不知道 spacing"与"没有结节"在物理尺度上同处不可判状态,这是有意语义。
+
+    Returns:
+        [B, 1] —— 物理直径 mm,**已 detach**(同模块级契约:四头梯度不得回流分割主干)。
+        空 mask → 0(与 nodule_scale 语义一致:clamp(min=0) 后 sqrt(0)=0)。
+
+    数值安全:面积求和用 `sum(dtype=torch.float32)`(512²=262144 像素,fp16 朴素
+    求和溢出成 inf,QA_VP §1.3,同 `nodule_scale_from_mask` 的实测);sqrt 前不再
+    clamp(面积恒 ≥0,权重图非负假设下无 NaN 源)。
+    """
+    assert soft_mask.dim() == 4 and soft_mask.shape[1] == 1, (
+        f"physical_diameter_from_mask 期望 [B,1,H,W],got {tuple(soft_mask.shape)}"
+    )
+    area_px = soft_mask.detach().sum(dim=(2, 3), dtype=torch.float32)  # [B, 1]
+    # spacing=None → 恒 0(不编造物理量,docstring 语义);有 spacing 时
+    # d_px = 2·sqrt(A/π)(等效直径,像素)→ × spacing。
+    if spacing_mm is None:
+        return torch.zeros_like(area_px)
+    d_px = 2.0 * torch.sqrt(area_px / math.pi)          # 等效直径(像素)
+    if isinstance(spacing_mm, torch.Tensor):
+        if spacing_mm.dim() == 1:                    # [B] → [B,1](广播成 [B,B] 的坑,
+            spacing_mm = spacing_mm.unsqueeze(-1)    #   同 nodule_scale 的 [B,1] 契约)
+        elif spacing_mm.dim() == 2 and spacing_mm.shape[-1] != 1:
+            raise ValueError(
+                f"spacing_mm 期望 None/标量/[B]/[B,1],got {tuple(spacing_mm.shape)}"
+                " —— [B,S] 形张量会与 [B,1] 隐式广播成 [B,B]"
+            )
+        sp = spacing_mm.detach().float()
+    else:
+        sp = torch.tensor(float(spacing_mm), dtype=torch.float32,
+                          device=soft_mask.device)
+    return d_px.to(sp.device) * sp

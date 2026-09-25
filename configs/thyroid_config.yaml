@@ -240,3 +240,25 @@ train:
   # 下等效权重 = w_i·B/v.sum() 非裸 w_i——标定按"cliff 分项/净主项 20-30%"
   # 反推勿低估占比;起手 1ep 读 loss_seg_cliff 分项再定,勿抄绝对数。
   seg_cliff_weight: 0.0
+  # ROI 范式波3·损失组(方案一 P3,2026-09-25):两阶段 ROI 范式的 per-lesion
+  # 四头损失(位置/ETE/临床T/TI-RADS,losses/components/*_roi.py)总权重。
+  # 默认 0 = 生产默认关闭(零回归);>0 时编入四条 ROI 损失(1:1:1:1 内部
+  # 相对权重)。ROI 损失的超参(ETE 类权重/focal γ、TI-RADS 平滑/有序项)
+  # 复用上方整图版同键——单一配置源,勿另立 roi_ 前缀。
+  # 🔴 权重>0 时模型 forward 必须产 roi_outputs、训练循环必注 roi_labels,
+  # 缺任一键 fail-loud(新损失配旧模型输出拒绝静默空算)。
+  roi_head_weight: 0.0
+  # 债6(2026-09-25,方案 A 简化版):ROI 概念头监督权重——RoiConceptHead 的
+  # composition/echogenicity/shape/margin 四概念 per-lesion CE(键名 = 官方
+  # xlsx 概念列实测名,勿用 DR 报告简写;标签经 roi_labels_from_meta 桥产
+  # gt_composition 等)。foci 无官方标注,恒零损失零梯度。
+  # 🔴 >0 时模型 forward_roi 的**完整返回**(含顶层 roi_concepts 键)须传进
+  # 损失——只传 {"roi_outputs": ...} 窄 dict 会 fail-loud(概念 logits 在顶层)。
+  # 与 roi_head_weight 独立(可单独开纯概念标定);损失侧 detail 恒产
+  # roi_concept_* 与 concept_n_valid_* 键(计数惯例照 n_cc_*)。
+  # 🔴 2026-09-26 R2 review P0-1 定案:官方表无独立概念列(成分/回声/形状/
+  # 边缘 候选名实测不命中,概念信息只在 TI-RADS详细评分 复合串里、缺 84.4%)
+  # → 本监督在官方数据上**结构性恒空**,权重保持 0 直到数据侧解锁(拆复合串
+  # 解析 + 类索引与 TN3K 对齐,见 official_loader._parse_concept docstring)。
+  # 启动横幅会打警告;训练 JSONL 判据 = concept_n_valid_* 恒 0 即坐实链断。
+  roi_concept_weight: 0.0

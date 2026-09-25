@@ -530,7 +530,7 @@ class TestHedgeKeys:
     """#116a 对冲键 `TI_RADS_Probs` / `ETE_Probs` 的三处联通(改动三)。
 
     🔴 只测 `build_nodule_entry` 单函数会漏掉"调用处没透传"这一步 —— 那正是
-    审查抓到的缺陷形态:参数加了、写出逻辑也有,但 `_build_entries_and_save_masks`
+    审查抓到的缺陷形态:参数加了、写出逻辑也有,但 `_build_entries_and_save_slices`
     不传,于是键静默消失,而 `validate_prediction_json` 只查缺失不查多余 → 不报错。
     """
 

@@ -22,6 +22,7 @@ This package provides reusable inference modules shared by `predict.py` (product
 | `tiling.py` | **Z1(2026-09-21)**。静态滑窗 tiling:tile=512/stride=384,概率域 **max** 融合(禁平均),分类头取融合图 argmax 像素所属单 tile。env `AICOMP_STATIC_TILING` **默认关**;tile 必须=512、stride∈[256,512) fail-loud。只接静态,动态不碰。 |
 | `case_pipeline.py` | **A0 重构新增**。CLI 与 service 共用的**单病例推理核心**(静态图 `diagnose_static_case` + 动态图 `diagnose_dynamic_case`),从 `predict.py`/`video_predict.py` 的 `main()` 抽出,零行为变更。见 §6。Z1 在 `diagnose_static_case` 早退接 tiling(env 开且图大于 tile)。 |
 | `v21_output.py` | **A3 新增**。**唯一 V2.1 写盘入口** `write_case_v21`:把 `case_pipeline` 结果落成官方 V2.1 逐结节交付形态(软/二值 mask resize 回原图 → `split_nodules` 逐实例 → 每结节 `.nii.gz` + `prediction.json` 原子写)。静/动两链路,动态逐结节 3D mask 跨帧关联(最简实现,@云TODO)。见 §12 |
+| `roi_pipeline.py` | 🆕 **ROI 范式波5(2026-09-25 完工,新架构 §J)**:逐实例裁 ROI(bbox+pad,与 `nodule_split.crop_nodule` 同口径)→ 调 `model.forward_roi` → per-instance 四头值;env `AICOMP_ROI_HEADS` 默认关走现状整图共享**逐字节一致**(golden 对拍实测 diff=0);动态侧逐实例串行+帧在线消费 chunk=16(禁批量预裁,OOM 史)。**落地实况**:v21_output 加 `roi_ctx=None` keyword 参数(runner 构建传入,v21 全程不读 env;`_roi_nodule_context` 与整图 context 同键同编码)/`_build_entries_and_save_slices` 加 `per_nodule_contexts`/静态缺 `orig_img_np` fail-loud(runner 开时注入);postprocess `_assert_finite` 提为模块级 `assert_finite`+`validate_roi_probs`(长度错 raise);case_pipeline env 记录+tiling 互斥 raise;测试 `test_roi_inference.py` 39+1 项+`tmp_roi_inf_golden.py`。🔴 **模型面 review P0-1 修复(2026-09-25 夜,§J.5)**:静态 ROI 路 malignancy 裸 logits 曾直通 `malignancy_confidence`(越界 [0,1]→官方按 0 垫底;`validate_roi_probs` 只查长度+finite 查不出)——`_roi_contexts_from_outputs` 现先 `_softmax_mal_logits`(numpy 与 `_aggregate_roi_frame_rows` 同款浮点路径)再转 context;回归测试 `test_static_mal_confidence_is_softmaxed_not_raw_logit`。🔴 **E2 review P0-1/P1-1 修复(2026-09-25 深夜,§J.7)**:①`run_roi_forward` 曾三参调 `forward_roi(model, img, metas)`(bound method 参数错位,真模型必崩——fake 契约曾把错位写进签名致全绿);现两参调用+**真 forward_roi 返回整包 dict**(含 roi_outputs 键+9 观测键)的 dict/list 双形态解包+缺键 fail-loud,新锚 `test_run_roi_forward_real_model_contract`(真模型契约测试);②`iter_instance_frames_static/dynamic` 的 meta `bbox_xyxy` 统一记**实例半开框**(与训练侧 GT 半开同口径,loc 头 CoordConv 两侧基准一致;此前记 crop_nodule pad 后外扩框);③`_run_roi_dynamic` 单帧实例 stdout 打点(不再静默退化)。测试 39→**41**。🔴 交付红线:模型代码带 ROI 头后旧权重 build_model strict 拒——**裁决=保底交付旧代码旧权重,判线赢才换同批新代码+新权重(scoping §J.4)**。 |
 
 ---
 
@@ -668,7 +669,7 @@ argmax=idx1 时一路静默写出 `T=1`。故不依赖下游偶然拦截,在源�
 - **动态 3D 跨帧关联(@云TODO 最简实现)**:抽样帧逐帧 resize → `scatter_frames_to_full_length`
   回填全帧 `(n_total, H, W)` 3D mask → 3D 连通域 = 跨帧同一结节自然连成一个实例;分割中间帧
   漏检会拆成两个实例,空间相邻结节可能被闭运算粘连——真正的 tracking 待官方数据校正。
-- **`_build_entries_and_save_masks(...)` 只返回 `entries`**(2026-08-10 nit:原返回
+- **`_build_entries_and_save_slices(...)` 只返回 `entries`**(2026-08-10 nit:原返回
   `(entries, rel_paths)`,`rel_paths` 无其它用途,两处调用点原都写 `entries, _ =` 丢弃,已简化)。
 
 ### 失败语义
@@ -676,3 +677,9 @@ argmax=idx1 时一路静默写出 `T=1`。故不依赖下游偶然拦截,在源�
 `V21OutputError`(独立于 `PredictionSchemaError`):case_result 缺关键键 / 维度不符 / 依赖缺失
 (cv2)等运行期故障,由 runner 的病例级隔离捕获转 ERROR 占位,不拖垮整批。`rejected` 标记的
 case_result 不应走本函数(由 runner 的 ERROR/REJECTED 兜底)。
+
+## 2026-09-26 推理侧双路 review(R-A/R-B)修复记录(J.10)
+
+- **🔴 ROI_PAD_RATIO 0.25→0.0**(roi_pipeline.py):推理侧裁剪必须与训练侧 RoiDataset.crop_roi 紧切片逐位同口径——训练 GT bbox=mask 精确外接框无上下文,旧 0.25 边距致同一结节推理 ROI 结节占比 100%→44.4% 分布漂移(静默劣化)。测试 fixture _two_hot_patch_image 同步修(块位置须对齐 fullres 实例框,非 _MODEL 域)。**训练侧若加边距须两侧同步**。
+- **_to_np 加 .float()**(postprocess.py+v21_output.py 两处):bf16 张量 .numpy() TypeError 防雷(生产默认 fp16 不触发,合法配置值防御)。
+- 其余 R-A/R-B finding 全复核降级记档(裁决表=docs/新架构文件级改动清单_20260925.md §J.10):roi_mask 推理不装=设计(训练-推理输入不对称);动态零帧 raise=结构性不可达。

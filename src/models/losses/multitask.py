@@ -13,6 +13,7 @@ from src.models.losses.components import (
     compute_regularizers,
     compute_official_head_losses,
 )
+from src.models.losses.components.roi_heads import compute_roi_head_losses
 
 
 # 任务名 → loss_dict key 映射（多源异构标注的 task_mask 屏蔽路径参考）。
@@ -108,6 +109,18 @@ class MultiTaskLoss(nn.Module):
         # per-sample hard IoU(GT 全零记 -1 哨兵)。train_step 查表注入
         # targets["cliff_weights"];空 dict = 全 w=1 中性(epoch 1 预期)。
         self._cliff_iou_prev: dict = {}
+        # 两阶段 ROI 范式损失组(方案一 P3,2026-09-25):默认 0 = 零回归,
+        # 权重在 config.train.roi_head_weight;>0 时编入四条 ROI 损失
+        # (location/ete/clin_t/tirads 的 per-lesion 版)。ROI 损失的类权重/
+        # 平滑超参复用整图版同键(单一配置源,不另立 roi_ 前缀超参——避免
+        # "整图开加权 ROI 没开"的两把尺子)。
+        self.roi_head_weight = float(cfg.get("roi_head_weight", 0.0))
+        # 债6(2026-09-25,方案 A 简化版):ROI 概念头监督权重。默认 0 = 零回归;
+        # >0 时 compute_roi_head_losses 对 composition/echogenicity/shape/margin
+        # 四概念做 per-lesion CE(RoiConceptHead 此前无损失消费方=随机噪声旁路,
+        # 本键给它监督)。与 roi_head_weight 独立(可纯概念标定)。foci 无官方
+        # 标注,恒零损失零梯度。
+        self.roi_concept_weight = float(cfg.get("roi_concept_weight", 0.0))
         self.ete_focal_gamma = float(cfg.get("ete_focal_gamma", 2.0))
         self.ete_la_tau = float(cfg.get("ete_la_tau", 0.0))
         # backlog #128 LA-SoftQWK-OD:0(默认)= 走 CB-Focal 老路径,零回归。
@@ -247,6 +260,25 @@ class MultiTaskLoss(nn.Module):
         )
         total_loss = total_loss + head_total
 
+        # 4.6 ROI 四头(per-lesion)固定 λ 外挂(方案一 P3,2026-09-25)——
+        # 与 4.5 整图三头外挂同位(FAMO 之后、正则之前),**不进 FAMO**,
+        # 理由同 `components/official_heads.py` docstring(checkpoint 兼容 +
+        # masked 0 值会被 FAMO 误读为"已收敛")。默认权重 0 = 零回归:
+        # targets 无 ROI 键时整组跳过;**权重>0 而无 ROI 键 → raise
+        # fail-loud**(deepsup 同型:新损失配旧模型输出,拒绝静默空算)。
+        roi_total, roi_detail = compute_roi_head_losses(
+            outputs,
+            targets,
+            lambda_roi=self.roi_head_weight,
+            ete_class_weights=self.ete_class_weights,
+            ete_focal_gamma=self.ete_focal_gamma,
+            tirads_class_weights=self.tirads_class_weights,
+            tirads_label_smoothing=self.tirads_label_smoothing,
+            tirads_ordinal_weight=self.tirads_ordinal_weight,
+            concept_weight=self.roi_concept_weight,
+        )
+        total_loss = total_loss + roi_total
+
         # 5. Regularization
         total_loss, loss_l2 = compute_regularizers(
             total_loss,
@@ -274,6 +306,11 @@ class MultiTaskLoss(nn.Module):
         # 三头监控项(未乘 λ 的原始量级)。targets 无三头键时 head_detail 为空,
         # loss_dict 与 legacy 完全一致。
         loss_dict.update(head_detail)
+        # ROI 四头监控项(未乘 λ 的原始量级)。两分支都写:
+        # 权重 0(默认)时恒 0.0(键恒在——接线被删 JSONL 立刻可见,不自证,
+        # 与 seg_boundary/seg_lovasz 的 Gate2 F3 同款);权重>0 且有 ROI 键时
+        # 为真实分项。legacy 恒 0。
+        loss_dict.update(roi_detail)
         # seg 分项监控(Gate2 F3,2026-09-14):seg_boundary/seg_lovasz 的
         # 实际量级必须进 loss_dict → JSONL——config 写着"先观察量级再定权重",
         # 合并进 "seg" 后操作者无从观察;分项恒写出(权重=0 时为 0.0),

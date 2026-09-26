@@ -29,7 +29,7 @@ import re
 import random
 import sys
 import unicodedata
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -754,8 +754,8 @@ def _read_nifti_binmasks(path: str) -> Tuple[List[np.ndarray], List[int]]:
     复用 load_nifti_frames 的 (X,Y,Z)↔(H,W) 转置约定(勿另抄,定稿最易错处);
     max_frames<=0 取全帧;任意非零→前景。读失败返回 ([], [])。
     """
-    frames, idxs, _, err, _ = load_nifti_frames(path, max_frames=-1)
-    if err or not frames:
+    frames, idxs, err = _nifti_frames_cached(path)
+    if frames is None:
         return [], []
     binf = [(np.asarray(f) > 0).astype(np.uint8) for f in frames]
     return binf, list(idxs)
@@ -848,10 +848,35 @@ _ROI_LABEL_KEYS = (
 )
 
 
-def _read_nifti_frame_gray(path: str, frame_index: int) -> np.ndarray:
-    """读动态 `.nii.gz` 指定原始帧号的灰度帧 (H,W) uint8。"""
+_NIFTI_FRAMES_MEMO: "OrderedDict[str, tuple]" = OrderedDict()  # ROI 支路 IO 缓存(2026-09-26 提速)
+_NIFTI_MEMO_MAX = 4  # 🔴 2026-09-26 二修:48 在 16 workers 下爆内存杀容器(每 worker 独立 dict,数百 GB,容器 OOMKilled 两次实锤)。窗口 4(用户拍板加量):峰值 16×4×600MB≈38G+基础 ~12G=50G<64G 留 14G 余量;单份 600MB 是影像+mask 双缓最坏,实际均值 ~300MB → 期望占用 ~18G。窗口 6+ 峰值顶满不可再大
+
+
+def _nifti_frames_cached(path: str):
+    """load_nifti_frames(max_frames=-1) 的进程级 LRU(解码结果缓存,数值零变)。
+
+    动态 ROI 样本对同一 .nii.gz 反复解压(影像+mask 同体量,258MB/次):每病灶
+    3-5 交集帧 = 同文件解 3-5 次。缓存后一 epoch 内同文件只解一次。**只动 IO
+    不动数值**:缓存的是解码后的 (frames, idxs) 原样返回。
+    """
+    hit = _NIFTI_FRAMES_MEMO.get(path)
+    if hit is not None:
+        _NIFTI_FRAMES_MEMO.move_to_end(path)
+        return hit[0], hit[1], None
     frames, idxs, _, err, _ = load_nifti_frames(path, max_frames=-1)
     if err or not frames:
+        return None, None, err
+    _NIFTI_FRAMES_MEMO[path] = (frames, idxs)
+    _NIFTI_FRAMES_MEMO.move_to_end(path)
+    while len(_NIFTI_FRAMES_MEMO) > _NIFTI_MEMO_MAX:
+        _NIFTI_FRAMES_MEMO.popitem(last=False)
+    return frames, idxs, None
+
+
+def _read_nifti_frame_gray(path: str, frame_index: int) -> np.ndarray:
+    """读动态 `.nii.gz` 指定原始帧号的灰度帧 (H,W) uint8。"""
+    frames, idxs, err = _nifti_frames_cached(path)
+    if frames is None:
         raise RuntimeError(f"读动图失败 {path}: {err}")
     pos = idxs.index(frame_index) if frame_index in idxs else frame_index
     return np.asarray(frames[pos])

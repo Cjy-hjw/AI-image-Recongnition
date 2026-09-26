@@ -26,6 +26,10 @@
 - `QA_VP.md` — 代码审查 / 验证门细则,由 `rules.md §2` 在跑 Gate 2 时触发去读。
 - 各目录 `AGENTS.md` — 模块级规则(架构 / 训练 / 推理 / 数据 / 测试 / gatekeeper),**改某模块前先读其 `AGENTS.md`**;总索引见根目录 `AGENTS.md`。
 
+## 🔴 速度红线(2026-09-26 用户铁令)
+
+**任何改动都要兼顾速度**——尤其数据消费路径:新增/改 DataLoader/Dataset/诊断/推理读取路径,先算**每 epoch(或全量)读多少字节、解压多少次**,与旧同型路径对比,超 ~2 倍即红旗;**重复解压/解码必须缓存**(进程级 LRU,先算内存上限)。反例:ROI 支路每样本整读原图(动态 258MB 全卷解压取一帧,同文件解 3-5 次),六路 review+1554 测试全绿却 10min/ep(旧轮 6 倍)。修复模板 `src/dataset/official_loader.py` `_nifti_frames_cached`;审查清单=QA_VP §1.8 末条。🔴 **多进程 DataLoader 缓存内存账 ×num_workers**(48×16 workers 爆容器 OOMKilled 实锤,常量上限写算式勿拍脑袋)。
+
 ## 开发命令（AI 无法从代码推断）
 
 ```bash

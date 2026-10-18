@@ -50,3 +50,17 @@ desktop.ini
 # 就没被上面任何一条盖住,以 untracked 身份出现在 git status 里);按前缀逐条列同样会漏
 # (新起一个 `tmp_qavp_*` 前缀就又漏了)。改用单条通配收口:凡 `tmp_` 开头一律不入库。
 /tmp_*
+
+# 2026-10-18 开源清理:内部工作文档与官方材料不入公开仓
+/docs/历史存档/
+/docs/官方原文/
+/docs/8.1赛事公开资料/
+/docs/项目现状总纲.md
+/docs/会话状态*.md
+/docs/待官方答复清单.md
+/docs/提示词_*.md
+/docs/新架构*.md
+/docs/Opus战略咨询*.md
+/技术方案模板及撰写要求.wps
+/cloud_train_*.zip
+/云端任务_*.txt
